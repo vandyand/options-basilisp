@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stevetrading-basilisp"
+version = "0.1.0"
+description = "Ground-up Basilisp rewrite of StevenTrading."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "basilisp==0.5.1",
+  "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = [
+  ".",
+  "components/domain.identifiers/src",
+  "components/domain.enums/src",
+  "components/domain.instruments/src",
+  "components/domain.schemas/src",
+  "components/domain.validation/src",
+  "components/engine.state/src",
+  "components/engine.fold/src",
+  "components/engine.machines/src",
+  "components/engine.recovery/src",
+  "components/engine.commands/src",
+  "components/strategy.registry/src",
+  "components/feature.core/src",
+  "components/inference.core/src",
+  "components/signal.core/src",
+  "components/risk.core/src",
+  "components/execution.core/src",
+  "components/ledger.core/src",
+  "components/portfolio.core/src",
+  "components/broker.protocol/src",
+  "components/market-data.protocol/src",
+  "components/persistence.protocol/src",
+  "components/observability.protocol/src",
+  "components/control-plane.protocol/src",
+  "components/artifact.protocol/src",
+  "components/broker.alpaca/src",
+  "components/broker.sim/src",
+  "components/market-data.polygon/src",
+  "components/market-data.replay/src",
+  "components/persistence.fact-store/src",
+  "components/persistence.snapshot-store/src",
+  "components/observability.structured-log/src",
+  "components/control-plane.file-store/src",
+  "components/artifact.file-store/src",
+  "components/time.core/src",
+  "components/calendar.core/src",
+  "components/config.core/src",
+  "components/replay.fixture/src",
+  "bases/engine-live/src",
+  "bases/engine-replay/src",
+  "bases/control-plane/src",
+  "bases/reports/src",
+  "bases/dev/src",
+]
+testpaths = [
+  "tests",
+]
+
+[tool.setuptools]
+include-package-data = true
+

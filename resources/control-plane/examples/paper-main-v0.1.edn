@@ -1,0 +1,38 @@
+;; Example control-plane manifest for one paper-runtime deployment scope.
+
+{:control-plane/revision "cp-000001"
+ :control-plane/generated-at "2026-06-10T14:00:00Z"
+ :control-plane/status :control-plane-status/proposed
+ :control-plane/strategies
+ [{:strategy/id "strategy/spx-credit/spread-entry/v1"
+   :strategy/enabled? true
+   :strategy/mode :mode/paper
+   :strategy/process "engine-paper-main"
+   :strategy/account-route "route/paper-spreads"
+   :strategy/artifacts {:model-ref "model/spx-credit/v7"
+                        :feature-manifest-ref "feature/spx-credit/v3"}
+   :strategy/schedule {:session :session/us-equities-regular}}]
+ :control-plane/accounts
+ [{:account/id "account/alpaca/paper-ops"
+   :account/broker :broker/alpaca-paper
+   :account/environment :environment/paper
+   :account/allowed-modes #{:mode/paper :mode/shadow}
+   :account/live-enabled? false}]
+ :control-plane/processes
+ [{:process/id "engine-paper-main"
+   :process/base :base/engine-live
+   :process/allowed-modes #{:mode/paper}
+   :process/strategies ["strategy/spx-credit/spread-entry/v1"]}]
+ :control-plane/routes
+ [{:route/id "route/paper-spreads"
+   :route/strategy-id "strategy/spx-credit/spread-entry/v1"
+   :route/account-id "account/alpaca/paper-ops"
+   :route/broker :broker/alpaca-paper}]
+ :control-plane/kill-switches
+ [{:kill-switch/scope :kill-switch-scope/global
+   :kill-switch/active? false
+   :kill-switch/reason nil
+   :kill-switch/activated-at nil
+   :kill-switch/actor nil}]
+ :control-plane/policies
+ {:policy/default-degradation :degradation-policy/default-paper}}

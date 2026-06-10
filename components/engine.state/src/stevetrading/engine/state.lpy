@@ -1,0 +1,18 @@
+(ns stevetrading.engine.state)
+
+(def engine-state-version 1)
+
+(def empty-engine-state
+  {:engine/version engine-state-version
+   :engine/run nil
+   :engine/control-plane nil
+   :engine/strategies {}
+   :engine/unresolved-orders {}
+   :engine/portfolio {}
+   :engine/watermarks {}
+   :engine/health {:health/status :health/starting}})
+
+(defn fresh-state
+  []
+  empty-engine-state)
+

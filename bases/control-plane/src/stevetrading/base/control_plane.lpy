@@ -1,0 +1,9 @@
+(ns stevetrading.base.control-plane)
+
+(def base-id :base/control-plane)
+
+(defn describe-base
+  []
+  {:base/id base-id
+   :base/modes #{:mode/control-plane}})
+

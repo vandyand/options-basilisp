@@ -1,0 +1,20 @@
+;; Example canonical broker acknowledgement fact.
+
+{:record/type :fact/broker-ack-accepted
+ :record/version 1
+ :record/run-id "01JX8GZY6S3N8W3PK0T4V8M6C2"
+ :record/mode :mode/paper
+ :record/correlation-id "01JX8H0CKVJ9P4CZAFSRJ5VY5H"
+ :record/causation-ids ["01JX8H0V7QMP2T8A3N8D0SY5Z4"]
+ :record/strategy-id "strategy/spx-credit/spread-entry/v1"
+ :record/account-id "account/alpaca/paper-ops"
+ :record/source-system :broker/alpaca-paper
+ :fact/occurred-at "2026-06-10T14:31:02.181Z"
+ :fact/recorded-at "2026-06-10T14:31:02.182Z"
+ :fact/payload
+ {:order-intent/id "oi_9d1a4f"
+  :broker/source-system :broker/alpaca-paper
+  :broker/account-id "account/alpaca/paper-ops"
+  :broker/order-id "8b8f3b7d-1234-5678-90ab-fedcba123456"
+  :broker/status :broker-status/accepted
+  :broker/observed-at "2026-06-10T14:31:02.181Z"}}

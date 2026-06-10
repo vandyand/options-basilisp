@@ -1,0 +1,14 @@
+(ns stevetrading.domain.schemas)
+
+(def schema-version 1)
+
+(def canonical-record-kinds
+  #{:fact
+    :command
+    :snapshot
+    :projection})
+
+(defn supported-record-kind?
+  [record-kind]
+  (contains? canonical-record-kinds record-kind))
+

@@ -1,0 +1,9 @@
+(ns stevetrading.base.reports)
+
+(def base-id :base/reports)
+
+(defn describe-base
+  []
+  {:base/id base-id
+   :base/modes #{:mode/report}})
+

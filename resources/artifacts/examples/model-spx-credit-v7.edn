@@ -1,0 +1,8 @@
+;; Example model-artifact reference payload.
+
+{:model/id "model/spx-credit/v7"
+ :model/version 7
+ :model/feature-manifest-ref "feature/spx-credit/v3"
+ :model/prediction-schema-version 1
+ :model/build-metadata-ref "build/spx-credit/2026-06-01"
+ :model/runtime-format :model-format/onnx}

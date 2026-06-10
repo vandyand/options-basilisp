@@ -1,0 +1,25 @@
+;; Example canonical broker submit command payload.
+
+{:record/type :command/submit-order-intent
+ :record/version 1
+ :record/run-id "01JX8GZY6S3N8W3PK0T4V8M6C2"
+ :record/mode :mode/paper
+ :record/correlation-id "01JX8H0CKVJ9P4CZAFSRJ5VY5H"
+ :record/causation-ids ["01JX8H07B9M0AZ6KN4V1M4VE0P"]
+ :record/strategy-id "strategy/spx-credit/spread-entry/v1"
+ :record/account-id "account/alpaca/paper-ops"
+ :record/source-system :engine/core
+ :command/issued-at "2026-06-10T14:31:02.126Z"
+ :command/target-adapter :adapter/broker
+ :command/idempotency-key "submit/intent/oi_9d1a4f"
+ :command/payload
+ {:order-intent/id "oi_9d1a4f"
+  :broker/account-id "account/alpaca/paper-ops"
+  :broker/route {:broker/source-system :broker/alpaca-paper}
+  :order-intent/order-type :order-type/limit
+  :order-intent/time-in-force :tif/day
+  :order-intent/legs
+  [{:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+    :leg/side :order-side/buy
+    :leg/quantity "1"}]
+  :order-intent/limit-price "2.15"}}

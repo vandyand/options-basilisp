@@ -1,0 +1,12 @@
+(ns stevetrading.engine.machines)
+
+(def lifecycle-machine-ids
+  #{:machine/strategy
+    :machine/order
+    :machine/recovery
+    :machine/health})
+
+(defn known-machine?
+  [machine-id]
+  (contains? lifecycle-machine-ids machine-id))
+

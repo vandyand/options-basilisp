@@ -1,0 +1,8 @@
+(ns stevetrading.base.dev)
+
+(def base-id :base/dev)
+
+(defn describe-base
+  []
+  {:base/id base-id
+   :base/modes #{:mode/dev}})

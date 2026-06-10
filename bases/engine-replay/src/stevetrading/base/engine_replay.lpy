@@ -1,0 +1,9 @@
+(ns stevetrading.base.engine-replay)
+
+(def base-id :base/engine-replay)
+
+(defn describe-base
+  []
+  {:base/id base-id
+   :base/modes #{:mode/replay :mode/sim}})
+

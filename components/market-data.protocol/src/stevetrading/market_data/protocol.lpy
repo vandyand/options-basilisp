@@ -1,0 +1,22 @@
+(ns stevetrading.market-data.protocol)
+
+(def market-observation-types
+  #{:fact/market-bar-observed
+    :fact/quote-observed
+    :fact/option-chain-observed
+    :fact/calendar-session-observed})
+
+(def market-command-types
+  #{:command/request-market-bars
+    :command/request-quotes
+    :command/request-option-chain
+    :command/request-calendar-state})
+
+(defn market-observation?
+  [record-type]
+  (contains? market-observation-types record-type))
+
+(defn market-command?
+  [record-type]
+  (contains? market-command-types record-type))
+

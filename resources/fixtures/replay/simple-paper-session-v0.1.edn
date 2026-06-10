@@ -1,0 +1,16 @@
+;; Example replay fixture metadata for one minimal paper-style session.
+
+{:fixture/id "fixture/replay/simple-paper-session/v0.1"
+ :fixture/version 1
+ :fixture/mode :mode/replay
+ :fixture/description "Minimal one-session replay fixture with one bar, one signal path, one submit, one ack, and one fill."
+ :fixture/inputs
+ [{:ref "contracts/market-data/market-bar-observed.edn"}
+  {:ref "contracts/market-data/option-chain-observed.edn"}]
+ :fixture/expected-outputs
+ [{:record/type :fact/prediction-produced}
+  {:record/type :fact/signal-decision-produced}
+  {:record/type :fact/risk-decision-recorded}
+  {:record/type :fact/order-intent-created}
+  {:record/type :fact/broker-ack-accepted}
+  {:record/type :fact/fill-observed}]}

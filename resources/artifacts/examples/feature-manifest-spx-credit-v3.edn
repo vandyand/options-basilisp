@@ -1,0 +1,14 @@
+;; Example feature-manifest reference payload.
+
+{:feature-manifest/id "feature/spx-credit/v3"
+ :feature-manifest/version 3
+ :feature-manifest/features
+ [:feature/iv-rank
+  :feature/realized-vol-20d
+  :feature/spread-width]
+ :feature-manifest/required-inputs
+ [:input/bar-1m
+  :input/option-chain]
+ :feature-manifest/compatibility
+ {:strategy-family :strategy-family/spx-credit
+  :prediction-schema-version 1}}

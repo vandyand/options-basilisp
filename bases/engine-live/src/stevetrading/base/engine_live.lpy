@@ -1,0 +1,9 @@
+(ns stevetrading.base.engine-live)
+
+(def base-id :base/engine-live)
+
+(defn describe-base
+  []
+  {:base/id base-id
+   :base/modes #{:mode/live :mode/paper}})
+

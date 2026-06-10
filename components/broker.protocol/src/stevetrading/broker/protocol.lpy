@@ -1,0 +1,25 @@
+(ns stevetrading.broker.protocol)
+
+(def broker-command-types
+  #{:command/submit-order-intent
+    :command/cancel-broker-order
+    :command/request-broker-open-orders
+    :command/request-broker-fills-since
+    :command/request-broker-account-state
+    :command/request-broker-health})
+
+(def broker-fact-types
+  #{:fact/broker-ack-accepted
+    :fact/broker-ack-rejected
+    :fact/broker-order-status-observed
+    :fact/fill-observed
+    :fact/broker-account-observed})
+
+(defn broker-command?
+  [record-type]
+  (contains? broker-command-types record-type))
+
+(defn broker-fact?
+  [record-type]
+  (contains? broker-fact-types record-type))
+

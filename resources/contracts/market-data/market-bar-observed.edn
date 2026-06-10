@@ -1,0 +1,25 @@
+;; Example canonical market bar fact.
+
+{:record/type :fact/market-bar-observed
+ :record/version 1
+ :record/run-id "01JX8GZY6S3N8W3PK0T4V8M6C2"
+ :record/mode :mode/paper
+ :record/correlation-id "01JX8H07B9M0AZ6KN4V1M4VE0P"
+ :record/causation-ids []
+ :record/instrument-id "equity/NASDAQ/SPY"
+ :record/source-system :market-data/polygon
+ :fact/occurred-at "2026-06-10T14:30:00Z"
+ :fact/recorded-at "2026-06-10T14:30:00.412Z"
+ :fact/source-ref "polygon:bar:SPY:2026-06-10T14:30:00Z"
+ :fact/payload
+ {:bar/time "2026-06-10T14:30:00Z"
+  :bar/timeframe :timeframe/1m
+  :bar/open "550.10"
+  :bar/high "550.22"
+  :bar/low "549.98"
+  :bar/close "550.05"
+  :bar/volume "18234"
+  :data/provider :market-data/polygon
+  :data/provider-ref "polygon:bar:SPY:2026-06-10T14:30:00Z"
+  :data/received-at "2026-06-10T14:30:00.412Z"
+  :data/quality {:quality/complete? true}}}

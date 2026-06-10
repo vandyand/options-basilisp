@@ -1,0 +1,22 @@
+;; Example canonical option-chain snapshot fact.
+
+{:record/type :fact/option-chain-observed
+ :record/version 1
+ :record/run-id "01JX8GZY6S3N8W3PK0T4V8M6C2"
+ :record/mode :mode/paper
+ :record/correlation-id "01JX8H07B9M0AZ6KN4V1M4VE0P"
+ :record/causation-ids []
+ :record/instrument-id "equity/NASDAQ/SPY"
+ :record/source-system :market-data/polygon
+ :fact/occurred-at "2026-06-10T14:30:00.500Z"
+ :fact/recorded-at "2026-06-10T14:30:00.550Z"
+ :fact/source-ref "polygon:chain:SPY:2026-06-10T14:30:00.500Z"
+ :fact/payload
+ {:chain/observed-at "2026-06-10T14:30:00.500Z"
+  :chain/underlying "equity/NASDAQ/SPY"
+  :chain/contracts
+  [{:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+    :quote/bid "2.10"
+    :quote/ask "2.15"}]
+  :data/provider :market-data/polygon
+  :data/provider-ref "polygon:chain:SPY:2026-06-10T14:30:00.500Z"}}

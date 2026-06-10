@@ -1,0 +1,20 @@
+(ns stevetrading.persistence.protocol)
+
+(def persistence-command-types
+  #{:command/append-facts
+    :command/persist-snapshot
+    :command/advance-recovery-watermark})
+
+(def persistence-read-models
+  #{:read/latest-snapshot
+    :read/facts-since-watermark
+    :read/active-control-plane-revision})
+
+(defn persistence-command?
+  [record-type]
+  (contains? persistence-command-types record-type))
+
+(defn known-read-model?
+  [read-model]
+  (contains? persistence-read-models read-model))
+
