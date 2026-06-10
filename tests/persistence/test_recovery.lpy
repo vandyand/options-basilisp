@@ -1,0 +1,435 @@
+(ns persistence.test-recovery
+  "Recovery planner + executor tests (ENGINE_STATE_AND_RECOVERY §9-§12,
+  ADR-0004): golden convergence, unresolved-order survival, ambiguity →
+  :blocked, broker reconciliation."
+  (:import tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.engine.recovery :as rec]
+            [stevetrading.engine.state :as st]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.persistence.snapshot-store :as ss]))
+
+(def oi "oi_testintent00000000000000000000000000000000000000")
+
+(defn ffact
+  ([fact-type payload occurred-at]
+   (ffact fact-type payload occurred-at nil))
+  ([fact-type payload occurred-at dedupe-key]
+   (sch/fact-envelope
+    (cond-> {:record/type fact-type
+             :record/mode :mode/sim
+             :record/strategy-id "strategy/simple-direction/sma-cross/v1"
+             :record/account-id "account/sim/test"
+             :record/instrument-id "equity/ARCA/SPY"
+             :record/source-system :broker/sim
+             :fact/occurred-at occurred-at
+             :fact/recorded-at occurred-at
+             :fact/payload payload}
+      (some? dedupe-key) (assoc :fact/dedupe-key dedupe-key)))))
+
+(defn intent-fact
+  []
+  (ffact :fact/order-intent-created
+         {:order-intent/id oi
+          :order-intent/decision-id "dec_x"
+          :order-intent/intent-slot 0
+          :order-intent/role :intent-role/entry
+          :order-intent/side :order-side/buy
+          :order-intent/effect :position-effect/open
+          :order-intent/order-type :order-type/market
+          :order-intent/time-in-force :tif/day
+          :order-intent/quantity "2"
+          :order-intent/legs [{:instrument/id "equity/ARCA/SPY"
+                               :leg/side :order-side/buy
+                               :leg/quantity "2"}]}
+         "2026-06-10T14:30:00Z"))
+
+(defn dispatch-fact
+  []
+  (ffact :fact/command-dispatched
+         {:command/type :command/submit-order-intent
+          :order-intent/id oi}
+         "2026-06-10T14:30:01Z"))
+
+(defn ack-fact
+  []
+  (ffact :fact/broker-ack-accepted
+         {:order-intent/id oi
+          :broker/source-system :broker/sim
+          :broker/order-id "sim-1"
+          :broker/status :broker-status/accepted
+          :broker/observed-at "2026-06-10T14:30:02Z"}
+         "2026-06-10T14:30:02Z"))
+
+(defn fill-fact
+  ([fill-id quantity occurred-at]
+   (fill-fact fill-id quantity occurred-at oi))
+  ([fill-id quantity occurred-at order-intent-id]
+   (ffact :fact/fill-observed
+          {:order-intent/id order-intent-id
+           :broker/source-system :broker/sim
+           :broker/order-id "sim-1"
+           :fill/id fill-id
+           :fill/occurred-at occurred-at
+           :fill/quantity quantity
+           :fill/price "550.00"
+           :fill/liquidity :liquidity/taker}
+          occurred-at
+          (str "fill/sim/account-sim-test/sim-1/" fill-id))))
+
+(defn happy-sequence
+  []
+  [(intent-fact)
+   (dispatch-fact)
+   (ack-fact)
+   (fill-fact "t1" "1" "2026-06-10T14:30:03Z")
+   (fill-fact "t2" "1" "2026-06-10T14:30:04Z")])
+
+(defn stores
+  []
+  {:fact-store (fs/make-fact-store ":memory:")
+   :snapshot-store (ss/make-snapshot-store (tempfile/mkdtemp))})
+
+(defn snapshot-at!
+  "Fold the first n facts of the log into a snapshot at watermark n and
+  write it."
+  [{:keys [fact-store snapshot-store]} n]
+  (let [state (:state (fold/fold-facts (st/fresh-state)
+                                       (take n (p/facts-since fact-store 0))))]
+    (p/write-snapshot!
+     snapshot-store
+     (sch/snapshot-envelope
+      {:snapshot/engine-version "0.1.0"
+       :snapshot/written-at "2026-06-10T14:30:02Z"
+       :snapshot/fact-watermark {:stream "fact-log" :offset n}
+       :snapshot/state state}))))
+
+(defn with-fact-log-watermark
+  [state offset]
+  (assoc-in state [:engine/watermarks :watermark/fact-log] offset))
+
+;; ---------------------------------------------------------------------------
+;; plan-recovery (pure, §9)
+;; ---------------------------------------------------------------------------
+
+(deftest plan-recovery-modes
+  (testing "§9.1 fresh start: nothing usable"
+    (is (= {:recovery/mode :fresh-start :recovery/reconcile? false}
+           (rec/plan-recovery {:run-mode :mode/sim
+                               :snapshot? false :facts? false}))))
+  (testing "§9.2 warm restart: snapshot + facts, non-broker mode"
+    (is (= {:recovery/mode :warm-restart :recovery/reconcile? false}
+           (rec/plan-recovery {:run-mode :mode/sim
+                               :snapshot? true :facts? true}))))
+  (testing "§9.3/§14.1 live and paper require reconciliation"
+    (is (= {:recovery/mode :crash-recovery :recovery/reconcile? true}
+           (rec/plan-recovery {:run-mode :mode/paper
+                               :snapshot? true :facts? true})))
+    (is (= {:recovery/mode :crash-recovery :recovery/reconcile? true}
+           (rec/plan-recovery {:run-mode :mode/live
+                               :snapshot? false :facts? true}))))
+  (testing "§9.4/§14.3 replay never consults broker truth"
+    (is (= {:recovery/mode :replay :recovery/reconcile? false}
+           (rec/plan-recovery {:run-mode :mode/replay
+                               :snapshot? true :facts? true}))))
+  (testing "explicit requested mode wins"
+    (is (= :crash-recovery
+           (:recovery/mode
+            (rec/plan-recovery {:requested-mode :crash-recovery
+                                :run-mode :mode/sim
+                                :snapshot? true :facts? true}))))
+    (is (= {:recovery/mode :warm-restart :recovery/reconcile? false}
+           (rec/plan-recovery {:requested-mode :warm-restart
+                               :run-mode :mode/sim
+                               :snapshot? true :facts? true}))))
+  (testing "unknown requested mode is rejected"
+    (is (thrown? python/Exception
+                 (rec/plan-recovery {:requested-mode :time-travel
+                                     :run-mode :mode/sim
+                                     :snapshot? false :facts? false})))))
+
+;; ---------------------------------------------------------------------------
+;; Fresh start
+;; ---------------------------------------------------------------------------
+
+(deftest fresh-start-over-empty-stores
+  (let [{:keys [fact-store] :as sts} (stores)
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :ready (:recovery/outcome res)))
+    (is (= :fresh-start (:recovery/mode res)))
+    (is (= [] (:recovery/facts res)))
+    (testing "recovery bookkeeping facts were appended"
+      (is (= [:fact/recovery-started :fact/recovery-completed]
+             (mapv :record/type (p/facts-since fact-store 0)))))))
+
+;; ---------------------------------------------------------------------------
+;; Golden convergence (warm restart)
+;; ---------------------------------------------------------------------------
+
+(deftest warm-restart-converges-to-full-fold
+  (let [{:keys [fact-store] :as sts} (stores)
+        facts (happy-sequence)
+        _ (p/append-facts! fact-store facts)
+        full-fold (:state (fold/fold-facts (st/fresh-state) facts))
+        _ (snapshot-at! sts 3)
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :ready (:recovery/outcome res)))
+    (is (= :warm-restart (:recovery/mode res)))
+    (testing "snapshot at watermark 3 + tail == fold of everything from 0"
+      (is (= (with-fact-log-watermark full-fold 5)
+             (:engine/state res))))
+    (testing "only the post-watermark tail was replayed"
+      (is (= [4 5] (mapv :fact-log/offset (:recovery/facts res)))))
+    (testing "the recovered order resolved to :filled"
+      (let [entry (st/unresolved-order (:engine/state res) oi)]
+        (is (= :filled (:order/lifecycle entry)))
+        (is (true? (:order/resolved? entry)))))))
+
+(deftest recovery-without-snapshot-replays-from-origin
+  (let [{:keys [fact-store] :as sts} (stores)
+        facts (happy-sequence)
+        _ (p/append-facts! fact-store facts)
+        full-fold (:state (fold/fold-facts (st/fresh-state) facts))
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :ready (:recovery/outcome res)))
+    (is (= (with-fact-log-watermark full-fold 5) (:engine/state res)))
+    (is (= [1 2 3 4 5] (mapv :fact-log/offset (:recovery/facts res))))))
+
+(deftest repeated-recovery-converges
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store (happy-sequence))
+        _ (snapshot-at! sts 3)
+        res1 (rec/run-recovery! (assoc sts :run-mode :mode/sim))
+        res2 (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    ;; the second run additionally replays the first run's recovery facts —
+    ;; they fold as no-ops, so engine state must converge (golden property)
+    (is (= :ready (:recovery/outcome res2)))
+    (is (= (update-in (:engine/state res1)
+                      [:engine/watermarks] dissoc :watermark/fact-log)
+           (update-in (:engine/state res2)
+                      [:engine/watermarks] dissoc :watermark/fact-log)))))
+
+;; ---------------------------------------------------------------------------
+;; Unresolved order survival
+;; ---------------------------------------------------------------------------
+
+(deftest unresolved-order-in-snapshot-survives-recovery
+  (let [{:keys [fact-store] :as sts} (stores)
+        ;; only intent → dispatch → ack in the log: order is unresolved
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       (ack-fact)])
+        _ (snapshot-at! sts 3)
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))
+        entry (st/unresolved-order (:engine/state res) oi)]
+    (is (= :ready (:recovery/outcome res)))
+    (testing "the §4.3 entry survives with full lineage context"
+      (is (= :acknowledged (:order/lifecycle entry)))
+      (is (false? (:order/resolved? entry)))
+      (is (= "sim-1" (:order/broker-order-id entry)))
+      (is (= "2" (:order/quantity entry))))
+    (is (= {oi entry} (rec/unresolved-entries (:engine/state res))))))
+
+;; ---------------------------------------------------------------------------
+;; Ambiguity → :blocked
+;; ---------------------------------------------------------------------------
+
+(deftest fill-for-unknown-intent-blocks-recovery
+  (let [{:keys [fact-store] :as sts} (stores)
+        ;; a fill with lineage no intent in the log can explain (§11.3 E)
+        _ (p/append-facts!
+           fact-store
+           [(fill-fact "tx" "1" "2026-06-10T14:30:03Z"
+                       "oi_unknownintent000000000000000000000000000000000")])
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :blocked (:recovery/outcome res)))
+    (testing "the fold's unknown-intent fault was made durable"
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/fault-recorded})))))
+    (testing "recovery-completed records the blocked outcome"
+      (let [completed (first (p/facts-by
+                              fact-store
+                              {:fact-type :fact/recovery-completed}))]
+        (is (= :blocked (get-in completed
+                                [:fact/payload :recovery/outcome])))))))
+
+(deftest orphaned-order-blocks-recovery
+  (let [{:keys [fact-store] :as sts} (stores)
+        anomaly (ffact :fact/fault-recorded
+                       {:fault/kind :fault/reconciliation-anomaly
+                        :order-intent/id oi
+                        :fault/reason :anomaly/ack-status-ambiguous}
+                       "2026-06-10T14:30:02Z")
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact) anomaly])
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :blocked (:recovery/outcome res)))
+    (is (= :orphaned-needs-reconcile
+           (:order/lifecycle
+            (st/unresolved-order (:engine/state res) oi))))))
+
+;; ---------------------------------------------------------------------------
+;; Broker reconciliation (§10 steps 8-10, §11.3)
+;; ---------------------------------------------------------------------------
+
+(defn fn-map-broker
+  "Phase-3 broker seam: a fn-map standing in for the Phase 4 protocol."
+  [{:keys [open-orders fills]}]
+  {:open-orders (fn [_account-id] (vec (or open-orders [])))
+   :fills-since (fn [_account-id _cursor] (vec (or fills [])))})
+
+(deftest crash-recovery-reconciles-missed-fills
+  (let [{:keys [fact-store] :as sts} (stores)
+        ;; crash happened after ack, before the fill was recorded locally
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       (ack-fact)])
+        _ (snapshot-at! sts 3)
+        broker (fn-map-broker {:fills [(fill-fact "t1" "2"
+                                                  "2026-06-10T14:30:03Z")]})
+        res (rec/run-recovery! (assoc sts
+                                      :run-mode :mode/paper
+                                      :broker broker))
+        entry (st/unresolved-order (:engine/state res) oi)]
+    (is (= :crash-recovery (:recovery/mode res)))
+    (is (= :ready (:recovery/outcome res)))
+    (testing "§11.3 Case B: broker fill resolves the order"
+      (is (= :filled (:order/lifecycle entry)))
+      (is (= "2" (:order/filled-quantity entry)))
+      (is (true? (:order/resolved? entry))))
+    (testing "the normalized broker fill was appended to the log"
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/fill-observed})))))))
+
+(deftest reconciliation-is-dedupe-safe-across-repeated-recoveries
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       (ack-fact)])
+        _ (snapshot-at! sts 3)
+        ;; the broker returns a FRESH envelope for the same fill each call
+        ;; (new :record/id, same :fact/dedupe-key) — exactly the replayed-
+        ;; broker-truth shape dedupe keys exist for
+        broker {:open-orders (fn [_] [])
+                :fills-since (fn [_ _]
+                               [(fill-fact "t1" "2"
+                                           "2026-06-10T14:30:03Z")])}
+        res1 (rec/run-recovery! (assoc sts :run-mode :mode/paper
+                                       :broker broker))
+        res2 (rec/run-recovery! (assoc sts :run-mode :mode/paper
+                                       :broker broker))]
+    (is (= :ready (:recovery/outcome res1)))
+    (is (= :ready (:recovery/outcome res2)))
+    (testing "the fill exists exactly once in the log"
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/fill-observed})))))
+    (testing "both recoveries converge on the same resolved order"
+      (is (= (st/unresolved-order (:engine/state res1) oi)
+             (st/unresolved-order (:engine/state res2) oi))))))
+
+(deftest reconciliation-with-open-order-stays-ready
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       (ack-fact)])
+        _ (snapshot-at! sts 3)
+        ;; §11.3 Case A: broker still shows the order open — unresolved but
+        ;; unambiguous, so recovery is :ready
+        open-status (ffact :fact/broker-order-status-observed
+                           {:order-intent/id oi
+                            :broker/source-system :broker/sim
+                            :broker/order-id "sim-1"
+                            :broker/status :broker-status/open}
+                           "2026-06-10T14:30:05Z"
+                           "status/sim/account-sim-test/sim-1/open-1")
+        broker (fn-map-broker {:open-orders [open-status]})
+        res (rec/run-recovery! (assoc sts :run-mode :mode/paper
+                                      :broker broker))
+        entry (st/unresolved-order (:engine/state res) oi)]
+    (is (= :ready (:recovery/outcome res)))
+    (is (false? (:order/resolved? entry)))))
+
+(deftest reconciliation-anomaly-blocks
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       (ack-fact)])
+        _ (snapshot-at! sts 3)
+        ;; broker returns a fill it cannot tie to any known intent (§11.3 E)
+        broker (fn-map-broker
+                {:fills [(fill-fact
+                          "tz" "1" "2026-06-10T14:30:03Z"
+                          "oi_unknownintent000000000000000000000000000000000")]})
+        res (rec/run-recovery! (assoc sts :run-mode :mode/paper
+                                      :broker broker))]
+    (is (= :blocked (:recovery/outcome res)))
+    (testing "the known order's exposure did not change"
+      (is (= "0" (:order/filled-quantity
+                  (st/unresolved-order (:engine/state res) oi)))))))
+
+(deftest orphaned-order-restored-by-reconciliation
+  (let [{:keys [fact-store] :as sts} (stores)
+        anomaly (ffact :fact/fault-recorded
+                       {:fault/kind :fault/reconciliation-anomaly
+                        :order-intent/id oi
+                        :fault/reason :anomaly/ack-status-ambiguous}
+                       "2026-06-10T14:30:02Z")
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       anomaly])
+        ;; broker truth proves the orphan actually filled (§5.2
+        ;; :reconciled/complete-fill row)
+        broker (fn-map-broker {:fills [(fill-fact "t1" "2"
+                                                  "2026-06-10T14:30:03Z")]})
+        res (rec/run-recovery! (assoc sts :run-mode :mode/paper
+                                      :broker broker))
+        entry (st/unresolved-order (:engine/state res) oi)]
+    (is (= :ready (:recovery/outcome res)))
+    (is (= :filled (:order/lifecycle entry)))
+    (is (true? (:order/resolved? entry)))))
+
+(deftest reconcile-skipped-without-broker
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store [(intent-fact) (dispatch-fact)
+                                       (ack-fact)])
+        res (rec/run-recovery! (assoc sts :run-mode :mode/paper))]
+    ;; documented seam: crash-recovery without a broker computes the
+    ;; outcome from replay alone
+    (is (= :crash-recovery (:recovery/mode res)))
+    (is (= :ready (:recovery/outcome res)))))
+
+;; ---------------------------------------------------------------------------
+;; Store failure → :recovery-failed
+;; ---------------------------------------------------------------------------
+
+(deftest store-failure-yields-recovery-failed
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (fs/close! fact-store)
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :recovery-failed (:recovery/outcome res)))
+    (is (some? (:recovery/error res)))))
+
+;; ---------------------------------------------------------------------------
+;; Control-plane revision acceptance (§8.5, recovery-owned bit)
+;; ---------------------------------------------------------------------------
+
+(deftest snapshot-with-unknown-control-plane-revision-is-not-used
+  (let [{:keys [fact-store snapshot-store] :as sts} (stores)
+        facts (happy-sequence)
+        _ (p/append-facts! fact-store facts)
+        state3 (:state (fold/fold-facts (st/fresh-state) (take 3 facts)))
+        _ (p/write-snapshot!
+           snapshot-store
+           (sch/snapshot-envelope
+            {:snapshot/engine-version "0.1.0"
+             :snapshot/written-at "2026-06-10T14:30:02Z"
+             :snapshot/control-plane-revision "cp-gone"
+             :snapshot/fact-watermark {:stream "fact-log" :offset 3}
+             :snapshot/state state3}))
+        res (rec/run-recovery!
+             (assoc sts
+                    :run-mode :mode/sim
+                    :control-plane {"cp-000014" {:control-plane/revision
+                                                 "cp-000014"}}))]
+    (testing "falls back to the fact log alone, with a warning"
+      (is (= :ready (:recovery/outcome res)))
+      (is (= [1 2 3 4 5] (mapv :fact-log/offset (:recovery/facts res))))
+      (is (some #(= :warning/snapshot-control-plane-revision-unknown
+                    (:warning/code %))
+                (:recovery/warnings res))))))

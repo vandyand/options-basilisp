@@ -1,4 +1,9 @@
-(ns stevetrading.persistence.protocol)
+(ns stevetrading.persistence.protocol
+  "Persistence boundary protocols (PERSISTENCE_SCHEMA §3-§5, §7-§8).
+
+  Protocol components are importable by anyone (POLYLITH §7); the SQLite /
+  file-backed implementations live in persistence.fact-store and
+  persistence.snapshot-store and may only be required by bases.")
 
 (def persistence-command-types
   #{:command/append-facts
@@ -18,3 +23,49 @@
   [read-model]
   (contains? persistence-read-models read-model))
 
+;; ---------------------------------------------------------------------------
+;; Storage class protocols
+;; ---------------------------------------------------------------------------
+
+(defprotocol FactStore
+  "Canonical fact storage (PERSISTENCE_SCHEMA §3.1/§5.1): append-only,
+  immutable records, queryable by lineage keys."
+  (append-facts! [this facts]
+    "Append a batch of canonical fact envelopes in one transaction.
+    Returns {:appended [{:fact-id .. :offset ..}] :duplicates [facts]} —
+    a fact whose :record/id or :fact/dedupe-key already exists in the log
+    is reported under :duplicates and not inserted again.")
+  (facts-since [this offset]
+    "All fact envelopes with stream offset strictly greater than `offset`,
+    ordered by offset ascending. Each returned envelope carries its offset
+    as an extra :fact-log/offset key.")
+  (facts-by [this criteria]
+    "Fact envelopes matching the AND of the provided lineage criteria
+    (keys: :order-intent-id :broker-order-id :correlation-id :strategy-id
+    :account-id :instrument-id :fact-type), ordered by offset ascending.")
+  (latest-offset [this]
+    "Highest stream offset in the log, or 0 when the log is empty."))
+
+(defprotocol SnapshotStore
+  "Snapshot storage (PERSISTENCE_SCHEMA §3.2/§5.2): restart accelerators,
+  never canonical truth."
+  (write-snapshot! [this snapshot]
+    "Atomically persist a canonical snapshot envelope (§10). The envelope's
+    :snapshot/scope (default \"runtime-main\") selects the partition.
+    Returns {:snapshot/id .. :snapshot/path ..}.")
+  (latest-snapshot [this scope]
+    "Latest acceptable snapshot envelope for scope per
+    ENGINE_STATE_AND_RECOVERY §8.5, falling back to the next-most-recent
+    valid snapshot when the latest is rejected or corrupt. Returns nil when
+    no valid snapshot exists. Rejection/corruption warnings are attached as
+    metadata under :snapshot-store/warnings.")
+  (snapshots [this scope]
+    "All parseable snapshot envelopes for scope, most recent first."))
+
+(defprotocol ControlPlaneStore
+  "Control-plane storage (PERSISTENCE_SCHEMA §3.3/§5.3): validated
+  manifests and activation records, consumed read-only by runtimes."
+  (active-revision [this scope]
+    "The active control-plane revision record for a deployment scope.")
+  (revision [this rev-id]
+    "The immutable revision record for rev-id, or nil."))

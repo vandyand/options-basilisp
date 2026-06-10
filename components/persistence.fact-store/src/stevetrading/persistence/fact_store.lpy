@@ -1,0 +1,215 @@
+(ns stevetrading.persistence.fact-store
+  "SQLite implementation of persistence.protocol/FactStore.
+
+  Normative: PERSISTENCE_SCHEMA §3.1/§5.1/§6.1/§9/§12.
+
+  Design notes (documented decisions):
+  - One sqlite3 connection per store instance, WAL journal mode,
+    check_same_thread=false (the store is used from REPL/test threads; all
+    writes go through one connection serially).
+  - The `record` column holds the canonical EDN of the FULL envelope
+    (basilisp.edn round-trips it exactly); index columns are extracted
+    copies and never replace envelope fields (§5.1 rules).
+  - Duplicate detection: both `fact_id` and `dedupe_key` are unique
+    (partial index WHERE dedupe_key IS NOT NULL). Appends pre-check each
+    row with a SELECT inside the batch transaction instead of catching
+    sqlite3.IntegrityError per-row — the simplest way to keep ONE
+    transaction for the whole batch while reporting duplicates without
+    aborting it. The unique indexes remain as a backstop invariant.
+  - `facts-since` / `facts-by` return envelopes parsed from `record` with
+    the stream offset attached as an extra :fact-log/offset key (chosen
+    over metadata so the offset survives serialization and is visible in
+    test output; consumers compare envelopes with the key dissoc'ed).
+  - `latest-offset` returns 0 for an empty log; offsets are 1-based and
+    monotonic (AUTOINCREMENT), so (facts-since store 0) is the full log."
+  (:import sqlite3)
+  (:require [basilisp.edn :as edn]
+            [basilisp.string :as bstr]
+            [stevetrading.persistence.protocol :as p]))
+
+(def ^:private create-table-sql
+  "CREATE TABLE IF NOT EXISTS facts (
+     \"offset\"      INTEGER PRIMARY KEY AUTOINCREMENT,
+     fact_id         TEXT UNIQUE NOT NULL,
+     fact_type       TEXT NOT NULL,
+     dedupe_key      TEXT,
+     correlation_id  TEXT,
+     strategy_id     TEXT,
+     account_id      TEXT,
+     instrument_id   TEXT,
+     order_intent_id TEXT,
+     broker_order_id TEXT,
+     occurred_at     TEXT,
+     recorded_at     TEXT,
+     mode            TEXT,
+     record          TEXT NOT NULL)")
+
+(def ^:private index-sqls
+  ["CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_dedupe_key
+      ON facts(dedupe_key) WHERE dedupe_key IS NOT NULL"
+   "CREATE INDEX IF NOT EXISTS idx_facts_fact_type ON facts(fact_type)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_correlation_id ON facts(correlation_id)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_strategy_id ON facts(strategy_id)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_account_id ON facts(account_id)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_instrument_id ON facts(instrument_id)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_order_intent_id ON facts(order_intent_id)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_broker_order_id ON facts(broker_order_id)"
+   "CREATE INDEX IF NOT EXISTS idx_facts_occurred_at ON facts(occurred_at)"])
+
+(defn- kw-str
+  "Stable TEXT form of a keyword index value (\":fact/fill-observed\");
+  nil-safe."
+  [k]
+  (when (some? k) (str k)))
+
+(defn- index-columns
+  "Extract the §5.1 index column values from a fact envelope. Lineage ids
+  that live in the payload (:order-intent/id, :broker/order-id) are pulled
+  from there."
+  [fact]
+  (let [payload (:fact/payload fact)]
+    {:fact-id         (:record/id fact)
+     :fact-type       (kw-str (:record/type fact))
+     :dedupe-key      (:fact/dedupe-key fact)
+     :correlation-id  (:record/correlation-id fact)
+     :strategy-id     (:record/strategy-id fact)
+     :account-id      (:record/account-id fact)
+     :instrument-id   (:record/instrument-id fact)
+     :order-intent-id (:order-intent/id payload)
+     :broker-order-id (:broker/order-id payload)
+     :occurred-at     (:fact/occurred-at fact)
+     :recorded-at     (:fact/recorded-at fact)
+     :mode            (kw-str (:record/mode fact))}))
+
+(defn- duplicate?
+  "Pre-check one row inside the batch transaction: true when fact_id or
+  (non-nil) dedupe_key already exists."
+  [conn cols]
+  (let [cur (if (some? (:dedupe-key cols))
+              (.execute conn
+                        "SELECT 1 FROM facts WHERE fact_id = ? OR dedupe_key = ? LIMIT 1"
+                        (python/tuple [(:fact-id cols) (:dedupe-key cols)]))
+              (.execute conn
+                        "SELECT 1 FROM facts WHERE fact_id = ? LIMIT 1"
+                        (python/tuple [(:fact-id cols)])))]
+    (some? (.fetchone cur))))
+
+(def ^:private insert-sql
+  "INSERT INTO facts (fact_id, fact_type, dedupe_key, correlation_id,
+                      strategy_id, account_id, instrument_id,
+                      order_intent_id, broker_order_id, occurred_at,
+                      recorded_at, mode, record)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+
+(defn- insert-fact!
+  "INSERT one fact; returns its assigned offset (cursor lastrowid)."
+  [conn cols fact]
+  (let [cur (.execute conn insert-sql
+                      (python/tuple [(:fact-id cols)
+                                     (:fact-type cols)
+                                     (:dedupe-key cols)
+                                     (:correlation-id cols)
+                                     (:strategy-id cols)
+                                     (:account-id cols)
+                                     (:instrument-id cols)
+                                     (:order-intent-id cols)
+                                     (:broker-order-id cols)
+                                     (:occurred-at cols)
+                                     (:recorded-at cols)
+                                     (:mode cols)
+                                     (edn/write-string fact)]))]
+    (.-lastrowid cur)))
+
+(defn- row->envelope
+  "Parse a (offset, record) row into the envelope with :fact-log/offset."
+  [row]
+  (let [offset (nth row 0)
+        record (nth row 1)]
+    (assoc (edn/read-string record) :fact-log/offset offset)))
+
+(def ^:private criteria-columns
+  {:fact-id         "fact_id"
+   :fact-type       "fact_type"
+   :correlation-id  "correlation_id"
+   :strategy-id     "strategy_id"
+   :account-id      "account_id"
+   :instrument-id   "instrument_id"
+   :order-intent-id "order_intent_id"
+   :broker-order-id "broker_order_id"
+   :mode            "mode"})
+
+(defn- criteria-clause
+  "Build [where-sql params] for a facts-by criteria map. Keyword values
+  (fact-type, mode) are matched on their stable string form."
+  [criteria]
+  (let [pairs (keep (fn [[k col]]
+                      (when (contains? criteria k)
+                        (let [v (get criteria k)]
+                          [(str col " = ?")
+                           (if (keyword? v) (kw-str v) v)])))
+                    criteria-columns)]
+    (when-not (seq pairs)
+      (throw (ex-info "facts-by requires at least one known criteria key"
+                      {:error/code :error/empty-criteria
+                       :error/known (vec (keys criteria-columns))
+                       :error/got (vec (keys criteria))})))
+    [(bstr/join " AND " (map first pairs))
+     (mapv second pairs)]))
+
+(defrecord SqliteFactStore [conn]
+  p/FactStore
+  (append-facts! [_this facts]
+    (let [outcome (reduce
+                   (fn [acc fact]
+                     (let [cols (index-columns fact)]
+                       (if (duplicate? conn cols)
+                         (update acc :duplicates conj fact)
+                         (let [offset (insert-fact! conn cols fact)]
+                           (update acc :appended conj
+                                   {:fact-id (:fact-id cols)
+                                    :offset offset})))))
+                   {:appended [] :duplicates []}
+                   facts)]
+      ;; sqlite3 opened the implicit transaction on the first INSERT;
+      ;; commit closes it — the whole batch is one transaction.
+      (.commit conn)
+      outcome))
+
+  (facts-since [_this offset]
+    (let [cur (.execute conn
+                        "SELECT \"offset\", record FROM facts WHERE \"offset\" > ? ORDER BY \"offset\" ASC"
+                        (python/tuple [(or offset 0)]))]
+      (mapv row->envelope (.fetchall cur))))
+
+  (facts-by [_this criteria]
+    (let [[where params] (criteria-clause criteria)
+          cur (.execute conn
+                        (str "SELECT \"offset\", record FROM facts WHERE "
+                             where
+                             " ORDER BY \"offset\" ASC")
+                        (python/tuple params))]
+      (mapv row->envelope (.fetchall cur))))
+
+  (latest-offset [_this]
+    (let [cur (.execute conn "SELECT MAX(\"offset\") FROM facts")
+          row (.fetchone cur)
+          mx (nth row 0)]
+      (or mx 0))))
+
+(defn make-fact-store
+  "Open (creating if needed) a SQLite-backed fact store at db-path
+  (a file path or \":memory:\"). Enables WAL journal mode and creates the
+  facts table + lineage indexes."
+  [db-path]
+  (let [conn (sqlite3/connect db-path ** :check_same_thread false)]
+    (.execute conn "PRAGMA journal_mode=WAL")
+    (.execute conn create-table-sql)
+    (doseq [sql index-sqls]
+      (.execute conn sql))
+    (.commit conn)
+    (->SqliteFactStore conn)))
+
+(defn close!
+  "Close the store's underlying connection."
+  [store]
+  (.close (:conn store)))

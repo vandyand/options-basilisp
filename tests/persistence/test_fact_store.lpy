@@ -1,0 +1,244 @@
+(ns persistence.test-fact-store
+  "SQLite fact store tests (PERSISTENCE_SCHEMA §5.1/§9/§12)."
+  (:import tempfile os.path)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]))
+
+(def oi "oi_testintent00000000000000000000000000000000000000")
+
+(defn ffact
+  ([fact-type payload occurred-at]
+   (ffact fact-type payload occurred-at nil))
+  ([fact-type payload occurred-at dedupe-key]
+   (sch/fact-envelope
+    (cond-> {:record/type fact-type
+             :record/mode :mode/sim
+             :record/correlation-id "corr-1"
+             :record/strategy-id "strategy/simple-direction/sma-cross/v1"
+             :record/account-id "account/sim/test"
+             :record/instrument-id "equity/ARCA/SPY"
+             :record/source-system :broker/sim
+             :fact/occurred-at occurred-at
+             :fact/recorded-at occurred-at
+             :fact/payload payload}
+      (some? dedupe-key) (assoc :fact/dedupe-key dedupe-key)))))
+
+(defn happy-sequence
+  []
+  [(ffact :fact/order-intent-created
+          {:order-intent/id oi
+           :order-intent/decision-id "dec_x"
+           :order-intent/intent-slot 0
+           :order-intent/role :intent-role/entry
+           :order-intent/side :order-side/buy
+           :order-intent/effect :position-effect/open
+           :order-intent/order-type :order-type/market
+           :order-intent/time-in-force :tif/day
+           :order-intent/quantity "2"
+           :order-intent/legs [{:instrument/id "equity/ARCA/SPY"
+                                :leg/side :order-side/buy
+                                :leg/quantity "2"}]}
+          "2026-06-10T14:30:00Z")
+   (ffact :fact/command-dispatched
+          {:command/type :command/submit-order-intent
+           :order-intent/id oi}
+          "2026-06-10T14:30:01Z")
+   (ffact :fact/broker-ack-accepted
+          {:order-intent/id oi
+           :broker/source-system :broker/sim
+           :broker/order-id "sim-1"
+           :broker/status :broker-status/accepted
+           :broker/observed-at "2026-06-10T14:30:02Z"}
+          "2026-06-10T14:30:02Z")
+   (ffact :fact/fill-observed
+          {:order-intent/id oi
+           :broker/source-system :broker/sim
+           :broker/order-id "sim-1"
+           :fill/id "t1"
+           :fill/occurred-at "2026-06-10T14:30:03Z"
+           :fill/quantity "1"
+           :fill/price "550.00"
+           :fill/liquidity :liquidity/taker}
+          "2026-06-10T14:30:03Z"
+          "fill/sim/account-sim-test/sim-1/t1")
+   (ffact :fact/fill-observed
+          {:order-intent/id oi
+           :broker/source-system :broker/sim
+           :broker/order-id "sim-1"
+           :fill/id "t2"
+           :fill/occurred-at "2026-06-10T14:30:04Z"
+           :fill/quantity "1"
+           :fill/price "550.00"
+           :fill/liquidity :liquidity/taker}
+          "2026-06-10T14:30:04Z"
+          "fill/sim/account-sim-test/sim-1/t2")])
+
+(defn mem-store
+  []
+  (fs/make-fact-store ":memory:"))
+
+;; ---------------------------------------------------------------------------
+;; Round trip + offsets
+;; ---------------------------------------------------------------------------
+
+(deftest append-read-round-trip-preserves-envelopes
+  (let [store (mem-store)
+        facts (happy-sequence)
+        res (p/append-facts! store facts)
+        got (p/facts-since store 0)]
+    (testing "all appended, none duplicate"
+      (is (= 5 (count (:appended res))))
+      (is (= [] (:duplicates res))))
+    (testing "EDN round trip is exact (offset attached as extra key)"
+      (is (= facts (mapv #(dissoc % :fact-log/offset) got))))
+    (testing "every returned envelope carries its offset"
+      (is (every? int? (map :fact-log/offset got))))))
+
+(deftest offsets-are-monotonic-and-1-based
+  (let [store (mem-store)
+        res (p/append-facts! store (happy-sequence))
+        offsets (mapv :offset (:appended res))]
+    (is (= [1 2 3 4 5] offsets))
+    (is (= 5 (p/latest-offset store)))
+    (testing "second batch continues the stream"
+      (let [more (p/append-facts!
+                  store
+                  [(ffact :fact/market-bar-observed
+                          {:bar/close "551.00"}
+                          "2026-06-10T14:31:00Z")])]
+        (is (= [6] (mapv :offset (:appended more))))))))
+
+(deftest latest-offset-empty-log-is-zero
+  (is (= 0 (p/latest-offset (mem-store)))))
+
+(deftest facts-since-respects-watermark-and-order
+  (let [store (mem-store)
+        _ (p/append-facts! store (happy-sequence))
+        tail (p/facts-since store 3)]
+    (is (= 2 (count tail)))
+    (is (= [4 5] (mapv :fact-log/offset tail)))
+    (is (= [:fact/fill-observed :fact/fill-observed]
+           (mapv :record/type tail)))))
+
+;; ---------------------------------------------------------------------------
+;; Dedupe
+;; ---------------------------------------------------------------------------
+
+(deftest duplicate-fact-id-reported-not-inserted
+  (let [store (mem-store)
+        facts (happy-sequence)
+        _ (p/append-facts! store facts)
+        again (p/append-facts! store facts)]
+    (is (= [] (:appended again)))
+    (is (= 5 (count (:duplicates again))))
+    (is (= 5 (p/latest-offset store)))))
+
+(deftest duplicate-dedupe-key-reported-not-inserted
+  (let [store (mem-store)
+        original (ffact :fact/fill-observed
+                        {:order-intent/id oi
+                         :broker/order-id "sim-1"
+                         :fill/id "t1"
+                         :fill/quantity "1"
+                         :fill/price "550.00"}
+                        "2026-06-10T14:30:03Z"
+                        "fill/sim/account-sim-test/sim-1/t1")
+        ;; different :record/id (fresh envelope) but the same dedupe key
+        replayed (ffact :fact/fill-observed
+                        {:order-intent/id oi
+                         :broker/order-id "sim-1"
+                         :fill/id "t1"
+                         :fill/quantity "1"
+                         :fill/price "550.00"}
+                        "2026-06-10T14:30:03Z"
+                        "fill/sim/account-sim-test/sim-1/t1")
+        _ (p/append-facts! store [original])
+        res (p/append-facts! store [replayed])]
+    (is (not= (:record/id original) (:record/id replayed)))
+    (is (= [] (:appended res)))
+    (is (= [replayed] (:duplicates res)))
+    (is (= 1 (count (p/facts-since store 0))))))
+
+(deftest mixed-batch-appends-new-and-reports-duplicates-in-one-call
+  (let [store (mem-store)
+        facts (happy-sequence)
+        _ (p/append-facts! store (take 3 facts))
+        res (p/append-facts! store facts)]
+    (is (= 3 (count (:duplicates res))))
+    (is (= [4 5] (mapv :offset (:appended res))))
+    (is (= 5 (count (p/facts-since store 0))))))
+
+(deftest nil-dedupe-keys-do-not-collide
+  (let [store (mem-store)
+        f1 (ffact :fact/market-bar-observed {:bar/close "550.00"}
+                  "2026-06-10T14:30:00Z")
+        f2 (ffact :fact/market-bar-observed {:bar/close "550.10"}
+                  "2026-06-10T14:31:00Z")
+        res (p/append-facts! store [f1 f2])]
+    (is (= 2 (count (:appended res))))
+    (is (= [] (:duplicates res)))))
+
+;; ---------------------------------------------------------------------------
+;; Lineage queries (PERSISTENCE_SCHEMA §12)
+;; ---------------------------------------------------------------------------
+
+(deftest facts-by-order-intent-id-returns-full-lineage
+  (let [store (mem-store)
+        _ (p/append-facts! store (happy-sequence))
+        ;; unrelated fact must not appear in the lineage
+        _ (p/append-facts! store
+                           [(ffact :fact/market-bar-observed
+                                   {:bar/close "551.00"}
+                                   "2026-06-10T14:31:00Z")])
+        lineage (p/facts-by store {:order-intent-id oi})]
+    (is (= [:fact/order-intent-created
+            :fact/command-dispatched
+            :fact/broker-ack-accepted
+            :fact/fill-observed
+            :fact/fill-observed]
+           (mapv :record/type lineage)))
+    (is (= [1 2 3 4 5] (mapv :fact-log/offset lineage)))))
+
+(deftest facts-by-composes-criteria
+  (let [store (mem-store)
+        _ (p/append-facts! store (happy-sequence))]
+    (testing "broker-order-id"
+      (is (= 3 (count (p/facts-by store {:broker-order-id "sim-1"})))))
+    (testing "fact-type keyword"
+      (is (= 2 (count (p/facts-by store {:fact-type :fact/fill-observed})))))
+    (testing "AND of two criteria"
+      (is (= 2 (count (p/facts-by store {:order-intent-id oi
+                                         :fact-type :fact/fill-observed})))))
+    (testing "strategy-id"
+      (is (= 5 (count (p/facts-by
+                       store
+                       {:strategy-id
+                        "strategy/simple-direction/sma-cross/v1"})))))
+    (testing "no match"
+      (is (= [] (p/facts-by store {:order-intent-id "oi_nope"}))))))
+
+(deftest facts-by-requires-known-criteria
+  (let [store (mem-store)]
+    (is (thrown? python/Exception (p/facts-by store {})))
+    (is (thrown? python/Exception (p/facts-by store {:bogus-key "x"})))))
+
+;; ---------------------------------------------------------------------------
+;; File-backed store persists across instances
+;; ---------------------------------------------------------------------------
+
+(deftest file-backed-store-persists-across-reopen
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "facts.db")
+        facts (happy-sequence)
+        store1 (fs/make-fact-store path)
+        _ (p/append-facts! store1 facts)
+        _ (fs/close! store1)
+        store2 (fs/make-fact-store path)]
+    (is (= 5 (p/latest-offset store2)))
+    (is (= facts (mapv #(dissoc % :fact-log/offset)
+                       (p/facts-since store2 0))))
+    (testing "dedupe holds across reopen"
+      (is (= 5 (count (:duplicates (p/append-facts! store2 facts))))))
+    (fs/close! store2)))

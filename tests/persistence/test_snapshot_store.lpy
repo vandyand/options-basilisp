@@ -1,0 +1,167 @@
+(ns persistence.test-snapshot-store
+  "Snapshot store tests (PERSISTENCE_SCHEMA §5.2;
+  ENGINE_STATE_AND_RECOVERY §8.4-§8.5)."
+  (:import os os.path tempfile)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.persistence.snapshot-store :as ss]))
+
+(defn snap
+  "A valid snapshot envelope; overrides merged on top."
+  ([offset] (snap offset {}))
+  ([offset overrides]
+   (sch/snapshot-envelope
+    (merge {:snapshot/engine-version "0.1.0"
+            :snapshot/written-at "2026-06-10T14:35:00Z"
+            :snapshot/control-plane-revision "cp-000001"
+            :snapshot/fact-watermark {:stream "fact-log" :offset offset}
+            :snapshot/state {:engine/unresolved-orders {}}}
+           overrides))))
+
+(defn fresh-store
+  []
+  (ss/make-snapshot-store (tempfile/mkdtemp)))
+
+;; ---------------------------------------------------------------------------
+;; Round trip
+;; ---------------------------------------------------------------------------
+
+(deftest write-read-round-trip
+  (let [store (fresh-store)
+        s1 (snap 10)
+        res (p/write-snapshot! store s1)]
+    (is (= (:snapshot/id s1) (:snapshot/id res)))
+    (is (string? (:snapshot/path res)))
+    (testing "latest-snapshot returns the exact envelope value"
+      (is (= s1 (p/latest-snapshot store nil))))
+    (testing "default scope is addressable explicitly"
+      (is (= s1 (p/latest-snapshot store ss/default-scope))))))
+
+(deftest latest-pointer-tracks-most-recent-write
+  (let [store (fresh-store)
+        s1 (snap 10)
+        s2 (snap 20)]
+    (p/write-snapshot! store s1)
+    (p/write-snapshot! store s2)
+    (is (= s2 (p/latest-snapshot store nil)))
+    (testing "snapshots lists newest first"
+      (is (= [s2 s1] (p/snapshots store nil))))))
+
+(deftest scopes-are-isolated
+  (let [store (fresh-store)
+        sa (snap 10 {:snapshot/scope "scope-a"})
+        sb (snap 20 {:snapshot/scope "scope-b"})]
+    (p/write-snapshot! store sa)
+    (p/write-snapshot! store sb)
+    (is (= sa (p/latest-snapshot store "scope-a")))
+    (is (= sb (p/latest-snapshot store "scope-b")))
+    (is (nil? (p/latest-snapshot store "scope-c")))))
+
+(deftest no-snapshots-returns-nil
+  (let [store (fresh-store)]
+    (is (nil? (p/latest-snapshot store nil)))
+    (is (= [] (p/snapshots store nil)))))
+
+;; ---------------------------------------------------------------------------
+;; Write validation
+;; ---------------------------------------------------------------------------
+
+(deftest write-refuses-invalid-envelope
+  (let [store (fresh-store)]
+    (testing "missing required §10 keys"
+      (is (thrown? python/Exception
+                   (p/write-snapshot!
+                    store
+                    {:snapshot/id "x" :snapshot/state {}}))))
+    (testing "inconsistent watermark"
+      (is (thrown? python/Exception
+                   (p/write-snapshot!
+                    store
+                    (snap 10 {:snapshot/fact-watermark
+                              {:stream "fact-log" :offset "not-a-number"}})))))
+    (is (nil? (p/latest-snapshot store nil)))))
+
+;; ---------------------------------------------------------------------------
+;; §8.5 acceptance + fallback
+;; ---------------------------------------------------------------------------
+
+(defn write-raw-snapshot!
+  "Write a snapshot file + latest pointer directly, bypassing
+  write-snapshot! validation (simulates a bad producer / disk state)."
+  [store envelope]
+  (let [dir (os.path/join (:root store) ss/default-scope)
+        file-name (str "snap-" (:snapshot/id envelope) ".edn")]
+    (os/makedirs dir ** :exist_ok true)
+    (spit (os.path/join dir file-name) (edn/write-string envelope))
+    (spit (os.path/join dir "latest.edn")
+          (edn/write-string {:snapshot/id (:snapshot/id envelope)
+                             :snapshot/file file-name}))))
+
+(deftest corrupt-latest-falls-back-to-prior-valid
+  (let [store (fresh-store)
+        s1 (snap 10)
+        s2 (snap 20)]
+    (p/write-snapshot! store s1)
+    (let [{:keys [snapshot/path]} (p/write-snapshot! store s2)]
+      ;; corrupt the latest file on disk
+      (spit path "{:half-written"))
+    (let [got (p/latest-snapshot store nil)]
+      (is (= s1 got))
+      (testing "skip is reported as warning data"
+        (let [warnings (:snapshot-store/warnings (meta got))]
+          (is (= 1 (count warnings)))
+          (is (= :warning/corrupt-snapshot-file
+                 (:warning/code (first warnings)))))))))
+
+(deftest rejected-latest-falls-back-to-prior-valid
+  (let [store (fresh-store)
+        s1 (snap 10)]
+    (p/write-snapshot! store s1)
+    ;; newer snapshot with an unsupported schema version, written raw
+    (write-raw-snapshot! store (snap 20 {:snapshot/version 99}))
+    (let [got (p/latest-snapshot store nil)]
+      (is (= s1 got))
+      (is (= :warning/snapshot-rejected
+             (:warning/code (first (:snapshot-store/warnings (meta got)))))))))
+
+(deftest inconsistent-watermarks-rejected
+  (let [store (fresh-store)
+        s1 (snap 10)]
+    (p/write-snapshot! store s1)
+    (write-raw-snapshot!
+     store (snap 20 {:snapshot/fact-watermark {:stream "fact-log"}}))
+    (is (= s1 (p/latest-snapshot store nil)))))
+
+(deftest unparseable-unresolved-shard-rejected
+  (let [store (fresh-store)
+        s1 (snap 10)]
+    (p/write-snapshot! store s1)
+    (write-raw-snapshot!
+     store (snap 20 {:snapshot/state
+                     {:engine/unresolved-orders
+                      {"oi_x" {:not-a-lifecycle true}}}}))
+    (is (= s1 (p/latest-snapshot store nil)))))
+
+(deftest all-snapshots-invalid-returns-nil
+  (let [store (fresh-store)]
+    (write-raw-snapshot! store (snap 20 {:snapshot/version 99}))
+    (is (nil? (p/latest-snapshot store nil)))))
+
+(deftest acceptance-errors-shape
+  (testing "accepted snapshot has no errors"
+    (is (= [] (ss/acceptance-errors (snap 10)))))
+  (testing "each §8.5 rule reports its own rejection code"
+    (is (= [:reject/unsupported-schema-version]
+           (mapv :reject/code
+                 (ss/acceptance-errors (snap 10 {:snapshot/version 99})))))
+    (is (= [:reject/inconsistent-watermarks]
+           (mapv :reject/code
+                 (ss/acceptance-errors
+                  (snap 10 {:snapshot/fact-watermark {:offset -1}})))))
+    (is (= [:reject/unparseable-unresolved-shard]
+           (mapv :reject/code
+                 (ss/acceptance-errors
+                  (snap 10 {:snapshot/state
+                            {:engine/unresolved-orders [:not :a :map]}})))))))

@@ -1,0 +1,194 @@
+(ns stevetrading.persistence.snapshot-store
+  "EDN-file implementation of persistence.protocol/SnapshotStore.
+
+  Normative: PERSISTENCE_SCHEMA §3.2/§5.2/§6.2/§10.2;
+  ENGINE_STATE_AND_RECOVERY §8 (snapshot model, §8.5 acceptance rules).
+
+  Layout: one EDN file per snapshot under <root>/<scope>/snap-<id>.edn plus
+  a <root>/<scope>/latest.edn pointer ({:snapshot/id .. :snapshot/file ..}).
+  All writes are atomic (tmp file in the same directory + os.replace).
+
+  Design notes (documented decisions):
+  - The partition scope is a path-safe string (e.g. \"runtime-main\").
+    write-snapshot! reads it from the envelope's optional :snapshot/scope
+    key, defaulting to \"runtime-main\" (the PERSISTENCE §5.1 stream name).
+  - Snapshot ids are ULIDs (domain.identifiers), so lexicographic filename
+    order is chronological order; fallback scans newest-first by filename
+    and breaks ties/garbage by :snapshot/written-at after parsing.
+  - §8.5 acceptance applied by latest-snapshot: schema version supported,
+    watermarks internally consistent, unresolved-order shard parseable.
+    The \"control-plane revision can still be validated\" check is NOT done
+    here — this adapter has no ControlPlaneStore; engine.recovery owns that
+    check (it receives the control-plane revision map).
+  - A rejected or corrupt latest falls back to the next-most-recent valid
+    snapshot; every skip is reported as warning data attached to the
+    returned envelope's metadata under :snapshot-store/warnings (metadata
+    keeps the envelope value itself round-trip equal)."
+  (:import os os.path)
+  (:require [basilisp.edn :as edn]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.persistence.protocol :as p]))
+
+(def default-scope "runtime-main")
+
+;; ---------------------------------------------------------------------------
+;; Atomic EDN file IO
+;; ---------------------------------------------------------------------------
+
+(defn- write-edn-atomic!
+  "Write value as EDN to dst-path via tmp file + os.replace (atomic on the
+  same filesystem)."
+  [dst-path value]
+  (let [tmp-path (str dst-path ".tmp")]
+    (spit tmp-path (edn/write-string value))
+    (os/replace tmp-path dst-path)))
+
+(defn- read-edn
+  "Parse the EDN file at path. Returns {:ok value} or {:error info-map}."
+  [path]
+  (try
+    {:ok (edn/read-string (slurp path))}
+    (catch python/Exception e
+      {:error {:warning/code :warning/corrupt-snapshot-file
+               :warning/path path
+               :warning/message (str e)}})))
+
+;; ---------------------------------------------------------------------------
+;; §8.5 acceptance rules
+;; ---------------------------------------------------------------------------
+
+(def supported-snapshot-versions #{1})
+
+(defn- watermark-consistent?
+  "The fact watermark must be a map with a non-negative integer :offset
+  (CANONICAL_SCHEMAS §10 shape {:stream .. :offset n})."
+  [fw]
+  (and (map? fw)
+       (int? (:offset fw))
+       (<= 0 (:offset fw))))
+
+(defn- unresolved-shard-parseable?
+  "The :engine/unresolved-orders shard must be absent or a map of maps each
+  carrying an :order/lifecycle — otherwise recovery could not derive the
+  unresolved set without ambiguity."
+  [state]
+  (let [shard (:engine/unresolved-orders state)]
+    (or (nil? shard)
+        (and (map? shard)
+             (every? (fn [[_ entry]]
+                       (and (map? entry)
+                            (keyword? (:order/lifecycle entry))))
+                     shard)))))
+
+(defn acceptance-errors
+  "ENGINE_STATE_AND_RECOVERY §8.5 acceptance check for one parsed snapshot
+  envelope. Returns a vector of rejection reasons; empty means accepted."
+  [snapshot]
+  (let [structural (v/validate-snapshot snapshot)]
+    (cond-> []
+      (not (:valid? structural))
+      (conj {:reject/code :reject/invalid-envelope
+             :reject/errors (:errors structural)})
+
+      (not (contains? supported-snapshot-versions (:snapshot/version snapshot)))
+      (conj {:reject/code :reject/unsupported-schema-version
+             :reject/version (:snapshot/version snapshot)})
+
+      (not (watermark-consistent? (:snapshot/fact-watermark snapshot)))
+      (conj {:reject/code :reject/inconsistent-watermarks
+             :reject/fact-watermark (:snapshot/fact-watermark snapshot)})
+
+      (not (unresolved-shard-parseable? (:snapshot/state snapshot)))
+      (conj {:reject/code :reject/unparseable-unresolved-shard}))))
+
+;; ---------------------------------------------------------------------------
+;; Scope directory scanning
+;; ---------------------------------------------------------------------------
+
+(defn- scope-dir
+  [root scope]
+  (os.path/join root (or scope default-scope)))
+
+(defn- snapshot-files-newest-first
+  "snap-*.edn filenames in the scope dir, newest first (ULID filenames sort
+  chronologically)."
+  [dir]
+  (if (os.path/isdir dir)
+    (->> (os/listdir dir)
+         (filter #(and (.startswith % "snap-") (.endswith % ".edn")))
+         (sort)
+         (reverse)
+         (vec))
+    []))
+
+(defn- latest-pointer-file
+  "The filename named by latest.edn, or nil (missing/corrupt pointers are
+  reported via the warnings accumulator atom)."
+  [dir warnings]
+  (let [pointer-path (os.path/join dir "latest.edn")]
+    (when (os.path/isfile pointer-path)
+      (let [{:keys [ok error]} (read-edn pointer-path)]
+        (if error
+          (do (swap! warnings conj error) nil)
+          (:snapshot/file ok))))))
+
+(defrecord FileSnapshotStore [root]
+  p/SnapshotStore
+  (write-snapshot! [_this snapshot]
+    (let [errors (acceptance-errors snapshot)]
+      (when (seq errors)
+        (throw (ex-info "snapshot envelope failed validation"
+                        {:error/code :error/invalid-snapshot
+                         :error/rejections errors})))
+      (let [scope (or (:snapshot/scope snapshot) default-scope)
+            dir (scope-dir root scope)
+            _ (os/makedirs dir ** :exist_ok true)
+            file-name (str "snap-" (:snapshot/id snapshot) ".edn")
+            path (os.path/join dir file-name)]
+        (write-edn-atomic! path snapshot)
+        (write-edn-atomic! (os.path/join dir "latest.edn")
+                           {:snapshot/id (:snapshot/id snapshot)
+                            :snapshot/file file-name})
+        {:snapshot/id (:snapshot/id snapshot)
+         :snapshot/path path})))
+
+  (latest-snapshot [_this scope]
+    (let [dir (scope-dir root scope)
+          warnings (atom [])
+          pointed (latest-pointer-file dir warnings)
+          ;; pointer target first, then the rest newest-first as fallbacks
+          candidates (distinct
+                      (concat (when pointed [pointed])
+                              (snapshot-files-newest-first dir)))
+          accepted
+          (reduce
+           (fn [_ file-name]
+             (let [path (os.path/join dir file-name)
+                   {:keys [ok error]} (read-edn path)]
+               (if error
+                 (do (swap! warnings conj error) nil)
+                 (let [rejections (acceptance-errors ok)]
+                   (if (seq rejections)
+                     (do (swap! warnings conj
+                                {:warning/code :warning/snapshot-rejected
+                                 :warning/path path
+                                 :warning/rejections rejections})
+                         nil)
+                     (reduced ok))))))
+           nil
+           candidates)]
+      (when (some? accepted)
+        (with-meta accepted {:snapshot-store/warnings @warnings}))))
+
+  (snapshots [_this scope]
+    (let [dir (scope-dir root scope)]
+      (->> (snapshot-files-newest-first dir)
+           (keep (fn [file-name]
+                   (:ok (read-edn (os.path/join dir file-name)))))
+           (vec)))))
+
+(defn make-snapshot-store
+  "File-backed snapshot store rooted at root-dir (created if needed)."
+  [root-dir]
+  (os/makedirs root-dir ** :exist_ok true)
+  (->FileSnapshotStore root-dir))

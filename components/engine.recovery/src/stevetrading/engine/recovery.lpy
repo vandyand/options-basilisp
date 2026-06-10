@@ -1,0 +1,337 @@
+(ns stevetrading.engine.recovery
+  "Recovery planner (pure) + executor (impure) split.
+
+  Normative: ENGINE_STATE_AND_RECOVERY §8-§14, ADR-0004,
+  ENGINE_STATE_MACHINES §6 (:machine/recovery lifecycle).
+
+  Core component: depends on domain.*, engine.*, and the persistence
+  PROTOCOLS only — never on the store implementations (POLYLITH §7).
+
+  Design notes (documented decisions):
+  - Broker shape: the Broker protocol does not exist until Phase 4, so
+    run-recovery! accepts a plain fn-map
+      {:open-orders  (fn [account-id] [canonical facts])
+       :fills-since  (fn [account-id cursor] [canonical facts])}
+    or nil (no reconciliation possible). Phase 4's protocol implementation
+    will be adapted to this call shape (or this seam widened to accept a
+    protocol instance) — the call signatures match BROKER_ADAPTER's
+    open-orders/fills-since.
+  - :control-plane is a revision map (rev-id → revision document). It backs
+    the §8.5 'control-plane revision can still be validated' acceptance
+    check that the snapshot store cannot perform: a snapshot whose
+    :snapshot/control-plane-revision is absent from a provided revision map
+    is rejected (recovery falls back to the fact log alone, with a
+    warning). When :control-plane is nil the check is skipped.
+  - The recovery-started fact is appended AFTER the replay tail has been
+    read, so a recovery run never folds its own bookkeeping facts; both
+    recovery facts carry no dedupe key (each recovery run is a real event).
+  - Fault facts emitted by the fold during replay/reconciliation are
+    appended to the fact store (they are canonical truth about this run).
+  - When the planned mode requires reconciliation but no broker is given,
+    reconciliation is skipped (the outcome is computed from replay alone) —
+    callers in live/paper modes must pass a broker.
+  - :degraded-ready exists in the outcome enum but no degradation policy
+    feeds it yet (kept simple; nothing maps to it in this phase)."
+  (:import datetime)
+  (:require [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.engine.machines :as m]
+            [stevetrading.engine.state :as st]
+            [stevetrading.persistence.protocol :as p]))
+
+;; ---------------------------------------------------------------------------
+;; Pure planner (§9)
+;; ---------------------------------------------------------------------------
+
+(def recovery-modes
+  #{:fresh-start :warm-restart :crash-recovery :replay})
+
+(def ^:private reconciling-run-modes
+  "§14.1 — broker reconciliation is required for live and paper."
+  #{:mode/live :mode/paper})
+
+(defn plan-recovery
+  "Pure recovery plan per §9.1-§9.4. Inputs:
+    :requested-mode  explicit recovery mode keyword or nil
+    :run-mode        engine run mode (:mode/live :mode/paper :mode/sim
+                     :mode/replay ...)
+    :snapshot?       a usable snapshot exists
+    :facts?          prior facts exist in the log
+  Returns {:recovery/mode .. :recovery/reconcile? ..}.
+
+  Mode selection: an explicit requested mode wins; :mode/replay runs always
+  plan :replay (§14.3, no broker truth); no snapshot and no facts is a
+  fresh start; otherwise live/paper plan :crash-recovery (unresolved
+  external work must be reconciled, §9.3/§14.1) and everything else plans
+  :warm-restart. Reconciliation is required for :crash-recovery and for
+  :warm-restart in live/paper run modes."
+  [{:keys [requested-mode run-mode snapshot? facts?]}]
+  (when (and (some? requested-mode)
+             (not (contains? recovery-modes requested-mode)))
+    (throw (ex-info "unknown recovery mode"
+                    {:error/code :error/unknown-recovery-mode
+                     :error/mode requested-mode
+                     :error/known recovery-modes})))
+  (let [mode (cond
+               (some? requested-mode) requested-mode
+               (= :mode/replay run-mode) :replay
+               (and (not snapshot?) (not facts?)) :fresh-start
+               (contains? reconciling-run-modes run-mode) :crash-recovery
+               :else :warm-restart)
+        reconcile? (or (= :crash-recovery mode)
+                       (and (= :warm-restart mode)
+                            (contains? reconciling-run-modes run-mode)))]
+    {:recovery/mode mode
+     :recovery/reconcile? reconcile?}))
+
+;; ---------------------------------------------------------------------------
+;; Executor helpers
+;; ---------------------------------------------------------------------------
+
+(defn- utc-now-str
+  []
+  (.strftime (datetime.datetime/now datetime.timezone/utc)
+             "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn- recovery-fact
+  [fact-type payload at]
+  (sch/fact-envelope
+   {:record/type fact-type
+    :record/source-system :engine/recovery
+    :fact/occurred-at at
+    :fact/recorded-at at
+    :fact/payload payload}))
+
+(defn- step!
+  "Drive one :machine/recovery transition; throws when the table rejects it
+  (a recovery-machine bug, not an operational condition)."
+  [lifecycle trigger ctx]
+  (let [res (m/transition :machine/recovery lifecycle trigger ctx)]
+    (if (:transition/applied? res)
+      (:transition/to res)
+      (throw (ex-info "recovery lifecycle transition rejected"
+                      {:error/code :error/recovery-transition-rejected
+                       :error/from lifecycle
+                       :error/trigger trigger
+                       :error/reason (:transition/reason res)})))))
+
+(defn unresolved-entries
+  "Entries of :engine/unresolved-orders that are not yet resolved
+  (resolved orders stay in the map with :order/resolved? true)."
+  [state]
+  (into {}
+        (filter (fn [[_ entry]] (not (:order/resolved? entry)))
+                (:engine/unresolved-orders state))))
+
+(defn- orphaned?
+  "Any order (resolved or not) sitting in :orphaned-needs-reconcile."
+  [state]
+  (boolean (some #(= :orphaned-needs-reconcile (:order/lifecycle %))
+                 (vals (:engine/unresolved-orders state)))))
+
+(defn- unknown-intent-fault?
+  [fact]
+  (and (= :fact/fault-recorded (:record/type fact))
+       (= :invariant/unknown-order-intent
+          (get-in fact [:fact/payload :fault/reason]))))
+
+(defn- reconciliation-anomaly-fault?
+  [fact]
+  (and (= :fact/fault-recorded (:record/type fact))
+       (= :fault/reconciliation-anomaly
+          (get-in fact [:fact/payload :fault/kind]))))
+
+(defn- snapshot-revision-ok?
+  "§8.5 control-plane acceptance bit owned by recovery: with a revision map
+  in hand, the snapshot's control-plane revision must still be known."
+  [snapshot control-plane]
+  (let [rev (:snapshot/control-plane-revision snapshot)]
+    (or (nil? control-plane)
+        (nil? rev)
+        (contains? control-plane rev))))
+
+(defn- fold-and-append!
+  "Fold facts into state and append any fold-emitted facts (faults) to the
+  store. Returns {:state .. :emitted-facts ..}."
+  [fact-store state facts]
+  (let [res (fold/fold-facts state facts)]
+    (when (seq (:emitted-facts res))
+      (p/append-facts! fact-store (:emitted-facts res)))
+    res))
+
+(defn- reconcile!
+  "§10 steps 8-10: query broker truth for every account with unresolved
+  work, append the normalized facts (dedupe-safe), fold only the newly
+  appended ones. Returns {:state .. :new-facts .. :emitted-facts ..}."
+  [fact-store broker state]
+  (let [accounts (->> (vals (unresolved-entries state))
+                      (keep :order/account-id)
+                      (distinct))
+        cursor (get-in state [:engine/watermarks :watermark/broker])
+        broker-facts (vec (mapcat (fn [account-id]
+                                    (concat ((:open-orders broker) account-id)
+                                            ((:fills-since broker) account-id
+                                                                   cursor)))
+                                  accounts))
+        {:keys [appended]} (if (seq broker-facts)
+                             (p/append-facts! fact-store broker-facts)
+                             {:appended []})
+        appended-ids (set (map :fact-id appended))
+        ;; duplicates are already in the log and already folded; fold only
+        ;; the genuinely new truth
+        new-facts (vec (filter #(contains? appended-ids (:record/id %))
+                               broker-facts))
+        res (fold-and-append! fact-store state new-facts)]
+    {:state (:state res)
+     :new-facts new-facts
+     :emitted-facts (:emitted-facts res)}))
+
+;; ---------------------------------------------------------------------------
+;; Impure executor (§10 steps 1-13)
+;; ---------------------------------------------------------------------------
+
+(defn run-recovery!
+  "Execute the §10 recovery algorithm. Args:
+    :fact-store     persistence.protocol/FactStore (required)
+    :snapshot-store persistence.protocol/SnapshotStore (required)
+    :control-plane  revision map (rev-id → revision doc) or nil
+    :mode           explicit recovery mode keyword or nil (planned from
+                    context when nil)
+    :run-mode       engine run mode keyword (default :mode/sim)
+    :broker         reconciliation fn-map {:open-orders .. :fills-since ..}
+                    or nil
+    :scope          snapshot partition scope (default handled by the store)
+    :run-info       optional engine.state/init-run info for fresh state
+    :now            optional (fn [] iso-ts) clock (defaults to UTC now)
+
+  Returns {:recovery/outcome :ready|:degraded-ready|:blocked|:recovery-failed
+           :recovery/mode .. :recovery/lifecycle ..
+           :engine/state .. :recovery/facts [replayed + reconciliation]
+           :recovery/warnings [...]} — :recovery-failed adds
+  :recovery/error instead of :engine/state."
+  [{:keys [fact-store snapshot-store control-plane mode run-mode broker
+           scope run-info now]
+    :or {run-mode :mode/sim}}]
+  (let [now-fn (or now utc-now-str)]
+    (try
+      (let [lifecycle (step! :not-started :event/engine-boot {})
+            ;; §10 step 3-4: locate + load latest valid snapshot
+            snap (p/latest-snapshot snapshot-store scope)
+            rev-ok? (snapshot-revision-ok? snap control-plane)
+            snap (when rev-ok? snap)
+            warnings (cond-> (vec (:snapshot-store/warnings (meta snap)))
+                       (not rev-ok?)
+                       (conj {:warning/code
+                              :warning/snapshot-control-plane-revision-unknown}))
+            latest (p/latest-offset fact-store)
+            plan (plan-recovery {:requested-mode mode
+                                 :run-mode run-mode
+                                 :snapshot? (some? snap)
+                                 :facts? (pos? latest)})
+            recovery-mode (:recovery/mode plan)
+            lifecycle (if (some? snap)
+                        (step! lifecycle :event/snapshot-accepted {})
+                        (step! lifecycle :event/no-valid-snapshot
+                               {:fallback-allowed? true}))
+            watermark (if (some? snap)
+                        (get-in snap [:snapshot/fact-watermark :offset])
+                        0)
+            base-state (if (some? snap)
+                         (:snapshot/state snap)
+                         (cond-> (st/fresh-state)
+                           (some? run-info) (st/init-run run-info)))
+            ;; §10 step 5: read the tail BEFORE appending recovery-started
+            tail (p/facts-since fact-store watermark)
+            started-at (now-fn)
+            _ (p/append-facts!
+               fact-store
+               [(recovery-fact :fact/recovery-started
+                               {:recovery/mode recovery-mode
+                                :recovery/snapshot-id (:snapshot/id snap)
+                                :recovery/fact-watermark watermark
+                                :recovery/facts-to-replay (count tail)}
+                               started-at)])
+            ;; §10 step 6: fold the tail
+            replay-res (fold-and-append! fact-store base-state tail)
+            state (:state replay-res)
+            state (st/record-watermark state :watermark/fact-log
+                                       (if (seq tail)
+                                         (apply max (map :fact-log/offset tail))
+                                         watermark))
+            replay-ambiguous? (boolean
+                               (some unknown-intent-fault?
+                                     (:emitted-facts replay-res)))
+            ;; §10 step 7-10: unresolved set + broker reconciliation
+            reconcile? (and (:recovery/reconcile? plan)
+                            (some? broker)
+                            (not replay-ambiguous?))
+            ;; an orphaned order with NO upcoming reconciliation can never
+            ;; be restored in this run — that is replay ambiguity (§9.5);
+            ;; with reconciliation pending it gets its chance via the
+            ;; :reconciled/* triggers first
+            replay-blocked? (or replay-ambiguous?
+                                (and (orphaned? state) (not reconcile?)))
+            lifecycle (cond
+                        replay-blocked?
+                        (step! lifecycle :event/replay-ambiguity-violates-safety {})
+
+                        reconcile?
+                        (step! lifecycle :event/fact-replay-complete
+                               {:reconciliation-required? true})
+
+                        :else
+                        (step! lifecycle :event/fact-replay-complete
+                               {:reconciliation-required? false}))
+            rec-res (when (and reconcile? (not replay-blocked?))
+                      (reconcile! fact-store broker state))
+            state (if rec-res (:state rec-res) state)
+            ;; Unresolved-but-unambiguous orders (e.g. still open at the
+            ;; broker, Case A) do NOT block; only orphaned lineage or
+            ;; reconciliation-anomaly/unknown-intent faults do.
+            reconcile-anomalous?
+            (and (some? rec-res)
+                 (boolean
+                  (or (some unknown-intent-fault? (:emitted-facts rec-res))
+                      (some reconciliation-anomaly-fault?
+                            (concat (:new-facts rec-res)
+                                    (:emitted-facts rec-res))))))
+            lifecycle (cond
+                        (= :blocked lifecycle) lifecycle
+
+                        (or (orphaned? state) reconcile-anomalous?)
+                        (step! lifecycle :event/ambiguity-unsafe-exposure {})
+
+                        (some? rec-res)
+                        (step! lifecycle :event/reconciliation-complete
+                               {:degradation-remains? false})
+
+                        :else lifecycle)
+            outcome (get {:ready :ready
+                          :degraded-ready :degraded-ready
+                          :blocked :blocked
+                          :recovery-failed :recovery-failed}
+                         lifecycle
+                         :recovery-failed)
+            all-facts (vec (concat tail (:new-facts rec-res)))
+            completed-at (now-fn)
+            _ (p/append-facts!
+               fact-store
+               [(recovery-fact :fact/recovery-completed
+                               {:recovery/mode recovery-mode
+                                :recovery/outcome outcome
+                                :recovery/facts-replayed (count tail)
+                                :recovery/reconciliation-facts
+                                (count (:new-facts rec-res))}
+                               completed-at)])]
+        {:recovery/outcome outcome
+         :recovery/mode recovery-mode
+         :recovery/lifecycle lifecycle
+         :engine/state state
+         :recovery/facts all-facts
+         :recovery/warnings warnings})
+      (catch python/Exception e
+        {:recovery/outcome :recovery-failed
+         :recovery/mode mode
+         :recovery/lifecycle :recovery-failed
+         :recovery/error {:error/code :error/recovery-store-failure
+                          :error/message (str e)}}))))
