@@ -1,0 +1,92 @@
+(ns domain.test-instruments
+  "Instrument id derivation/parsing and canonical leg ordering tests
+  (CANONICAL_SCHEMAS §5.2.3, §6.1, §12.3)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.instruments :as ins]))
+
+(deftest equity-round-trip
+  (let [ref {:instrument/asset-class :asset-class/equity
+             :instrument/venue "NASDAQ"
+             :instrument/symbol "SPY"}
+        id (ins/instrument-id ref)]
+    (is (= "equity/NASDAQ/SPY" id))
+    (is (= (assoc ref :instrument/id id)
+           (ins/parse-instrument-id id)))))
+
+(deftest option-round-trip
+  (let [ref {:instrument/asset-class :asset-class/option
+             :instrument/venue "OPRA"
+             :instrument/underlying "SPY"
+             :instrument/expiry "2026-06-19"
+             :instrument/right :option-right/call
+             :instrument/strike "550.000"}
+        id (ins/instrument-id ref)]
+    (is (= "option/OPRA/SPY/2026-06-19/C/550.000" id))
+    (is (= (assoc ref :instrument/id id)
+           (ins/parse-instrument-id id)))))
+
+(deftest future-round-trip
+  (let [ref {:instrument/asset-class :asset-class/future
+             :instrument/venue "CME"
+             :instrument/root "ES"
+             :instrument/expiry "2026-09-18"}
+        id (ins/instrument-id ref)]
+    (is (= "future/CME/ES/2026-09-18" id))
+    (is (= (assoc ref :instrument/id id)
+           (ins/parse-instrument-id id)))))
+
+(deftest strike-formatting
+  (testing "strikes render with exactly 3 decimal places"
+    (is (= "550.000" (ins/format-strike "550")))
+    (is (= "550.000" (ins/format-strike "550.0")))
+    (is (= "552.375" (ins/format-strike "552.375")))
+    (is (= "0.500"   (ins/format-strike "0.5"))))
+  (testing "instrument-id normalizes the strike"
+    (is (= "option/OPRA/SPY/2026-06-19/P/545.500"
+           (ins/instrument-id {:instrument/asset-class :asset-class/option
+                               :instrument/venue "OPRA"
+                               :instrument/underlying "SPY"
+                               :instrument/expiry "2026-06-19"
+                               :instrument/right :option-right/put
+                               :instrument/strike "545.5"})))))
+
+(deftest instrument-ref-normalizes
+  (let [r (ins/instrument-ref {:instrument/asset-class :asset-class/option
+                               :instrument/venue "OPRA"
+                               :instrument/underlying "SPY"
+                               :instrument/expiry "2026-06-19"
+                               :instrument/right :option-right/call
+                               :instrument/strike "550"})]
+    (is (= "550.000" (:instrument/strike r)))
+    (is (= "option/OPRA/SPY/2026-06-19/C/550.000" (:instrument/id r)))))
+
+(deftest parse-rejects-malformed-ids
+  (is (nil? (ins/parse-instrument-id "equity/NYSE")))
+  (is (nil? (ins/parse-instrument-id "option/OPRA/SPY/2026-06-19/X/550.000")))
+  (is (nil? (ins/parse-instrument-id "option/OPRA/SPY/2026-06-19/C/550")))
+  (is (nil? (ins/parse-instrument-id "option/OPRA/SPY/June/C/550.000")))
+  (is (nil? (ins/parse-instrument-id "bond/NYSE/IBM")))
+  (is (nil? (ins/parse-instrument-id nil)))
+  (is (nil? (ins/parse-instrument-id 42))))
+
+(deftest canonical-leg-sort-ordering
+  (let [a {:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+           :leg/side :order-side/buy
+           :leg/quantity "1"}
+        b {:instrument/id "option/OPRA/SPY/2026-06-19/C/555.000"
+           :leg/side :order-side/sell
+           :leg/quantity "1"}
+        c {:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+           :leg/side :order-side/sell
+           :leg/quantity "1"}
+        d {:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+           :leg/side :order-side/sell
+           :leg/quantity "2"}]
+    (testing "sorted by instrument-id, then side, then quantity (§12.3)"
+      (is (= [a c d b] (ins/canonical-leg-sort [b d c a]))))
+    (testing "deterministic for any input ordering"
+      (is (= (ins/canonical-leg-sort [a b c d])
+             (ins/canonical-leg-sort [d c b a])
+             (ins/canonical-leg-sort [c a d b]))))
+    (testing "returns a vector"
+      (is (vector? (ins/canonical-leg-sort [b a]))))))

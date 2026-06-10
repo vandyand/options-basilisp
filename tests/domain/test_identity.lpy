@@ -1,0 +1,121 @@
+(ns domain.test-identity
+  "Order-intent identity algorithm tests (CANONICAL_SCHEMAS §12)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]))
+
+(def base-identity
+  "The §12.1 canonical identity input example."
+  {:identity/version 1
+   :identity/decision-id "dec_5f1c2a"
+   :identity/intent-slot 0
+   :identity/account-id "account/alpaca/paper-ops"
+   :identity/role :intent-role/entry
+   :identity/order-shape
+   {:side :order-side/buy
+    :effect :position-effect/open
+    :order-type :order-type/limit
+    :time-in-force :tif/day
+    :quantity "1"
+    :limit-price "2.15"
+    :stop-price nil
+    :legs [{:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+            :leg/side :order-side/buy
+            :leg/quantity "1"}]}})
+
+(def two-leg-identity
+  (assoc-in base-identity [:identity/order-shape :legs]
+            [{:instrument/id "option/OPRA/SPY/2026-06-19/C/555.000"
+              :leg/side :order-side/sell
+              :leg/quantity "1"}
+             {:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+              :leg/side :order-side/buy
+              :leg/quantity "1"}]))
+
+(deftest stable-across-calls
+  (testing "same identity input produces the same id across calls"
+    (let [id1 (sch/order-intent-id base-identity)
+          id2 (sch/order-intent-id base-identity)]
+      (is (= id1 id2))
+      (is (.startswith id1 "oi_")))))
+
+(deftest stable-across-key-and-leg-order
+  (testing "shuffled construction order of the same identity is id-identical"
+    (let [rebuilt (-> {}
+                      (assoc :identity/order-shape (:identity/order-shape base-identity))
+                      (assoc :identity/role :intent-role/entry)
+                      (assoc :identity/account-id "account/alpaca/paper-ops")
+                      (assoc :identity/intent-slot 0)
+                      (assoc :identity/decision-id "dec_5f1c2a")
+                      (assoc :identity/version 1))]
+      (is (= (sch/order-intent-id base-identity)
+             (sch/order-intent-id rebuilt)))))
+  (testing "leg declaration order does not affect identity (§12.3 canonical sort)"
+    (let [shuffled (update-in two-leg-identity
+                              [:identity/order-shape :legs]
+                              (comp vec reverse))]
+      (is (= (sch/order-intent-id two-leg-identity)
+             (sch/order-intent-id shuffled))))))
+
+(deftest mutations-change-identity
+  (let [base-id (sch/order-intent-id base-identity)]
+    (testing "different account (§12.4)"
+      (is (not= base-id
+                (sch/order-intent-id
+                 (assoc base-identity :identity/account-id "account/sim/main")))))
+    (testing "different role (§12.4)"
+      (is (not= base-id
+                (sch/order-intent-id
+                 (assoc base-identity :identity/role :intent-role/exit)))))
+    (testing "different quantity (§12.4)"
+      (is (not= base-id
+                (sch/order-intent-id
+                 (assoc-in base-identity [:identity/order-shape :quantity] "2")))))
+    (testing "different instrument leg set (§12.4)"
+      (is (not= base-id (sch/order-intent-id two-leg-identity))))
+    (testing "different order type (§12.4)"
+      (is (not= base-id
+                (sch/order-intent-id
+                 (assoc-in base-identity [:identity/order-shape :order-type]
+                           :order-type/market)))))
+    (testing "different limit price (§12.4)"
+      (is (not= base-id
+                (sch/order-intent-id
+                 (assoc-in base-identity [:identity/order-shape :limit-price] "2.20")))))
+    (testing "different decision slot (§12.4)"
+      (is (not= base-id
+                (sch/order-intent-id
+                 (assoc base-identity :identity/intent-slot 1)))))))
+
+(deftest envelope-metadata-must-not-change-identity
+  (testing "extra metadata keys are excluded from identity (§12.5)"
+    (is (= (sch/order-intent-id base-identity)
+           (sch/order-intent-id
+            (assoc base-identity
+                   :record/id "01JX8H0V7QMP2T8A3N8D0SY5Z4"
+                   :record/run-id "01JX8GZY6S3N8W3PK0T4V8M6C2"
+                   :extra/retry-count 7)))))
+  (testing "extra keys inside order shape and legs are excluded"
+    (is (= (sch/order-intent-id base-identity)
+           (sch/order-intent-id
+            (-> base-identity
+                (assoc-in [:identity/order-shape :broker/hint] "x")
+                (update-in [:identity/order-shape :legs 0]
+                           assoc :leg/note "annotated")))))))
+
+(deftest decision-id-deterministic
+  (let [seed {:decision/strategy-id "strategy/spx-credit/spread-entry/v1"
+              :decision/scope :decision-scope/per-bar
+              :decision/source-fact-ids ["01JX8H07B9M0AZ6KN4V1M4VE0P"]
+              :decision/at "2026-06-10T14:30:00Z"
+              :decision/slot 0}]
+    (testing "same seed, same id"
+      (let [d1 (sch/decision-id seed)
+            d2 (sch/decision-id seed)]
+        (is (= d1 d2))
+        (is (.startswith d1 "dec_"))))
+    (testing "different slot, different id"
+      (is (not= (sch/decision-id seed)
+                (sch/decision-id (assoc seed :decision/slot 1)))))
+    (testing "missing source lineage rejected"
+      (is (thrown? python/Exception
+                   (sch/decision-id (dissoc seed :decision/source-fact-ids)))))))

@@ -1,0 +1,137 @@
+(ns stevetrading.domain.instruments
+  "Canonical instrument ids and structured instrument references.
+
+  Normative: CANONICAL_SCHEMAS_V0.1 §5.2.3 (instrument-id formats), §6.1
+  (structured reference shape), §12.3 (canonical leg ordering).
+
+  Formats:
+  - equity: equity/<venue>/<symbol>
+  - option: option/<venue>/<underlying>/<expiry>/<right>/<strike>
+  - future: future/<venue>/<root>/<expiry>
+
+  Strikes are rendered with exactly 3 decimal places (e.g. 550.000)."
+  (:import decimal))
+
+(defn format-strike
+  "Render a strike (decimal string or Decimal) with exactly 3 decimal places."
+  [strike]
+  (python/format (decimal/Decimal (str strike)) ".3f"))
+
+(def ^:private right->code
+  {:option-right/call "C"
+   :option-right/put  "P"})
+
+(def ^:private code->right
+  {"C" :option-right/call
+   "P" :option-right/put})
+
+(defn instrument-id
+  "Derive the deterministic canonical instrument-id string from a structured
+  instrument reference per §5.2.3. Throws ex-info on unknown asset class or
+  missing fields."
+  [{:instrument/keys [asset-class venue symbol underlying expiry right strike root]
+    :as ref}]
+  (cond
+    (= asset-class :asset-class/equity)
+    (do
+      (when-not (and venue symbol)
+        (throw (ex-info "equity instrument ref requires venue and symbol"
+                        {:error/code :error/malformed-instrument-ref
+                         :instrument/ref ref})))
+      (str "equity/" venue "/" symbol))
+
+    (= asset-class :asset-class/option)
+    (do
+      (when-not (and venue underlying expiry right strike)
+        (throw (ex-info "option instrument ref requires venue, underlying, expiry, right, strike"
+                        {:error/code :error/malformed-instrument-ref
+                         :instrument/ref ref})))
+      (when-not (contains? right->code right)
+        (throw (ex-info "option right must be :option-right/call or :option-right/put"
+                        {:error/code :error/malformed-instrument-ref
+                         :instrument/right right})))
+      (str "option/" venue "/" underlying "/" expiry "/"
+           (get right->code right) "/" (format-strike strike)))
+
+    (= asset-class :asset-class/future)
+    (do
+      (when-not (and venue root expiry)
+        (throw (ex-info "future instrument ref requires venue, root, expiry"
+                        {:error/code :error/malformed-instrument-ref
+                         :instrument/ref ref})))
+      (str "future/" venue "/" root "/" expiry))
+
+    :else
+    (throw (ex-info "unknown asset class"
+                    {:error/code :error/malformed-instrument-ref
+                     :instrument/asset-class asset-class}))))
+
+(def ^:private expiry-re #"^\d{4}-\d{2}-\d{2}$")
+(def ^:private segment-re #"^[A-Za-z0-9._-]+$")
+(def ^:private strike-re #"^\d+\.\d{3}$")
+
+(defn parse-instrument-id
+  "Parse a canonical instrument-id string into its structured §6.1 reference
+  map (including :instrument/id). Returns nil when the string is not a valid
+  canonical instrument id."
+  [s]
+  (when (string? s)
+    (let [parts (vec (.split s "/"))]
+      (cond
+        (and (= 3 (count parts))
+             (= "equity" (parts 0))
+             (re-matches segment-re (parts 1))
+             (re-matches segment-re (parts 2)))
+        {:instrument/id          s
+         :instrument/asset-class :asset-class/equity
+         :instrument/venue       (parts 1)
+         :instrument/symbol      (parts 2)}
+
+        (and (= 6 (count parts))
+             (= "option" (parts 0))
+             (re-matches segment-re (parts 1))
+             (re-matches segment-re (parts 2))
+             (re-matches expiry-re (parts 3))
+             (contains? code->right (parts 4))
+             (re-matches strike-re (parts 5)))
+        {:instrument/id          s
+         :instrument/asset-class :asset-class/option
+         :instrument/venue       (parts 1)
+         :instrument/underlying  (parts 2)
+         :instrument/expiry      (parts 3)
+         :instrument/right       (get code->right (parts 4))
+         :instrument/strike      (parts 5)}
+
+        (and (= 4 (count parts))
+             (= "future" (parts 0))
+             (re-matches segment-re (parts 1))
+             (re-matches segment-re (parts 2))
+             (re-matches expiry-re (parts 3)))
+        {:instrument/id          s
+         :instrument/asset-class :asset-class/future
+         :instrument/venue       (parts 1)
+         :instrument/root        (parts 2)
+         :instrument/expiry      (parts 3)}
+
+        :else nil))))
+
+(defn instrument-ref
+  "Normalize a structured instrument reference into its full canonical §6.1
+  shape: strike rendered with 3 decimals and :instrument/id derived and
+  attached."
+  [ref]
+  (let [normalized (if (:instrument/strike ref)
+                     (assoc ref :instrument/strike (format-strike (:instrument/strike ref)))
+                     ref)]
+    (assoc normalized :instrument/id (instrument-id normalized))))
+
+(defn canonical-leg-sort
+  "Sort an order's legs canonically per §12.3:
+  1. instrument-id, 2. side, 3. quantity.
+  Returns a vector. Deterministic for any input ordering of the same leg set."
+  [legs]
+  (vec (sort-by (fn [leg]
+                  (python/tuple [(str (:instrument/id leg))
+                                 (pr-str (:leg/side leg))
+                                 (str (:leg/quantity leg))]))
+                legs)))

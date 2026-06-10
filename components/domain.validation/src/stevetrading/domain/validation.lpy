@@ -1,0 +1,243 @@
+(ns stevetrading.domain.validation
+  "Validation of canonical fact/command/snapshot records.
+
+  Normative: CANONICAL_SCHEMAS_V0.1 §13 — the schema layer must reject:
+  - missing required keys
+  - unknown enum values in strict fields
+  - binary floating-point payloads in canonical numeric fields
+  - malformed business ids
+
+  Validators return {:valid? true} or
+  {:valid? false :errors [{:error/code .. :error/path .. :error/message ..}]}."
+  (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.identifiers :as identifiers]
+            [stevetrading.domain.instruments :as instruments])
+  (:import decimal))
+
+;; ---------------------------------------------------------------------------
+;; Scalar predicates
+;; ---------------------------------------------------------------------------
+
+(def ^:private rfc3339-utc-re
+  #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$")
+
+(defn rfc3339-utc?
+  "True when s is an RFC 3339 UTC timestamp string with offset Z
+  (CANONICAL_SCHEMAS §4.1), e.g. \"2026-06-10T14:30:00Z\" or
+  \"2026-06-10T14:30:00.125Z\"."
+  [s]
+  (and (string? s) (some? (re-matches rfc3339-utc-re s))))
+
+(defn decimal-string?
+  "True when s is a string parseable by decimal.Decimal
+  (CANONICAL_SCHEMAS §4.2 durable decimal form)."
+  [s]
+  (and (string? s)
+       (try
+         (do (decimal/Decimal s) true)
+         (catch python/Exception _ false))))
+
+(defn- err
+  [code path message]
+  {:error/code    code
+   :error/path    path
+   :error/message message})
+
+;; ---------------------------------------------------------------------------
+;; Payload field tables (strict fields known to v0.1)
+;; ---------------------------------------------------------------------------
+
+(def ^:private enum-fields
+  {:record/mode                enums/modes
+   :order-intent/side          enums/order-sides
+   :order-intent/effect        enums/position-effects
+   :order-intent/order-type    enums/order-types
+   :order-intent/time-in-force enums/tifs
+   :order-intent/role          enums/intent-roles
+   :leg/side                   enums/order-sides
+   :broker/status              enums/broker-statuses
+   :fill/liquidity             enums/liquidity})
+
+(def ^:private decimal-fields
+  #{:order-intent/quantity
+    :order-intent/limit-price
+    :order-intent/stop-price
+    :leg/quantity
+    :fill/quantity
+    :fill/price
+    :bar/open
+    :bar/high
+    :bar/low
+    :bar/close
+    :bar/volume})
+
+;; Decimal fields where nil is acceptable (price params only apply to some
+;; order types).
+(def ^:private nilable-decimal-fields
+  #{:order-intent/limit-price
+    :order-intent/stop-price})
+
+(def ^:private timestamp-fields
+  #{:fact/occurred-at
+    :fact/recorded-at
+    :command/issued-at
+    :snapshot/written-at
+    :fill/occurred-at
+    :broker/observed-at
+    :bar/time
+    :decision/market-time
+    :prediction/at})
+
+(defn- check-field
+  "Field-level checks for one key/value pair at path."
+  [errors path k v]
+  (let [errors (if-let [allowed (get enum-fields k)]
+                 (if (contains? allowed v)
+                   errors
+                   (conj errors (err :error/invalid-enum (conj path k)
+                                     (str "value " (pr-str v) " not in allowed enum set for " k))))
+                 errors)
+        errors (if (contains? decimal-fields k)
+                 (cond
+                   (and (nil? v) (contains? nilable-decimal-fields k))
+                   errors
+
+                   (float? v)
+                   (conj errors (err :error/invalid-decimal (conj path k)
+                                     "binary floating-point values are forbidden in canonical decimal fields; use a decimal string"))
+
+                   (not (string? v))
+                   (conj errors (err :error/invalid-decimal (conj path k)
+                                     (str "canonical decimal fields must be decimal strings, got " (pr-str v))))
+
+                   (not (decimal-string? v))
+                   (conj errors (err :error/invalid-decimal (conj path k)
+                                     (str "not parseable as Decimal: " (pr-str v))))
+
+                   :else errors)
+                 errors)
+        errors (if (contains? timestamp-fields k)
+                 (if (rfc3339-utc? v)
+                   errors
+                   (conj errors (err :error/invalid-timestamp (conj path k)
+                                     (str "must be an RFC 3339 UTC timestamp ending in Z, got " (pr-str v)))))
+                 errors)]
+    errors))
+
+(defn- walk-value
+  "Recursively walk a payload value, applying field checks at every map entry."
+  [errors path v]
+  (cond
+    (map? v)
+    (reduce-kv (fn [errs k val]
+                 (let [errs (check-field errs path k val)]
+                   (walk-value errs (conj path k) val)))
+               errors
+               v)
+
+    (or (vector? v) (seq? v))
+    (first
+     (reduce (fn [[errs i] item]
+               [(walk-value errs (conj path i) item) (inc i)])
+             [errors 0]
+             v))
+
+    :else errors))
+
+;; ---------------------------------------------------------------------------
+;; Envelope-level checks
+;; ---------------------------------------------------------------------------
+
+(defn- check-required
+  [errors record ks]
+  (reduce (fn [errs k]
+            (if (some? (get record k))
+              errs
+              (conj errs (err :error/missing-key [k]
+                              (str "required key " k " is missing or nil")))))
+          errors
+          ks))
+
+(defn- check-business-ids
+  [errors record]
+  (let [errors (if-let [sid (:record/strategy-id record)]
+                 (if (identifiers/valid-strategy-id? sid)
+                   errors
+                   (conj errors (err :error/malformed-id [:record/strategy-id]
+                                     (str "malformed strategy id: " (pr-str sid)))))
+                 errors)
+        errors (if-let [aid (:record/account-id record)]
+                 (if (identifiers/valid-account-id? aid)
+                   errors
+                   (conj errors (err :error/malformed-id [:record/account-id]
+                                     (str "malformed account id: " (pr-str aid)))))
+                 errors)
+        errors (if-let [iid (:record/instrument-id record)]
+                 (if (instruments/parse-instrument-id iid)
+                   errors
+                   (conj errors (err :error/malformed-id [:record/instrument-id]
+                                     (str "malformed instrument id: " (pr-str iid)))))
+                 errors)]
+    errors))
+
+(defn- result
+  [errors]
+  (if (seq errors)
+    {:valid? false :errors (vec errors)}
+    {:valid? true}))
+
+(defn validate-fact
+  "Validate a canonical fact envelope per CANONICAL_SCHEMAS §8/§13 and
+  EVENT_COMMAND_TAXONOMY §8."
+  [record]
+  (let [errors []
+        errors (check-required errors record
+                               [:record/id :record/type :record/version
+                                :fact/occurred-at :fact/recorded-at :fact/payload])
+        errors (if (and (some? (:record/type record))
+                        (not (contains? enums/fact-types (:record/type record))))
+                 (conj errors (err :error/unknown-type [:record/type]
+                                   (str "unknown fact type: " (pr-str (:record/type record)))))
+                 errors)
+        errors (check-business-ids errors record)
+        errors (walk-value errors [] (dissoc record :fact/payload))
+        errors (if (map? (:fact/payload record))
+                 (walk-value errors [:fact/payload] (:fact/payload record))
+                 errors)]
+    (result errors)))
+
+(defn validate-command
+  "Validate a canonical command envelope per CANONICAL_SCHEMAS §9/§13 and
+  EVENT_COMMAND_TAXONOMY §9."
+  [record]
+  (let [errors []
+        errors (check-required errors record
+                               [:record/id :record/type :record/version
+                                :command/issued-at :command/target-adapter
+                                :command/idempotency-key :command/payload])
+        errors (if (and (some? (:record/type record))
+                        (not (contains? enums/command-types (:record/type record))))
+                 (conj errors (err :error/unknown-type [:record/type]
+                                   (str "unknown command type: " (pr-str (:record/type record)))))
+                 errors)
+        errors (check-business-ids errors record)
+        errors (walk-value errors [] (dissoc record :command/payload))
+        errors (if (map? (:command/payload record))
+                 (walk-value errors [:command/payload] (:command/payload record))
+                 errors)]
+    (result errors)))
+
+(defn validate-snapshot
+  "Validate a canonical snapshot envelope per CANONICAL_SCHEMAS §10."
+  [record]
+  (let [errors []
+        errors (check-required errors record
+                               [:snapshot/id :snapshot/version :snapshot/engine-version
+                                :snapshot/written-at :snapshot/fact-watermark :snapshot/state])
+        errors (if (and (some? (:snapshot/written-at record))
+                        (not (rfc3339-utc? (:snapshot/written-at record))))
+                 (conj errors (err :error/invalid-timestamp [:snapshot/written-at]
+                                   (str "must be an RFC 3339 UTC timestamp ending in Z, got "
+                                        (pr-str (:snapshot/written-at record)))))
+                 errors)]
+    (result errors)))

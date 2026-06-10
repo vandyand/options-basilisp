@@ -1,0 +1,57 @@
+(ns stevetrading.domain.identifiers
+  "Canonical identifier construction and parsing.
+
+  Normative: CANONICAL_SCHEMAS_V0.1 §5.
+  - Opaque record ids (§5.1): ULID strings, uniqueness-oriented and sortable.
+  - Stable business ids (§5.2): deterministic, meaning-oriented; must survive
+    restart, replay, and storage migration."
+  (:import ulid))
+
+(defn new-record-id
+  "Return a fresh opaque record id (ULID string) per CANONICAL_SCHEMAS §5.1.
+  Applies to fact-id, command-id, run-id, snapshot-id."
+  []
+  (str (ulid/ULID)))
+
+;; ---------------------------------------------------------------------------
+;; Strategy id: strategy/<family>/<name>/v<major>   (§5.2.1)
+;; ---------------------------------------------------------------------------
+
+(def ^:private strategy-id-re
+  #"^strategy/([a-z0-9][a-z0-9-]*)/([a-z0-9][a-z0-9-]*)/v(\d+)$")
+
+(defn parse-strategy-id
+  "Parse a strategy id string per §5.2.1. Returns
+  {:strategy/family ... :strategy/name ... :strategy/major <int>} or nil."
+  [s]
+  (when (string? s)
+    (when-let [m (re-matches strategy-id-re s)]
+      (let [[_ family nm major] m]
+        {:strategy/family family
+         :strategy/name   nm
+         :strategy/major  (python/int major)}))))
+
+(defn valid-strategy-id?
+  [s]
+  (some? (parse-strategy-id s)))
+
+;; ---------------------------------------------------------------------------
+;; Account id: account/<broker>/<logical-name>   (§5.2.2)
+;; ---------------------------------------------------------------------------
+
+(def ^:private account-id-re
+  #"^account/([a-z0-9][a-z0-9-]*)/([a-z0-9][a-z0-9-]*)$")
+
+(defn parse-account-id
+  "Parse an account id string per §5.2.2. Returns
+  {:account/broker ... :account/logical-name ...} or nil."
+  [s]
+  (when (string? s)
+    (when-let [m (re-matches account-id-re s)]
+      (let [[_ broker logical] m]
+        {:account/broker       broker
+         :account/logical-name logical}))))
+
+(defn valid-account-id?
+  [s]
+  (some? (parse-account-id s)))

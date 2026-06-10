@@ -1,4 +1,18 @@
-(ns stevetrading.domain.schemas)
+(ns stevetrading.domain.schemas
+  "Canonical envelopes, deterministic serialization, and the order-intent
+  identity algorithm.
+
+  Normative: CANONICAL_SCHEMAS_V0.1 §7-§10 (envelopes), §12 (order-intent
+  identity), §5.2.6 (decision id).
+
+  The canonical serializer (canonical-edn-str) builds its output string
+  explicitly — sorted map keys, sorted set elements, ordered vectors — and
+  does NOT rely on printer internals, so identity hashes are stable across
+  Basilisp versions."
+  (:require [basilisp.string :as bstr]
+            [stevetrading.domain.identifiers :as identifiers]
+            [stevetrading.domain.instruments :as instruments])
+  (:import hashlib))
 
 (def schema-version 1)
 
@@ -12,3 +26,204 @@
   [record-kind]
   (contains? canonical-record-kinds record-kind))
 
+;; ---------------------------------------------------------------------------
+;; Canonicalization (CANONICAL_SCHEMAS §12.2-§12.3)
+;; ---------------------------------------------------------------------------
+
+(def ^:private leg-keys
+  "Keys whose vector values hold order legs and must be canonically sorted."
+  #{:legs :order-intent/legs})
+
+(defn canonicalize
+  "Recursively canonicalize a value for deterministic serialization:
+  - any vector under a leg key (:legs / :order-intent/legs) is sorted via
+    instruments/canonical-leg-sort (§12.3)
+  - other vectors/seqs keep their order
+  - maps and sets are canonicalized per-element (key ordering is realized at
+    serialization time by canonical-edn-str, which sorts by pr-str)"
+  [v]
+  (cond
+    (map? v)
+    (reduce-kv (fn [m k val]
+                 (let [cv (canonicalize val)
+                       cv (if (and (contains? leg-keys k) (sequential? cv))
+                            (instruments/canonical-leg-sort cv)
+                            cv)]
+                   (assoc m k cv)))
+               {}
+               v)
+
+    (vector? v) (mapv canonicalize v)
+    (set? v)    (into #{} (map canonicalize v))
+    (seq? v)    (mapv canonicalize v)
+    :else v))
+
+(defn canonical-edn-str
+  "Deterministic EDN-style serialization of a (canonicalized) value.
+  Builds the string explicitly:
+  - maps:    \"{\" + (k v pairs, keys sorted by pr-str) + \"}\"
+  - vectors/seqs: \"[\" + elements in order + \"]\"
+  - sets:    \"#{\" + elements sorted by pr-str + \"}\"
+  - scalars (keywords/strings/numbers/nil/booleans): pr-str"
+  [v]
+  (cond
+    (map? v)
+    (str "{"
+         (bstr/join
+          " "
+          (mapcat (fn [k] [(canonical-edn-str k) (canonical-edn-str (get v k))])
+                  (sort-by pr-str (keys v))))
+         "}")
+
+    (or (vector? v) (seq? v))
+    (str "[" (bstr/join " " (map canonical-edn-str v)) "]")
+
+    (set? v)
+    (str "#{" (bstr/join " " (sort (map canonical-edn-str v))) "}")
+
+    :else (pr-str v)))
+
+(defn sha256-hex
+  "Lowercase hex SHA-256 of a string."
+  [s]
+  (.hexdigest (hashlib/sha256 (.encode s "utf-8"))))
+
+;; ---------------------------------------------------------------------------
+;; Decision id (CANONICAL_SCHEMAS §5.2.6)
+;; ---------------------------------------------------------------------------
+
+(def ^:private decision-seed-required-keys
+  [:decision/strategy-id :decision/scope :decision/at :decision/slot])
+
+(defn decision-id
+  "Deterministic decision id: \"dec_\" + SHA-256 over the canonical decision
+  seed. Seed must include strategy-id, decision-scope, source fact ids or a
+  source watermark tuple, decision timestamp, and decision slot (§5.2.6)."
+  [seed]
+  (let [missing (remove #(contains? seed %) decision-seed-required-keys)]
+    (when (seq missing)
+      (throw (ex-info "decision seed missing required keys"
+                      {:error/code :error/missing-key
+                       :error/missing (vec missing)})))
+    (when-not (or (contains? seed :decision/source-fact-ids)
+                  (contains? seed :decision/source-watermark))
+      (throw (ex-info "decision seed requires :decision/source-fact-ids or :decision/source-watermark"
+                      {:error/code :error/missing-key
+                       :error/missing [:decision/source-fact-ids :decision/source-watermark]})))
+    (str "dec_" (sha256-hex (canonical-edn-str (canonicalize seed))))))
+
+;; ---------------------------------------------------------------------------
+;; Order-intent identity (CANONICAL_SCHEMAS §12)
+;; ---------------------------------------------------------------------------
+
+(def ^:private identity-keys
+  [:identity/version
+   :identity/decision-id
+   :identity/intent-slot
+   :identity/account-id
+   :identity/role
+   :identity/order-shape])
+
+(def ^:private order-shape-keys
+  [:side :effect :order-type :time-in-force
+   :quantity :limit-price :stop-price :legs])
+
+(def ^:private leg-identity-keys
+  [:instrument/id :leg/side :leg/quantity])
+
+(defn- normalize-identity-input
+  "Restrict an identity input to exactly the §12.1 identity fields, so extra
+  envelope metadata can never affect the id (§12.5). Absent limit/stop prices
+  normalize to nil. Legs are restricted to their identity keys and sorted
+  canonically (§12.3)."
+  [input]
+  (let [missing (remove #(contains? input %) identity-keys)]
+    (when (seq missing)
+      (throw (ex-info "order-intent identity input missing required keys"
+                      {:error/code :error/missing-key
+                       :error/missing (vec missing)})))
+    (let [shape (:identity/order-shape input)
+          shape-missing (remove #(contains? shape %)
+                                [:side :effect :order-type :time-in-force :quantity :legs])]
+      (when (seq shape-missing)
+        (throw (ex-info "order shape missing required keys"
+                        {:error/code :error/missing-key
+                         :error/missing (vec shape-missing)})))
+      (when-not (seq (:legs shape))
+        (throw (ex-info "order shape requires at least one leg"
+                        {:error/code :error/missing-key
+                         :error/missing [:legs]})))
+      (let [legs (mapv #(select-keys % leg-identity-keys) (:legs shape))
+            shape' (-> (merge {:limit-price nil :stop-price nil}
+                              (select-keys shape order-shape-keys))
+                       (assoc :legs (instruments/canonical-leg-sort legs)))]
+        (-> (select-keys input identity-keys)
+            (assoc :identity/order-shape shape'))))))
+
+(defn order-intent-id
+  "Deterministic, replay-stable order-intent id (§12): \"oi_\" + SHA-256 over
+  the canonicalized §12.1 identity input. Two replays of the same logical
+  decision produce the same id; the §12.4 mutations (account, role, quantity,
+  leg set, order type, limit/stop price, decision slot) each change it."
+  [identity-input]
+  (str "oi_" (sha256-hex (canonical-edn-str (canonicalize (normalize-identity-input identity-input))))))
+
+;; ---------------------------------------------------------------------------
+;; Envelope constructors (CANONICAL_SCHEMAS §8-§10)
+;; ---------------------------------------------------------------------------
+
+(defn- require-keys!
+  [m ks kind]
+  (let [missing (remove #(some? (get m %)) ks)]
+    (when (seq missing)
+      (throw (ex-info (str (name kind) " missing required keys")
+                      {:error/code :error/missing-key
+                       :error/kind kind
+                       :error/missing (vec missing)})))))
+
+(defn fact-envelope
+  "Build a canonical fact envelope (§8) from a single map of payload +
+  metadata. Fills :record/id (fresh ULID) and :record/version when absent.
+  Required: :record/type, :fact/occurred-at, :fact/recorded-at,
+  :fact/payload. Throws ex-info when required keys are missing."
+  [m]
+  (let [record (merge {:record/id      (identifiers/new-record-id)
+                       :record/version schema-version}
+                      m)]
+    (require-keys! record
+                   [:record/id :record/type :record/version
+                    :fact/occurred-at :fact/recorded-at :fact/payload]
+                   :fact)
+    record))
+
+(defn command-envelope
+  "Build a canonical command envelope (§9) from a single map of payload +
+  metadata. Fills :record/id (fresh ULID) and :record/version when absent.
+  Required: :record/type, :command/issued-at, :command/target-adapter,
+  :command/idempotency-key, :command/payload. Throws ex-info when required
+  keys are missing."
+  [m]
+  (let [record (merge {:record/id      (identifiers/new-record-id)
+                       :record/version schema-version}
+                      m)]
+    (require-keys! record
+                   [:record/id :record/type :record/version
+                    :command/issued-at :command/target-adapter
+                    :command/idempotency-key :command/payload]
+                   :command)
+    record))
+
+(defn snapshot-envelope
+  "Build a canonical snapshot envelope (§10) from a single map. Fills
+  :snapshot/id (fresh ULID) and :snapshot/version when absent. Required:
+  :snapshot/engine-version, :snapshot/written-at, :snapshot/fact-watermark,
+  :snapshot/state. Throws ex-info when required keys are missing."
+  [m]
+  (let [record (merge {:snapshot/id      (identifiers/new-record-id)
+                       :snapshot/version schema-version}
+                      m)]
+    (require-keys! record
+                   [:snapshot/id :snapshot/version :snapshot/engine-version
+                    :snapshot/written-at :snapshot/fact-watermark :snapshot/state]
+                   :snapshot)
+    record))

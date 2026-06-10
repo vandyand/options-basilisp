@@ -1,0 +1,153 @@
+(ns domain.test-schemas
+  "Envelope constructor + validation tests (CANONICAL_SCHEMAS §8-§10, §13)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]))
+
+(defn fill-fact
+  []
+  (sch/fact-envelope
+   {:record/type :fact/fill-observed
+    :record/mode :mode/paper
+    :record/correlation-id "01JX8H0CKVJ9P4CZAFSRJ5VY5H"
+    :record/causation-ids ["01JX8H07B9M0AZ6KN4V1M4VE0P"]
+    :record/strategy-id "strategy/spx-credit/spread-entry/v1"
+    :record/account-id "account/alpaca/paper-ops"
+    :record/instrument-id "option/OPRA/SPY/2026-06-19/C/550.000"
+    :record/source-system :broker/alpaca-paper
+    :fact/occurred-at "2026-06-10T14:31:04.001Z"
+    :fact/recorded-at "2026-06-10T14:31:04.182Z"
+    :fact/source-ref "alpaca:trade-update:abc123"
+    :fact/dedupe-key "fill/alpaca-paper/8b8f3b7d/trade-42"
+    :fact/payload {:order-intent/id "oi_abc"
+                   :broker/source-system :broker/alpaca-paper
+                   :broker/order-id "8b8f3b7d-1234"
+                   :fill/id "trade-42"
+                   :fill/occurred-at "2026-06-10T14:31:04.001Z"
+                   :fill/quantity "1"
+                   :fill/price "2.10"
+                   :fill/liquidity :liquidity/unknown}}))
+
+(defn submit-command
+  []
+  (sch/command-envelope
+   {:record/type :command/submit-order-intent
+    :record/mode :mode/paper
+    :record/strategy-id "strategy/spx-credit/spread-entry/v1"
+    :record/account-id "account/alpaca/paper-ops"
+    :record/source-system :engine/core
+    :command/issued-at "2026-06-10T14:31:02.126Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key "submit/intent/oi_abc"
+    :command/payload {:order-intent/id "oi_abc"
+                      :order-intent/side :order-side/buy
+                      :order-intent/quantity "1"}}))
+
+(deftest legacy-stub-api-still-works
+  (is (= 1 sch/schema-version))
+  (is (sch/supported-record-kind? :fact))
+  (is (not (sch/supported-record-kind? :other))))
+
+(deftest fact-envelope-valid
+  (let [fact (fill-fact)]
+    (testing "constructor fills opaque record id and version"
+      (is (string? (:record/id fact)))
+      (is (= 26 (count (:record/id fact))))
+      (is (= 1 (:record/version fact))))
+    (testing "constructed fact passes validation"
+      (is (= {:valid? true} (v/validate-fact fact))))))
+
+(deftest command-envelope-valid
+  (let [cmd (submit-command)]
+    (is (string? (:record/id cmd)))
+    (is (= {:valid? true} (v/validate-command cmd)))))
+
+(deftest snapshot-envelope-valid
+  (let [snap (sch/snapshot-envelope
+              {:snapshot/engine-version "0.1.0"
+               :snapshot/written-at "2026-06-10T14:35:00Z"
+               :snapshot/control-plane-revision "cp-000014"
+               :snapshot/run-independent? true
+               :snapshot/fact-watermark {:stream "fact-log" :offset 183225}
+               :snapshot/market-watermarks [{:stream "bars" :cursor "2026-06-10T14:34:59Z"}]
+               :snapshot/broker-watermarks []
+               :snapshot/state {:engine/version 1}})]
+    (is (string? (:snapshot/id snap)))
+    (is (= 1 (:snapshot/version snap)))
+    (is (= {:valid? true} (v/validate-snapshot snap)))))
+
+(deftest constructors-reject-missing-required-keys
+  (testing "fact constructor without occurred-at throws"
+    (is (thrown? python/Exception
+                 (sch/fact-envelope {:record/type :fact/fill-observed
+                                     :fact/recorded-at "2026-06-10T14:31:04.182Z"
+                                     :fact/payload {}}))))
+  (testing "command constructor without idempotency-key throws"
+    (is (thrown? python/Exception
+                 (sch/command-envelope {:record/type :command/submit-order-intent
+                                        :command/issued-at "2026-06-10T14:31:02.126Z"
+                                        :command/target-adapter :adapter/broker
+                                        :command/payload {}}))))
+  (testing "snapshot constructor without state throws"
+    (is (thrown? python/Exception
+                 (sch/snapshot-envelope {:snapshot/engine-version "0.1.0"
+                                         :snapshot/written-at "2026-06-10T14:35:00Z"
+                                         :snapshot/fact-watermark {:stream "fact-log" :offset 1}})))))
+
+(deftest validation-rejects-bad-records
+  (testing "missing required key"
+    (let [{:keys [valid? errors]} (v/validate-fact (dissoc (fill-fact) :fact/recorded-at))]
+      (is (false? valid?))
+      (is (some #(= :error/missing-key (:error/code %)) errors))))
+  (testing "unknown fact type"
+    (let [{:keys [valid? errors]} (v/validate-fact (assoc (fill-fact) :record/type :fact/not-a-thing))]
+      (is (false? valid?))
+      (is (some #(= :error/unknown-type (:error/code %)) errors))))
+  (testing "float quantity rejected"
+    (let [{:keys [valid? errors]} (v/validate-fact (assoc-in (fill-fact) [:fact/payload :fill/quantity] 1.0))]
+      (is (false? valid?))
+      (is (some #(= :error/invalid-decimal (:error/code %)) errors))))
+  (testing "integer quantity rejected (decimal fields must be strings)"
+    (let [{:keys [valid?]} (v/validate-fact (assoc-in (fill-fact) [:fact/payload :fill/quantity] 1))]
+      (is (false? valid?))))
+  (testing "non-decimal string rejected"
+    (let [{:keys [valid?]} (v/validate-fact (assoc-in (fill-fact) [:fact/payload :fill/price] "two-ten"))]
+      (is (false? valid?))))
+  (testing "non-UTC / malformed timestamp rejected"
+    (let [{:keys [valid? errors]} (v/validate-fact (assoc (fill-fact) :fact/occurred-at "2026-06-10T14:31:04-05:00"))]
+      (is (false? valid?))
+      (is (some #(= :error/invalid-timestamp (:error/code %)) errors))))
+  (testing "unknown enum value in strict field rejected"
+    (let [{:keys [valid? errors]} (v/validate-fact (assoc-in (fill-fact) [:fact/payload :fill/liquidity] :liquidity/bogus))]
+      (is (false? valid?))
+      (is (some #(= :error/invalid-enum (:error/code %)) errors))))
+  (testing "malformed business ids rejected"
+    (let [{:keys [valid? errors]} (v/validate-fact (assoc (fill-fact)
+                                                          :record/strategy-id "strategy/nope"
+                                                          :record/account-id "acct/x"
+                                                          :record/instrument-id "option/bad"))]
+      (is (false? valid?))
+      (is (= 3 (count (filter #(= :error/malformed-id (:error/code %)) errors))))))
+  (testing "unknown command type rejected"
+    (let [{:keys [valid?]} (v/validate-command (assoc (submit-command) :record/type :command/do-magic))]
+      (is (false? valid?))))
+  (testing "snapshot with bad written-at rejected"
+    (let [{:keys [valid?]} (v/validate-snapshot
+                            (sch/snapshot-envelope
+                             {:snapshot/engine-version "0.1.0"
+                              :snapshot/written-at "2026-06-10 14:35:00"
+                              :snapshot/fact-watermark {:stream "fact-log" :offset 1}
+                              :snapshot/state {}}))]
+      (is (false? valid?)))))
+
+(deftest canonical-serializer-deterministic
+  (testing "explicit string construction with sorted keys and sets"
+    (is (= "{:a [1 2] :b 2 :c #{:a :z}}"
+           (sch/canonical-edn-str {:b 2 :a [1 2] :c #{:z :a}})))
+    (is (= (sch/canonical-edn-str {:x 1 :y 2})
+           (sch/canonical-edn-str {:y 2 :x 1}))))
+  (testing "canonicalize sorts legs under leg keys"
+    (let [legs [{:instrument/id "equity/NYSE/IBM" :leg/side :order-side/sell :leg/quantity "1"}
+                {:instrument/id "equity/NASDAQ/SPY" :leg/side :order-side/buy :leg/quantity "1"}]]
+      (is (= (sch/canonical-edn-str (sch/canonicalize {:order-intent/legs legs}))
+             (sch/canonical-edn-str (sch/canonicalize {:order-intent/legs (vec (reverse legs))})))))))

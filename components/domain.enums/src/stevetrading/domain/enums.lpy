@@ -1,0 +1,205 @@
+(ns stevetrading.domain.enums
+  "Canonical enumeration sets for the v0.1 domain language.
+
+  Normative sources:
+  - CANONICAL_SCHEMAS_V0.1 §4.4 (enums are namespaced keywords)
+  - EVENT_COMMAND_TAXONOMY_V0.1 §8 (canonical fact types), §9 (canonical
+    command types)
+  - ENGINE_STATE_MACHINES_V0.1 §4.1/§5.1/§6.1/§7.1 (lifecycle state lists,
+    bare state keywords matching the transition tables)
+  - BROKER_ADAPTER_CONTRACTS_V0.1 §5.2 (canonical broker statuses)")
+
+;; ---------------------------------------------------------------------------
+;; Run modes (engine modes + base process modes)
+;; ---------------------------------------------------------------------------
+
+(def modes
+  #{:mode/live
+    :mode/paper
+    :mode/sim
+    :mode/replay
+    :mode/shadow
+    :mode/control-plane
+    :mode/dev
+    :mode/report})
+
+;; ---------------------------------------------------------------------------
+;; Order vocabulary
+;; ---------------------------------------------------------------------------
+
+(def order-sides
+  #{:order-side/buy
+    :order-side/sell})
+
+(def position-effects
+  #{:position-effect/open
+    :position-effect/close})
+
+(def order-types
+  #{:order-type/market
+    :order-type/limit
+    :order-type/stop
+    :order-type/stop-limit})
+
+(def tifs
+  #{:tif/day
+    :tif/gtc
+    :tif/ioc
+    :tif/fok})
+
+(def intent-roles
+  #{:intent-role/entry
+    :intent-role/exit
+    :intent-role/adjust})
+
+;; BROKER_ADAPTER_CONTRACTS §5.2 — allowed canonical broker statuses.
+(def broker-statuses
+  #{:broker-status/new
+    :broker-status/accepted
+    :broker-status/open
+    :broker-status/partially-filled
+    :broker-status/filled
+    :broker-status/cancelled
+    :broker-status/rejected
+    :broker-status/expired})
+
+(def liquidity
+  #{:liquidity/maker
+    :liquidity/taker
+    :liquidity/unknown})
+
+;; ---------------------------------------------------------------------------
+;; Lifecycle state sets (ENGINE_STATE_MACHINES — bare state keywords as used
+;; by the transition tables)
+;; ---------------------------------------------------------------------------
+
+;; §4.1 strategy lifecycle
+(def strategy-lifecycle-states
+  #{:inactive
+    :warming-up
+    :active
+    :degraded
+    :halted})
+
+;; §5.1 order lifecycle
+(def order-lifecycle-states
+  #{:absent
+    :intent-created
+    :submit-requested
+    :acknowledged
+    :partially-filled
+    :filled
+    :cancel-requested
+    :cancelled
+    :rejected
+    :orphaned-needs-reconcile})
+
+;; §6.1 recovery lifecycle
+(def recovery-states
+  #{:not-started
+    :loading-snapshot
+    :replaying-facts
+    :reconciling-broker
+    :ready
+    :degraded-ready
+    :blocked
+    :recovery-failed})
+
+;; §7.1 process health lifecycle
+(def health-states
+  #{:starting
+    :healthy
+    :degraded
+    :stopping
+    :stopped})
+
+;; ---------------------------------------------------------------------------
+;; Canonical fact types (EVENT_COMMAND_TAXONOMY §8)
+;; ---------------------------------------------------------------------------
+
+(def market-fact-types
+  #{:fact/market-bar-observed
+    :fact/quote-observed
+    :fact/option-chain-observed
+    :fact/calendar-session-observed})
+
+(def inference-fact-types
+  #{:fact/prediction-produced})
+
+(def strategy-decision-fact-types
+  #{:fact/signal-decision-produced
+    :fact/risk-decision-recorded
+    :fact/execution-plan-produced})
+
+(def order-lifecycle-fact-types
+  #{:fact/order-intent-created
+    :fact/broker-ack-accepted
+    :fact/broker-ack-rejected
+    :fact/broker-order-status-observed
+    :fact/fill-observed
+    :fact/cancel-ack-accepted
+    :fact/cancel-ack-rejected})
+
+(def ledger-fact-types
+  #{:fact/cash-movement-recorded
+    :fact/position-lot-opened
+    :fact/position-lot-closed
+    :fact/position-mark-recorded})
+
+(def control-fact-types
+  #{:fact/control-plane-activated
+    :fact/control-plane-violation-recorded
+    :fact/kill-switch-activated
+    :fact/kill-switch-cleared})
+
+(def recovery-and-health-fact-types
+  #{:fact/command-dispatched
+    :fact/recovery-started
+    :fact/recovery-completed
+    :fact/snapshot-written
+    :fact/fault-recorded
+    :fact/health-heartbeat-recorded
+    :fact/degraded-mode-recorded})
+
+(def fact-types
+  "The full canonical v0.1 fact-type set (EVENT_COMMAND_TAXONOMY §8)."
+  (reduce into
+          #{}
+          [market-fact-types
+           inference-fact-types
+           strategy-decision-fact-types
+           order-lifecycle-fact-types
+           ledger-fact-types
+           control-fact-types
+           recovery-and-health-fact-types]))
+
+;; ---------------------------------------------------------------------------
+;; Canonical command types (EVENT_COMMAND_TAXONOMY §9)
+;; ---------------------------------------------------------------------------
+
+(def trading-command-types
+  #{:command/submit-order-intent
+    :command/cancel-broker-order})
+
+(def broker-query-command-types
+  #{:command/request-broker-open-orders
+    :command/request-broker-fills-since
+    :command/request-broker-account-state
+    :command/request-broker-health})
+
+(def persistence-command-types
+  #{:command/persist-snapshot
+    :command/append-facts})
+
+(def operational-command-types
+  #{:command/emit-health-heartbeat
+    :command/emit-audit-event})
+
+(def command-types
+  "The full canonical v0.1 command-type set (EVENT_COMMAND_TAXONOMY §9)."
+  (reduce into
+          #{}
+          [trading-command-types
+           broker-query-command-types
+           persistence-command-types
+           operational-command-types]))
