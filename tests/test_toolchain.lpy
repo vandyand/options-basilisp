@@ -1,0 +1,7 @@
+(ns test-toolchain
+  "Phase 0 smoke test: component namespaces resolve from the test runner."
+  (:require [basilisp.test :refer [deftest is]]
+            [stevetrading.engine.state :as state]))
+
+(deftest engine-state-resolvable
+  (is (= 1 (:engine/version (state/fresh-state)))))

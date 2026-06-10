@@ -22,3 +22,7 @@ htmlcov/
 .idea/
 .vscode/
 
+# Local nREPL tooling artifacts
+.nrepl-port
+.nrepl-pythonpath
+

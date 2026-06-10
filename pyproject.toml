@@ -11,11 +11,13 @@ requires-python = ">=3.10"
 dependencies = [
   "basilisp==0.5.1",
   "pytest>=8.0",
+  "python-ulid>=2.7",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
 pythonpath = [
+  "tests",
   ".",
   "components/domain.identifiers/src",
   "components/domain.enums/src",
