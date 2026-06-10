@@ -1,0 +1,320 @@
+(ns market-data.test-composite
+  "Composite market-data source — occurred-at interleaving, composite
+  cursor resume, exhaustion (both children), tie-break, and the
+  non-blocking child contract of the real alpaca/thetadata sources
+  (stub transports throughout; scripted fakes for the merge logic)."
+  (:import json
+           time)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.market-data.alpaca :as mda]
+            [stevetrading.market-data.composite :as mdc]
+            [stevetrading.market-data.protocol :as mdp]
+            [stevetrading.market-data.thetadata :as td]))
+
+;; ---------------------------------------------------------------------
+;; scripted fake children (defrecord over the protocol; integer cursors)
+
+(defn- fake-fact
+  [label at]
+  {:record/type :fact/market-bar-observed
+   :fact/occurred-at at
+   :fact/payload {:label label}})
+
+(defrecord FakeSource [facts exhausted-flag]
+  mdp/MarketDataSource
+  (source-id [this] :market-data/fake)
+  (next-observations [this cursor max-n]
+    (let [i (if (or (nil? cursor) (= 0 cursor)) 0 cursor)]
+      (if (< i (count facts))
+        {:observations [(nth facts i)] :cursor (inc i) :exhausted? false}
+        {:observations [] :cursor i
+         :exhausted? (boolean @exhausted-flag)})))
+  (source-health [this]
+    {:source/provider :market-data/fake :source/healthy? true}))
+
+(defrecord SlowStartFake [calls fact]
+  ;; returns empty/not-exhausted on the first two calls, then emits —
+  ;; exercises the composite's internal sleep-and-retry loop
+  mdp/MarketDataSource
+  (source-id [this] :market-data/slow-fake)
+  (next-observations [this cursor max-n]
+    (let [n (swap! calls inc)
+          i (if (or (nil? cursor) (= 0 cursor)) 0 cursor)]
+      (cond
+        (>= i 1) {:observations [] :cursor i :exhausted? true}
+        (< n 3) {:observations [] :cursor i :exhausted? false}
+        :else {:observations [fact] :cursor 1 :exhausted? false})))
+  (source-health [this]
+    {:source/provider :market-data/slow-fake :source/healthy? true}))
+
+(defn- labels
+  [observations]
+  (mapv #(get-in % [:fact/payload :label]) observations))
+
+(defn- drain
+  "Pull up to n one-observation calls; stops early on an empty batch."
+  [src cursor n]
+  (loop [c cursor acc [] k n]
+    (if (zero? k)
+      {:observations acc :cursor c}
+      (let [r (mdp/next-observations src c 1)]
+        (if (seq (:observations r))
+          (recur (:cursor r) (conj acc (first (:observations r))) (dec k))
+          {:observations acc :cursor (:cursor r)
+           :exhausted? (:exhausted? r)})))))
+
+(defn- make-fakes
+  []
+  {:bars (->FakeSource [(fake-fact :bar-0 "2026-06-10T14:30:00Z")
+                        (fake-fact :bar-1 "2026-06-10T14:31:00Z")
+                        (fake-fact :bar-2 "2026-06-10T14:32:00Z")]
+                       (atom true))
+   :chains (->FakeSource [(fake-fact :chain-0 "2026-06-10T14:30:30Z")
+                          (fake-fact :chain-1 "2026-06-10T14:31:30Z")]
+                         (atom true))})
+
+;; ---------------------------------------------------------------------
+;; 1. interleaving
+
+(deftest interleaving-by-occurred-at
+  (let [{:keys [bars chains]} (make-fakes)
+        src (mdc/make-composite-source {:sources [bars chains]
+                                        :poll-seconds 0})
+        r1 (mdp/next-observations src nil 1)]
+    (testing "one observation per call; only the picked child's cursor advances"
+      (is (= [:bar-0] (labels (:observations r1))))
+      (is (= {:composite/cursors [1 nil]} (:cursor r1)))
+      (is (false? (:exhausted? r1))))
+    (testing "source identity"
+      (is (= :market-data/composite (mdp/source-id src))))
+    (testing "strict occurred-at order across both children"
+      (let [{:keys [observations cursor]} (drain src nil 5)]
+        (is (= [:bar-0 :chain-0 :bar-1 :chain-1 :bar-2]
+               (labels observations)))
+        (is (= {:composite/cursors [3 2]} cursor))))
+    (testing "0 is accepted as a fresh composite cursor"
+      (is (= [:bar-0] (labels (:observations (mdp/next-observations src 0 1))))))))
+
+;; ---------------------------------------------------------------------
+;; 2. resume from a composite cursor in a FRESH composite
+
+(deftest cursor-resume-across-instances
+  (let [{:keys [bars chains]} (make-fakes)
+        src-a (mdc/make-composite-source {:sources [bars chains]
+                                          :poll-seconds 0})
+        {obs-a :observations cur :cursor} (drain src-a 0 2)
+        src-b (mdc/make-composite-source {:sources [bars chains]
+                                          :poll-seconds 0})
+        {obs-b :observations} (drain src-b cur 3)]
+    (is (= [:bar-0 :chain-0] (labels obs-a)))
+    (testing "fresh composite continues exactly where the cursor left off"
+      (is (= [:bar-1 :chain-1 :bar-2] (labels obs-b))))))
+
+;; ---------------------------------------------------------------------
+;; 3. exhaustion only when BOTH children exhausted
+
+(deftest exhaustion-requires-all-children
+  (let [a (->FakeSource [] (atom true)) ;; exhausted from the start
+        flag-b (atom false)
+        b (->FakeSource [(fake-fact :b-0 "2026-06-10T14:30:00Z")
+                         (fake-fact :b-1 "2026-06-10T14:31:00Z")]
+                        flag-b)
+        src (mdc/make-composite-source {:sources [a b] :poll-seconds 0})
+        r1 (mdp/next-observations src nil 1)
+        r2 (mdp/next-observations src (:cursor r1) 1)]
+    (testing "one exhausted child + one active → keeps emitting"
+      (is (= [:b-0] (labels (:observations r1))))
+      (is (false? (:exhausted? r1)))
+      (is (= [:b-1] (labels (:observations r2))))
+      (is (false? (:exhausted? r2))))
+    (testing "exhausted once the active child also reports exhausted"
+      (reset! flag-b true)
+      (let [r3 (mdp/next-observations src (:cursor r2) 1)]
+        (is (empty? (:observations r3)))
+        (is (true? (:exhausted? r3)))
+        (is (= (:cursor r2) (:cursor r3)))))))
+
+(deftest composite-retries-until-a-child-produces
+  (let [calls (atom 0)
+        slow (->SlowStartFake calls (fake-fact :late "2026-06-10T14:30:00Z"))
+        done (->FakeSource [] (atom true))
+        src (mdc/make-composite-source {:sources [slow done]
+                                        :poll-seconds 0})
+        r (mdp/next-observations src nil 1)]
+    (testing "no child emitted + not all exhausted → composite retried internally"
+      (is (= [:late] (labels (:observations r))))
+      (is (= 3 @calls)))))
+
+(deftest composite-until-forces-exhaustion
+  (let [idle (->FakeSource [] (atom false)) ;; never emits, never exhausts
+        src (mdc/make-composite-source {:sources [idle]
+                                        :poll-seconds 0
+                                        :until "2000-01-01T00:00:00Z"})
+        r (mdp/next-observations src nil 1)]
+    (is (empty? (:observations r)))
+    (is (true? (:exhausted? r)))))
+
+;; ---------------------------------------------------------------------
+;; 4. tie-break: equal occurred-at → lowest child index first
+
+(deftest tie-break-lowest-child-index
+  (let [a (->FakeSource [(fake-fact :a-0 "2026-06-10T14:30:00Z")] (atom true))
+        b (->FakeSource [(fake-fact :b-0 "2026-06-10T14:30:00Z")] (atom true))
+        src (mdc/make-composite-source {:sources [a b] :poll-seconds 0})
+        {:keys [observations]} (drain src nil 2)]
+    (is (= [:a-0 :b-0] (labels observations)))))
+
+;; ---------------------------------------------------------------------
+;; 5. non-blocking child contract of the REAL sources (stub transports)
+
+(def alpaca-bars
+  (vec (map (fn [i]
+              {"t" (str "2026-06-10T19:3" i ":00Z")
+               "o" 725.0 "h" 726.0 "l" 724.0 "c" (+ 725.0 i)
+               "v" 1000 "n" 10 "vw" 725.5})
+            (range 3))))
+
+(defn- alpaca-stub
+  "Bars stub honoring start= (inclusive, like Alpaca); counts hits."
+  [available hits]
+  (fn [{:keys [url]}]
+    (swap! hits inc)
+    (let [start (second (re-find #"start=([^&]+)" url))
+          bars (filterv #(or (nil? start)
+                             (>= (compare (get % "t") start) 0))
+                        @available)]
+      {:status 200
+       :body (json/dumps (python/dict {"bars" (python/list
+                                               (map python/dict bars))
+                                       "symbol" "SPY"}))})))
+
+(defn- make-nb-alpaca
+  [available hits]
+  (mda/make-alpaca-bars-source
+   {:symbol "SPY"
+    :instrument-id "equity/NASDAQ/SPY"
+    :key-id "k" :secret "s"
+    :block? false
+    :poll-seconds 9999
+    :seed-start "2026-06-10T19:29:00Z"
+    :until "2099-01-01T00:00:00Z"
+    :transport (alpaca-stub available hits)}))
+
+(deftest alpaca-non-blocking-contract
+  (let [available (atom alpaca-bars)
+        hits (atom 0)
+        src (make-nb-alpaca available hits)
+        at-end "2026-06-10T19:32:00Z" ;; cursor at the newest stub bar
+        t0 (time/monotonic)
+        r1 (mdp/next-observations src at-end 99)
+        r2 (mdp/next-observations src at-end 99)
+        elapsed (- (time/monotonic) t0)]
+    (testing "no new data → empty, NOT exhausted, and no sleep"
+      (is (empty? (:observations r1)))
+      (is (false? (:exhausted? r1)))
+      (is (empty? (:observations r2)))
+      (is (false? (:exhausted? r2)))
+      (is (< elapsed 5)))
+    (testing "fetch throttle: two immediate calls → exactly one transport hit"
+      (is (= 1 @hits)))
+    (testing "with data available it emits normally"
+      (let [hits2 (atom 0)
+            src2 (make-nb-alpaca available hits2)
+            r (mdp/next-observations src2 0 99)]
+        (is (= ["2026-06-10T19:30:00Z" "2026-06-10T19:31:00Z"
+                "2026-06-10T19:32:00Z"]
+               (mapv #(get-in % [:fact/payload :bar/time])
+                     (:observations r))))
+        (is (= "2026-06-10T19:32:00Z" (:cursor r)))
+        (is (false? (:exhausted? r)))))))
+
+(defn- columnar
+  [rows]
+  (let [col (fn [k] (python/list (map #(get % k) rows)))]
+    (json/dumps
+     (python/dict {"strike" (col "strike") "right" (col "right")
+                   "bid" (col "bid") "ask" (col "ask")
+                   "bid_size" (col "bid_size") "ask_size" (col "ask_size")
+                   "expiration" (col "expiration")
+                   "timestamp" (col "timestamp")}))))
+
+(def td-rows
+  ;; ET 15:30:30.100 → UTC 19:30:30.100000Z
+  [{"strike" 550.0 "right" "PUT" "bid" 2.15 "ask" 2.2 "bid_size" 5
+    "ask_size" 7 "expiration" "2026-06-12"
+    "timestamp" "2026-06-10T15:30:30.100"}])
+
+(def td-observed-at "2026-06-10T19:30:30.100000Z")
+
+(defn- td-stub
+  [current hits]
+  (fn [{:keys [url]}]
+    (swap! hits inc)
+    (if (>= (.find url "/v3/option/snapshot/quote") 0)
+      {:status 200 :body (columnar @current)}
+      {:status 404 :body "?"})))
+
+(defn- make-nb-td
+  [current hits]
+  (td/make-thetadata-chain-source
+   {:symbol "SPY"
+    :underlying-id "equity/NASDAQ/SPY"
+    :expiration "2026-06-12"
+    :block? false
+    :poll-seconds 9999
+    :until "2099-01-01T00:00:00Z"
+    :transport (td-stub current hits)}))
+
+(deftest thetadata-non-blocking-contract
+  (let [current (atom td-rows)
+        hits (atom 0)
+        src (make-nb-td current hits)
+        t0 (time/monotonic)
+        r1 (mdp/next-observations src td-observed-at 1)
+        r2 (mdp/next-observations src td-observed-at 1)
+        elapsed (- (time/monotonic) t0)]
+    (testing "no fresher snapshot → empty, NOT exhausted, and no sleep"
+      (is (empty? (:observations r1)))
+      (is (false? (:exhausted? r1)))
+      (is (empty? (:observations r2)))
+      (is (false? (:exhausted? r2)))
+      (is (< elapsed 5)))
+    (testing "fetch throttle: two immediate calls → exactly one transport hit"
+      (is (= 1 @hits)))
+    (testing "with a fresher snapshot it emits normally"
+      (let [hits2 (atom 0)
+            src2 (make-nb-td current hits2)
+            r (mdp/next-observations src2 0 1)]
+        (is (= 1 (count (:observations r))))
+        (is (= td-observed-at (:cursor r)))
+        (is (false? (:exhausted? r)))))))
+
+;; ---------------------------------------------------------------------
+;; integration: composite over the REAL non-blocking sources
+
+(deftest composite-over-real-sources
+  (let [available (atom (subvec alpaca-bars 0 2))
+        a-hits (atom 0)
+        bars-src (make-nb-alpaca available a-hits)
+        current (atom td-rows)
+        t-hits (atom 0)
+        chain-src (make-nb-td current t-hits)
+        src (mdc/make-composite-source {:sources [bars-src chain-src]
+                                        :poll-seconds 0})
+        {:keys [observations cursor]} (drain src nil 3)]
+    (testing "bars and chains interleave by market time"
+      (is (= [:fact/market-bar-observed
+              :fact/option-chain-observed
+              :fact/market-bar-observed]
+             (mapv :record/type observations)))
+      (is (= ["2026-06-10T19:30:00Z" td-observed-at "2026-06-10T19:31:00Z"]
+             (mapv :fact/occurred-at observations))))
+    (testing "composite cursor carries each child's own cursor"
+      (is (= {:composite/cursors ["2026-06-10T19:31:00Z" td-observed-at]}
+             cursor)))
+    (testing "health aggregates the children"
+      (let [h (mdp/source-health src)]
+        (is (= :market-data/composite (:source/provider h)))
+        (is (= 2 (count (:source/children h))))
+        (is (= [:market-data/alpaca :market-data/thetadata]
+               (mapv :source/provider (:source/children h))))))))

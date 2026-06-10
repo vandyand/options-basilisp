@@ -173,43 +173,73 @@
     (int? cursor) (min cursor (count bars))
     :else 0))
 
+(defn- emit-from-held
+  "Emission result for held bars newer than the cursor, or nil when
+  nothing is emittable yet."
+  [opts state cursor max-n]
+  (let [bars (:bars @state)
+        total (count bars)
+        start (emit-index bars cursor)]
+    (when (< start total)
+      (let [end (min total (+ start (max 1 (or max-n 1))))
+            facts (vec (map #(bar->fact opts (nth bars %))
+                            (range start end)))]
+        {:observations facts
+         :cursor (:t (nth bars (dec end)))
+         :exhausted? false}))))
+
+(defn- throttled-fetch!
+  "Non-blocking fetch gate: fetch at most once per call, and only when
+  at least :poll-seconds have elapsed since the last fetch ATTEMPT
+  (first call always may fetch). Records the attempt time (monotonic
+  clock) in the state atom."
+  [{:keys [poll-seconds] :as opts} state]
+  (let [last-mono (:last-fetch-mono @state)
+        now (time/monotonic)]
+    (when (or (nil? last-mono)
+              (>= (- now last-mono) (or poll-seconds 5)))
+      (swap! state assoc :last-fetch-mono now)
+      (fetch-new-bars! opts state))))
+
 (defrecord AlpacaBarsSource [opts state]
   p/MarketDataSource
 
   (source-id [this] provider)
 
   (next-observations [this cursor max-n]
-    (let [{:keys [until poll-seconds]} opts]
+    (let [{:keys [until poll-seconds block?]} opts
+          blocking? (not (false? block?))]
       ;; warmup seed — anchored to the cursor timestamp when resuming so
-      ;; the fetch window starts where the previous instance left off
+      ;; the fetch window starts where the previous instance left off.
+      ;; Non-blocking mode defers the seed fetch to the throttled fetch
+      ;; below (so the first call performs at most one transport hit).
       (when-not (:seeded? @state)
         (when (string? cursor)
           (swap! state assoc :seed-anchor cursor))
-        (fetch-new-bars! opts state)
+        (when blocking?
+          (fetch-new-bars! opts state))
         (swap! state assoc :seeded? true))
-      (loop []
-        (let [bars (:bars @state)
-              total (count bars)
-              start (emit-index bars cursor)]
-          (cond
+      (if blocking?
+        (loop []
+          (if-let [r (emit-from-held opts state cursor max-n)]
             ;; emit what we hold
-            (< start total)
-            (let [end (min total (+ start (max 1 (or max-n 1))))
-                  facts (vec (map #(bar->fact opts (nth bars %))
-                                  (range start end)))]
-              {:observations facts
-               :cursor (:t (nth bars (dec end)))
-               :exhausted? false})
-
-            ;; session over?
-            (and until (>= (compare (utc-now-str) until) 0))
-            {:observations [] :cursor cursor :exhausted? true}
-
-            ;; block-poll for the next bar
-            :else
-            (do (time/sleep (or poll-seconds 5))
-                (fetch-new-bars! opts state)
-                (recur)))))))
+            r
+            (if (and until (>= (compare (utc-now-str) until) 0))
+              ;; session over?
+              {:observations [] :cursor cursor :exhausted? true}
+              ;; block-poll for the next bar
+              (do (time/sleep (or poll-seconds 5))
+                  (fetch-new-bars! opts state)
+                  (recur)))))
+        ;; non-blocking child mode (:block? false): never sleeps; at most
+        ;; one throttled fetch per call; empty + :exhausted? false means
+        ;; "nothing yet" (a composite parent owns the block-poll)
+        (or (emit-from-held opts state cursor max-n)
+            (if (and until (>= (compare (utc-now-str) until) 0))
+              {:observations [] :cursor cursor :exhausted? true}
+              (do (throttled-fetch! opts state)
+                  (or (emit-from-held opts state cursor max-n)
+                      {:observations [] :cursor cursor :exhausted? false})))))))
 
   (source-health [this]
     (let [{:keys [bars last-poll-ok? last-error last-poll-at]} @state]
@@ -233,7 +263,15 @@
     :seed-start     RFC3339 Z explicit seed-fetch start (optional; a
                     string resume cursor takes precedence, then this,
                     then now-minus-warmup)
-    :poll-seconds   poll cadence while blocked (default 5)
+    :poll-seconds   poll cadence while blocked (default 5); in
+                    non-blocking mode it is the minimum interval
+                    between fetch attempts (fetch throttle)
+    :block? true    (default) next-observations blocks (poll + sleep)
+                    until data or :until. :block? false → child mode
+                    for a composite parent: never sleeps, at most one
+                    throttled fetch per call, and returns
+                    {:observations [] :exhausted? false} when nothing
+                    new is available yet
     :warmup-bars    history depth seeded on first use (default 8)
     :run-mode       envelope mode (default :mode/paper)
     :transport      injectable (fn [{:url :key-id :secret}] {:status :body})"

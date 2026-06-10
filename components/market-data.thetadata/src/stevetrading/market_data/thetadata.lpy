@@ -205,42 +205,74 @@
                             observed-at)
       :fact/payload payload})))
 
+(defn- emit-held
+  "Emission result when the held snapshot is strictly fresher than the
+  (timestamp) cursor, else nil."
+  [opts state cursor]
+  (let [held (:snapshot @state)]
+    (when (and held
+               (or (nil? cursor) (= 0 cursor)
+                   (> (compare (:observed-at held) cursor) 0)))
+      {:observations [(chain->fact opts held)]
+       :cursor (:observed-at held)
+       :exhausted? false})))
+
+(defn- poll-chain!
+  "One snapshot poll; records the result (or degradation) in the state
+  atom. Errors degrade health — they never throw across the boundary."
+  [opts state]
+  (let [res (fetch-chain! opts)]
+    (swap! state assoc :polled-once? true)
+    (if (:error res)
+      (swap! state assoc :last-error (:error res)
+             :last-poll-ok? false)
+      (swap! state assoc :snapshot res :last-error nil
+             :last-poll-ok? true
+             :last-poll-at (utc-now-str)))))
+
+(defn- throttled-poll!
+  "Non-blocking fetch gate: poll at most once per call, and only when
+  at least :poll-seconds have elapsed since the last fetch ATTEMPT
+  (first call always may fetch). Records the attempt time (monotonic
+  clock) in the state atom."
+  [{:keys [poll-seconds] :as opts} state]
+  (let [last-mono (:last-fetch-mono @state)
+        now (time/monotonic)]
+    (when (or (nil? last-mono)
+              (>= (- now last-mono) (or poll-seconds 30)))
+      (swap! state assoc :last-fetch-mono now)
+      (poll-chain! opts state))))
+
 (defrecord ThetaDataChainSource [opts state]
   p/MarketDataSource
 
   (source-id [this] provider)
 
   (next-observations [this cursor max-n]
-    (let [{:keys [until poll-seconds]} opts]
-      (loop []
-        (let [held (:snapshot @state)]
-          (cond
-            ;; emit the held snapshot when it is strictly fresher than
-            ;; the (timestamp) cursor
-            (and held
-                 (or (nil? cursor) (= 0 cursor)
-                     (> (compare (:observed-at held) cursor) 0)))
-            {:observations [(chain->fact opts held)]
-             :cursor (:observed-at held)
-             :exhausted? false}
-
-            ;; session over?
-            (and until (>= (compare (utc-now-str) until) 0))
-            {:observations [] :cursor cursor :exhausted? true}
-
-            ;; block-poll for a fresher snapshot
-            :else
-            (do (when (:polled-once? @state)
-                  (time/sleep (or poll-seconds 30)))
-                (let [res (fetch-chain! opts)]
-                  (swap! state assoc :polled-once? true)
-                  (if (:error res)
-                    (swap! state assoc :last-error (:error res)
-                           :last-poll-ok? false)
-                    (swap! state assoc :snapshot res :last-error nil
-                           :last-poll-ok? true
-                           :last-poll-at (utc-now-str))))
-                (recur)))))))
+    (let [{:keys [until poll-seconds block?]} opts]
+      (if (false? block?)
+        ;; non-blocking child mode (:block? false): never sleeps; at
+        ;; most one throttled poll per call; empty + :exhausted? false
+        ;; means "nothing fresher yet" (a composite parent owns the
+        ;; block-poll)
+        (or (emit-held opts state cursor)
+            (if (and until (>= (compare (utc-now-str) until) 0))
+              {:observations [] :cursor cursor :exhausted? true}
+              (do (throttled-poll! opts state)
+                  (or (emit-held opts state cursor)
+                      {:observations [] :cursor cursor :exhausted? false}))))
+        (loop []
+          (if-let [r (emit-held opts state cursor)]
+            ;; emit the held snapshot when strictly fresher than cursor
+            r
+            (if (and until (>= (compare (utc-now-str) until) 0))
+              ;; session over?
+              {:observations [] :cursor cursor :exhausted? true}
+              ;; block-poll for a fresher snapshot
+              (do (when (:polled-once? @state)
+                    (time/sleep (or poll-seconds 30)))
+                  (poll-chain! opts state)
+                  (recur))))))))
 
   (source-health [this]
     (let [{:keys [snapshot last-error last-poll-ok? last-poll-at]} @state]
@@ -263,7 +295,15 @@
     :strike-range   [\"540\" \"560\"] inclusive decimal-string bounds
                     (optional payload bound)
     :until          RFC3339 Z session end (required for live)
-    :poll-seconds   chain poll cadence (default 30)
+    :poll-seconds   chain poll cadence (default 30); in non-blocking
+                    mode it is the minimum interval between fetch
+                    attempts (fetch throttle)
+    :block? true    (default) next-observations blocks (poll + sleep)
+                    until a fresher snapshot or :until. :block? false
+                    → child mode for a composite parent: never sleeps,
+                    at most one throttled poll per call, and returns
+                    {:observations [] :exhausted? false} when nothing
+                    fresher is available yet
     :run-mode       envelope mode (default :mode/paper)
     :transport      injectable (fn [{:url ..}] {:status :body})"
   [opts]

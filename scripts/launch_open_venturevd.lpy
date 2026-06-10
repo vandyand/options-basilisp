@@ -1,0 +1,234 @@
+;; Market-open paper session on the venturevd account: Alpaca bars +
+;; ThetaData chains (composite source) driving BOTH the sma-cross equity
+;; strategy and a generated-at-launch put credit-spread strategy.
+;;
+;; Everything price-dependent (spread strikes, expiration) is resolved at
+;; LAUNCH from live data, then written as dated artifacts + a manifest
+;; revision under live_runtime/ (runtime state, not source) before the
+;; engine starts.
+;;
+;; Env:
+;;   ALPACA_VENTUREVD_API_KEY / ALPACA_VENTUREVD_API_SECRET  (required)
+;;   STAGE_DRY_RUN=1   resolve + generate + activate + validate, print the
+;;                     plan, and EXIT before run-live (no theta needed when
+;;                     STAGE_SKIP_THETA=1 also set: expiration defaults to
+;;                     the session date)
+;;   SESSION_DATE      dashed UTC date override (default: today UTC)
+(import datetime os)
+(require '[basilisp.edn :as edn]
+         '[stevetrading.base.engine-live :as live]
+         '[stevetrading.control-plane.file-store :as cpfs]
+         '[stevetrading.market-data.alpaca :as mda]
+         '[stevetrading.market-data.composite :as mdc]
+         '[stevetrading.market-data.protocol :as mdp]
+         '[stevetrading.market-data.thetadata :as td])
+
+(def key-id (os/getenv "ALPACA_VENTUREVD_API_KEY"))
+(def secret (os/getenv "ALPACA_VENTUREVD_API_SECRET"))
+(def dry-run? (= "1" (os/getenv "STAGE_DRY_RUN")))
+(def skip-theta? (= "1" (os/getenv "STAGE_SKIP_THETA")))
+
+(when-not (and key-id secret)
+  (println "FATAL: ALPACA_VENTUREVD_API_KEY/_SECRET not set")
+  (python/exit 1))
+
+(def session-date
+  (or (os/getenv "SESSION_DATE")
+      (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d")))
+(def compact-date (.replace session-date "-" ""))
+(def until (str session-date "T19:59:00Z"))
+
+;; --- resolve SPY reference price (latest trade — works at any hour) ---------
+(import json urllib.request)
+(def spy-price
+  (try
+    (let [req (urllib.request/Request
+               "https://data.alpaca.markets/v2/stocks/SPY/trades/latest?feed=iex")
+          _ (.add-header req "APCA-API-KEY-ID" key-id)
+          _ (.add-header req "APCA-API-SECRET-KEY" secret)
+          resp (urllib.request/urlopen req ** :timeout 10)
+          data (json/loads (.decode (.read resp) "utf-8"))]
+      (python/float (get-in data ["trade" "p"])))
+    (catch python/Exception e
+      (println "FATAL: could not fetch SPY latest trade:" (str e))
+      (python/exit 1))))
+
+;; --- resolve expiration + strikes -------------------------------------------
+(def expiration
+  (if skip-theta?
+    session-date
+    (let [e (td/nearest-expiration {:transport @#'td/default-transport
+                                    :symbol "SPY"}
+                                   session-date)]
+      (if (:error e)
+        (do (println "FATAL: expiration resolution failed:" (:error e))
+            (python/exit 1))
+        e))))
+
+(def near-strike (- (python/int (python/round spy-price)) 3))
+(def far-strike (- near-strike 5))
+(defn- strike-str [n] (str n ".000"))
+
+;; --- generate dated artifacts + declaration + manifest ----------------------
+(def gen-root "live_runtime/generated")
+(def artifact-root (str gen-root "/artifacts"))
+(def feature-ref (str "feature/simple-vol/open-" compact-date))
+(def model-ref (str "model/simple-vol/open-" compact-date))
+(def spread-strategy-id "strategy/simple-vol/credit-spread-open/v1")
+
+(defn- write-edn! [path value]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (edn/write-string value)))
+
+(write-edn! (str artifact-root "/" feature-ref ".edn")
+            {:feature-manifest/id feature-ref
+             :feature-manifest/version 1
+             :feature-manifest/features [:feature/chain-mid-width]
+             :feature-manifest/params
+             {:spread {:venue "OPRA"
+                       :underlying-symbol "SPY"
+                       :expiry expiration
+                       :right :option-right/put
+                       :near-strike (strike-str near-strike)
+                       :far-strike (strike-str far-strike)}}
+             :feature-manifest/required-inputs [:input/option-chain]
+             :feature-manifest/compatibility
+             {:strategy-family :strategy-family/simple-vol
+              :prediction-schema-version 1}})
+
+(write-edn! (str artifact-root "/" model-ref ".edn")
+            {:model/id model-ref
+             :model/version 1
+             :model/type :model.type/threshold
+             :model/params {:feature :feature/chain-mid-width
+                            :threshold "0.50"}
+             :model/feature-manifest-ref feature-ref
+             :model/prediction-schema-version 1})
+
+;; the sma artifacts ship in resources/; copy them into the generated
+;; artifact root so ONE artifact store serves both strategies
+(write-edn! (str artifact-root "/feature/simple-direction/v1.edn")
+            (edn/read-string (slurp "resources/artifacts/feature/simple-direction/v1.edn")))
+(write-edn! (str artifact-root "/model/simple-direction/v1.edn")
+            (edn/read-string (slurp "resources/artifacts/model/simple-direction/v1.edn")))
+
+(def spread-decl-path (str gen-root "/strategies/credit-spread-open.edn"))
+(write-edn! spread-decl-path
+            {:strategy/id spread-strategy-id
+             :strategy/family :strategy-family/simple-vol
+             :strategy/name :strategy-name/credit-spread-open
+             :strategy/version 1
+             :strategy/mode-policy #{:mode/sim :mode/paper}
+             :strategy/schedule {:session :session/us-equities-regular}
+             :strategy/warmup {:required-bars 1}
+             :strategy/instruments ["equity/NASDAQ/SPY"]
+             :strategy/features {:manifest-ref feature-ref}
+             :strategy/inference {:artifact-ref model-ref}
+             :strategy/signal {:fn-id :signal/credit-threshold-v1}
+             :strategy/risk {:policy-id :risk/defined-risk-spread
+                             :params {:max-spreads 1 :max-risk "6.00"}}
+             :strategy/execution {:policy-id :execution/vertical-credit-spread-v1
+                                  :params {:quantity "1"}}})
+
+(def revision (str "cp-vv-open-" compact-date))
+(def manifest
+  {:control-plane/revision revision
+   :control-plane/generated-at (td/utc-now-str)
+   :control-plane/status :control-plane-status/proposed
+   :control-plane/strategies
+   [{:strategy/id "strategy/simple-direction/sma-cross/v1"
+     :strategy/enabled? true
+     :strategy/mode :mode/paper
+     :strategy/process "engine-paper-main"
+     :strategy/account-route "route/venturevd-direction"
+     :strategy/artifacts {:model-ref "model/simple-direction/v1"
+                          :feature-manifest-ref "feature/simple-direction/v1"}
+     :strategy/schedule {:session :session/us-equities-regular}}
+    {:strategy/id spread-strategy-id
+     :strategy/enabled? true
+     :strategy/mode :mode/paper
+     :strategy/process "engine-paper-main"
+     :strategy/account-route "route/venturevd-vol"
+     :strategy/artifacts {:model-ref model-ref
+                          :feature-manifest-ref feature-ref}
+     :strategy/schedule {:session :session/us-equities-regular}}]
+   :control-plane/accounts
+   [{:account/id "account/alpaca/venturevd-paper"
+     :account/broker :broker/alpaca-paper
+     :account/environment :environment/paper
+     :account/allowed-modes #{:mode/paper :mode/shadow}
+     :account/live-enabled? false}]
+   :control-plane/processes
+   [{:process/id "engine-paper-main"
+     :process/base :base/engine-live
+     :process/allowed-modes #{:mode/paper}
+     :process/strategies ["strategy/simple-direction/sma-cross/v1"
+                          spread-strategy-id]}]
+   :control-plane/routes
+   [{:route/id "route/venturevd-direction"
+     :route/strategy-id "strategy/simple-direction/sma-cross/v1"
+     :route/account-id "account/alpaca/venturevd-paper"
+     :route/broker :broker/alpaca-paper}
+    {:route/id "route/venturevd-vol"
+     :route/strategy-id spread-strategy-id
+     :route/account-id "account/alpaca/venturevd-paper"
+     :route/broker :broker/alpaca-paper}]
+   :control-plane/kill-switches
+   [{:kill-switch/scope :kill-switch-scope/global
+     :kill-switch/active? false
+     :kill-switch/reason nil
+     :kill-switch/activated-at nil
+     :kill-switch/actor nil}]
+   :control-plane/policies
+   {:policy/default-degradation :degradation-policy/default-paper}})
+
+(def cp-store (cpfs/make-file-control-plane-store "live_runtime/cp"))
+(def activation (cpfs/activate! cp-store manifest {:activation/actor "open-launcher"}))
+(when-not (:activated? activation)
+  (println "FATAL: manifest activation failed:" activation)
+  (python/exit 1))
+
+(println "=== STAGED PLAN ===")
+(prn {:session/date session-date
+      :spy/price spy-price
+      :spread {:expiration expiration
+               :near (strike-str near-strike)
+               :far (strike-str far-strike)
+               :threshold "0.50"}
+      :manifest/revision revision
+      :until until})
+
+(if dry-run?
+  (println "DRY RUN — stopping before run-live.")
+  (let [bars-src (mda/make-alpaca-bars-source
+                  {:symbol "SPY" :instrument-id "equity/NASDAQ/SPY"
+                   :key-id key-id :secret secret
+                   :warmup-bars 8 :block? false :poll-seconds 5
+                   :until until})
+        chains-src (td/make-thetadata-chain-source
+                    {:symbol "SPY" :underlying-id "equity/NASDAQ/SPY"
+                     :expiration expiration
+                     :strike-range [(str (- near-strike 15))
+                                    (str (+ near-strike 15))]
+                     :block? false :poll-seconds 30
+                     :until until})
+        source (mdc/make-composite-source
+                {:sources [bars-src chains-src]
+                 :poll-seconds 2
+                 :until until})
+        result (live/run-live
+                {:control-plane-root "live_runtime/cp"
+                 :process-id "engine-paper-main"
+                 :out-dir (str "live_runtime/session-" session-date)
+                 :source source
+                 :mode :mode/paper
+                 :snapshot-every 25
+                 :strategy-paths
+                 ["resources/strategies/simple-direction-sma-cross-v1.edn"
+                  spread-decl-path]
+                 :artifact-root artifact-root
+                 :alpaca {:key-id key-id :secret secret}})]
+    (println "=== SESSION RESULT ===")
+    (prn (select-keys result [:live/started? :live/refusal :run/id
+                              :facts-appended :orders]))
+    (prn (:portfolio result))))

@@ -1,0 +1,119 @@
+(ns stevetrading.market-data.composite
+  "Composite market-data source (MARKET_DATA_ADAPTER §3, §8).
+
+  Merges N child MarketDataSources into ONE observation stream ordered
+  by market time: each call emits at most one observation — the oldest
+  `:fact/occurred-at` (string compare) among the children's next
+  observations; ties break to the lowest child index.
+
+  Children MUST be constructed non-blocking (`:block? false`) — the
+  composite owns the block-poll: when no child has fresh data it
+  sleeps `:poll-seconds` (default 2) and retries; it returns exhausted
+  only when EVERY child reports `:exhausted? true` (or the composite's
+  own optional `:until` has passed).
+
+  Cursor: `{:composite/cursors [c1 c2 ...]}` aligned with the
+  `:sources` vector (nil/0 → every child starts fresh). Emitting
+  advances ONLY the picked child's cursor; the other children's data
+  is not lost — child emission is deterministic for a given cursor
+  (cursor-driven pagination over internally held data), so an unpicked
+  child re-emits its observation on the next call.
+
+  Dependency rule: this adapter requires ONLY market-data.protocol
+  (+ stdlib time interop). Child adapters are injected — adapter-to-
+  adapter reach-through is forbidden."
+  (:import time
+           datetime)
+  (:require [stevetrading.market-data.protocol :as p]))
+
+(def provider :market-data/composite)
+
+(defn- utc-now-str
+  []
+  (let [now (datetime.datetime/now (.-utc datetime/timezone))]
+    (str (.strftime now "%Y-%m-%dT%H:%M:%S.%f") "Z")))
+
+(defn- child-cursors
+  "Per-child cursor vector from a composite cursor (nil/0 → all fresh)."
+  [cursor n]
+  (if (or (nil? cursor) (= 0 cursor))
+    (vec (repeat n nil))
+    (vec (:composite/cursors cursor))))
+
+(defn- pick-oldest
+  "Candidate with the oldest :fact/occurred-at (string compare).
+  Candidates arrive in child-index order, so keeping the incumbent on
+  ties breaks them toward the lowest child index."
+  [candidates]
+  (reduce (fn [a b]
+            (if (< (compare (:fact/occurred-at (:child/observation b))
+                            (:fact/occurred-at (:child/observation a)))
+                   0)
+              b
+              a))
+          candidates))
+
+(defrecord CompositeSource [opts]
+  p/MarketDataSource
+
+  (source-id [this] provider)
+
+  (next-observations [this cursor max-n]
+    (let [{:keys [sources poll-seconds until]} opts
+          n (count sources)
+          cursors (child-cursors cursor n)]
+      (loop []
+        (let [results (mapv #(p/next-observations (nth sources %)
+                                                  (nth cursors %) 1)
+                            (range n))
+              candidates (vec (keep-indexed
+                               (fn [i r]
+                                 (when-let [obs (first (:observations r))]
+                                   {:child/index i
+                                    :child/observation obs
+                                    :child/cursor (:cursor r)}))
+                               results))]
+          (cond
+            ;; emit the market-time-oldest observation; advance ONLY
+            ;; that child's cursor
+            (seq candidates)
+            (let [pick (pick-oldest candidates)]
+              {:observations [(:child/observation pick)]
+               :cursor {:composite/cursors (assoc cursors
+                                                  (:child/index pick)
+                                                  (:child/cursor pick))}
+               :exhausted? false})
+
+            ;; nothing emitted + every child exhausted → session over
+            (every? :exhausted? results)
+            {:observations [] :cursor {:composite/cursors cursors}
+             :exhausted? true}
+
+            ;; composite's own session end
+            (and until (>= (compare (utc-now-str) until) 0))
+            {:observations [] :cursor {:composite/cursors cursors}
+             :exhausted? true}
+
+            ;; the composite owns the block-poll
+            :else
+            (do (time/sleep (or poll-seconds 2))
+                (recur)))))))
+
+  (source-health [this]
+    (let [healths (mapv p/source-health (:sources opts))]
+      {:source/provider provider
+       :source/healthy? (every? #(boolean (:source/healthy? %)) healths)
+       :source/children healths})))
+
+(defn make-composite-source
+  "Composite over child MarketDataSources. Opts (explicit map — never
+  kwargs):
+    :sources       vector of MarketDataSource children, each built with
+                   :block? false (required — the composite owns the
+                   block-poll; a blocking child would stall the merge)
+    :poll-seconds  sleep between merge retries when no child has fresh
+                   data (default 2)
+    :until         optional RFC3339 Z session end; forces exhausted
+                   once passed even while children are merely idle"
+  [opts]
+  (->CompositeSource (merge {:poll-seconds 2} opts)))
