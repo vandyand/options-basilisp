@@ -1,0 +1,182 @@
+(ns stevetrading.portfolio.core
+  "Derived portfolio views over canonical ledger state.
+
+  Normative: LEDGER_AND_PORTFOLIO_MODEL_V0.1 §7 (derivation), §8 (marks vs
+  trade truth), §11 (exposure). The ledger is canonical; everything here is
+  a pure derivation and stamps its :portfolio/source-watermark (the
+  ledger's highest folded fact-log offset, nil when state was built purely
+  from pre-append derived facts).
+
+  Documented decisions:
+  - Headline :portfolio/realized-pnl = sum of closed-lot price P&L + sum of
+    fee cash movements (fees are realized costs the moment they are paid).
+    On a completed round trip this equals (sell - buy) x qty - fees. The
+    components are exposed separately as :portfolio/realized-trade-pnl and
+    :portfolio/fees.
+  - Marks: the optional :marks argument {instrument-id price-str} is merged
+    OVER the ledger's durable :ledger/marks (an explicit mark wins).
+  - Unrealized P&L is nil-safe: per-lot unrealized is computed only for
+    lots whose instrument has a mark; :portfolio/unrealized-pnl is the sum
+    over marked lots, \"0\" when there are no open lots, and nil when open
+    lots exist but none has a mark. :portfolio/unmarked-instruments lists
+    open instruments without marks.
+  - Exposure notional per open lot = (mark | open price) x remaining —
+    open price is the documented fallback pricing policy when no mark
+    exists. Gross = sum |notional|; net = sum signed (long +, short -).
+  - Net position sign: buy-side lots count positive, sell-side (short)
+    negative."
+  (:import decimal)
+  (:require [stevetrading.ledger.core :as ledger]))
+
+(defn- ->dec
+  [s]
+  (decimal/Decimal (or s "0")))
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn- signed-qty
+  [lot]
+  (let [q (->dec (:lot/remaining-quantity lot))]
+    (if (= :order-side/sell (:lot/side lot)) (- q) q)))
+
+(defn- sum-str
+  [decs]
+  (str (reduce + dec-zero decs)))
+
+(defn- lot-unrealized
+  "Per-lot unrealized P&L Decimal, or nil when the instrument has no mark."
+  [marks lot]
+  (when-let [mark (get marks (:lot/instrument-id lot))]
+    (let [diff (- (->dec mark) (->dec (:lot/price lot)))
+          qty (->dec (:lot/remaining-quantity lot))]
+      (if (= :order-side/sell (:lot/side lot))
+        (* (- diff) qty)
+        (* diff qty)))))
+
+(defn- lot-notional
+  "Signed exposure notional Decimal: (mark | open price) x remaining,
+  negative for short lots."
+  [marks lot]
+  (let [price (->dec (or (get marks (:lot/instrument-id lot))
+                         (:lot/price lot)))
+        notional (* price (->dec (:lot/remaining-quantity lot)))]
+    (if (= :order-side/sell (:lot/side lot)) (- notional) notional)))
+
+(defn- net-positions
+  [open-lots]
+  (reduce (fn [m lot]
+            (update m (:lot/instrument-id lot)
+                    (fn [q] (str (+ (->dec (or q "0")) (signed-qty lot))))))
+          {}
+          open-lots))
+
+(defn- realized-trade-pnl
+  [closed-lots]
+  (sum-str (map #(->dec (:lot-close/realized-pnl %)) closed-lots)))
+
+(defn- fees-total
+  [cash-movements]
+  (sum-str (->> cash-movements
+                (filter #(= :cash/fees (:cash/category %)))
+                (map #(->dec (:cash/amount %))))))
+
+(defn- group-view
+  "Shared per-strategy / per-account sub-view."
+  [open-lots closed-lots cash-movements marks]
+  (let [trade-pnl (->dec (realized-trade-pnl closed-lots))
+        fees (->dec (fees-total cash-movements))]
+    {:view/net-positions (net-positions open-lots)
+     :view/open-lots (vec open-lots)
+     :view/realized-trade-pnl (str trade-pnl)
+     :view/fees (str fees)
+     :view/realized-pnl (str (+ trade-pnl fees))
+     :view/gross-exposure (sum-str (map #(let [n (lot-notional marks %)]
+                                           (if (< n dec-zero) (- n) n))
+                                        open-lots))}))
+
+(defn- views-by
+  "Group lots by lot-key-fn and cash movements by cash-key-fn into per-id
+  sub-views."
+  [lot-key-fn cash-key-fn open-lots closed-lots cash-movements marks]
+  (let [ids (distinct (concat (keep lot-key-fn open-lots)
+                              (keep lot-key-fn closed-lots)
+                              (keep cash-key-fn cash-movements)))]
+    (into {}
+          (map (fn [id]
+                 [id (group-view
+                      (filterv #(= id (lot-key-fn %)) open-lots)
+                      (filterv #(= id (lot-key-fn %)) closed-lots)
+                      (filterv #(= id (cash-key-fn %)) cash-movements)
+                      marks)])
+               ids))))
+
+(defn derive-portfolio
+  "Derive the full portfolio view from canonical ledger state. opts:
+    :marks {instrument-id price-str} — merged over durable ledger marks.
+
+  Returns
+    {:portfolio/source-watermark   ledger fact-log watermark (or nil)
+     :portfolio/cash               {account-id balance-str}
+     :portfolio/positions          {instrument-id {:position/net-quantity ..
+                                                   :position/open-lot-ids [..]
+                                                   :position/unrealized-pnl ..|nil}}
+     :portfolio/open-lots          [lot maps, FIFO order]
+     :portfolio/realized-trade-pnl closed-lot price P&L sum
+     :portfolio/fees               fee cash sum (negative)
+     :portfolio/realized-pnl       trade pnl + fees (headline)
+     :portfolio/unrealized-pnl     sum over marked open lots | \"0\" | nil
+     :portfolio/unmarked-instruments #{...}
+     :portfolio/gross-exposure     sum |notional|
+     :portfolio/net-exposure       signed notional sum
+     :portfolio/by-strategy        {strategy-id view}
+     :portfolio/by-account         {account-id view}}"
+  ([ledger-state] (derive-portfolio ledger-state {}))
+  ([ledger-state {:keys [marks]}]
+   (let [durable-marks (into {}
+                             (map (fn [[iid m]] [iid (:mark/price m)])
+                                  (:ledger/marks ledger-state)))
+         marks (merge durable-marks (or marks {}))
+         open-lots (ledger/open-lots ledger-state)
+         closed-lots (:ledger/closed-lots ledger-state)
+         cash-movements (:ledger/cash-movements ledger-state)
+         lots-by-instrument (group-by :lot/instrument-id open-lots)
+         positions
+         (into {}
+               (map (fn [[iid lots]]
+                      (let [unreal (keep #(lot-unrealized marks %) lots)]
+                        [iid
+                         {:position/net-quantity
+                          (sum-str (map signed-qty lots))
+                          :position/open-lot-ids (mapv :lot/id lots)
+                          :position/unrealized-pnl
+                          (when (contains? marks iid) (sum-str unreal))}]))
+                    lots-by-instrument))
+         marked-unreal (keep #(lot-unrealized marks %) open-lots)
+         unrealized (cond
+                      (empty? open-lots) "0"
+                      (empty? marked-unreal) nil
+                      :else (sum-str marked-unreal))
+         trade-pnl (->dec (realized-trade-pnl closed-lots))
+         fees (->dec (fees-total cash-movements))
+         notionals (map #(lot-notional marks %) open-lots)]
+     {:portfolio/source-watermark (:ledger/source-watermark ledger-state)
+      :portfolio/cash (:ledger/cash-by-account ledger-state)
+      :portfolio/positions positions
+      :portfolio/open-lots (vec open-lots)
+      :portfolio/realized-trade-pnl (str trade-pnl)
+      :portfolio/fees (str fees)
+      :portfolio/realized-pnl (str (+ trade-pnl fees))
+      :portfolio/unrealized-pnl unrealized
+      :portfolio/unmarked-instruments
+      (into #{}
+            (remove #(contains? marks %)
+                    (keys lots-by-instrument)))
+      :portfolio/gross-exposure (sum-str (map #(if (< % dec-zero) (- %) %)
+                                              notionals))
+      :portfolio/net-exposure (sum-str notionals)
+      :portfolio/by-strategy (views-by :lot/strategy-id :cash/strategy-id
+                                       open-lots closed-lots cash-movements
+                                       marks)
+      :portfolio/by-account (views-by :lot/account-id :cash/account-id
+                                      open-lots closed-lots cash-movements
+                                      marks)})))

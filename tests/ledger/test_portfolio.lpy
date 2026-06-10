@@ -1,0 +1,332 @@
+(ns ledger.test-portfolio
+  "portfolio.core derivation tests (LEDGER_AND_PORTFOLIO_MODEL §7, §8, §11)
+  + the Phase 6 recovery wiring: run-recovery! rebuilds a non-stale
+  :engine/portfolio from fills + derived ledger facts in the log."
+  (:import tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.recovery :as rec]
+            [stevetrading.engine.state :as st]
+            [stevetrading.ledger.core :as led]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.persistence.snapshot-store :as ss]
+            [stevetrading.portfolio.core :as port]))
+
+(def strategy-id "strategy/simple-direction/sma-cross/v1")
+(def account-id "account/sim/test")
+(def instrument-id "equity/ARCA/SPY")
+
+(defn fill-fact
+  [{:keys [fill-id qty price at fees side broker-order-id intent-id]
+    :or {at "2026-06-10T14:30:03Z"
+         broker-order-id "sim-1"
+         intent-id "oi_a"}}]
+  (sch/fact-envelope
+   {:record/type :fact/fill-observed
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id account-id
+    :record/instrument-id instrument-id
+    :record/source-system :broker/sim
+    :fact/occurred-at at
+    :fact/recorded-at at
+    :fact/payload (cond-> {:order-intent/id intent-id
+                           :broker/source-system :broker/sim
+                           :broker/order-id broker-order-id
+                           :fill/id fill-id
+                           :fill/occurred-at at
+                           :fill/quantity qty
+                           :fill/price price
+                           :fill/liquidity :liquidity/taker}
+                    (some? fees) (assoc :fill/fees fees))}))
+
+(defn ctx
+  [effect side intent-id]
+  {:order-intent/id intent-id
+   :order-intent/effect effect
+   :order-intent/side side
+   :order-intent/account-id account-id
+   :order-intent/strategy-id strategy-id
+   :order-intent/instrument-id instrument-id})
+
+(defn derive+fold
+  [ledger fill intent-ctx]
+  (led/fold-ledger-facts ledger
+                         (led/derive-ledger-facts ledger fill intent-ctx)))
+
+(defn round-trip-ledger
+  "Buy 2 @ 550.00 (fees 1.00), sell 2 @ 555.00 (fees 1.00)."
+  []
+  (-> led/empty-ledger
+      (derive+fold (fill-fact {:fill-id "t1" :qty "2" :price "550.00"
+                               :fees "1.00"})
+                   (ctx :position-effect/open :order-side/buy "oi_a"))
+      (derive+fold (fill-fact {:fill-id "t2" :qty "2" :price "555.00"
+                               :fees "1.00" :broker-order-id "sim-2"
+                               :intent-id "oi_b"
+                               :at "2026-06-10T14:31:00Z"})
+                   (ctx :position-effect/close :order-side/sell "oi_b"))))
+
+;; ---------------------------------------------------------------------------
+;; Realized P&L
+;; ---------------------------------------------------------------------------
+
+(deftest realized-pnl-on-round-trip
+  (let [pf (port/derive-portfolio (round-trip-ledger))]
+    (testing "realized = (sell - buy) x qty - fees"
+      ;; (555 - 550) x 2 - 1.00 - 1.00 = 8.00
+      (is (= "8.00" (:portfolio/realized-pnl pf))))
+    (testing "components exposed separately"
+      (is (= "10.00" (:portfolio/realized-trade-pnl pf)))
+      (is (= "-2.00" (:portfolio/fees pf))))
+    (testing "cash equals realized when flat (no open lots)"
+      (is (= {account-id "8.00"} (:portfolio/cash pf)))
+      (is (= [] (:portfolio/open-lots pf)))
+      (is (= {} (:portfolio/positions pf))))))
+
+(deftest short-round-trip-realized-pnl
+  (let [ledger (-> led/empty-ledger
+                   (derive+fold (fill-fact {:fill-id "s1" :qty "1"
+                                            :price "560.00"})
+                                (ctx :position-effect/open :order-side/sell
+                                     "oi_s"))
+                   (derive+fold (fill-fact {:fill-id "s2" :qty "1"
+                                            :price "550.00"
+                                            :broker-order-id "sim-2"
+                                            :intent-id "oi_c"})
+                                (ctx :position-effect/close :order-side/buy
+                                     "oi_c")))
+        pf (port/derive-portfolio ledger)]
+    ;; short: (open - close) x qty = (560 - 550) x 1 = 10.00
+    (is (= "10.00" (:portfolio/realized-pnl pf)))
+    (is (= {account-id "10.00"} (:portfolio/cash pf)))))
+
+;; ---------------------------------------------------------------------------
+;; Unrealized P&L + marks (nil-safe)
+;; ---------------------------------------------------------------------------
+
+(deftest unrealized-from-marks
+  (let [ledger (derive+fold led/empty-ledger
+                            (fill-fact {:fill-id "t1" :qty "2"
+                                        :price "550.00"})
+                            (ctx :position-effect/open :order-side/buy
+                                 "oi_a"))]
+    (testing "with a mark: (mark - basis) x remaining"
+      (let [pf (port/derive-portfolio ledger
+                                      {:marks {instrument-id "560.00"}})]
+        (is (= "20.00" (:portfolio/unrealized-pnl pf)))
+        (is (= "20.00" (get-in pf [:portfolio/positions instrument-id
+                                   :position/unrealized-pnl])))
+        (is (= #{} (:portfolio/unmarked-instruments pf)))))
+    (testing "nil-safe without a mark"
+      (let [pf (port/derive-portfolio ledger)]
+        (is (nil? (:portfolio/unrealized-pnl pf)))
+        (is (nil? (get-in pf [:portfolio/positions instrument-id
+                              :position/unrealized-pnl])))
+        (is (= #{instrument-id} (:portfolio/unmarked-instruments pf)))))
+    (testing "zero string when flat"
+      (is (= "0" (:portfolio/unrealized-pnl
+                  (port/derive-portfolio (round-trip-ledger))))))))
+
+;; ---------------------------------------------------------------------------
+;; Exposure (§11)
+;; ---------------------------------------------------------------------------
+
+(deftest gross-and-net-exposure
+  (let [ledger (-> led/empty-ledger
+                   (derive+fold (fill-fact {:fill-id "t1" :qty "2"
+                                            :price "550.00"})
+                                (ctx :position-effect/open :order-side/buy
+                                     "oi_a"))
+                   (derive+fold (fill-fact {:fill-id "s1" :qty "1"
+                                            :price "560.00"
+                                            :broker-order-id "sim-3"
+                                            :intent-id "oi_s"})
+                                (ctx :position-effect/open :order-side/sell
+                                     "oi_s")))
+        pf (port/derive-portfolio ledger {:marks {instrument-id "560.00"}})]
+    (testing "net quantity nets long and short lots"
+      (is (= "1" (get-in pf [:portfolio/positions instrument-id
+                             :position/net-quantity]))))
+    (testing "gross = sum |notional| at marks; net = signed sum"
+      ;; long 2 x 560 = 1120, short 1 x 560 = -560
+      (is (= "1680.00" (:portfolio/gross-exposure pf)))
+      (is (= "560.00" (:portfolio/net-exposure pf))))
+    (testing "without marks, open price is the fallback pricing policy"
+      (let [pf2 (port/derive-portfolio ledger)]
+        (is (= "1660.00" (:portfolio/gross-exposure pf2)))
+        (is (= "540.00" (:portfolio/net-exposure pf2)))))))
+
+;; ---------------------------------------------------------------------------
+;; Strategy / account views (§7, §11)
+;; ---------------------------------------------------------------------------
+
+(deftest per-strategy-and-per-account-views
+  (let [pf (port/derive-portfolio (round-trip-ledger))]
+    (testing "per-strategy realized includes its fee drag"
+      (is (= "8.00" (get-in pf [:portfolio/by-strategy strategy-id
+                                :view/realized-pnl])))
+      (is (= "-2.00" (get-in pf [:portfolio/by-strategy strategy-id
+                                 :view/fees]))))
+    (testing "per-account view"
+      (is (= "8.00" (get-in pf [:portfolio/by-account account-id
+                                :view/realized-pnl])))
+      (is (= {} (get-in pf [:portfolio/by-account account-id
+                            :view/net-positions]))))))
+
+;; ---------------------------------------------------------------------------
+;; Rebuild-from-facts determinism
+;; ---------------------------------------------------------------------------
+
+(deftest rebuild-from-facts-folds-to-equal-portfolio
+  (let [open-fill (fill-fact {:fill-id "t1" :qty "3" :price "550.00"
+                              :fees "1.00"})
+        d1 (led/derive-ledger-facts led/empty-ledger open-fill
+                                    (ctx :position-effect/open
+                                         :order-side/buy "oi_a"))
+        l1 (led/fold-ledger-facts led/empty-ledger d1)
+        close-fill (fill-fact {:fill-id "t2" :qty "1" :price "555.00"
+                               :broker-order-id "sim-2" :intent-id "oi_b"})
+        d2 (led/derive-ledger-facts l1 close-fill
+                                    (ctx :position-effect/close
+                                         :order-side/sell "oi_b"))
+        all (vec (concat d1 d2))
+        fold1 (led/fold-ledger-facts led/empty-ledger all)
+        fold2 (led/fold-ledger-facts led/empty-ledger all)]
+    (is (= fold1 fold2))
+    (is (= (port/derive-portfolio fold1) (port/derive-portfolio fold2)))
+    (testing "folding the list again over folded state changes nothing"
+      (is (= (port/derive-portfolio fold1)
+             (port/derive-portfolio (led/fold-ledger-facts fold1 all)))))))
+
+;; ---------------------------------------------------------------------------
+;; Recovery wiring: run-recovery! rebuilds a non-stale :engine/portfolio
+;; ---------------------------------------------------------------------------
+
+(def oi "oi_testintent00000000000000000000000000000000000000")
+
+(defn envelope
+  [fact-type payload at]
+  (sch/fact-envelope
+   {:record/type fact-type
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id account-id
+    :record/instrument-id instrument-id
+    :record/source-system :broker/sim
+    :fact/occurred-at at
+    :fact/recorded-at at
+    :fact/payload payload}))
+
+(defn order-lifecycle-facts
+  "intent → dispatch → ack → fill(2 @ 550.00) for one open intent."
+  []
+  [(envelope :fact/order-intent-created
+             {:order-intent/id oi
+              :order-intent/decision-id "dec_x"
+              :order-intent/intent-slot 0
+              :order-intent/role :intent-role/entry
+              :order-intent/side :order-side/buy
+              :order-intent/effect :position-effect/open
+              :order-intent/order-type :order-type/market
+              :order-intent/time-in-force :tif/day
+              :order-intent/quantity "2"
+              :order-intent/legs [{:instrument/id instrument-id
+                                   :leg/side :order-side/buy
+                                   :leg/quantity "2"}]}
+             "2026-06-10T14:30:00Z")
+   (envelope :fact/command-dispatched
+             {:command/type :command/submit-order-intent
+              :order-intent/id oi}
+             "2026-06-10T14:30:01Z")
+   (envelope :fact/broker-ack-accepted
+             {:order-intent/id oi
+              :broker/source-system :broker/sim
+              :broker/order-id "sim-1"
+              :broker/status :broker-status/accepted
+              :broker/observed-at "2026-06-10T14:30:02Z"}
+             "2026-06-10T14:30:02Z")
+   (assoc (fill-fact {:fill-id "t1" :qty "2" :price "550.00"
+                      :intent-id oi})
+          :fact/dedupe-key "fill/sim/account-sim-test/sim-1/t1")])
+
+(defn stores
+  []
+  {:fact-store (fs/make-fact-store ":memory:")
+   :snapshot-store (ss/make-snapshot-store (tempfile/mkdtemp))})
+
+(deftest recovery-rebuilds-non-stale-portfolio
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store (order-lifecycle-facts))
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))
+        portfolio (get-in res [:engine/state :engine/portfolio])]
+    (is (= :ready (:recovery/outcome res)))
+    (testing "portfolio reflects the recovered fill (not the stale {} cache)"
+      (is (= "2" (get-in portfolio [:portfolio/positions instrument-id
+                                    :position/net-quantity])))
+      (is (= {account-id "-1100.00"} (:portfolio/cash portfolio)))
+      (is (some? (:portfolio/source-watermark portfolio))))
+    (testing "missing ledger facts were derived and appended to the log"
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/position-lot-opened}))))
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/cash-movement-recorded})))))
+    (testing "rebuilt ledger state is returned for the runtime to fold from"
+      (is (= 1 (count (led/open-lots (:recovery/ledger res)))))
+      (is (= [] (:recovery/skipped-ledger-fills res))))))
+
+(deftest repeated-recovery-is-ledger-idempotent
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts! fact-store (order-lifecycle-facts))
+        res1 (rec/run-recovery! (assoc sts :run-mode :mode/sim))
+        res2 (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (testing "re-derivation appended nothing (dedupe keys absorb it)"
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/position-lot-opened}))))
+      (is (= 1 (count (p/facts-by fact-store
+                                  {:fact-type :fact/cash-movement-recorded})))))
+    (testing "portfolios converge (watermark legitimately advances in run 2
+              because the in-log ledger facts are now part of the stream)"
+      (is (= (dissoc (get-in res1 [:engine/state :engine/portfolio])
+                     :portfolio/source-watermark)
+             (dissoc (get-in res2 [:engine/state :engine/portfolio])
+                     :portfolio/source-watermark))))))
+
+(deftest recovery-folds-preexisting-ledger-facts-without-duplication
+  ;; the log already contains the derived ledger facts (a previous run
+  ;; appended them): recovery must fold them, derive nothing new, and land
+  ;; on the same portfolio
+  (let [{:keys [fact-store] :as sts} (stores)
+        facts (order-lifecycle-facts)
+        fill (last facts)
+        derived (led/derive-ledger-facts
+                 led/empty-ledger fill
+                 {:order-intent/id oi
+                  :order-intent/effect :position-effect/open
+                  :order-intent/side :order-side/buy
+                  :order-intent/account-id account-id
+                  :order-intent/strategy-id strategy-id
+                  :order-intent/instrument-id instrument-id})
+        _ (p/append-facts! fact-store (concat facts derived))
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :ready (:recovery/outcome res)))
+    (is (= 1 (count (p/facts-by fact-store
+                                {:fact-type :fact/position-lot-opened}))))
+    (is (= "2" (get-in res [:engine/state :engine/portfolio
+                            :portfolio/positions instrument-id
+                            :position/net-quantity])))))
+
+(deftest blocked-recovery-skips-ledger-rebuild
+  (let [{:keys [fact-store] :as sts} (stores)
+        _ (p/append-facts!
+           fact-store
+           [(assoc (fill-fact {:fill-id "tx" :qty "1" :price "550.00"
+                               :intent-id "oi_unknownintent0000000000000000000000000000000"})
+                   :fact/dedupe-key "fill/sim/account-sim-test/sim-1/tx")])
+        res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
+    (is (= :blocked (:recovery/outcome res)))
+    (testing "no ledger facts derived for unexplained fills"
+      (is (nil? (:recovery/ledger res)))
+      (is (= 0 (count (p/facts-by fact-store
+                                  {:fact-type :fact/position-lot-opened})))))))

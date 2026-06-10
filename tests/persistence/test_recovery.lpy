@@ -178,9 +178,14 @@
         res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
     (is (= :ready (:recovery/outcome res)))
     (is (= :warm-restart (:recovery/mode res)))
-    (testing "snapshot at watermark 3 + tail == fold of everything from 0"
-      (is (= (with-fact-log-watermark full-fold 5)
-             (:engine/state res))))
+    (testing "snapshot at watermark 3 + tail == fold of everything from 0
+              (modulo the Phase 6 portfolio refresh, asserted separately)"
+      (is (= (dissoc (with-fact-log-watermark full-fold 5) :engine/portfolio)
+             (dissoc (:engine/state res) :engine/portfolio))))
+    (testing "Phase 6: recovery refreshed the derived portfolio cache"
+      (is (= "2" (get-in res [:engine/state :engine/portfolio
+                              :portfolio/positions "equity/ARCA/SPY"
+                              :position/net-quantity]))))
     (testing "only the post-watermark tail was replayed"
       (is (= [4 5] (mapv :fact-log/offset (:recovery/facts res)))))
     (testing "the recovered order resolved to :filled"
@@ -195,7 +200,8 @@
         full-fold (:state (fold/fold-facts (st/fresh-state) facts))
         res (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
     (is (= :ready (:recovery/outcome res)))
-    (is (= (with-fact-log-watermark full-fold 5) (:engine/state res)))
+    (is (= (dissoc (with-fact-log-watermark full-fold 5) :engine/portfolio)
+           (dissoc (:engine/state res) :engine/portfolio)))
     (is (= [1 2 3 4 5] (mapv :fact-log/offset (:recovery/facts res))))))
 
 (deftest repeated-recovery-converges
@@ -205,12 +211,17 @@
         res1 (rec/run-recovery! (assoc sts :run-mode :mode/sim))
         res2 (rec/run-recovery! (assoc sts :run-mode :mode/sim))]
     ;; the second run additionally replays the first run's recovery facts —
-    ;; they fold as no-ops, so engine state must converge (golden property)
+    ;; they fold as no-ops, so engine state must converge (golden property);
+    ;; the portfolio source watermark legitimately advances (run 2 also sees
+    ;; the ledger facts run 1 appended), so it is normalized too
     (is (= :ready (:recovery/outcome res2)))
-    (is (= (update-in (:engine/state res1)
-                      [:engine/watermarks] dissoc :watermark/fact-log)
-           (update-in (:engine/state res2)
-                      [:engine/watermarks] dissoc :watermark/fact-log)))))
+    (letfn [(normalize [state]
+              (-> state
+                  (update-in [:engine/watermarks] dissoc :watermark/fact-log)
+                  (update :engine/portfolio dissoc
+                          :portfolio/source-watermark)))]
+      (is (= (normalize (:engine/state res1))
+             (normalize (:engine/state res2)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Unresolved order survival

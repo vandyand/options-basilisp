@@ -1,0 +1,317 @@
+(ns ledger.test-ledger
+  "ledger.core derive/fold split tests (LEDGER_AND_PORTFOLIO_MODEL §3-§6):
+  lot opening, FIFO partial closes with exact lineage, cash movements,
+  Decimal-string discipline, deterministic dedupe identity, and idempotent
+  re-derivation through a real fact store."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.ledger.core :as led]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]))
+
+(def strategy-id "strategy/simple-direction/sma-cross/v1")
+(def account-id "account/sim/test")
+(def instrument-id "equity/ARCA/SPY")
+
+(defn fill-fact
+  [{:keys [fill-id qty price at fees account broker-order-id intent-id]
+    :or {at "2026-06-10T14:30:03Z"
+         account account-id
+         broker-order-id "sim-1"
+         intent-id "oi_a"}}]
+  (sch/fact-envelope
+   {:record/type :fact/fill-observed
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id account
+    :record/instrument-id instrument-id
+    :record/source-system :broker/sim
+    :fact/occurred-at at
+    :fact/recorded-at at
+    :fact/payload (cond-> {:order-intent/id intent-id
+                           :broker/source-system :broker/sim
+                           :broker/order-id broker-order-id
+                           :fill/id fill-id
+                           :fill/occurred-at at
+                           :fill/quantity qty
+                           :fill/price price
+                           :fill/liquidity :liquidity/taker}
+                    (some? fees) (assoc :fill/fees fees))}))
+
+(defn ctx
+  [effect side & {:keys [intent-id account]
+                  :or {intent-id "oi_a" account account-id}}]
+  {:order-intent/id intent-id
+   :order-intent/effect effect
+   :order-intent/side side
+   :order-intent/account-id account
+   :order-intent/strategy-id strategy-id
+   :order-intent/instrument-id instrument-id})
+
+(def open-buy (ctx :position-effect/open :order-side/buy))
+(def close-sell (ctx :position-effect/close :order-side/sell
+                     :intent-id "oi_close"))
+
+(defn derive+fold
+  "Derive from a fill against ledger, fold the derived facts, return
+  [ledger' derived-facts]."
+  [ledger fill intent-ctx]
+  (let [derived (led/derive-ledger-facts ledger fill intent-ctx)]
+    [(led/fold-ledger-facts ledger derived) derived]))
+
+;; ---------------------------------------------------------------------------
+;; Opening
+;; ---------------------------------------------------------------------------
+
+(deftest open-fill-creates-lot-and-principal-cash
+  (let [fill (fill-fact {:fill-id "t1" :qty "2" :price "550.00"})
+        [ledger derived] (derive+fold led/empty-ledger fill open-buy)
+        lot (first (led/open-lots ledger))]
+    (testing "exactly one lot-opened + one cash movement derived"
+      (is (= [:fact/position-lot-opened :fact/cash-movement-recorded]
+             (mapv :record/type derived))))
+    (testing "every derived fact is a valid canonical envelope"
+      (is (every? #(:valid? (v/validate-fact %)) derived)))
+    (testing "dedupe keys embed the full fill identity"
+      (is (= "lot-open/broker/sim/account/sim/test/sim-1/t1"
+             (:fact/dedupe-key (first derived))))
+      (is (= "cash/broker/sim/account/sim/test/sim-1/t1/trade-principal"
+             (:fact/dedupe-key (second derived)))))
+    (testing "causation points at the fill fact"
+      (is (every? #(= [(:record/id fill)] (:record/causation-ids %))
+                  derived)))
+    (testing "§5 lot fields"
+      (is (= "lot-broker/sim/account/sim/test/sim-1/t1" (:lot/id lot)))
+      (is (= "oi_a" (:lot/order-intent-id lot)))
+      (is (= instrument-id (:lot/instrument-id lot)))
+      (is (= account-id (:lot/account-id lot)))
+      (is (= strategy-id (:lot/strategy-id lot)))
+      (is (= "2026-06-10T14:30:03Z" (:lot/opened-at lot)))
+      (is (= "2" (:lot/quantity lot)))
+      (is (= "2" (:lot/remaining-quantity lot)))
+      (is (= "550.00" (:lot/price lot)))
+      (is (= "1100.00" (:lot/cost-basis lot))))
+    (testing "buy principal is cash OUT (§6 sign by side)"
+      (is (= "-1100.00" (get-in ledger [:ledger/cash-by-account account-id]))))))
+
+(deftest fees-reduce-cash
+  (let [fill (fill-fact {:fill-id "t1" :qty "2" :price "550.00" :fees "1.50"})
+        [ledger derived] (derive+fold led/empty-ledger fill open-buy)
+        fees-fact (last derived)]
+    (is (= 3 (count derived)))
+    (is (= :fact/cash-movement-recorded (:record/type fees-fact)))
+    (is (= :cash/fees (get-in fees-fact [:fact/payload :cash/category])))
+    (is (= "-1.50" (get-in fees-fact [:fact/payload :cash/amount])))
+    (is (= "cash/broker/sim/account/sim/test/sim-1/t1/fees"
+           (:fact/dedupe-key fees-fact)))
+    (is (= "-1101.50" (get-in ledger [:ledger/cash-by-account account-id])))))
+
+;; ---------------------------------------------------------------------------
+;; Closing — FIFO with partial-close splitting and exact lineage
+;; ---------------------------------------------------------------------------
+
+(deftest partial-close-consumes-fifo-with-exact-lineage
+  (let [[l1 _] (derive+fold led/empty-ledger
+                            (fill-fact {:fill-id "t1" :qty "3"
+                                        :price "550.00"})
+                            open-buy)
+        close-fill (fill-fact {:fill-id "t2" :qty "1" :price "555.00"
+                               :broker-order-id "sim-2"
+                               :intent-id "oi_close"
+                               :at "2026-06-10T14:31:00Z"})
+        [l2 derived] (derive+fold l1 close-fill close-sell)
+        close-record (first (:ledger/closed-lots l2))]
+    (testing "one close fact + principal cash"
+      (is (= [:fact/position-lot-closed :fact/cash-movement-recorded]
+             (mapv :record/type derived))))
+    (testing "dedupe key embeds fill identity AND source lot id"
+      (is (= (str "lot-close/broker/sim/account/sim/test/sim-2/t2"
+                  "/lot-broker/sim/account/sim/test/sim-1/t1")
+             (:fact/dedupe-key (first derived)))))
+    (testing "closed portion references original lot + closing intent"
+      (is (= "lot-broker/sim/account/sim/test/sim-1/t1"
+             (:lot/id close-record)))
+      (is (= "oi_close" (:lot-close/closing-order-intent-id close-record)))
+      (is (= "t2" (:lot-close/closing-fill-id close-record)))
+      (is (= "1" (:lot-close/quantity close-record)))
+      (is (= "5.00" (:lot-close/realized-pnl close-record))))
+    (testing "partial-close splitting: lot remains open with remainder"
+      (is (= ["2"] (mapv :lot/remaining-quantity (led/open-lots l2)))))
+    (testing "sell principal is cash IN"
+      (is (= "-1095.00" (get-in l2 [:ledger/cash-by-account account-id]))))))
+
+(deftest close-spans-multiple-lots-fifo
+  (let [[l1 _] (derive+fold led/empty-ledger
+                            (fill-fact {:fill-id "t1" :qty "1"
+                                        :price "550.00"})
+                            open-buy)
+        [l2 _] (derive+fold l1
+                            (fill-fact {:fill-id "t2" :qty "2"
+                                        :price "551.00"})
+                            open-buy)
+        [l3 derived] (derive+fold l2
+                                  (fill-fact {:fill-id "t3" :qty "2"
+                                              :price "555.00"
+                                              :broker-order-id "sim-2"
+                                              :intent-id "oi_close"})
+                                  close-sell)
+        closes (filterv #(= :fact/position-lot-closed (:record/type %))
+                        derived)]
+    (testing "oldest lot consumed first, second split partially"
+      (is (= 2 (count closes)))
+      (is (= ["lot-broker/sim/account/sim/test/sim-1/t1"
+              "lot-broker/sim/account/sim/test/sim-1/t2"]
+             (mapv #(get-in % [:fact/payload :lot/id]) closes)))
+      (is (= ["1" "1"]
+             (mapv #(get-in % [:fact/payload :lot-close/quantity]) closes))))
+    (testing "per-lot realized pnl from each lot's own basis"
+      (is (= ["5.00" "4.00"]
+             (mapv #(get-in % [:fact/payload :lot-close/realized-pnl])
+                   closes))))
+    (testing "one lot remains open with quantity 1"
+      (is (= [["lot-broker/sim/account/sim/test/sim-1/t2" "1"]]
+             (mapv (juxt :lot/id :lot/remaining-quantity)
+                   (led/open-lots l3)))))))
+
+(deftest over-close-derives-no-lot-fact-for-remainder
+  (let [[l1 _] (derive+fold led/empty-ledger
+                            (fill-fact {:fill-id "t1" :qty "1"
+                                        :price "550.00"})
+                            open-buy)
+        [l2 derived] (derive+fold l1
+                                  (fill-fact {:fill-id "t2" :qty "3"
+                                              :price "555.00"
+                                              :broker-order-id "sim-2"
+                                              :intent-id "oi_close"})
+                                  close-sell)]
+    (testing "only the available quantity closes (no silent short flip)"
+      (is (= 1 (count (filterv #(= :fact/position-lot-closed (:record/type %))
+                               derived))))
+      (is (= [] (led/open-lots l2))))
+    (testing "the cash effect of the full fill is still recorded"
+      (is (= "1665.00"
+             (get-in (led/fold-ledger-facts led/empty-ledger
+                                            (filterv #(= :fact/cash-movement-recorded
+                                                         (:record/type %))
+                                                     derived))
+                     [:ledger/cash-by-account account-id]))))))
+
+;; ---------------------------------------------------------------------------
+;; Decimal-string discipline
+;; ---------------------------------------------------------------------------
+
+(defn no-floats?
+  [v]
+  (cond
+    (map? v) (every? no-floats? (vals v))
+    (or (vector? v) (seq? v)) (every? no-floats? v)
+    :else (not (float? v))))
+
+(deftest decimal-strings-in-and-out-everywhere
+  (let [[l1 d1] (derive+fold led/empty-ledger
+                             (fill-fact {:fill-id "t1" :qty "3"
+                                         :price "550.10" :fees "0.35"})
+                             open-buy)
+        [l2 d2] (derive+fold l1
+                             (fill-fact {:fill-id "t2" :qty "1"
+                                         :price "555.55"
+                                         :broker-order-id "sim-2"
+                                         :intent-id "oi_close"})
+                             close-sell)]
+    (testing "no binary floats anywhere in derived facts or ledger state"
+      (is (no-floats? (mapv :fact/payload (concat d1 d2))))
+      (is (no-floats? l2)))
+    (testing "amounts are decimal STRINGS"
+      (is (string? (get-in l2 [:ledger/cash-by-account account-id])))
+      (is (every? #(string? (:cash/amount %)) (:ledger/cash-movements l2)))
+      (is (every? #(string? (:lot-close/realized-pnl %))
+                  (:ledger/closed-lots l2))))))
+
+;; ---------------------------------------------------------------------------
+;; Deterministic identity + idempotence
+;; ---------------------------------------------------------------------------
+
+(deftest idempotent-re-derivation-through-real-fact-store
+  (let [store (fs/make-fact-store ":memory:")
+        fill (fill-fact {:fill-id "t1" :qty "2" :price "550.00" :fees "1.00"})
+        d1 (led/derive-ledger-facts led/empty-ledger fill open-buy)
+        d2 (led/derive-ledger-facts led/empty-ledger fill open-buy)
+        r1 (p/append-facts! store d1)
+        r2 (p/append-facts! store d2)]
+    (testing "first append inserts everything"
+      (is (= 3 (count (:appended r1))))
+      (is (= [] (:duplicates r1))))
+    (testing "re-derivation appends NOTHING new (dedupe keys absorb it)"
+      (is (= [] (:appended r2)))
+      (is (= 3 (count (:duplicates r2)))))
+    (testing "the log holds each derived fact exactly once"
+      (is (= 1 (count (p/facts-by store
+                                  {:fact-type :fact/position-lot-opened}))))
+      (is (= 2 (count (p/facts-by store
+                                  {:fact-type :fact/cash-movement-recorded})))))
+    (testing "folding both derivations yields = ledger state"
+      (let [after-first (led/fold-ledger-facts led/empty-ledger d1)
+            after-both (led/fold-ledger-facts after-first d2)]
+        (is (= after-first after-both))))))
+
+(deftest same-fill-id-different-accounts-both-produce-facts
+  (let [fill-a (fill-fact {:fill-id "t1" :qty "1" :price "550.00"
+                           :account "account/sim/test"})
+        fill-b (fill-fact {:fill-id "t1" :qty "1" :price "550.00"
+                           :account "account/alpaca/paper-ops"})
+        ctx-b (ctx :position-effect/open :order-side/buy
+                   :account "account/alpaca/paper-ops")
+        d-a (led/derive-ledger-facts led/empty-ledger fill-a open-buy)
+        ledger-a (led/fold-ledger-facts led/empty-ledger d-a)
+        d-b (led/derive-ledger-facts ledger-a fill-b ctx-b)
+        ledger (led/fold-ledger-facts ledger-a d-b)
+        store (fs/make-fact-store ":memory:")
+        res (p/append-facts! store (concat d-a d-b))]
+    (testing "no silent drop: both accounts derived ledger facts"
+      (is (= 2 (count d-a)))
+      (is (= 2 (count d-b))))
+    (testing "dedupe keys differ (full broker context in the key)"
+      (is (= [] (:duplicates res)))
+      (is (= 4 (count (:appended res)))))
+    (testing "two distinct lots exist, one per account"
+      (is (= 2 (count (led/open-lots ledger))))
+      (is (= #{"account/sim/test" "account/alpaca/paper-ops"}
+             (into #{} (map :lot/account-id (led/open-lots ledger))))))
+    (testing "cash tracked per account"
+      (is (= {"account/sim/test" "-550.00"
+              "account/alpaca/paper-ops" "-550.00"}
+             (:ledger/cash-by-account ledger))))))
+
+(deftest fold-is-deterministic-and-duplicate-safe
+  (let [fill1 (fill-fact {:fill-id "t1" :qty "3" :price "550.00"})
+        fill2 (fill-fact {:fill-id "t2" :qty "1" :price "555.00"
+                          :broker-order-id "sim-2" :intent-id "oi_close"})
+        d1 (led/derive-ledger-facts led/empty-ledger fill1 open-buy)
+        l1 (led/fold-ledger-facts led/empty-ledger d1)
+        d2 (led/derive-ledger-facts l1 fill2 close-sell)
+        all (vec (concat d1 d2))
+        once (led/fold-ledger-facts led/empty-ledger all)
+        ;; fold the full list TWICE over the same state
+        twice (led/fold-ledger-facts once all)
+        ;; and fold two independent passes from empty
+        replayed (led/fold-ledger-facts led/empty-ledger all)]
+    (is (= once twice))
+    (is (= once replayed))))
+
+(deftest derive-requires-intent-ctx
+  (let [fill (fill-fact {:fill-id "t1" :qty "1" :price "550.00"})]
+    (is (thrown? python/Exception
+                 (led/derive-ledger-facts led/empty-ledger fill nil)))
+    (is (thrown? python/Exception
+                 (led/derive-ledger-facts led/empty-ledger fill
+                                          (dissoc open-buy
+                                                  :order-intent/effect))))))
+
+;; ---------------------------------------------------------------------------
+;; Fold never consumes raw fills
+;; ---------------------------------------------------------------------------
+
+(deftest fold-ignores-raw-fill-facts
+  (let [fill (fill-fact {:fill-id "t1" :qty "2" :price "550.00"})]
+    (is (= led/empty-ledger (led/fold-ledger-fact led/empty-ledger fill)))))

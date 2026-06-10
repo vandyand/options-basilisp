@@ -31,13 +31,28 @@
     reconciliation is skipped (the outcome is computed from replay alone) —
     callers in live/paper modes must pass a broker.
   - :degraded-ready exists in the outcome enum but no degradation policy
-    feeds it yet (kept simple; nothing maps to it in this phase)."
+    feeds it yet (kept simple; nothing maps to it in this phase).
+  - Ledger/portfolio rebuild (Phase 6, LEDGER_AND_PORTFOLIO §2.4): when the
+    recovery outcome is :ready/:degraded-ready, the WHOLE log's fills +
+    derived ledger facts are replayed through ledger.core/replay-ledger —
+    the same derive/fold code the runtime uses (no recovery-only derivation
+    logic). Intent context for each fill is read from the recovered
+    :engine/unresolved-orders entry (resolved orders stay there for exactly
+    this lookup). Any ledger facts missing from the log are derived and
+    appended; deterministic dedupe keys make the append idempotent. The
+    rebuilt portfolio replaces :engine/portfolio so the post-recovery state
+    is never stale; ledger state is returned as :recovery/ledger for the
+    runtime to keep folding. The replay covers the FULL log (not just the
+    snapshot tail) because ledger state is not snapshotted in v0.1."
   (:import datetime)
-  (:require [stevetrading.domain.schemas :as sch]
+  (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.schemas :as sch]
             [stevetrading.engine.fold :as fold]
             [stevetrading.engine.machines :as m]
             [stevetrading.engine.state :as st]
-            [stevetrading.persistence.protocol :as p]))
+            [stevetrading.ledger.core :as ledger]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.portfolio.core :as portfolio]))
 
 ;; ---------------------------------------------------------------------------
 ;; Pure planner (§9)
@@ -187,6 +202,53 @@
      :emitted-facts (:emitted-facts res)}))
 
 ;; ---------------------------------------------------------------------------
+;; Ledger + portfolio rebuild (Phase 6 wiring)
+;; ---------------------------------------------------------------------------
+
+(defn order-entry->intent-ctx
+  "Build the ledger.core intent-ctx from a §4.3 unresolved-order entry
+  (resolved orders stay in the map, so this works for terminal orders too).
+  Returns nil when the entry is nil or lacks the intent effect (an entry
+  recovered from a pre-Phase-6 snapshot with no :order/effect cannot drive
+  derivation — the fill is reported as skipped, never guessed)."
+  [entry]
+  (when (and (some? entry) (some? (:order/effect entry)))
+    {:order-intent/id (:order/intent-id entry)
+     :order-intent/effect (:order/effect entry)
+     :order-intent/side (:order/side entry)
+     :order-intent/account-id (:order/account-id entry)
+     :order-intent/strategy-id (:order/strategy-id entry)
+     :order-intent/instrument-id (:order/instrument-id entry)}))
+
+(defn- ledger-stream
+  "All fills + derived ledger facts in the log, in offset order — the
+  replay-ledger input."
+  [fact-store]
+  (->> (cons :fact/fill-observed (seq enums/ledger-fact-types))
+       (mapcat #(p/facts-by fact-store {:fact-type %}))
+       (sort-by :fact-log/offset)
+       vec))
+
+(defn- rebuild-ledger!
+  "Replay the whole log's fills + ledger facts through the runtime
+  derive/fold path, append any newly derived ledger facts (dedupe-key
+  idempotent), and refresh :engine/portfolio from the rebuilt ledger.
+  Returns {:state state' :ledger ledger-state :skipped-fills [...]}."
+  [fact-store state]
+  (let [intent-ctx-fn (fn [fill-fact]
+                        (order-entry->intent-ctx
+                         (st/unresolved-order
+                          state
+                          (get-in fill-fact [:fact/payload :order-intent/id]))))
+        {:keys [ledger derived-facts skipped-fills]}
+        (ledger/replay-ledger (ledger-stream fact-store) intent-ctx-fn)]
+    (when (seq derived-facts)
+      (p/append-facts! fact-store derived-facts))
+    {:state (assoc state :engine/portfolio (portfolio/derive-portfolio ledger))
+     :ledger ledger
+     :skipped-fills skipped-fills}))
+
+;; ---------------------------------------------------------------------------
 ;; Impure executor (§10 steps 1-13)
 ;; ---------------------------------------------------------------------------
 
@@ -208,7 +270,11 @@
            :recovery/mode .. :recovery/lifecycle ..
            :engine/state .. :recovery/facts [replayed + reconciliation]
            :recovery/warnings [...]} — :recovery-failed adds
-  :recovery/error instead of :engine/state."
+  :recovery/error instead of :engine/state. On :ready/:degraded-ready the
+  result additionally carries :recovery/ledger (rebuilt ledger state — the
+  runtime keeps folding from it) and :recovery/skipped-ledger-fills (fill
+  record ids with no resolvable intent context), and :engine/portfolio in
+  the returned state has been refreshed from the rebuilt ledger."
   [{:keys [fact-store snapshot-store control-plane mode run-mode broker
            scope run-info now]
     :or {run-mode :mode/sim}}]
@@ -312,6 +378,12 @@
                           :recovery-failed :recovery-failed}
                          lifecycle
                          :recovery-failed)
+            ;; Phase 6: rebuild ledger state + portfolio from the full log
+            ;; (skipped when blocked — unresolved lineage means intent ctx
+            ;; cannot be trusted for derivation)
+            ledger-res (when (contains? #{:ready :degraded-ready} outcome)
+                         (rebuild-ledger! fact-store state))
+            state (if ledger-res (:state ledger-res) state)
             all-facts (vec (concat tail (:new-facts rec-res)))
             completed-at (now-fn)
             _ (p/append-facts!
@@ -323,12 +395,16 @@
                                 :recovery/reconciliation-facts
                                 (count (:new-facts rec-res))}
                                completed-at)])]
-        {:recovery/outcome outcome
-         :recovery/mode recovery-mode
-         :recovery/lifecycle lifecycle
-         :engine/state state
-         :recovery/facts all-facts
-         :recovery/warnings warnings})
+        (cond-> {:recovery/outcome outcome
+                 :recovery/mode recovery-mode
+                 :recovery/lifecycle lifecycle
+                 :engine/state state
+                 :recovery/facts all-facts
+                 :recovery/warnings warnings}
+          (some? ledger-res)
+          (assoc :recovery/ledger (:ledger ledger-res)
+                 :recovery/skipped-ledger-fills
+                 (vec (:skipped-fills ledger-res)))))
       (catch python/Exception e
         {:recovery/outcome :recovery-failed
          :recovery/mode mode

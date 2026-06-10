@@ -1,0 +1,441 @@
+(ns stevetrading.ledger.core
+  "Canonical ledger: derivation of durable ledger facts from fills, and the
+  pure fold that rebuilds canonical financial state from those facts.
+
+  Normative: LEDGER_AND_PORTFOLIO_MODEL_V0.1 (whole doc),
+  CANONICAL_SCHEMAS §5.2.4-§5.2.5 (broker context / fill identity).
+
+  Two explicit layers (the derive/fold split):
+
+  1. `derive-ledger-facts` (pure) — given current ledger state, one
+     :fact/fill-observed envelope, and the originating intent context,
+     produce the derived ledger fact ENVELOPES (:fact/position-lot-opened,
+     :fact/position-lot-closed, :fact/cash-movement-recorded). Every derived
+     fact carries a deterministic :fact/dedupe-key embedding the FULL
+     canonical fill identity, so re-derivation after restart appends nothing
+     new (the fact store's dedupe-key uniqueness absorbs it) while identical
+     :fill/id values from DIFFERENT accounts/brokers never collide:
+
+       fill-key = <source-system>/<account-id>/<broker-order-id>/<fill-id>
+       lot open : \"lot-open/\"  + fill-key
+       lot close: \"lot-close/\" + fill-key + \"/\" + source-lot-id
+       cash     : \"cash/\"      + fill-key + \"/\" + category-name
+
+  2. `fold-ledger-fact` (pure) — consumes the DERIVED ledger facts (never
+     raw fills) into ledger state. Folding is idempotent per dedupe key
+     (:ledger/applied-keys), and uses only the fact's payload + dedupe key —
+     never the derived fact's own :record/id — so two independently derived
+     copies of the same logical fact fold to `=` state.
+
+  Documented decisions:
+  - Lot id = \"lot-\" + fill-key (NOT bare \"lot-\" + fill-id): fill ids are
+    only unique within broker context (CANONICAL_SCHEMAS §5.2.4-§5.2.5), so
+    the lot id embeds the same full fill identity as the dedupe key. Two
+    fills sharing :fill/id under different account ids produce two distinct
+    lots.
+  - Opening vs closing effect comes from the originating intent's
+    :order-intent/effect, supplied via intent-ctx at derivation time (the
+    fill payload itself carries no effect).
+  - FIFO close scope: closes consume open lots matching [account-id,
+    instrument-id] whose side is OPPOSITE the closing fill's side, in lot
+    open order, with partial-close splitting. Strategy attribution of the
+    close comes from the consumed lot (the lot's strategy-id), not the
+    closing intent.
+  - Over-close: a closing fill larger than the available open quantity
+    consumes everything available and derives NO lot fact for the remainder
+    (no silent short flip); the trade-principal cash movement still records
+    the full fill amount because the cash effect is real. The mismatch is
+    reconciliation's problem, not the ledger's.
+  - Realized P&L per closed lot is price-only: (close - open) x qty for
+    long lots, (open - close) x qty for short lots. Fees are realized the
+    moment they are paid, as :cash/fees movements — portfolio.core nets
+    them into headline realized P&L (see portfolio.core docstring). This
+    keeps all Decimal math exact (no pro-rata fee division).
+  - Cash sign is by fill side regardless of effect: buy -> principal out
+    (negative), sell -> principal in (positive). Fees are always negative.
+  - :fact/position-mark-recorded folds into :ledger/marks (latest mark per
+    instrument) per LEDGER §8 'marks stored durably are typed as marks'.
+  - Timestamps on derived facts copy the fill's occurred-at/recorded-at
+    (derivation is deterministic: no clock reads; the only fresh value is
+    the envelope's :record/id, which the fold ignores)."
+  (:import decimal)
+  (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.schemas :as sch]))
+
+(def ledger-version 1)
+
+(def empty-ledger
+  {:ledger/version ledger-version
+   ;; lot-id → lot map; lots stay here after full close (lineage), with
+   ;; :lot/remaining-quantity "0"
+   :ledger/lots {}
+   ;; lot ids in open order — the FIFO queue (filtered at close time)
+   :ledger/lot-order []
+   ;; close records (one per consumed lot portion), in fold order
+   :ledger/closed-lots []
+   ;; cash movement payloads, in fold order
+   :ledger/cash-movements []
+   ;; account-id → balance decimal-string
+   :ledger/cash-by-account {}
+   ;; instrument-id → {:mark/price .. :mark/at ..} (latest durable mark)
+   :ledger/marks {}
+   ;; dedupe keys already folded (idempotence)
+   :ledger/applied-keys #{}
+   ;; defensive: facts that could not be applied (e.g. close for unknown lot)
+   :ledger/anomalies []
+   ;; highest :fact-log/offset seen across folded/derived-from facts
+   :ledger/source-watermark nil})
+
+;; ---------------------------------------------------------------------------
+;; Decimal helpers (decimal strings durable, Decimal math internal)
+;; ---------------------------------------------------------------------------
+
+(defn- ->dec
+  [s]
+  (decimal/Decimal (or s "0")))
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn- kw-str
+  "Render a keyword as \"ns/name\" (no leading colon) for identity strings."
+  [k]
+  (if (keyword? k)
+    (if (namespace k) (str (namespace k) "/" (name k)) (name k))
+    (str k)))
+
+;; ---------------------------------------------------------------------------
+;; Fill identity (CANONICAL_SCHEMAS §5.2.4-§5.2.5)
+;; ---------------------------------------------------------------------------
+
+(defn fill-key
+  "Full canonical fill identity string:
+  <source-system>/<account-id>/<broker-order-id>/<fill-id>.
+  account-id comes from intent-ctx (canonical broker context), matching the
+  engine fold's fill dedupe tuple."
+  [fill-fact account-id]
+  (let [payload (:fact/payload fill-fact)]
+    (str (kw-str (:broker/source-system payload)) "/"
+         account-id "/"
+         (:broker/order-id payload) "/"
+         (:fill/id payload))))
+
+;; ---------------------------------------------------------------------------
+;; Derivation (layer 1)
+;; ---------------------------------------------------------------------------
+
+(def ^:private intent-ctx-required
+  [:order-intent/id :order-intent/effect :order-intent/side
+   :order-intent/account-id])
+
+(defn- check-intent-ctx!
+  [intent-ctx fill-fact]
+  (let [missing (remove #(some? (get intent-ctx %)) intent-ctx-required)]
+    (when (seq missing)
+      (throw (ex-info "intent-ctx missing required keys for ledger derivation"
+                      {:error/code :error/missing-key
+                       :error/missing (vec missing)
+                       :fill/fact-id (:record/id fill-fact)})))))
+
+(defn- derived-envelope
+  "Common envelope for a derived ledger fact: lineage copied from the fill,
+  causation = the fill's fact id, deterministic dedupe key."
+  [fill-fact fact-type dedupe-key strategy-id account-id instrument-id payload]
+  (sch/fact-envelope
+   (into {}
+         (filter (comp some? val)
+                 {:record/type fact-type
+                  :record/mode (:record/mode fill-fact)
+                  :record/correlation-id (:record/correlation-id fill-fact)
+                  :record/strategy-id strategy-id
+                  :record/account-id account-id
+                  :record/instrument-id instrument-id
+                  :record/source-system :engine/ledger
+                  :record/causation-ids [(:record/id fill-fact)]
+                  :fact/dedupe-key dedupe-key
+                  :fact/occurred-at (:fact/occurred-at fill-fact)
+                  :fact/recorded-at (:fact/recorded-at fill-fact)
+                  :fact/payload payload}))))
+
+(defn open-lots
+  "Open lots (remaining > 0) in FIFO (open) order."
+  [ledger]
+  (->> (:ledger/lot-order ledger)
+       (map #(get-in ledger [:ledger/lots %]))
+       (filterv #(> (->dec (:lot/remaining-quantity %)) dec-zero))))
+
+(defn- consumable-lots
+  "Open lots a closing fill may consume, FIFO: same account + instrument,
+  side opposite the closing fill's side."
+  [ledger account-id instrument-id close-side]
+  (let [open-side (if (= :order-side/sell close-side)
+                    :order-side/buy
+                    :order-side/sell)]
+    (filterv #(and (= account-id (:lot/account-id %))
+                   (= instrument-id (:lot/instrument-id %))
+                   (= open-side (:lot/side %)))
+             (open-lots ledger))))
+
+(defn- cash-fact
+  [fill-fact fk category amount-str strategy-id account-id instrument-id
+   occurred-at]
+  (derived-envelope
+   fill-fact :fact/cash-movement-recorded
+   (str "cash/" fk "/" (name category))
+   strategy-id account-id instrument-id
+   {:cash/category category
+    :cash/amount amount-str
+    :cash/account-id account-id
+    :cash/strategy-id strategy-id
+    :cash/instrument-id instrument-id
+    :cash/fill-key fk
+    :cash/occurred-at occurred-at}))
+
+(defn derive-ledger-facts
+  "Pure derivation: (derive-ledger-facts ledger-state fill-fact intent-ctx)
+  → vector of derived ledger fact envelopes.
+
+  intent-ctx (from the originating order intent — at runtime/recovery this
+  is read from the :engine/unresolved-orders entry, which retains resolved
+  orders for exactly this lookup):
+    :order-intent/id            originating intent id (required)
+    :order-intent/effect        :position-effect/open | :position-effect/close (required)
+    :order-intent/side          :order-side/buy | :order-side/sell (required)
+    :order-intent/account-id    canonical account id (required)
+    :order-intent/strategy-id   strategy id (optional, falls back to fill)
+    :order-intent/instrument-id instrument id (optional; the fill envelope's
+                                :record/instrument-id wins — per leg)
+
+  Open effect  → [:fact/position-lot-opened, principal cash, fees cash?]
+  Close effect → [:fact/position-lot-closed per consumed lot (FIFO,
+                  partial-close splitting), principal cash, fees cash?]
+
+  Fees: an optional :fill/fees decimal-string on the fill payload derives a
+  :cash/fees movement (negative).
+
+  Throws ex-info when intent-ctx is nil/incomplete — callers that cannot
+  resolve intent context must skip derivation explicitly (see
+  replay-ledger), never silently drop fills inside this fn."
+  [ledger fill-fact intent-ctx]
+  (check-intent-ctx! intent-ctx fill-fact)
+  (let [payload (:fact/payload fill-fact)
+        effect (:order-intent/effect intent-ctx)
+        side (:order-intent/side intent-ctx)
+        account-id (:order-intent/account-id intent-ctx)
+        strategy-id (or (:order-intent/strategy-id intent-ctx)
+                        (:record/strategy-id fill-fact))
+        instrument-id (or (:record/instrument-id fill-fact)
+                          (:order-intent/instrument-id intent-ctx))
+        fk (fill-key fill-fact account-id)
+        qty (->dec (:fill/quantity payload))
+        price (->dec (:fill/price payload))
+        principal (* price qty)
+        occurred-at (or (:fill/occurred-at payload)
+                        (:fact/occurred-at fill-fact))
+        ;; cash sign by side: buy pays, sell receives
+        principal-str (str (if (= :order-side/buy side)
+                             (- principal)
+                             principal))
+        principal-fact (cash-fact fill-fact fk :cash/trade-principal
+                                  principal-str strategy-id account-id
+                                  instrument-id occurred-at)
+        fees (:fill/fees payload)
+        fees-fact (when (and (some? fees)
+                             (> (->dec fees) dec-zero))
+                    (cash-fact fill-fact fk :cash/fees
+                               (str (- (->dec fees)))
+                               strategy-id account-id instrument-id
+                               occurred-at))
+        lot-facts
+        (if (= :position-effect/open effect)
+          [(derived-envelope
+            fill-fact :fact/position-lot-opened
+            (str "lot-open/" fk)
+            strategy-id account-id instrument-id
+            {:lot/id (str "lot-" fk)
+             :lot/fill-key fk
+             :lot/fill-id (:fill/id payload)
+             :lot/order-intent-id (:order-intent/id intent-ctx)
+             :lot/instrument-id instrument-id
+             :lot/account-id account-id
+             :lot/strategy-id strategy-id
+             :lot/side side
+             :lot/opened-at occurred-at
+             :lot/quantity (str qty)
+             :lot/price (str price)
+             :lot/cost-basis (str principal)})]
+          ;; close: consume FIFO with partial-close splitting
+          (loop [lots (consumable-lots ledger account-id instrument-id side)
+                 remaining qty
+                 acc []]
+            (if (or (empty? lots) (<= remaining dec-zero))
+              ;; over-close remainder derives no lot fact (documented above)
+              acc
+              (let [lot (first lots)
+                    lot-remaining (->dec (:lot/remaining-quantity lot))
+                    take-qty (if (< lot-remaining remaining)
+                               lot-remaining
+                               remaining)
+                    open-price (->dec (:lot/price lot))
+                    ;; long lot: close - open; short lot: open - close
+                    pnl (if (= :order-side/buy (:lot/side lot))
+                          (* (- price open-price) take-qty)
+                          (* (- open-price price) take-qty))
+                    close-fact
+                    (derived-envelope
+                     fill-fact :fact/position-lot-closed
+                     (str "lot-close/" fk "/" (:lot/id lot))
+                     ;; strategy attribution from the consumed lot
+                     (:lot/strategy-id lot) account-id instrument-id
+                     {:lot/id (:lot/id lot)
+                      :lot/instrument-id instrument-id
+                      :lot/account-id account-id
+                      :lot/strategy-id (:lot/strategy-id lot)
+                      :lot/side (:lot/side lot)
+                      :lot-close/quantity (str take-qty)
+                      :lot-close/price (str price)
+                      :lot-close/closed-at occurred-at
+                      :lot-close/closing-order-intent-id
+                      (:order-intent/id intent-ctx)
+                      :lot-close/closing-fill-id (:fill/id payload)
+                      :lot-close/closing-fill-key fk
+                      :lot-close/basis (str (* open-price take-qty))
+                      :lot-close/proceeds (str (* price take-qty))
+                      :lot-close/realized-pnl (str pnl)})]
+                (recur (rest lots) (- remaining take-qty)
+                       (conj acc close-fact))))))]
+    (vec (concat lot-facts
+                 [principal-fact]
+                 (when fees-fact [fees-fact])))))
+
+;; ---------------------------------------------------------------------------
+;; Fold (layer 2)
+;; ---------------------------------------------------------------------------
+
+(defn- advance-watermark
+  "Track the highest :fact-log/offset seen (facts folded straight from
+  derivation carry no offset — nil-safe)."
+  [ledger fact]
+  (if-let [offset (:fact-log/offset fact)]
+    (update ledger :ledger/source-watermark
+            (fn [wm] (if (or (nil? wm) (> offset wm)) offset wm)))
+    ledger))
+
+(defn- mark-applied
+  [ledger dedupe-key]
+  (if (some? dedupe-key)
+    (update ledger :ledger/applied-keys conj dedupe-key)
+    ledger))
+
+(defn- apply-lot-opened
+  [ledger payload]
+  (let [lot (assoc payload :lot/remaining-quantity (:lot/quantity payload))]
+    (-> ledger
+        (assoc-in [:ledger/lots (:lot/id payload)] lot)
+        (update :ledger/lot-order conj (:lot/id payload)))))
+
+(defn- apply-lot-closed
+  [ledger payload dedupe-key]
+  (let [lot (get-in ledger [:ledger/lots (:lot/id payload)])]
+    (if (nil? lot)
+      (update ledger :ledger/anomalies conj
+              {:anomaly/kind :ledger/close-for-unknown-lot
+               :lot/id (:lot/id payload)
+               :fact/dedupe-key dedupe-key})
+      (-> ledger
+          (assoc-in [:ledger/lots (:lot/id payload) :lot/remaining-quantity]
+                    (str (- (->dec (:lot/remaining-quantity lot))
+                            (->dec (:lot-close/quantity payload)))))
+          (update :ledger/closed-lots conj payload)))))
+
+(defn- apply-cash-movement
+  [ledger payload]
+  (-> ledger
+      (update :ledger/cash-movements conj payload)
+      (update-in [:ledger/cash-by-account (:cash/account-id payload)]
+                 (fn [balance]
+                   (str (+ (->dec (or balance "0"))
+                           (->dec (:cash/amount payload))))))))
+
+(defn- apply-mark-recorded
+  [ledger fact payload]
+  (assoc-in ledger [:ledger/marks (or (:record/instrument-id fact)
+                                      (:mark/instrument-id payload))]
+            {:mark/price (:mark/price payload)
+             :mark/at (or (:mark/at payload) (:fact/occurred-at fact))}))
+
+(defn fold-ledger-fact
+  "Pure fold of one DERIVED ledger fact (never a raw fill) into ledger
+  state. Idempotent per :fact/dedupe-key — a fact whose dedupe key has
+  already been folded is a no-op (apart from watermark advancement when the
+  duplicate carries a higher :fact-log/offset). Uses only the payload and
+  dedupe key, never the derived fact's own :record/id, so independently
+  re-derived copies fold to `=` state. Non-ledger fact types fold to the
+  unchanged state."
+  [ledger fact]
+  (let [fact-type (:record/type fact)]
+    (if-not (contains? enums/ledger-fact-types fact-type)
+      ledger
+      (let [dedupe-key (:fact/dedupe-key fact)
+            ledger (advance-watermark ledger fact)
+            payload (:fact/payload fact)]
+        (if (and (some? dedupe-key)
+                 (contains? (:ledger/applied-keys ledger) dedupe-key))
+          ledger
+          (-> (cond
+                (= :fact/position-lot-opened fact-type)
+                (apply-lot-opened ledger payload)
+
+                (= :fact/position-lot-closed fact-type)
+                (apply-lot-closed ledger payload dedupe-key)
+
+                (= :fact/cash-movement-recorded fact-type)
+                (apply-cash-movement ledger payload)
+
+                (= :fact/position-mark-recorded fact-type)
+                (apply-mark-recorded ledger fact payload)
+
+                :else ledger)
+              (mark-applied dedupe-key)))))))
+
+(defn fold-ledger-facts
+  [ledger facts]
+  (reduce fold-ledger-fact ledger facts))
+
+;; ---------------------------------------------------------------------------
+;; Replay (recovery + rebuild path — same derive/fold code as runtime)
+;; ---------------------------------------------------------------------------
+
+(defn replay-ledger
+  "Rebuild ledger state from an offset-ordered stream of fills + derived
+  ledger facts (the runtime fold path applied in bulk — there is no
+  recovery-only derivation logic).
+
+  For each :fact/fill-observed: look up intent context via intent-ctx-fn
+  (fn [fill-fact] → intent-ctx or nil), derive ledger facts against the
+  CURRENT ledger state, and fold them immediately — so a later closing fill
+  sees the lots opened by an earlier fill. Fills with nil intent-ctx are
+  skipped and reported (never silently dropped).
+
+  Derived ledger facts already present in the log arrive later in the
+  stream (their offsets are always greater than their fill's) and fold as
+  dedupe-key no-ops; their offsets still advance the source watermark.
+
+  Returns {:ledger ledger-state
+           :derived-facts [every derived envelope — append these through
+                           the fact store; its dedupe-key uniqueness keeps
+                           the operation idempotent]
+           :skipped-fills [record ids of fills with no intent context]}."
+  [facts intent-ctx-fn]
+  (reduce
+   (fn [acc fact]
+     (if (= :fact/fill-observed (:record/type fact))
+       (if-let [ctx (intent-ctx-fn fact)]
+         (let [ledger (advance-watermark (:ledger acc) fact)
+               derived (derive-ledger-facts ledger fact ctx)]
+           (-> acc
+               (assoc :ledger (fold-ledger-facts ledger derived))
+               (update :derived-facts into derived)))
+         (update acc :skipped-fills conj (:record/id fact)))
+       (update acc :ledger fold-ledger-fact fact)))
+   {:ledger empty-ledger :derived-facts [] :skipped-fills []}
+   facts))

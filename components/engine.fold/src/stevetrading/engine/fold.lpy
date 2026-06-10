@@ -179,6 +179,9 @@
                                                :instrument/id]))
              :order/quantity (:order-intent/quantity payload)
              :order/side (:order-intent/side payload)
+             ;; retained for ledger derivation (Phase 6): opening vs closing
+             ;; effect of every fill comes from the originating intent
+             :order/effect (:order-intent/effect payload)
              :order/route (or (:order-intent/route payload)
                               (:record/source-system fact))
              :order/broker-order-id nil
