@@ -215,14 +215,14 @@ Goal: the imperative shell + first full session. **Status: COMPLETE (commit 23c5
 
 ## Phase 9: Options Execution Path
 
-Goal: multi-leg instruments end to end. Normative: CANONICAL_SCHEMAS §11.3/§12.3, BROKER_ADAPTER §5.3, LEDGER §5.
+Goal: multi-leg instruments end to end. **Status: COMPLETE (commit 3883b00)** — per-leg fill side from intent legs (fills carry no side); multi-leg filled-quantity = spread units (min across legs); spread strike config in feature manifest :spread params; replay marks now track replay position (Phase 8 static-marks revised); engine-replay CLI flag is --strategies (comma-separated; unknown flags silently ignored — polish candidate). Normative: CANONICAL_SCHEMAS §11.3/§12.3, BROKER_ADAPTER §5.3, LEDGER §5.
 
-- [ ] Extend `execution.core`: policy `:execution/vertical-credit-spread-v1` — two-leg intent (sell near strike, buy far strike, same expiry, both puts or calls; legs canonically sorted; net-credit limit price); policy `:execution/iron-condor-v1` — 4-leg (put spread + call spread) single intent.
-- [ ] Extend `broker.sim`: per-leg fills for multi-leg intents (one `:fact/fill-observed` per leg sharing broker-order-id, leg-identified by `:fill/instrument-id`); per-leg marks for pricing.
-- [ ] Extend `ledger.core`/`portfolio.core` where needed: per-leg lots keyed by instrument-id (short legs = negative qty lots); spread P&L nets across legs (likely already works — prove with tests).
-- [ ] Strategy `strategy/simple-vol/credit-spread/v1` (data at `resources/strategies/simple-vol-credit-spread-v1.edn`): consumes `:fact/option-chain-observed`; feature `:feature/chain-mid-width` (mid of spread credit from chain quotes); signal: enter spread when credit ≥ threshold param, flatten at session end; risk policy `:risk/defined-risk-spread` (max 1 spread, max width × qty risk cap); inference: `:model.type/threshold` model artifact.
-- [ ] Fixture `resources/fixtures/replay/options-session-v0.1.edn`: bars + 2 chain snapshots (entry-attractive then exit), expected outputs covering 2-leg intent lifecycle.
-- [ ] Tests `tests/options/test_spread_e2e.lpy` — leg ordering: same legs in different declaration order → same `order-intent-id`; different leg set → different id; replay of options fixture → spread opened (2 lots, one short one long) and flattened; portfolio nets to zero position with realized P&L = credit − debit − fees; 4-leg iron-condor intent builds with 4 canonical legs and round-trips the sim broker.
+- [x] Extend `execution.core`: policy `:execution/vertical-credit-spread-v1` — two-leg intent (sell near strike, buy far strike, same expiry, both puts or calls; legs canonically sorted; net-credit limit price); policy `:execution/iron-condor-v1` — 4-leg (put spread + call spread) single intent.
+- [x] Extend `broker.sim`: per-leg fills for multi-leg intents (one `:fact/fill-observed` per leg sharing broker-order-id, leg-identified by `:fill/instrument-id`); per-leg marks for pricing.
+- [x] Extend `ledger.core`/`portfolio.core` where needed: per-leg lots keyed by instrument-id (short legs = negative qty lots); spread P&L nets across legs (likely already works — prove with tests).
+- [x] Strategy `strategy/simple-vol/credit-spread/v1` (data at `resources/strategies/simple-vol-credit-spread-v1.edn`): consumes `:fact/option-chain-observed`; feature `:feature/chain-mid-width` (mid of spread credit from chain quotes); signal: enter spread when credit ≥ threshold param, flatten at session end; risk policy `:risk/defined-risk-spread` (max 1 spread, max width × qty risk cap); inference: `:model.type/threshold` model artifact.
+- [x] Fixture `resources/fixtures/replay/options-session-v0.1.edn`: bars + 2 chain snapshots (entry-attractive then exit), expected outputs covering 2-leg intent lifecycle.
+- [x] Tests `tests/options/test_spread_e2e.lpy` — leg ordering: same legs in different declaration order → same `order-intent-id`; different leg set → different id; replay of options fixture → spread opened (2 lots, one short one long) and flattened; portfolio nets to zero position with realized P&L = credit − debit − fees; 4-leg iron-condor intent builds with 4 canonical legs and round-trips the sim broker.
 
 **REPL checkpoints:**
 - build spread plan from sample chain → intent with 2 sorted legs; shuffle input leg order → identical intent id
