@@ -1,0 +1,182 @@
+(ns stevetrading.control-plane.file-store
+  "File-backed control-plane store (CONTROL_PLANE_MANIFESTS §3.2, §10;
+  PERSISTENCE_SCHEMA §3.3/§5.3). ADAPTER component — only bases may
+  require it.
+
+  Layout under <root>/:
+    revisions/<rev-id>.edn    immutable manifest revisions — writing an
+                              existing rev-id REFUSES (throws); revisions
+                              are never mutated in place
+    activations/<rev-id>.edn  activation records — one per revision;
+                              re-activating the same rev-id REFUSES
+                              (activation immutability)
+    active/<scope>.edn        the active-revision pointer per deployment
+                              scope, flipped atomically (tmp + os.replace)
+
+  Deployment scopes are filename-safe strings (no path separators);
+  default scope is \"deployment-main\".
+
+  activate! is the §10 sequence: validate the proposed revision → write
+  the revision (refusing content drift under an existing rev-id) → write
+  the activation record → atomically flip the scope pointer. Validation
+  failure or a prior activation returns {:activated? false ...} (no
+  partial writes)."
+  (:import datetime os os.path tempfile)
+  (:require [basilisp.edn :as edn]
+            [stevetrading.control-plane.protocol :as cpp]
+            [stevetrading.persistence.protocol :as pp]))
+
+(def default-scope "deployment-main")
+
+(defn- utc-now-str
+  []
+  (.strftime (datetime.datetime/now datetime.timezone/utc)
+             "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn- revision-path
+  [root rev-id]
+  (os.path/join root "revisions" (str rev-id ".edn")))
+
+(defn- activation-path
+  [root rev-id]
+  (os.path/join root "activations" (str rev-id ".edn")))
+
+(defn- active-path
+  [root scope]
+  (os.path/join root "active" (str scope ".edn")))
+
+(defn- read-edn-file
+  [path]
+  (when (os.path/exists path)
+    (edn/read-string (slurp path))))
+
+(defn- write-edn-atomic!
+  "Atomic EDN write: tmp file in the destination directory + os.replace."
+  [path value]
+  (let [dir (os.path/dirname path)
+        _ (os/makedirs dir ** :exist_ok true)
+        [fd tmp] (tempfile/mkstemp ** :dir dir :suffix ".tmp")]
+    (os/close fd)
+    (spit tmp (pr-str value))
+    (os/replace tmp path)))
+
+(defn- write-edn-new!
+  "Write an EDN file that must NOT already exist (immutability guard)."
+  [path value error-code what]
+  (when (os.path/exists path)
+    (throw (ex-info (str what " already exists: " path)
+                    {:error/code error-code
+                     :error/path path})))
+  (write-edn-atomic! path value))
+
+;; ---------------------------------------------------------------------------
+;; Store
+;; ---------------------------------------------------------------------------
+
+(defrecord FileControlPlaneStore [root]
+  pp/ControlPlaneStore
+
+  (active-revision [this scope]
+    (let [scope (or scope default-scope)
+          pointer (read-edn-file (active-path root scope))]
+      (when (some? pointer)
+        (when-let [manifest (read-edn-file
+                             (revision-path root
+                                            (:active/revision pointer)))]
+          (assoc manifest :control-plane/activation pointer)))))
+
+  (revision [this rev-id]
+    (read-edn-file (revision-path root rev-id))))
+
+(defn make-file-control-plane-store
+  [root]
+  (os/makedirs root ** :exist_ok true)
+  (->FileControlPlaneStore root))
+
+;; ---------------------------------------------------------------------------
+;; Writes
+;; ---------------------------------------------------------------------------
+
+(defn write-revision!
+  "Persist one immutable manifest revision. Refuses overwrite when the
+  rev-id already exists with DIFFERENT content (throws); writing identical
+  content again is a no-op (idempotent). Returns
+  {:revision/id .. :revision/path .. :revision/existing? bool}."
+  [store manifest]
+  (let [root (:root store)
+        rev-id (:control-plane/revision manifest)]
+    (when-not (and (string? rev-id) (pos? (count rev-id)))
+      (throw (ex-info "manifest has no :control-plane/revision"
+                      {:error/code :error/missing-revision-id})))
+    (let [path (revision-path root rev-id)
+          existing (read-edn-file path)]
+      (cond
+        (nil? existing)
+        (do (write-edn-new! path manifest :error/revision-exists "revision")
+            {:revision/id rev-id :revision/path path :revision/existing? false})
+
+        (= existing manifest)
+        {:revision/id rev-id :revision/path path :revision/existing? true}
+
+        :else
+        (throw (ex-info (str "revision " rev-id
+                             " already exists with different content — "
+                             "revisions are immutable")
+                        {:error/code :error/revision-exists
+                         :error/path path
+                         :revision/id rev-id}))))))
+
+(defn activation-record
+  [store rev-id]
+  (read-edn-file (activation-path (:root store) rev-id)))
+
+(defn activate!
+  "§10 activation: validate → write revision → write activation record →
+  atomic pointer flip. opts (explicit map, all optional):
+    :scope  deployment scope (default \"deployment-main\")
+    :actor  who activated (string)
+    :now    (fn [] iso-ts) clock override
+
+  Returns {:activated? true :revision/id .. :activation {..}
+           :validation {..}} on success;
+          {:activated? false :reason :validation-failed|:already-activated
+           ...} otherwise. Never leaves partial state: validation and the
+  already-activated guard run before any write."
+  [store manifest opts]
+  (let [root (:root store)
+        scope (or (:scope opts) default-scope)
+        now-fn (or (:now opts) utc-now-str)
+        rev-id (:control-plane/revision manifest)
+        validation (cpp/validate-manifest manifest)]
+    (cond
+      (not (:valid? validation))
+      {:activated? false
+       :reason :validation-failed
+       :revision/id rev-id
+       :validation validation}
+
+      (some? (activation-record store rev-id))
+      {:activated? false
+       :reason :already-activated
+       :revision/id rev-id
+       :activation (activation-record store rev-id)
+       :validation validation}
+
+      :else
+      (let [_ (write-revision! store manifest)
+            activation {:activation/revision rev-id
+                        :activation/scope scope
+                        :activation/activated-at (now-fn)
+                        :activation/actor (:actor opts)
+                        :activation/warnings (:warnings validation)}]
+        (write-edn-new! (activation-path root rev-id) activation
+                        :error/already-activated "activation record")
+        (write-edn-atomic! (active-path root scope)
+                           {:active/revision rev-id
+                            :active/scope scope
+                            :active/activated-at
+                            (:activation/activated-at activation)})
+        {:activated? true
+         :revision/id rev-id
+         :activation activation
+         :validation validation}))))

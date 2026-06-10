@@ -1,0 +1,200 @@
+(ns stevetrading.observability.structured-log
+  "JSON-lines structured audit sink (OBSERVABILITY §4, §11). ADAPTER
+  component — only bases may require it.
+
+  - Writes one JSON object per line to a file (append mode, opened per
+    emit — simple, crash-safe, no handle state) or to stdout when no
+    :path is configured.
+  - Keywords serialize as \"ns/name\" strings; maps/vectors/sets recurse;
+    anything non-JSON-native falls back to pr-str (identifiers stay
+    joinable per §11 — no canonical decision information lives ONLY
+    here, facts are the deeper truth).
+  - An in-memory ring buffer (default 256 entries) backs health-view:
+    {:health/recent [..] :health/audit-counts {event-type n}
+     :health/last-metrics {metric-name value} :health/sink {..}}.
+
+  Engine integration (§4 audit-event coverage): audit-relevant-fact-type?
+  + fact->audit-event derive audit events from appended canonical facts;
+  emit-fact-audits! is the hook the live base wires into the shared
+  engine loop's :on-facts seam — every appended fact of an audit-relevant
+  type (decision, order, broker outcome, recovery, lifecycle,
+  degradation, fault, control-plane) also emits an audit event."
+  (:import json)
+  (:require [stevetrading.observability.protocol :as op]))
+
+(def default-ring-size 256)
+
+;; ---------------------------------------------------------------------------
+;; JSON conversion (keywords → "ns/name" strings)
+;; ---------------------------------------------------------------------------
+
+(defn- kw->str
+  [k]
+  (if (some? (namespace k))
+    (str (namespace k) "/" (name k))
+    (name k)))
+
+(defn ->jsonable
+  "Recursively convert a Basilisp value into JSON-native Python data:
+  maps → dicts (keyword keys → \"ns/name\" strings), vectors/seqs/sets →
+  lists, keywords → strings, nil/bool/number/string pass through,
+  everything else → pr-str."
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple
+                      [(cond (keyword? k) (kw->str k)
+                             (string? k) k
+                             :else (pr-str k))
+                       (->jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (keyword? x) (kw->str x)
+    (or (nil? x) (boolean? x) (number? x) (string? x)) x
+    :else (pr-str x)))
+
+(defn- json-line
+  [m]
+  (json/dumps (->jsonable m) ** :sort_keys true))
+
+;; ---------------------------------------------------------------------------
+;; Sink
+;; ---------------------------------------------------------------------------
+
+(defn- write-line!
+  [path line]
+  (if (some? path)
+    (with-open [f (python/open path "a")]
+      (.write f (str line "\n")))
+    (println line)))
+
+(defn- ring-conj
+  [ring ring-size entry]
+  (let [ring (conj ring entry)]
+    (if (> (count ring) ring-size)
+      (vec (take-last ring-size ring))
+      ring)))
+
+(defrecord StructuredLogSink [path ring-size buffer]
+  op/AuditSink
+
+  (emit-audit! [this event]
+    (let [event (op/audit-event event)]
+      (write-line! path (json-line (assoc event :log/kind :log/audit)))
+      (swap! buffer
+             (fn [b]
+               (-> b
+                   (update :recent ring-conj ring-size
+                           (assoc event :log/kind :log/audit))
+                   (update-in [:audit-counts (:audit/event-type event)]
+                              (fnil inc 0)))))
+      event))
+
+  (emit-metric! [this metric]
+    (write-line! path (json-line (assoc metric :log/kind :log/metric)))
+    (swap! buffer
+           (fn [b]
+             (-> b
+                 (update :recent ring-conj ring-size
+                         (assoc metric :log/kind :log/metric))
+                 (assoc-in [:last-metrics (:metric/name metric)]
+                           (:metric/value metric)))))
+    metric)
+
+  (health-view [this]
+    (let [b @buffer]
+      {:health/recent (:recent b)
+       :health/audit-counts (:audit-counts b)
+       :health/last-metrics (:last-metrics b)
+       :health/sink {:sink/kind :sink/structured-log
+                     :sink/path path
+                     :sink/ring-size ring-size}})))
+
+(defn make-structured-log-sink
+  "Build a JSON-lines AuditSink. opts (explicit map):
+    :path       output file (append). nil → stdout.
+    :ring-size  in-memory health-view buffer size (default 256)."
+  [opts]
+  (->StructuredLogSink (:path opts)
+                       (or (:ring-size opts) default-ring-size)
+                       (atom {:recent []
+                              :audit-counts {}
+                              :last-metrics {}})))
+
+;; ---------------------------------------------------------------------------
+;; Engine integration: canonical facts → audit events (§4)
+;; ---------------------------------------------------------------------------
+
+(def fact-type->audit
+  "Audit-relevant canonical fact types (OBSERVABILITY §4) with their
+  event classification."
+  {:fact/recovery-started {:audit/event-type :audit/recovery
+                           :audit/severity :severity/info}
+   :fact/recovery-completed {:audit/event-type :audit/recovery
+                             :audit/severity :severity/info}
+   :fact/control-plane-activated {:audit/event-type :audit/control-plane
+                                  :audit/severity :severity/info}
+   :fact/control-plane-violation-recorded {:audit/event-type :audit/control-plane
+                                           :audit/severity :severity/error}
+   :fact/kill-switch-activated {:audit/event-type :audit/control-plane
+                                :audit/severity :severity/warning}
+   :fact/kill-switch-cleared {:audit/event-type :audit/control-plane
+                              :audit/severity :severity/info}
+   :fact/signal-decision-produced {:audit/event-type :audit/decision
+                                   :audit/severity :severity/info}
+   :fact/risk-decision-recorded {:audit/event-type :audit/decision
+                                 :audit/severity :severity/info}
+   :fact/order-intent-created {:audit/event-type :audit/order
+                               :audit/severity :severity/info}
+   :fact/command-dispatched {:audit/event-type :audit/order-submission
+                             :audit/severity :severity/info}
+   :fact/broker-ack-accepted {:audit/event-type :audit/broker
+                              :audit/severity :severity/info}
+   :fact/broker-ack-rejected {:audit/event-type :audit/broker
+                              :audit/severity :severity/warning}
+   :fact/broker-order-status-observed {:audit/event-type :audit/broker
+                                       :audit/severity :severity/info}
+   :fact/fill-observed {:audit/event-type :audit/broker
+                        :audit/severity :severity/info}
+   :fact/degraded-mode-recorded {:audit/event-type :audit/degradation
+                                 :audit/severity :severity/warning}
+   :fact/fault-recorded {:audit/event-type :audit/fault
+                         :audit/severity :severity/error}})
+
+(defn audit-relevant-fact-type?
+  [fact-type]
+  (contains? fact-type->audit fact-type))
+
+(defn fact->audit-event
+  "Derive one §4.1 audit event from an appended canonical fact envelope,
+  or nil when the fact type is not audit-relevant. ctx (explicit map)
+  supplies the runtime identity: {:run-id .. :process-id .. :mode ..}."
+  [ctx fact]
+  (when-let [klass (get fact-type->audit (:record/type fact))]
+    (op/audit-event
+     (merge klass
+            {:audit/at (:fact/occurred-at fact)
+             :audit/run-id (:run-id ctx)
+             :audit/process-id (:process-id ctx)
+             :audit/mode (:mode ctx)
+             :audit/strategy-id (:record/strategy-id fact)
+             :audit/account-id (:record/account-id fact)
+             :audit/correlation-id (:record/correlation-id fact)
+             :audit/event-type (:audit/event-type klass)
+             :audit/message (str (kw->str (:record/type fact))
+                                 (when-let [oi (get-in fact [:fact/payload
+                                                             :order-intent/id])]
+                                   (str " " oi)))
+             :audit/payload {:fact/id (:record/id fact)
+                             :fact/type (:record/type fact)
+                             :fact/payload (:fact/payload fact)}}))))
+
+(defn emit-fact-audits!
+  "Emit audit events for every audit-relevant fact in the batch — the
+  engine-loop :on-facts integration point. Returns the emitted events."
+  [sink ctx facts]
+  (vec (keep (fn [fact]
+               (when-let [event (fact->audit-event ctx fact)]
+                 (op/emit-audit! sink event)))
+             facts)))

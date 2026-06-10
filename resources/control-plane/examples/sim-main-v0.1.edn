@@ -1,0 +1,41 @@
+;; Example control-plane manifest for one sim-runtime deployment scope —
+;; routes the Phase 7 simple-direction strategy to the sim broker. Used by
+;; the engine-live E2E tests (in-spec live runs are sim-broker routes only;
+;; see the Phase 10 stale-feed gate).
+
+{:control-plane/revision "cp-sim-000001"
+ :control-plane/generated-at "2026-06-10T14:00:00Z"
+ :control-plane/status :control-plane-status/proposed
+ :control-plane/strategies
+ [{:strategy/id "strategy/simple-direction/sma-cross/v1"
+   :strategy/enabled? true
+   :strategy/mode :mode/sim
+   :strategy/process "engine-sim-main"
+   :strategy/account-route "route/sim-direction"
+   :strategy/artifacts {:model-ref "model/simple-direction/v1"
+                        :feature-manifest-ref "feature/simple-direction/v1"}
+   :strategy/schedule {:session :session/us-equities-regular}}]
+ :control-plane/accounts
+ [{:account/id "account/sim/main"
+   :account/broker :broker/sim
+   :account/environment :environment/sim
+   :account/allowed-modes #{:mode/sim :mode/replay}
+   :account/live-enabled? false}]
+ :control-plane/processes
+ [{:process/id "engine-sim-main"
+   :process/base :base/engine-live
+   :process/allowed-modes #{:mode/sim}
+   :process/strategies ["strategy/simple-direction/sma-cross/v1"]}]
+ :control-plane/routes
+ [{:route/id "route/sim-direction"
+   :route/strategy-id "strategy/simple-direction/sma-cross/v1"
+   :route/account-id "account/sim/main"
+   :route/broker :broker/sim}]
+ :control-plane/kill-switches
+ [{:kill-switch/scope :kill-switch-scope/global
+   :kill-switch/active? false
+   :kill-switch/reason nil
+   :kill-switch/activated-at nil
+   :kill-switch/actor nil}]
+ :control-plane/policies
+ {:policy/default-degradation :degradation-policy/default-sim}}

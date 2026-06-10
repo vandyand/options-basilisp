@@ -1,4 +1,20 @@
-(ns stevetrading.base.control-plane)
+(ns stevetrading.base.control-plane
+  "Control-plane operations base (CONTROL_PLANE_MANIFESTS §9-§10).
+
+  Subcommands:
+    validate <manifest.edn>                 — §9 validation, exit 1 on invalid
+    activate <manifest.edn> --root <dir>    — §10 activation sequence
+             [--scope <scope>] [--actor <actor>]
+    show --root <dir> [--scope <scope>]     — active revision for a scope
+
+  run-cli is the testable core: it returns {:exit 0|1 :result ..} and
+  never calls sys.exit; -main prints the structured result and exits
+  non-zero on failure (CLI contract)."
+  (:import sys)
+  (:require [basilisp.edn :as edn]
+            [stevetrading.control-plane.file-store :as cpfs]
+            [stevetrading.control-plane.protocol :as cpp]
+            [stevetrading.persistence.protocol :as pp]))
 
 (def base-id :base/control-plane)
 
@@ -7,3 +23,89 @@
   {:base/id base-id
    :base/modes #{:mode/control-plane}})
 
+;; ---------------------------------------------------------------------------
+;; Arg parsing
+;; ---------------------------------------------------------------------------
+
+(defn- parse-flags
+  "Parse --flag value pairs into {:flag \"value\"}; positional args are
+  returned under :args in order."
+  [args]
+  (loop [args (seq args) acc {:args []}]
+    (if (nil? args)
+      acc
+      (let [head (first args)]
+        (if (and (string? head) (.startswith head "--"))
+          (recur (nnext args) (assoc acc (keyword (subs head 2))
+                                     (second args)))
+          (recur (next args) (update acc :args conj head)))))))
+
+(defn- read-manifest
+  [path]
+  (edn/read-string (slurp path)))
+
+;; ---------------------------------------------------------------------------
+;; Subcommands
+;; ---------------------------------------------------------------------------
+
+(defn- cli-validate
+  [{:keys [args]}]
+  (let [path (first args)]
+    (if (nil? path)
+      {:exit 1 :result {:error "usage: validate <manifest.edn>"}}
+      (let [validation (cpp/validate-manifest (read-manifest path))]
+        {:exit (if (:valid? validation) 0 1)
+         :result (assoc validation :manifest/path path)}))))
+
+(defn- cli-activate
+  [{:keys [args root scope actor]}]
+  (let [path (first args)]
+    (if (or (nil? path) (nil? root))
+      {:exit 1
+       :result {:error "usage: activate <manifest.edn> --root <dir> [--scope <scope>] [--actor <actor>]"}}
+      (let [store (cpfs/make-file-control-plane-store root)
+            outcome (cpfs/activate! store (read-manifest path)
+                                    {:scope scope :actor actor})]
+        {:exit (if (:activated? outcome) 0 1)
+         :result (assoc outcome :manifest/path path)}))))
+
+(defn- cli-show
+  [{:keys [root scope]}]
+  (if (nil? root)
+    {:exit 1 :result {:error "usage: show --root <dir> [--scope <scope>]"}}
+    (let [store (cpfs/make-file-control-plane-store root)
+          active (pp/active-revision store scope)]
+      (if (nil? active)
+        {:exit 1
+         :result {:error (str "no active revision for scope "
+                              (or scope cpfs/default-scope))}}
+        {:exit 0
+         :result {:scope (or scope cpfs/default-scope)
+                  :control-plane/revision (:control-plane/revision active)
+                  :control-plane/activation (:control-plane/activation active)
+                  :manifest active}}))))
+
+(defn run-cli
+  "Dispatch one CLI invocation. Returns {:exit 0|1 :result map} —
+  callable from tests/REPL without process exit."
+  [args]
+  (let [subcommand (first args)
+        parsed (parse-flags (rest args))]
+    (case subcommand
+      "validate" (cli-validate parsed)
+      "activate" (cli-activate parsed)
+      "show" (cli-show parsed)
+      {:exit 1
+       :result {:error (str "unknown subcommand " (pr-str subcommand)
+                            " — expected validate | activate | show")}})))
+
+(defn -main
+  [& args]
+  (let [{:keys [exit result]} (run-cli args)]
+    (println (pr-str result))
+    (when-not (zero? exit)
+      (sys/exit exit))
+    result))
+
+(when (= *main-ns* 'stevetrading.base.control-plane)
+  (apply -main *command-line-args*))

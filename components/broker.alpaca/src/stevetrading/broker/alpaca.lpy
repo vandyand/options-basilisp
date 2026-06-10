@@ -1,0 +1,898 @@
+(ns stevetrading.broker.alpaca
+  "Alpaca paper-trading REST adapter (BROKER_ADAPTER_CONTRACTS_V0.1 §4-§11).
+  ADAPTER component — only bases may require it; requires domain.* and
+  protocol components only (never engine.*).
+
+  Transport seam: every HTTP interaction goes through the injected
+  :transport fn — (fn [req] resp) with
+    req  {:method \"GET\"|\"POST\"|\"DELETE\" :url str
+          :headers {str str} :body json-str-or-nil}
+    resp {:status int :body str}
+  The default transport is a stdlib urllib.request wrapper (HTTP error
+  statuses are returned as responses; only genuine transport failures
+  raise). ALL tests inject stub transports — nothing in this repo calls
+  the real API. Request/response field shapes are transcribed from the
+  proven Python adapter (alpaca_paper_broker.py) + Alpaca v2 REST:
+    POST   /v2/orders                  submit (single-leg or mleg)
+    DELETE /v2/orders/<id>             cancel
+    GET    /v2/orders?status=open      open orders
+    GET    /v2/orders?status=closed    closed orders → fills
+    GET    /v2/account                 account state / health
+  Auth headers: APCA-API-KEY-ID / APCA-API-SECRET-KEY.
+
+  client_order_id idempotency + recovery lineage (§9.1, adversary-hardened):
+  - alpaca-client-order-id is a PURE function of the order-intent id:
+    (subs order-intent-id 0 48). Alpaca caps client_order_id at 48 chars;
+    \"oi_\" + the first 45 hex chars = 180 bits of the intent hash —
+    collision-negligible by construction.
+  - Recovery lineage rule: reconciliation maps broker-returned orders
+    back to intents by RECOMPUTING alpaca-client-order-id for every
+    known/unresolved intent id and matching — no extra durable mapping
+    store exists, because the short id is a pure function of the full id.
+  - Collision guard: if two known intent ids ever share a short id, the
+    adapter emits a reconciliation anomaly fact (:fact/fault-recorded,
+    :fault/kind :fault/reconciliation-anomaly) for EACH colliding intent
+    — the engine fold drives them to :orphaned-needs-reconcile. It never
+    guesses.
+  - Unknown client_order_id on a broker-returned order (ENGINE_STATE
+  case G): anomaly fact with the broker evidence and NO :order-intent/id
+    attachment — unattributed truth never enters the order fold.
+
+  Reconciliation input (§8.1): open-orders / fills-since accept the
+  account scope as EITHER an account-id string OR a map
+    {:broker/account-id \"account/alpaca/paper-ops\"
+     :reconcile/known-intent-ids [\"oi_...\"]}
+  — the known-intent-id list is how the caller hands the adapter its
+  unresolved intents for short-id→full-id lineage recomputation. With a
+  bare string, lineage falls back to this process's submit journal only.
+
+  Canonical status mapping (§5.2, documented):
+    new / accepted / pending_new / accepted_for_bidding
+                       → :broker-status/accepted   (accepted-ish: the
+                         broker holds the order; ack semantics)
+    partially_filled   → :broker-status/partially-filled
+    filled             → :broker-status/filled
+    canceled/cancelled → :broker-status/cancelled
+    rejected           → :broker-status/rejected
+    expired            → :broker-status/expired
+    done_for_day / pending_cancel / pending_replace / held / stopped /
+    suspended / calculated → :broker-status/open (resting at the broker)
+
+  Error model (§10) — submit/cancel outcomes by HTTP status:
+    403 \"insufficient buying power\" → :fact/broker-ack-rejected
+        :broker-rejection/insufficient-buying-power
+    403 other                      → rejected :broker-rejection/forbidden
+    422                            → rejected
+        :broker-rejection/request-validation-failed
+    401                  → :fact/fault-recorded :fault/auth-failure
+    429                  → fault :fault/rate-limited
+    5xx                  → fault :fault/broker-unavailable (the order MAY
+        exist server-side — ambiguous; never journaled, reconciliation
+        resolves)
+    transport exception  → fault :fault/transport-unavailable
+    unparseable body     → fault :fault/ambiguous-response
+  Raw exceptions NEVER cross the boundary as the contract — every
+  failure normalizes to a canonical fact.
+
+  Idempotency (§9): submits are journaled by :command/idempotency-key; a
+  duplicate submit returns the SAME stored ack fact (no second transport
+  call). Rejections are journaled too. Faults are NOT journaled — a
+  retry re-attempts the transport.
+
+  Fill timestamps from Alpaca may carry +00:00 offsets; they normalize
+  to the canonical Z suffix. Quantities/prices normalize to decimal
+  strings.
+
+  Health (§11): GET /v2/account only — health checks never submit
+  orders. Transport failure → heartbeat with :health/unreachable, not an
+  exception."
+  (:import datetime json urllib.error urllib.request)
+  (:require [stevetrading.broker.protocol :as p]
+            [stevetrading.domain.instruments :as instruments]
+            [stevetrading.domain.schemas :as sch]))
+
+(def source-system :broker/alpaca-paper)
+
+(def default-base-url "https://paper-api.alpaca.markets")
+
+;; ---------------------------------------------------------------------------
+;; client_order_id lineage (pure)
+;; ---------------------------------------------------------------------------
+
+(defn alpaca-client-order-id
+  "Deterministic Alpaca client_order_id for one order-intent id: the
+  first 48 chars (\"oi_\" + 45 hex). Pure — recovery recomputes it from
+  any known intent id; no mapping store needed."
+  [order-intent-id]
+  (subs order-intent-id 0 (min 48 (count order-intent-id))))
+
+(defn short-id-index
+  "Recompute alpaca-client-order-id for every known intent id →
+  {short-id [full-intent-ids]}. More than one full id under a short id is
+  a collision (anomaly, never a guess)."
+  [known-intent-ids]
+  (reduce (fn [idx oi]
+            (update idx (alpaca-client-order-id oi) (fnil conj []) oi))
+          {}
+          known-intent-ids))
+
+(defn resolve-client-order-id
+  "Resolve one broker-returned client_order_id against a short-id-index:
+    {:resolution :resolved :order-intent/id full}
+    {:resolution :collision :order-intent/ids [..]}
+    {:resolution :unknown}"
+  [idx client-order-id]
+  (let [fulls (get idx client-order-id)]
+    (cond
+      (nil? fulls) {:resolution :unknown}
+      (= 1 (count fulls)) {:resolution :resolved
+                           :order-intent/id (first fulls)}
+      :else {:resolution :collision :order-intent/ids (vec fulls)})))
+
+;; ---------------------------------------------------------------------------
+;; OCC option symbols (compact 18-char form — Alpaca rejects the padded
+;; 21-char form with \"asset not found\"; see Python adapter #247 note)
+;; ---------------------------------------------------------------------------
+
+(defn occ-symbol
+  "Alpaca order symbol for a canonical instrument id: the bare ticker for
+  equities, the compact OCC symbol (SPY260619C00550000) for options.
+  Throws ex-info on unparseable ids or unsupported asset classes."
+  [instrument-id]
+  (let [ref (instruments/parse-instrument-id instrument-id)]
+    (when (nil? ref)
+      (throw (ex-info (str "unparseable instrument id " (pr-str instrument-id))
+                      {:error/code :error/malformed-instrument-ref
+                       :instrument/id instrument-id})))
+    (case (:instrument/asset-class ref)
+      :asset-class/equity (:instrument/symbol ref)
+      :asset-class/option
+      (let [expiry (:instrument/expiry ref)            ;; YYYY-MM-DD
+            yymmdd (str (subs expiry 2 4) (subs expiry 5 7)
+                        (subs expiry 8 10))
+            right (if (= :option-right/call (:instrument/right ref)) "C" "P")
+            ;; strike "550.000" → millis "00550000" (8 digits)
+            [whole frac] (vec (.split (:instrument/strike ref) "."))
+            millis (str whole frac)                     ;; strike × 1000
+            padded (.zfill millis 8)]
+        (str (:instrument/underlying ref) yymmdd right padded))
+      (throw (ex-info (str "alpaca does not support asset class "
+                           (pr-str (:instrument/asset-class ref)))
+                      {:error/code :error/unsupported-asset-class
+                       :instrument/id instrument-id})))))
+
+;; ---------------------------------------------------------------------------
+;; Wire-shape helpers
+;; ---------------------------------------------------------------------------
+
+(def ^:private side->wire
+  {:order-side/buy "buy"
+   :order-side/sell "sell"})
+
+(def ^:private order-type->wire
+  {:order-type/market "market"
+   :order-type/limit "limit"
+   :order-type/stop "stop"
+   :order-type/stop-limit "stop_limit"})
+
+(def ^:private tif->wire
+  {:tif/day "day"
+   :tif/gtc "gtc"
+   :tif/ioc "ioc"
+   :tif/fok "fok"})
+
+(defn- position-intent
+  "Alpaca mleg position_intent from intent effect + leg side."
+  [effect side]
+  (case [effect side]
+    [:position-effect/open :order-side/buy] "buy_to_open"
+    [:position-effect/open :order-side/sell] "sell_to_open"
+    [:position-effect/close :order-side/buy] "buy_to_close"
+    [:position-effect/close :order-side/sell] "sell_to_close"))
+
+(def alpaca-status->canonical
+  "Documented §5.2 mapping — see ns docstring."
+  {"new" :broker-status/accepted
+   "accepted" :broker-status/accepted
+   "pending_new" :broker-status/accepted
+   "accepted_for_bidding" :broker-status/accepted
+   "partially_filled" :broker-status/partially-filled
+   "filled" :broker-status/filled
+   "canceled" :broker-status/cancelled
+   "cancelled" :broker-status/cancelled
+   "rejected" :broker-status/rejected
+   "expired" :broker-status/expired
+   "done_for_day" :broker-status/open
+   "pending_cancel" :broker-status/open
+   "pending_replace" :broker-status/open
+   "held" :broker-status/open
+   "stopped" :broker-status/open
+   "suspended" :broker-status/open
+   "calculated" :broker-status/open})
+
+(defn- normalize-ts
+  "Alpaca timestamps → canonical RFC 3339 Z form (+00:00 → Z)."
+  [ts]
+  (when (string? ts)
+    (if (.endswith ts "+00:00")
+      (str (subs ts 0 (- (count ts) 6)) "Z")
+      ts)))
+
+;; ---------------------------------------------------------------------------
+;; Python interop helpers
+;; ---------------------------------------------------------------------------
+
+(defn py->clj
+  "JSON-parsed Python data → Basilisp data (string keys preserved).
+  Public: stub-transport tests reuse it to inspect request bodies."
+  [x]
+  (cond
+    (python/isinstance x python/dict)
+    (into {} (map (fn [kv]
+                    [(first kv) (py->clj (second kv))])
+                  (.items x)))
+
+    (python/isinstance x python/list)
+    (mapv py->clj x)
+
+    :else x))
+
+(defn- parse-json
+  "Parse a JSON body → Basilisp data, or ::unparseable."
+  [body]
+  (try
+    (py->clj (json/loads body))
+    (catch python/Exception _ ::unparseable)))
+
+(defn clj->py
+  "Basilisp data (string keys) → JSON-native Python data for json.dumps.
+  Public: stub-transport tests reuse it to build response bodies."
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]]
+                                 (python/tuple [(str k) (clj->py v)]))
+                               x))
+    (or (vector? x) (seq? x)) (python/list (map clj->py x))
+    :else x))
+
+(defn- compact
+  [m]
+  (into {} (filter (comp some? val) m)))
+
+;; ---------------------------------------------------------------------------
+;; Default transport (stdlib urllib.request; never used by tests)
+;; ---------------------------------------------------------------------------
+
+(defn urllib-transport
+  "Default transport: {:method :url :headers :body} → {:status :body}.
+  HTTP error statuses come back as responses (urllib raises HTTPError —
+  caught and normalized); genuine transport failures (URLError, timeouts)
+  propagate as exceptions for the adapter's fault normalization."
+  [{:keys [method url headers body]}]
+  (let [data (when (some? body) (.encode body "utf-8"))
+        req (urllib.request/Request url
+                                    ** :data data
+                                    :headers (python/dict (or headers {}))
+                                    :method method)]
+    (try
+      (let [resp (urllib.request/urlopen req ** :timeout 30)]
+        {:status (.-status resp)
+         :body (.decode (.read resp) "utf-8")})
+      (catch urllib.error/HTTPError e
+        {:status (.-code e)
+         :body (.decode (.read e) "utf-8")}))))
+
+;; ---------------------------------------------------------------------------
+;; Fact constructors
+;; ---------------------------------------------------------------------------
+
+(defn- cmd-meta-of
+  [cmd]
+  (select-keys cmd [:record/id :record/correlation-id
+                    :record/mode :record/strategy-id]))
+
+(defn- broker-fact
+  [cmd-meta ts m]
+  (sch/fact-envelope
+   (compact
+    (merge {:record/mode (:record/mode cmd-meta)
+            :record/strategy-id (:record/strategy-id cmd-meta)
+            :record/correlation-id (or (:record/correlation-id cmd-meta)
+                                       (:record/id cmd-meta))
+            :record/causation-ids (when (some? (:record/id cmd-meta))
+                                    [(:record/id cmd-meta)])
+            :record/source-system source-system
+            :fact/occurred-at ts
+            :fact/recorded-at ts}
+           m))))
+
+(defn- accepted-ack
+  [cmd-meta ts payload boid status]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/broker-ack-accepted
+                :record/account-id (:broker/account-id payload)
+                :fact/dedupe-key (str "ack/alpaca/" boid "/accepted")
+                :fact/payload
+                {:order-intent/id (:order-intent/id payload)
+                 :broker/source-system source-system
+                 :broker/account-id (:broker/account-id payload)
+                 :broker/order-id boid
+                 :broker/status status
+                 :broker/observed-at ts}}))
+
+(defn- rejected-ack
+  [cmd-meta ts payload code message]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/broker-ack-rejected
+                :record/account-id (:broker/account-id payload)
+                :fact/dedupe-key (str "ack/alpaca/"
+                                      (alpaca-client-order-id
+                                       (:order-intent/id payload))
+                                      "/rejected")
+                :fact/payload
+                (compact
+                 {:order-intent/id (:order-intent/id payload)
+                  :broker/source-system source-system
+                  :broker/account-id (:broker/account-id payload)
+                  :broker/rejection-code code
+                  :broker/rejection-message message
+                  :broker/observed-at ts})}))
+
+(defn- fault-fact
+  "Normalized §10 fault — never journaled, never an exception across the
+  boundary."
+  [cmd-meta ts category message extra]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/fault-recorded
+                :fact/payload
+                (compact
+                 (merge {:fault/category category
+                         :fault/source-system source-system
+                         :fault/message message}
+                        extra))}))
+
+(defn- anomaly-fact
+  "Reconciliation anomaly (§8.2; ENGINE_STATE case G / short-id
+  collision). When order-intent-id is present the engine fold drives that
+  intent to :orphaned-needs-reconcile; when absent (unknown lineage) the
+  evidence is recorded without attaching to any intent."
+  [ts message evidence order-intent-id]
+  (broker-fact {} ts
+               {:record/type :fact/fault-recorded
+                :fact/payload
+                (compact
+                 (merge {:fault/kind :fault/reconciliation-anomaly
+                         :fault/category :fault/reconciliation-failure
+                         :fault/source-system source-system
+                         :fault/message message
+                         :order-intent/id order-intent-id}
+                        evidence))}))
+
+;; ---------------------------------------------------------------------------
+;; HTTP plumbing
+;; ---------------------------------------------------------------------------
+
+(defn- headers-for
+  [opts]
+  {"APCA-API-KEY-ID" (or (:key-id opts) "")
+   "APCA-API-SECRET-KEY" (or (:secret opts) "")
+   "Content-Type" "application/json"
+   "Accept" "application/json"})
+
+(defn- request!
+  "Run one transport call. Returns {:ok? true :status n :json data} or
+  {:ok? false :fault [category message]}."
+  [opts method path body-map]
+  (let [transport (:transport opts)
+        req {:method method
+             :url (str (:base-url opts) path)
+             :headers (headers-for opts)
+             :body (when (some? body-map)
+                     (json/dumps (clj->py body-map) ** :sort_keys true))}
+        resp (try
+               {:resp (transport req)}
+               (catch python/Exception e
+                 {:exception (str (.-__name__ (python/type e)) ": " (str e))}))]
+    (if-let [exc (:exception resp)]
+      {:ok? false :fault [:fault/transport-unavailable exc]}
+      (let [{:keys [status body]} (:resp resp)
+            parsed (when (some? body) (parse-json body))]
+        (cond
+          (and (>= status 200) (< status 300) (= ::unparseable parsed))
+          {:ok? false :fault [:fault/ambiguous-response
+                              (str "HTTP " status " with unparseable body")]}
+
+          (and (>= status 200) (< status 300))
+          {:ok? true :status status :json parsed}
+
+          :else
+          {:ok? false :status status
+           :json (when (not= ::unparseable parsed) parsed)
+           :body body})))))
+
+(defn- error-message-of
+  [result]
+  (or (when (map? (:json result)) (get (:json result) "message"))
+      (:body result)
+      "no error body"))
+
+;; ---------------------------------------------------------------------------
+;; Submit request building (wire shapes)
+;; ---------------------------------------------------------------------------
+
+(defn- submit-body
+  "Canonical intent → Alpaca POST /v2/orders JSON body (string keys).
+  Single leg → simple order (equity ticker or OCC symbol); multiple legs
+  → order_class \"mleg\" with ratio_qty legs."
+  [payload]
+  (let [intent (:order-intent/payload payload)
+        legs (vec (:order-intent/legs intent))
+        client-order-id (alpaca-client-order-id (:order-intent/id payload))
+        base {"type" (get order-type->wire (:order-intent/order-type intent))
+              "time_in_force" (get tif->wire
+                                   (:order-intent/time-in-force intent))
+              "client_order_id" client-order-id}
+        base (if (some? (:order-intent/limit-price intent))
+               (assoc base "limit_price"
+                      (str (:order-intent/limit-price intent)))
+               base)]
+    (if (= 1 (count legs))
+      (let [leg (first legs)]
+        (merge base
+               {"symbol" (occ-symbol (:instrument/id leg))
+                "qty" (str (:order-intent/quantity intent))
+                "side" (get side->wire (:order-intent/side intent))}))
+      (merge base
+             {"order_class" "mleg"
+              "qty" (str (:order-intent/quantity intent))
+              "legs" (mapv (fn [leg]
+                             {"symbol" (occ-symbol (:instrument/id leg))
+                              "ratio_qty" (str (:leg/quantity leg))
+                              "side" (get side->wire (:leg/side leg))
+                              "position_intent"
+                              (position-intent
+                               (:order-intent/effect intent)
+                               (:leg/side leg))})
+                           legs)}))))
+
+;; ---------------------------------------------------------------------------
+;; Reconciliation scope + lineage
+;; ---------------------------------------------------------------------------
+
+(defn- account-scope
+  "Normalize the open-orders/fills-since account argument (§8.1 — string
+  or {:broker/account-id .. :reconcile/known-intent-ids [..]})."
+  [account-id-or-scope]
+  (if (map? account-id-or-scope)
+    {:account-id (:broker/account-id account-id-or-scope)
+     :known-intent-ids (vec (:reconcile/known-intent-ids
+                             account-id-or-scope))}
+    {:account-id account-id-or-scope :known-intent-ids []}))
+
+(defn- lineage-index
+  "short-id → [full ids] over the caller-provided known intents PLUS this
+  process's own submit journal."
+  [journal known-intent-ids]
+  (short-id-index (distinct (concat known-intent-ids
+                                    (keep :order-intent/id
+                                          (vals (:by-client-id @journal)))))))
+
+(defn- resolve-lineage
+  "Resolve one broker order's client_order_id. Returns
+  {:order-intent/id ..} | {:anomalies [facts]} (collision → one anomaly
+  per colliding intent; unknown → one unattached anomaly)."
+  [idx client-order-id evidence ts]
+  (let [res (resolve-client-order-id idx client-order-id)]
+    (case (:resolution res)
+      :resolved {:order-intent/id (:order-intent/id res)}
+      :collision {:anomalies
+                  (mapv (fn [oi]
+                          (anomaly-fact
+                           ts
+                           (str "client_order_id " client-order-id
+                                " maps to " (count (:order-intent/ids res))
+                                " unresolved intents — treating all as"
+                                " orphaned, never guessing")
+                           (assoc evidence :broker/client-order-id
+                                  client-order-id)
+                           oi))
+                        (:order-intent/ids res))}
+      :unknown {:anomalies
+                [(anomaly-fact
+                  ts
+                  (str "broker order with unknown client_order_id "
+                       client-order-id " — no lineage, refusing to attach")
+                  (assoc evidence :broker/client-order-id client-order-id)
+                  nil)]})))
+
+(defn- order-status-fact
+  [account-id order oi-id ts]
+  (let [status (get alpaca-status->canonical (get order "status")
+                    :broker-status/open)
+        boid (get order "id")]
+    (broker-fact {} ts
+                 {:record/type :fact/broker-order-status-observed
+                  :record/account-id account-id
+                  :fact/dedupe-key (str "status/alpaca/" boid "/"
+                                        (name status))
+                  :fact/payload
+                  {:order-intent/id oi-id
+                   :broker/source-system source-system
+                   :broker/account-id account-id
+                   :broker/order-id boid
+                   :broker/status status
+                   :broker/observed-at ts}})))
+
+(defn- leg-instrument-id
+  "Map a broker order symbol back to a canonical instrument id via this
+  process's journal (intent legs keyed by their OCC/wire symbol). nil for
+  orders submitted by another process — the fill still carries
+  :fill/symbol; ledger derivation resolves the leg from intent context."
+  [journal client-order-id symbol]
+  (get-in @journal [:by-client-id client-order-id :symbol->instrument
+                    symbol]))
+
+(defn- fill-facts-of-order
+  "Normalized :fact/fill-observed facts for one CLOSED broker order JSON
+  (simple order → one fill; mleg → one per filled leg)."
+  [journal account-id order oi-id ts]
+  (let [coid (get order "client_order_id")
+        rows (if (seq (get order "legs"))
+               (get order "legs")
+               [order])]
+    (vec
+     (for [row rows
+           :let [filled-qty (get row "filled_qty")
+                 price (get row "filled_avg_price")]
+           :when (and (some? filled-qty) (some? price)
+                      (pos? (python/float (str filled-qty))))]
+       (let [boid (get order "id")
+             fill-id (get row "id")
+             symbol (get row "symbol")
+             occurred (normalize-ts (or (get row "filled_at")
+                                        (get order "filled_at")
+                                        ts))]
+         (broker-fact {} occurred
+                      {:record/type :fact/fill-observed
+                       :record/account-id account-id
+                       :record/instrument-id (leg-instrument-id journal coid
+                                                                symbol)
+                       :fact/dedupe-key (str "fill/alpaca/" account-id "/"
+                                             boid "/" fill-id)
+                       :fact/payload
+                       (compact
+                        {:order-intent/id oi-id
+                         :broker/source-system source-system
+                         :broker/account-id account-id
+                         :broker/order-id boid
+                         :fill/id fill-id
+                         :fill/instrument-id (leg-instrument-id journal coid
+                                                                symbol)
+                         :fill/symbol symbol
+                         :fill/occurred-at occurred
+                         :fill/quantity (str filled-qty)
+                         :fill/price (str price)})}))))))
+
+;; ---------------------------------------------------------------------------
+;; Clock
+;; ---------------------------------------------------------------------------
+
+(defn- default-clock
+  []
+  (fn []
+    (.strftime (datetime.datetime/now datetime.timezone/utc)
+               "%Y-%m-%dT%H:%M:%SZ")))
+
+;; ---------------------------------------------------------------------------
+;; AlpacaBroker
+;; ---------------------------------------------------------------------------
+
+(def ^:private empty-journal
+  {:by-key {}          ;; idempotency key → {:ack-facts [..] :client-order-id ..}
+   :by-client-id {}})  ;; client_order_id → {:order-intent/id ..
+                       ;;                    :symbol->instrument {sym iid}}
+
+(defrecord AlpacaBroker [journal opts]
+  p/Broker
+
+  (submit-order-intent! [this cmd]
+    (let [payload (:command/payload cmd)
+          idem-key (:command/idempotency-key payload)
+          cmd-meta (cmd-meta-of cmd)
+          clock (:clock opts)
+          dup (get-in @journal [:by-key idem-key])]
+      (if (some? dup)
+        ;; §9 — duplicate submit: same stored ack content, no transport call
+        (:ack-facts dup)
+        (let [ts (clock)
+              oi (:order-intent/id payload)
+              intent (:order-intent/payload payload)
+              client-order-id (alpaca-client-order-id oi)
+              body (try
+                     {:body (submit-body payload)}
+                     (catch python/Exception e
+                       {:error (str e)}))]
+          (if (some? (:error body))
+            [(rejected-ack cmd-meta ts payload
+                           :broker-rejection/request-validation-failed
+                           (str "unmappable intent: " (:error body)))]
+            (let [result (request! opts "POST" "/v2/orders" (:body body))
+                  journal-entry
+                  {:order-intent/id oi
+                   :symbol->instrument
+                   (into {} (map (fn [leg]
+                                   [(occ-symbol (:instrument/id leg))
+                                    (:instrument/id leg)])
+                                 (:order-intent/legs intent)))}
+                  facts
+                  (cond
+                    (:ok? result)
+                    [(accepted-ack cmd-meta ts payload
+                                   (get (:json result) "id")
+                                   (get alpaca-status->canonical
+                                        (get (:json result) "status")
+                                        :broker-status/accepted))]
+
+                    ;; transport / ambiguous / auth / rate-limit faults
+                    (some? (:fault result))
+                    [(fault-fact cmd-meta ts (first (:fault result))
+                                 (second (:fault result))
+                                 {:order-intent/id oi
+                                  :broker/account-id
+                                  (:broker/account-id payload)})]
+
+                    (= 403 (:status result))
+                    (let [message (error-message-of result)
+                          code (if (>= (.find (.lower (str message))
+                                              "insufficient buying power")
+                                       0)
+                                 :broker-rejection/insufficient-buying-power
+                                 :broker-rejection/forbidden)]
+                      [(rejected-ack cmd-meta ts payload code message)])
+
+                    (= 422 (:status result))
+                    [(rejected-ack cmd-meta ts payload
+                                   :broker-rejection/request-validation-failed
+                                   (error-message-of result))]
+
+                    (= 401 (:status result))
+                    [(fault-fact cmd-meta ts :fault/auth-failure
+                                 (error-message-of result)
+                                 {:order-intent/id oi})]
+
+                    (= 429 (:status result))
+                    [(fault-fact cmd-meta ts :fault/rate-limited
+                                 (error-message-of result)
+                                 {:order-intent/id oi})]
+
+                    :else
+                    [(fault-fact cmd-meta ts :fault/broker-unavailable
+                                 (str "HTTP " (:status result) ": "
+                                      (error-message-of result))
+                                 {:order-intent/id oi
+                                  :fault/ambiguous? true})])
+                  outcome-type (:record/type (first facts))]
+              ;; journal acks AND rejections (idempotent retries return
+              ;; the same outcome); never journal faults (retry allowed)
+              (when (contains? #{:fact/broker-ack-accepted
+                                 :fact/broker-ack-rejected}
+                               outcome-type)
+                (swap! journal
+                       (fn [j]
+                         (-> j
+                             (assoc-in [:by-key idem-key]
+                                       {:ack-facts facts
+                                        :client-order-id client-order-id})
+                             (assoc-in [:by-client-id client-order-id]
+                                       journal-entry)))))
+              facts))))))
+
+  (cancel-broker-order! [this cmd]
+    (let [payload (:command/payload cmd)
+          cmd-meta (cmd-meta-of cmd)
+          ts ((:clock opts))
+          boid (:broker/order-id payload)]
+      (if (nil? boid)
+        [(broker-fact cmd-meta ts
+                      {:record/type :fact/cancel-ack-rejected
+                       :record/account-id (:broker/account-id payload)
+                       :fact/payload
+                       (compact
+                        {:order-intent/id (:order-intent/id payload)
+                         :broker/source-system source-system
+                         :broker/account-id (:broker/account-id payload)
+                         :broker/rejection-code :broker-rejection/unknown-order
+                         :broker/rejection-message
+                         "cancel requires proven lineage (:broker/order-id)"
+                         :broker/observed-at ts})})]
+        (let [result (request! opts "DELETE" (str "/v2/orders/" boid) nil)]
+          (cond
+            (:ok? result)
+            [(broker-fact cmd-meta ts
+                          {:record/type :fact/broker-order-status-observed
+                           :record/account-id (:broker/account-id payload)
+                           :fact/dedupe-key (str "ack/alpaca/" boid
+                                                 "/cancelled")
+                           :fact/payload
+                           {:order-intent/id (:order-intent/id payload)
+                            :broker/source-system source-system
+                            :broker/account-id (:broker/account-id payload)
+                            :broker/order-id boid
+                            :broker/status :broker-status/cancelled
+                            :broker/observed-at ts}})]
+
+            (some? (:fault result))
+            [(fault-fact cmd-meta ts (first (:fault result))
+                         (second (:fault result))
+                         {:order-intent/id (:order-intent/id payload)
+                          :broker/order-id boid})]
+
+            (contains? #{404 422} (:status result))
+            ;; 422 = not cancelable (already filled — fill truth wins §7);
+            ;; 404 = unknown order
+            [(broker-fact cmd-meta ts
+                          {:record/type :fact/cancel-ack-rejected
+                           :record/account-id (:broker/account-id payload)
+                           :fact/dedupe-key (str "ack/alpaca/" boid
+                                                 "/cancel-rejected")
+                           :fact/payload
+                           (compact
+                            {:order-intent/id (:order-intent/id payload)
+                             :broker/source-system source-system
+                             :broker/account-id (:broker/account-id payload)
+                             :broker/order-id boid
+                             :broker/rejection-code
+                             (if (= 404 (:status result))
+                               :broker-rejection/unknown-order
+                               :broker-rejection/cancel-after-fill)
+                             :broker/rejection-message (error-message-of
+                                                        result)
+                             :broker/observed-at ts})})]
+
+            :else
+            [(fault-fact cmd-meta ts :fault/broker-unavailable
+                         (str "HTTP " (:status result) ": "
+                              (error-message-of result))
+                         {:order-intent/id (:order-intent/id payload)
+                          :broker/order-id boid})])))))
+
+  (open-orders [this account-id]
+    (let [{:keys [account-id known-intent-ids]} (account-scope account-id)
+          ts ((:clock opts))
+          result (request! opts "GET" "/v2/orders?status=open&limit=500" nil)]
+      (cond
+        (some? (:fault result))
+        [(fault-fact {} ts (first (:fault result)) (second (:fault result))
+                     {:broker/account-id account-id
+                      :fault/during :reconcile/open-orders})]
+
+        (not (:ok? result))
+        [(fault-fact {} ts :fault/reconciliation-failure
+                     (str "open-orders HTTP " (:status result) ": "
+                          (error-message-of result))
+                     {:broker/account-id account-id
+                      :fault/during :reconcile/open-orders})]
+
+        :else
+        (let [idx (lineage-index journal known-intent-ids)]
+          (vec
+           (mapcat
+            (fn [order]
+              (let [evidence {:broker/order-id (get order "id")
+                              :broker/account-id account-id
+                              :broker/raw-status (get order "status")}
+                    lineage (resolve-lineage idx
+                                             (get order "client_order_id")
+                                             evidence ts)]
+                (if (some? (:anomalies lineage))
+                  (:anomalies lineage)
+                  [(order-status-fact account-id order
+                                      (:order-intent/id lineage) ts)])))
+            (:json result)))))))
+
+  (fills-since [this account-id cursor]
+    (let [{:keys [account-id known-intent-ids]} (account-scope account-id)
+          ts ((:clock opts))
+          path (str "/v2/orders?status=closed&limit=500"
+                    (when (some? cursor) (str "&after=" cursor)))
+          result (request! opts "GET" path nil)]
+      (cond
+        (some? (:fault result))
+        [(fault-fact {} ts (first (:fault result)) (second (:fault result))
+                     {:broker/account-id account-id
+                      :fault/during :reconcile/fills-since})]
+
+        (not (:ok? result))
+        [(fault-fact {} ts :fault/reconciliation-failure
+                     (str "fills-since HTTP " (:status result) ": "
+                          (error-message-of result))
+                     {:broker/account-id account-id
+                      :fault/during :reconcile/fills-since})]
+
+        :else
+        (let [idx (lineage-index journal known-intent-ids)]
+          (vec
+           (mapcat
+            (fn [order]
+              (let [filled-qty (get order "filled_qty")]
+                (if-not (and (some? filled-qty)
+                             (pos? (python/float (str filled-qty))))
+                  []
+                  (let [evidence {:broker/order-id (get order "id")
+                                  :broker/account-id account-id
+                                  :broker/raw-status (get order "status")
+                                  :fill/quantity (str filled-qty)}
+                        lineage (resolve-lineage
+                                 idx (get order "client_order_id")
+                                 evidence ts)]
+                    (if (some? (:anomalies lineage))
+                      (:anomalies lineage)
+                      (fill-facts-of-order journal account-id order
+                                           (:order-intent/id lineage)
+                                           ts))))))
+            (:json result)))))))
+
+  (account-state [this account-id]
+    (let [ts ((:clock opts))
+          result (request! opts "GET" "/v2/account" nil)]
+      (if-not (:ok? result)
+        (fault-fact {} ts
+                    (or (first (:fault result)) :fault/broker-unavailable)
+                    (or (second (:fault result))
+                        (str "HTTP " (:status result) ": "
+                             (error-message-of result)))
+                    {:broker/account-id account-id
+                     :fault/during :query/account-state})
+        (let [account (:json result)]
+          (broker-fact {} ts
+                       {:record/type :fact/broker-account-observed
+                        :record/account-id account-id
+                        :fact/payload
+                        (compact
+                         {:broker/account-id account-id
+                          :broker/source-system source-system
+                          :broker/observed-at ts
+                          :account/cash (some-> (get account "cash") str)
+                          :account/buying-power (some-> (get account
+                                                             "buying_power")
+                                                        str)
+                          :account/equity (some-> (get account "equity")
+                                                  str)})})))))
+
+  (health [this]
+    ;; §11: read-only GET /v2/account — health checks never submit orders
+    (let [ts ((:clock opts))
+          result (request! opts "GET" "/v2/account" nil)]
+      (broker-fact {} ts
+                   {:record/type :fact/health-heartbeat-recorded
+                    :fact/payload
+                    (compact
+                     {:health/source-system source-system
+                      :health/connectivity (if (:ok? result)
+                                             :health/connected
+                                             :health/unreachable)
+                      :health/credentials-valid? (when-not (:fault result)
+                                                   (not= 401
+                                                         (:status result)))
+                      :health/last-interaction-at ts})}))))
+
+;; ---------------------------------------------------------------------------
+;; Constructor
+;; ---------------------------------------------------------------------------
+
+(defn make-alpaca-broker
+  "Build an Alpaca paper REST broker. opts (explicit map):
+    :base-url   API root (default https://paper-api.alpaca.markets)
+    :key-id     APCA-API-KEY-ID header value
+    :secret     APCA-API-SECRET-KEY header value
+    :transport  (fn [req] resp) HTTP seam — defaults to the stdlib
+                urllib.request wrapper; ALL tests inject stubs
+    :clock      (fn [] iso-ts) observation clock (default UTC wall clock —
+                broker observations are external truth, not replayed)"
+  [opts]
+  (->AlpacaBroker (atom empty-journal)
+                  {:base-url (or (:base-url opts) default-base-url)
+                   :key-id (:key-id opts)
+                   :secret (:secret opts)
+                   :transport (or (:transport opts) urllib-transport)
+                   :clock (or (:clock opts) (default-clock))}))

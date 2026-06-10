@@ -29,6 +29,7 @@ pythonpath = [
   "components/engine.machines/src",
   "components/engine.recovery/src",
   "components/engine.commands/src",
+  "components/engine.loop/src",
   "components/strategy.registry/src",
   "components/feature.core/src",
   "components/inference.core/src",

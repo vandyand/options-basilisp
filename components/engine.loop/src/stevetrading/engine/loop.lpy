@@ -1,0 +1,473 @@
+(ns stevetrading.engine.loop
+  "The shared engine cycle (ARCHITECTURE §9, ENGINE_STATE §6) — extracted
+  from bases/engine-replay in Phase 10 so the replay and live bases run
+  the SAME loop (POLYLITH §10.5). Bases own wiring (adapters, control
+  plane, recovery, CLI); this component owns the cycle mechanics:
+
+    pull observation → append → fold (newly appended only) → strategy
+    lifecycle advancement (warmup) → pure pipeline per active+relevant
+    strategy → append decision facts → fold → derive submit commands →
+    dispatch (dispatched fact appended BEFORE the adapter call) → append
+    outcome facts → fold outcomes → ledger derive→append→fold for each
+    newly folded fill (raw fills are NEVER folded into ledger state —
+    only derived ledger facts are) → portfolio cache refresh → cursor
+    advance → snapshot on cadence.
+
+  CORE component (POLYLITH §7): requires domain.*, engine.*, ledger,
+  portfolio, the strategy pipeline, and protocol components only — never
+  adapter implementations or bases. Adapters arrive fully constructed in
+  the run-loop config.
+
+  Granularity decision carried over from Phase 8: ONE observation per
+  cycle (the simplest §6-conformant batch; same-timestamp batching is a
+  later optimization).
+
+  Hooks (both optional):
+  - :on-observation (fn [obs new?]) — called once per pulled observation
+    after the append attempt; new? is true when the store accepted it.
+    The replay/live bases use this to advance their replay-position
+    marks + market-clock atoms (sim-broker pricing inputs).
+  - :on-facts (fn [facts]) — called with every batch of NEWLY APPENDED
+    facts (observations, decisions, dispatch/outcomes, ledger facts,
+    fold-emitted faults). The live base wires the observability audit
+    derivation here; the loop itself stays adapter-free."
+  (:import datetime decimal os.path)
+  (:require [basilisp.edn :as edn]
+            [stevetrading.artifact.protocol :as ap]
+            [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.commands :as cmds]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.engine.machines :as m]
+            [stevetrading.engine.recovery :as rec]
+            [stevetrading.engine.state :as st]
+            [stevetrading.ledger.core :as ledger]
+            [stevetrading.market-data.protocol :as mdp]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.portfolio.core :as portfolio]
+            [stevetrading.strategy.registry :as reg]))
+
+(def default-snapshot-every 50)
+
+(def default-snapshot-scope "runtime-main")
+
+(defn utc-now-str
+  []
+  (.strftime (datetime.datetime/now datetime.timezone/utc)
+             "%Y-%m-%dT%H:%M:%SZ"))
+
+;; ---------------------------------------------------------------------------
+;; Append + fold plumbing
+;; ---------------------------------------------------------------------------
+
+(defn- append!*
+  "ONE append path. Append facts; return {:new-facts [the accepted facts,
+  enriched with :fact-log/offset] :appended-count n}. Duplicates (already
+  in the log by record id or dedupe key) are dropped from :new-facts —
+  they were already folded (recovery or an earlier cycle). The :on-facts
+  hook fires with the accepted facts."
+  [fact-store on-facts facts]
+  (if (empty? facts)
+    {:new-facts [] :appended-count 0}
+    (let [{:keys [appended]} (p/append-facts! fact-store facts)
+          offsets (into {} (map (fn [a] [(:fact-id a) (:offset a)]) appended))
+          new-facts (vec (keep #(when-let [off (get offsets (:record/id %))]
+                                  (assoc % :fact-log/offset off))
+                               facts))]
+      (when (and on-facts (seq new-facts))
+        (on-facts new-facts))
+      {:new-facts new-facts
+       :appended-count (count appended)})))
+
+(defn- fold-new!
+  "Fold newly appended facts into engine state; any fold-emitted facts
+  (faults) are appended too (canonical truth about this run, matching the
+  recovery executor). Returns {:state state' :appended-count n}."
+  [fact-store on-facts state new-facts]
+  (let [{:keys [state emitted-facts]} (fold/fold-facts state new-facts)
+        {:keys [appended-count]} (append!* fact-store on-facts emitted-facts)
+        state (if (seq new-facts)
+                (st/record-watermark state :watermark/fact-log
+                                     (apply max (keep :fact-log/offset
+                                                      new-facts)))
+                state)]
+    {:state state :appended-count appended-count}))
+
+;; ---------------------------------------------------------------------------
+;; Replay-position marks (pure helpers shared by both bases — sim-broker
+;; pricing inputs; pure functions of the observation stream position)
+;; ---------------------------------------------------------------------------
+
+(defn- mid-str
+  [bid ask]
+  (str (/ (+ (decimal/Decimal bid) (decimal/Decimal ask))
+          (decimal/Decimal "2"))))
+
+(defn apply-payload-marks
+  "Fold one observation into the marks map (replay-position pricing):
+  bars mark the bar instrument at its close; option-chain snapshots mark
+  every two-sided contract at its (bid+ask)/2 mid. Works for both fixture
+  inputs and emitted fact envelopes (same payload shapes)."
+  [marks fact-type instrument-id payload]
+  (cond
+    (and (= :fact/market-bar-observed fact-type) (some? instrument-id))
+    (assoc marks instrument-id (:bar/close payload))
+
+    (= :fact/option-chain-observed fact-type)
+    (reduce (fn [m contract]
+              (if (and (some? (:instrument/id contract))
+                       (some? (:quote/bid contract))
+                       (some? (:quote/ask contract)))
+                (assoc m (:instrument/id contract)
+                       (mid-str (:quote/bid contract) (:quote/ask contract)))
+                m))
+            marks
+            (:chain/contracts payload))
+
+    :else marks))
+
+(defn marks-at
+  "Marks map after processing the first n fixture inputs — the pure
+  rebuild used on resume so marks stay a function of replay position."
+  [fixture* n]
+  (reduce (fn [marks input]
+            (apply-payload-marks marks (:input/type input)
+                                 (:input/instrument-id input)
+                                 (:input/payload input)))
+          {}
+          (take n (:fixture/inputs fixture*))))
+
+;; ---------------------------------------------------------------------------
+;; Strategy wiring
+;; ---------------------------------------------------------------------------
+
+(defn load-strategy
+  "Load + validate one strategy declaration with its artifacts. Throws on
+  structural/compatibility errors or a mode policy that excludes
+  run-mode."
+  [artifact-store run-mode path]
+  (let [decl (edn/read-string (slurp path))
+        artifacts {:feature-manifest (ap/feature-manifest
+                                      artifact-store
+                                      (get-in decl [:strategy/features
+                                                    :manifest-ref]))
+                   :model (ap/model-artifact
+                           artifact-store
+                           (get-in decl [:strategy/inference :artifact-ref]))}
+        {:keys [valid? errors]} (reg/validate-strategy-decl decl artifacts)]
+    (when-not valid?
+      (throw (ex-info (str "invalid strategy declaration: " path)
+                      {:error/code :error/invalid-strategy-decl
+                       :error/path path
+                       :error/errors errors})))
+    (when-not (contains? (:strategy/mode-policy decl) run-mode)
+      (throw (ex-info (str "strategy mode policy excludes " run-mode)
+                      {:error/code :error/mode-not-allowed
+                       :error/strategy-id (:strategy/id decl)
+                       :error/mode-policy (:strategy/mode-policy decl)})))
+    {:decl decl :artifacts artifacts}))
+
+(defn enable-strategies
+  "Register every strategy (idempotent) and drive :inactive entries to
+  :warming-up via the strategy lifecycle machine. The caller asserts
+  route validity (the live base validates routes against the control
+  plane BEFORE reaching the loop; the replay base has no control plane)."
+  [state strategies]
+  (reduce
+   (fn [state {:keys [decl]}]
+     (let [sid (:strategy/id decl)
+           state (st/register-strategy state sid)
+           lifecycle (:strategy/lifecycle (st/strategy-state state sid))]
+       (if (= :inactive lifecycle)
+         (let [res (m/transition :machine/strategy :inactive
+                                 :event/strategy-enabled
+                                 {:route-valid? true})]
+           (if (:transition/applied? res)
+             (st/update-strategy state sid
+                                 #(assoc % :strategy/lifecycle
+                                         (:transition/to res)))
+             state))
+         state)))
+   state
+   strategies))
+
+(defn- advance-warmups
+  "Drive :warming-up strategies to :active once their primary instrument
+  has accumulated :strategy/warmup :required-bars bars."
+  [state strategies]
+  (reduce
+   (fn [state {:keys [decl]}]
+     (let [sid (:strategy/id decl)
+           lifecycle (:strategy/lifecycle (st/strategy-state state sid))]
+       (if (= :warming-up lifecycle)
+         (let [instrument (first (:strategy/instruments decl))
+               bars (count (:bars (st/market-slice state instrument)))
+               required (get-in decl [:strategy/warmup :required-bars])]
+           (if (>= bars required)
+             (let [res (m/transition :machine/strategy :warming-up
+                                     :event/warmup-satisfied
+                                     {:dependencies-healthy? true
+                                      :history-loaded? true})]
+               (if (:transition/applied? res)
+                 (st/update-strategy state sid
+                                     #(assoc % :strategy/lifecycle
+                                             (:transition/to res)))
+                 state))
+             state))
+         state)))
+   state
+   strategies))
+
+(defn- observation-relevant?
+  "Pipeline trigger gate: instrument-scoped market observation for one of
+  the strategy's declared instruments."
+  [obs decl]
+  (and (contains? enums/market-fact-types (:record/type obs))
+       (some? (:record/instrument-id obs))
+       (some #(= (:record/instrument-id obs) %)
+             (:strategy/instruments decl))))
+
+;; ---------------------------------------------------------------------------
+;; Ledger integration (derive → append → fold; never fold raw fills)
+;; ---------------------------------------------------------------------------
+
+(defn- apply-fills-to-ledger!
+  "For each newly folded :fact/fill-observed: derive ledger facts (intent
+  ctx from the unresolved-order entry — resolved orders stay in the map
+  for exactly this lookup), append them (dedupe-key idempotent), and fold
+  ONLY the accepted ones into ledger state (duplicates were folded by the
+  recovery rebuild). Fills with no resolvable intent context are skipped
+  and reported, never guessed."
+  [fact-store on-facts state ledger fill-facts]
+  (reduce
+   (fn [acc fill]
+     (let [oi-id (get-in fill [:fact/payload :order-intent/id])
+           ctx (rec/order-entry->intent-ctx (st/unresolved-order state oi-id))]
+       (if (nil? ctx)
+         (update acc :skipped-fills conj (:record/id fill))
+         (let [{:keys [new-facts appended-count]}
+               (append!* fact-store on-facts
+                         (ledger/derive-ledger-facts (:ledger acc) fill ctx))]
+           (-> acc
+               (update :ledger ledger/fold-ledger-facts new-facts)
+               (update :appended-count + appended-count))))))
+   {:ledger ledger :appended-count 0 :skipped-fills []}
+   fill-facts))
+
+;; ---------------------------------------------------------------------------
+;; One strategy decision pass (§6 steps 4-10 for one strategy)
+;; ---------------------------------------------------------------------------
+
+(defn- run-strategy-cycle!
+  "Pipeline → append+fold decision facts → derive/dispatch commands →
+  append+fold outcomes → ledger derive/append/fold → portfolio refresh.
+  Returns {:state .. :ledger .. :appended-count n :skipped-fills [..]}."
+  [{:keys [fact-store broker state ledger strategy account-id run-id
+           run-mode broker-route on-facts]}]
+  (let [{:keys [decl artifacts]} strategy
+        sid (:strategy/id decl)
+        instrument (first (:strategy/instruments decl))
+        local-state (:strategy/signal-state (st/strategy-state state sid))
+        {:keys [facts strategy-local-state']}
+        (reg/run-pipeline {:strategy decl
+                           :market-slice (st/market-slice state instrument)
+                           :strategy-local-state local-state
+                           :portfolio-view (:engine/portfolio state)
+                           :artifacts artifacts
+                           :account-id account-id
+                           :mode run-mode
+                           :run-id run-id})
+        ;; §6 step 6: append decision facts, fold the newly accepted ones
+        {dec-new :new-facts dec-n :appended-count}
+        (append!* fact-store on-facts facts)
+        fold1 (fold-new! fact-store on-facts state dec-new)
+        state (:state fold1)
+        ;; strategy-local posture memory is loop-side state (explicit, §6)
+        state (st/update-strategy state sid
+                                  #(assoc % :strategy/signal-state
+                                          strategy-local-state'))
+        ;; §6 steps 5+7: derive commands from ALL pipeline intent facts
+        ;; (not just newly appended — after a crash the intent may already
+        ;; be in the log while its submit never happened; §12.1 dedupe
+        ;; decides), then dispatch with the durable pre-call append hook.
+        commands (cmds/derive-commands facts {:broker-route broker-route})
+        dispatched (atom {:new-facts [] :appended-count 0})
+        append-hook (fn [facts*]
+                      (let [res (append!* fact-store on-facts facts*)]
+                        (swap! dispatched
+                               (fn [acc]
+                                 (-> acc
+                                     (update :new-facts into (:new-facts res))
+                                     (update :appended-count +
+                                             (:appended-count res)))))
+                        res))
+        _ (cmds/dispatch-commands! {:broker broker
+                                    :state state
+                                    :commands commands
+                                    :append! append-hook})
+        ;; §6 steps 8-10: fold the newly appended dispatch/outcome facts
+        outcome-new (:new-facts @dispatched)
+        fold2 (fold-new! fact-store on-facts state outcome-new)
+        state (:state fold2)
+        ;; ledger integration point: derive→append→fold per new fill
+        fills (filterv #(= :fact/fill-observed (:record/type %)) outcome-new)
+        ledger-res (apply-fills-to-ledger! fact-store on-facts state ledger
+                                           fills)
+        ledger' (:ledger ledger-res)
+        state (assoc state :engine/portfolio
+                     (portfolio/derive-portfolio ledger'))]
+    {:state state
+     :ledger ledger'
+     :appended-count (+ dec-n
+                        (:appended-count fold1)
+                        (:appended-count @dispatched)
+                        (:appended-count fold2)
+                        (:appended-count ledger-res))
+     :skipped-fills (:skipped-fills ledger-res)}))
+
+;; ---------------------------------------------------------------------------
+;; Snapshots
+;; ---------------------------------------------------------------------------
+
+(defn write-snapshot!*
+  "Persist the runtime snapshot. State carries :engine/cursors and
+  strategy-local signal state — everything the loop needs to resume."
+  [snapshot-store fact-store state run-id snapshot-scope]
+  (p/write-snapshot!
+   snapshot-store
+   (sch/snapshot-envelope
+    {:snapshot/engine-version (:engine/version state)
+     :snapshot/scope snapshot-scope
+     :snapshot/run-id run-id
+     :snapshot/written-at (utc-now-str)
+     :snapshot/fact-watermark {:stream snapshot-scope
+                               :offset (p/latest-offset fact-store)}
+     :snapshot/state state})))
+
+;; ---------------------------------------------------------------------------
+;; Summary helpers (shared shape pieces; bases assemble their own summary)
+;; ---------------------------------------------------------------------------
+
+(defn orders-summary
+  [state]
+  {:order/count (count (:engine/unresolved-orders state))
+   :order/by-intent
+   (into {}
+         (map (fn [[oi entry]]
+                [oi (select-keys entry [:order/lifecycle :order/resolved?
+                                        :order/side :order/effect
+                                        :order/filled-quantity])])
+              (:engine/unresolved-orders state)))})
+
+;; ---------------------------------------------------------------------------
+;; The loop
+;; ---------------------------------------------------------------------------
+
+(defn run-loop
+  "Run the canonical engine cycle to source exhaustion. Config (explicit
+  map — never kwargs):
+    :fact-store     persistence.protocol/FactStore (required)
+    :snapshot-store persistence.protocol/SnapshotStore (required)
+    :broker         broker.protocol/Broker (required)
+    :source         market-data.protocol/MarketDataSource (required)
+    :strategies     [{:decl .. :artifacts ..}] from load-strategy (required)
+    :account-id     account route for intents (required)
+    :run-id         this run's id (required)
+    :run-mode       engine mode keyword (required)
+    :state0         initial engine state (already init-run'd + strategies
+                    enabled) (required)
+    :ledger0        initial ledger state (required)
+    :cursor0        source resume cursor (default 0)
+    :snapshot-every snapshot cadence in appended facts (default 50)
+    :snapshot-scope snapshot partition (default \"runtime-main\")
+    :max-facts      stop at the first CYCLE BOUNDARY where this run's
+                    appended-fact count reaches this, WITHOUT a final
+                    snapshot (simulated crash) (optional)
+    :broker-route   BROKER_ADAPTER §4.1 route map for derived submit
+                    commands (default {:broker/source-system :broker/sim})
+    :on-observation (fn [obs new?]) hook (optional; see ns docstring)
+    :on-facts       (fn [facts]) newly-appended-facts hook (optional)
+
+  Returns {:state .. :ledger .. :cursor n :appended n :stopped-early? bool
+           :skipped-fills [..]} — a final snapshot is written unless the
+  run stopped early."
+  [{:keys [fact-store snapshot-store broker source strategies account-id
+           run-id run-mode state0 ledger0 cursor0 snapshot-every
+           snapshot-scope max-facts broker-route on-observation on-facts]}]
+  (let [snapshot-every (or snapshot-every default-snapshot-every)
+        snapshot-scope (or snapshot-scope default-snapshot-scope)
+        cursor0 (or cursor0 0)]
+    (loop [state state0
+           ledger ledger0
+           cursor cursor0
+           appended 0
+           since-snap 0
+           skipped-fills []]
+      (let [{:keys [observations] next-cursor :cursor}
+            (mdp/next-observations source cursor 1)]
+        (if (empty? observations)
+          ;; finish: final snapshot
+          (do
+            (write-snapshot!* snapshot-store fact-store state run-id
+                              snapshot-scope)
+            {:state state :ledger ledger :cursor cursor :appended appended
+             :stopped-early? false :skipped-fills skipped-fills})
+          (let [obs (first observations)
+                ;; §6 steps 1-3
+                {obs-new :new-facts obs-n :appended-count}
+                (append!* fact-store on-facts [obs])
+                obs-fold (fold-new! fact-store on-facts state obs-new)
+                state (:state obs-fold)
+                cycle-n (+ obs-n (:appended-count obs-fold))
+                _ (when on-observation
+                    (on-observation obs (boolean (seq obs-new))))
+                ;; lifecycle: warmup advancement from accumulated history
+                state (advance-warmups state strategies)
+                ;; §6 steps 4-10 per active + relevant strategy
+                cycle-res
+                (reduce
+                 (fn [acc strategy]
+                   (let [sid (get-in strategy [:decl :strategy/id])
+                         lifecycle (:strategy/lifecycle
+                                    (st/strategy-state (:state acc) sid))]
+                     (if (and (= :active lifecycle)
+                              (observation-relevant? obs (:decl strategy)))
+                       (let [res (run-strategy-cycle!
+                                  {:fact-store fact-store
+                                   :broker broker
+                                   :state (:state acc)
+                                   :ledger (:ledger acc)
+                                   :strategy strategy
+                                   :account-id account-id
+                                   :run-id run-id
+                                   :run-mode run-mode
+                                   :broker-route broker-route
+                                   :on-facts on-facts})]
+                         {:state (:state res)
+                          :ledger (:ledger res)
+                          :n (+ (:n acc) (:appended-count res))
+                          :skipped (into (:skipped acc) (:skipped-fills res))})
+                       acc)))
+                 {:state state :ledger ledger :n cycle-n :skipped []}
+                 strategies)
+                state (:state cycle-res)
+                ledger (:ledger cycle-res)
+                cycle-n (:n cycle-res)
+                skipped-fills (into skipped-fills (:skipped cycle-res))
+                ;; cursor advance — the snapshot-carried resume point
+                state (st/record-cursor state :market-data next-cursor)
+                appended (+ appended cycle-n)
+                since-snap (+ since-snap cycle-n)
+                ;; §6 step 11: snapshot cadence
+                snap? (>= since-snap snapshot-every)
+                _ (when snap?
+                    (write-snapshot!* snapshot-store fact-store state run-id
+                                      snapshot-scope))
+                since-snap (if snap? 0 since-snap)]
+            (if (and (some? max-facts) (>= appended max-facts))
+              ;; simulated crash: stop WITHOUT a final snapshot
+              {:state state :ledger ledger :cursor next-cursor
+               :appended appended :stopped-early? true
+               :skipped-fills skipped-fills}
+              (recur state ledger next-cursor appended since-snap
+                     skipped-fills))))))))

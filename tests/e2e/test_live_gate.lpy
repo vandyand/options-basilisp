@@ -1,0 +1,227 @@
+(ns e2e.test-live-gate
+  "Phase 10 engine-live gate + E2E tests (CONTROL_PLANE §11, the
+  stale-feed safety gate, and a full v0.2 fixture session through the
+  live base with sim adapters):
+
+  - violating manifest (active kill switch) → startup refusal with a
+    durable :fact/control-plane-violation-recorded, no trading loop
+  - valid sim-route manifest → full E2E session via the SHARED loop
+    (intents, acks, fills, portfolio) + audit trail
+  - alpaca-paper route + replay feed WITHOUT --allow-replay-feed →
+    refusal with :violation/replay-feed-with-real-broker
+  - same with the override flag → gate passes against a stub-transport
+    alpaca broker (no real call anywhere)"
+  (:import json os.path tempfile)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.base.engine-live :as el]
+            [stevetrading.broker.alpaca :as alp]
+            [stevetrading.control-plane.file-store :as cpfs]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]))
+
+(def fixture-path "resources/fixtures/replay/simple-paper-session-v0.2.edn")
+(def sim-manifest-path "resources/control-plane/examples/sim-main-v0.1.edn")
+
+(defn- sim-manifest
+  []
+  (edn/read-string (slurp sim-manifest-path)))
+
+(defn- paper-manifest
+  "Sim example re-routed to :broker/alpaca-paper (paper account/process)
+  — the stale-feed gate subject."
+  []
+  (-> (sim-manifest)
+      (assoc :control-plane/revision "cp-paper-test-000001")
+      (assoc-in [:control-plane/strategies 0 :strategy/mode] :mode/paper)
+      (assoc-in [:control-plane/strategies 0 :strategy/account-route]
+                "route/paper-direction")
+      (assoc :control-plane/accounts
+             [{:account/id "account/alpaca/paper-main"
+               :account/broker :broker/alpaca-paper
+               :account/environment :environment/paper
+               :account/allowed-modes #{:mode/paper}
+               :account/live-enabled? false}])
+      (assoc-in [:control-plane/processes 0 :process/allowed-modes]
+                #{:mode/paper})
+      (assoc :control-plane/routes
+             [{:route/id "route/paper-direction"
+               :route/strategy-id "strategy/simple-direction/sma-cross/v1"
+               :route/account-id "account/alpaca/paper-main"
+               :route/broker :broker/alpaca-paper}])))
+
+(defn- activate-into!
+  "Activate a manifest into a fresh control-plane root; returns the root."
+  [manifest]
+  (let [root (tempfile/mkdtemp)
+        store (cpfs/make-file-control-plane-store root)
+        outcome (cpfs/activate! store manifest {:actor "test"})]
+    (when-not (:activated? outcome)
+      (throw (ex-info "test manifest failed to activate"
+                      {:outcome outcome})))
+    root))
+
+(defn- log-facts
+  [out-dir]
+  (p/facts-since (fs/make-fact-store (os.path/join out-dir "facts.db")) 0))
+
+(defn- fact-types
+  [out-dir]
+  (set (map :record/type (log-facts out-dir))))
+
+;; ---------------------------------------------------------------------------
+;; Refusal: violating manifest (active kill switch)
+;; ---------------------------------------------------------------------------
+
+(deftest violating-manifest-refuses-startup
+  (let [manifest (-> (sim-manifest)
+                     (assoc :control-plane/revision "cp-sim-killed-000001")
+                     (assoc :control-plane/kill-switches
+                            [{:kill-switch/scope :kill-switch-scope/global
+                              :kill-switch/active? true
+                              :kill-switch/reason "ops halt"
+                              :kill-switch/activated-at "2026-06-10T14:00:00Z"
+                              :kill-switch/actor "ops"}]))
+        root (activate-into! manifest)
+        out-dir (tempfile/mkdtemp)
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-sim-main"
+                             :out-dir out-dir
+                             :fixture-path fixture-path})]
+    (is (false? (:live/started? result)))
+    (is (= :violation/kill-switch-active (:live/refusal result)))
+    (testing "the violation fact is durable and the ONLY fact (no loop)"
+      (let [facts (log-facts out-dir)]
+        (is (= 1 (count facts)))
+        (is (= :fact/control-plane-violation-recorded
+               (:record/type (first facts))))
+        (is (= :violation/kill-switch-active
+               (get-in (first facts)
+                       [:fact/payload :violation/reason])))
+        (is (= "cp-sim-killed-000001"
+               (get-in (first facts)
+                       [:fact/payload :control-plane/revision])))))))
+
+(deftest unknown-process-refuses-startup
+  (let [root (activate-into! (sim-manifest))
+        out-dir (tempfile/mkdtemp)
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-ghost"
+                             :out-dir out-dir
+                             :fixture-path fixture-path})]
+    (is (false? (:live/started? result)))
+    (is (= :violation/unknown-process (:live/refusal result)))
+    (is (contains? (fact-types out-dir)
+                   :fact/control-plane-violation-recorded))))
+
+(deftest no-active-revision-refuses-startup
+  (let [result (el/run-live {:control-plane-root (tempfile/mkdtemp)
+                             :process-id "engine-sim-main"
+                             :out-dir (tempfile/mkdtemp)
+                             :fixture-path fixture-path})]
+    (is (false? (:live/started? result)))
+    (is (= :violation/no-active-revision (:live/refusal result)))))
+
+;; ---------------------------------------------------------------------------
+;; Happy path: sim route runs the v0.2 fixture E2E through the live base
+;; ---------------------------------------------------------------------------
+
+(deftest sim-route-runs-fixture-end-to-end
+  (let [root (activate-into! (sim-manifest))
+        out-dir (tempfile/mkdtemp)
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-sim-main"
+                             :out-dir out-dir
+                             :fixture-path fixture-path})]
+    (is (true? (:live/started? result)))
+    (is (= :mode/sim (:run/mode result)))
+    (is (= :broker/sim (:broker result)))
+    (is (= "cp-sim-000001" (:control-plane/revision result)))
+    (is (false? (:stopped-early? result)))
+    (testing "the full decision→order→fill lineage ran through the shared loop"
+      (let [types (fact-types out-dir)]
+        (is (contains? types :fact/control-plane-activated))
+        (is (contains? types :fact/prediction-produced))
+        (is (contains? types :fact/signal-decision-produced))
+        (is (contains? types :fact/order-intent-created))
+        (is (contains? types :fact/broker-ack-accepted))
+        (is (contains? types :fact/fill-observed))
+        (is (contains? types :fact/position-lot-opened))))
+    (testing "state proves which revision was active"
+      (is (= "cp-sim-000001"
+             (get-in result [:engine/state :engine/run
+                             :run/control-plane-revision]))))
+    (testing "orders resolved through the sim broker"
+      (is (pos? (get-in result [:orders :order/count]))))
+    (testing "the audit trail exists and covers the session"
+      (let [audit-path (os.path/join out-dir "audit.jsonl")
+            lines (vec (remove empty? (.split (slurp audit-path) "\n")))]
+        (is (pos? (count lines)))
+        (let [types (set (map #(get (alp/py->clj (json/loads %))
+                                    "audit/event-type")
+                              lines))]
+          (is (contains? types "audit/control-plane"))
+          (is (contains? types "audit/order"))
+          (is (contains? types "audit/broker")))))))
+
+;; ---------------------------------------------------------------------------
+;; Stale-feed safety gate
+;; ---------------------------------------------------------------------------
+
+(deftest alpaca-route-with-replay-feed-refuses-without-flag
+  (let [root (activate-into! (paper-manifest))
+        out-dir (tempfile/mkdtemp)
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-sim-main"
+                             :out-dir out-dir
+                             :fixture-path fixture-path})]
+    (is (false? (:live/started? result)))
+    (is (= :violation/replay-feed-with-real-broker (:live/refusal result)))
+    (testing "the refusal is a durable violation fact"
+      (let [facts (log-facts out-dir)]
+        (is (= 1 (count facts)))
+        (is (= :fact/control-plane-violation-recorded
+               (:record/type (first facts))))
+        (is (= :violation/replay-feed-with-real-broker
+               (get-in (first facts) [:fact/payload :violation/reason])))))))
+
+(deftest alpaca-route-with-flag-passes-gate-on-stub-transport
+  (let [root (activate-into! (paper-manifest))
+        out-dir (tempfile/mkdtemp)
+        requests (atom [])
+        stub (fn [req]
+               (swap! requests conj req)
+               (if (= "POST" (:method req))
+                 (let [body (alp/py->clj (json/loads (:body req)))]
+                   {:status 200
+                    :body (json/dumps
+                           (alp/clj->py
+                            {"id" (str "stub-ord-" (count @requests))
+                             "client_order_id" (get body "client_order_id")
+                             "status" "accepted"}))})
+                 {:status 200 :body "[]"}))
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-sim-main"
+                             :out-dir out-dir
+                             :fixture-path fixture-path
+                             :allow-replay-feed? true
+                             :alpaca {:key-id "test-key"
+                                      :secret "test-secret"
+                                      :transport stub}})]
+    (is (true? (:live/started? result)))
+    (is (= :mode/paper (:run/mode result)))
+    (is (= :broker/alpaca-paper (:broker result)))
+    (testing "intents were submitted through the stub transport only"
+      (is (pos? (count @requests)))
+      (is (every? #(.startswith (:url %) "https://paper-api.alpaca.markets")
+                  @requests)))
+    (testing "the alpaca ack normalized into the fact log"
+      (let [acks (filterv #(= :fact/broker-ack-accepted (:record/type %))
+                          (log-facts out-dir))]
+        (is (pos? (count acks)))
+        (is (every? #(= :broker/alpaca-paper
+                        (get-in % [:fact/payload :broker/source-system]))
+                    acks))
+        (is (every? #(.startswith
+                      (get-in % [:fact/payload :broker/order-id]) "stub-ord-")
+                    acks))))))

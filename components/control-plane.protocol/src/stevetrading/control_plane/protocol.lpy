@@ -1,0 +1,619 @@
+(ns stevetrading.control-plane.protocol
+  "Control-plane manifest schema + validation (CONTROL_PLANE_MANIFESTS
+  v0.1, ADR-0005). Pure data + pure functions — the file-backed store
+  lives in control-plane.file-store.
+
+  validate-manifest returns {:valid? bool :errors [..] :warnings [..]}:
+  - §9.1 structural: required fields, malformed ids, duplicate ids,
+    unknown enum values, dangling references → errors
+  - §9.2 safety: live strategies on non-live accounts/processes, paper
+    strategies on live-only accounts, strategies with no valid route,
+    process mode mismatches, conflicting kill-switch semantics → errors
+  - §9.3 policy: artifact ref format/compat, route order-class policy,
+    account environment vs broker consistency → warnings (validity is
+    not affected; operators review warnings at activation)
+
+  Error/warning entries are {:error/code kw :error/path [..]
+  :error/message str} (warnings use the same shape with warning codes).
+
+  kill-switch scope semantics (§8): :kill-switch-scope/global matches
+  every runtime; the other scopes carry a :kill-switch/target (process
+  id, strategy id, or account id) and match only a runtime context with
+  that identity. An ACTIVE switch must declare reason + activated-at;
+  inactive entries may carry nils (the example manifest does)."
+  (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.identifiers :as identifiers]))
+
+;; ---------------------------------------------------------------------------
+;; Enum sets (control-plane vocabulary)
+;; ---------------------------------------------------------------------------
+
+(def control-plane-statuses
+  #{:control-plane-status/proposed
+    :control-plane-status/active
+    :control-plane-status/retired})
+
+(def environments
+  #{:environment/sim
+    :environment/paper
+    :environment/live})
+
+(def brokers
+  #{:broker/sim
+    :broker/alpaca-paper
+    :broker/alpaca-live})
+
+(def process-bases
+  #{:base/engine-live
+    :base/engine-replay})
+
+(def kill-switch-scopes
+  #{:kill-switch-scope/global
+    :kill-switch-scope/process
+    :kill-switch-scope/strategy
+    :kill-switch-scope/account})
+
+(def required-top-level-keys
+  [:control-plane/revision
+   :control-plane/generated-at
+   :control-plane/status
+   :control-plane/strategies
+   :control-plane/accounts
+   :control-plane/processes
+   :control-plane/routes
+   :control-plane/kill-switches
+   :control-plane/policies])
+
+;; ---------------------------------------------------------------------------
+;; Helpers
+;; ---------------------------------------------------------------------------
+
+(defn- err
+  [code path message]
+  {:error/code code :error/path (vec path) :error/message message})
+
+(defn- non-blank-string?
+  [s]
+  (and (string? s) (pos? (count s))))
+
+(defn- duplicate-ids
+  [ids]
+  (->> (frequencies (filter some? ids))
+       (filter (fn [[_ n]] (> n 1)))
+       (mapv first)))
+
+(defn- check-duplicates
+  [errors section ids]
+  (reduce (fn [errors dup]
+            (conj errors (err :error/duplicate-id [section]
+                              (str "duplicate id " (pr-str dup)))))
+          errors
+          (duplicate-ids ids)))
+
+;; ---------------------------------------------------------------------------
+;; §9.1 structural validation
+;; ---------------------------------------------------------------------------
+
+(defn- check-top-level
+  [errors manifest]
+  (let [errors (reduce (fn [errors k]
+                         (if (contains? manifest k)
+                           errors
+                           (conj errors (err :error/missing-field [k]
+                                             (str "manifest missing " k)))))
+                       errors
+                       required-top-level-keys)
+        errors (if (and (contains? manifest :control-plane/revision)
+                        (not (non-blank-string?
+                              (:control-plane/revision manifest))))
+                 (conj errors (err :error/malformed-id
+                                   [:control-plane/revision]
+                                   "revision must be a non-empty string"))
+                 errors)
+        errors (if (and (contains? manifest :control-plane/status)
+                        (not (contains? control-plane-statuses
+                                        (:control-plane/status manifest))))
+                 (conj errors (err :error/invalid-enum
+                                   [:control-plane/status]
+                                   (str "unknown status "
+                                        (pr-str (:control-plane/status
+                                                 manifest)))))
+                 errors)]
+    errors))
+
+(defn- check-strategy
+  [errors i s]
+  (let [path [:control-plane/strategies i]
+        errors (if (identifiers/valid-strategy-id? (:strategy/id s))
+                 errors
+                 (conj errors (err :error/malformed-id
+                                   (conj path :strategy/id)
+                                   (str "malformed strategy id "
+                                        (pr-str (:strategy/id s))))))
+        errors (if (boolean? (:strategy/enabled? s))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :strategy/enabled?)
+                                   "strategy requires :strategy/enabled?")))
+        errors (if (contains? enums/modes (:strategy/mode s))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :strategy/mode)
+                                   (str "unknown mode "
+                                        (pr-str (:strategy/mode s))))))
+        errors (if (non-blank-string? (:strategy/process s))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :strategy/process)
+                                   "strategy requires :strategy/process")))
+        errors (if (non-blank-string? (:strategy/account-route s))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :strategy/account-route)
+                                   "strategy requires :strategy/account-route")))
+        artifacts (:strategy/artifacts s)
+        errors (if (and (map? artifacts)
+                        (non-blank-string? (:model-ref artifacts))
+                        (non-blank-string? (:feature-manifest-ref artifacts)))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :strategy/artifacts)
+                                   "strategy requires :strategy/artifacts with :model-ref and :feature-manifest-ref")))
+        errors (if (map? (:strategy/schedule s))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :strategy/schedule)
+                                   "strategy requires :strategy/schedule")))]
+    errors))
+
+(defn- check-account
+  [errors i a]
+  (let [path [:control-plane/accounts i]
+        errors (if (identifiers/valid-account-id? (:account/id a))
+                 errors
+                 (conj errors (err :error/malformed-id
+                                   (conj path :account/id)
+                                   (str "malformed account id "
+                                        (pr-str (:account/id a))))))
+        errors (if (contains? brokers (:account/broker a))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :account/broker)
+                                   (str "unknown broker "
+                                        (pr-str (:account/broker a))))))
+        errors (if (contains? environments (:account/environment a))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :account/environment)
+                                   (str "unknown environment "
+                                        (pr-str (:account/environment a))))))
+        allowed (:account/allowed-modes a)
+        errors (if (and (set? allowed) (seq allowed)
+                        (every? #(contains? enums/modes %) allowed))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :account/allowed-modes)
+                                   "allowed-modes must be a non-empty set of known modes")))
+        errors (if (boolean? (:account/live-enabled? a))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :account/live-enabled?)
+                                   "account requires :account/live-enabled?")))]
+    errors))
+
+(defn- check-process
+  [errors i p]
+  (let [path [:control-plane/processes i]
+        errors (if (non-blank-string? (:process/id p))
+                 errors
+                 (conj errors (err :error/malformed-id
+                                   (conj path :process/id)
+                                   "process requires a non-empty :process/id")))
+        errors (if (contains? process-bases (:process/base p))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :process/base)
+                                   (str "unknown process base "
+                                        (pr-str (:process/base p))))))
+        allowed (:process/allowed-modes p)
+        errors (if (and (set? allowed) (seq allowed)
+                        (every? #(contains? enums/modes %) allowed))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :process/allowed-modes)
+                                   "allowed-modes must be a non-empty set of known modes")))
+        errors (if (vector? (:process/strategies p))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :process/strategies)
+                                   "process requires :process/strategies vector")))]
+    errors))
+
+(defn- check-route
+  [errors i r]
+  (let [path [:control-plane/routes i]
+        errors (if (and (non-blank-string? (:route/id r))
+                        (.startswith (str (:route/id r)) "route/"))
+                 errors
+                 (conj errors (err :error/malformed-id
+                                   (conj path :route/id)
+                                   (str "route id must be a route/* string, got "
+                                        (pr-str (:route/id r))))))
+        errors (if (non-blank-string? (:route/strategy-id r))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :route/strategy-id)
+                                   "route requires :route/strategy-id")))
+        errors (if (non-blank-string? (:route/account-id r))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :route/account-id)
+                                   "route requires :route/account-id")))
+        errors (if (contains? brokers (:route/broker r))
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :route/broker)
+                                   (str "unknown broker "
+                                        (pr-str (:route/broker r))))))]
+    errors))
+
+(defn- check-kill-switch
+  [errors i ks]
+  (let [path [:control-plane/kill-switches i]
+        scope (:kill-switch/scope ks)
+        errors (if (contains? kill-switch-scopes scope)
+                 errors
+                 (conj errors (err :error/invalid-enum
+                                   (conj path :kill-switch/scope)
+                                   (str "unknown kill-switch scope "
+                                        (pr-str scope)))))
+        errors (if (boolean? (:kill-switch/active? ks))
+                 errors
+                 (conj errors (err :error/missing-field
+                                   (conj path :kill-switch/active?)
+                                   "kill switch requires :kill-switch/active?")))
+        ;; §8/§9.2 — active switches must be explicit and auditable;
+        ;; non-global scopes are meaningless without a target identity.
+        errors (if (and (true? (:kill-switch/active? ks))
+                        (contains? kill-switch-scopes scope)
+                        (not= :kill-switch-scope/global scope)
+                        (not (non-blank-string? (:kill-switch/target ks))))
+                 (conj errors (err :error/conflicting-kill-switch
+                                   (conj path :kill-switch/target)
+                                   (str "active " (pr-str scope)
+                                        " kill switch requires a :kill-switch/target")))
+                 errors)
+        errors (if (and (true? (:kill-switch/active? ks))
+                        (not (and (non-blank-string? (:kill-switch/reason ks))
+                                  (non-blank-string?
+                                   (:kill-switch/activated-at ks)))))
+                 (conj errors (err :error/conflicting-kill-switch
+                                   path
+                                   "active kill switch requires reason and activated-at"))
+                 errors)]
+    errors))
+
+(defn- conflicting-kill-switches
+  "Two entries for the SAME scope+target with different :kill-switch/active?
+  flags are conflicting scope semantics (§9.2)."
+  [errors switches]
+  (let [groups (group-by (juxt :kill-switch/scope :kill-switch/target)
+                         switches)]
+    (reduce (fn [errors [k entries]]
+              (if (> (count (set (map :kill-switch/active? entries))) 1)
+                (conj errors (err :error/conflicting-kill-switch
+                                  [:control-plane/kill-switches]
+                                  (str "conflicting active? flags for kill-switch scope "
+                                       (pr-str k))))
+                errors))
+            errors
+            groups)))
+
+(defn- check-references
+  "§9.1 — invalid references between strategies, accounts, processes,
+  and routes."
+  [errors manifest]
+  (let [strategy-ids (set (keep :strategy/id (:control-plane/strategies manifest)))
+        account-ids (set (keep :account/id (:control-plane/accounts manifest)))
+        process-ids (set (keep :process/id (:control-plane/processes manifest)))
+        route-ids (set (keep :route/id (:control-plane/routes manifest)))
+        errors
+        (reduce
+         (fn [errors [i s]]
+           (let [path [:control-plane/strategies i]
+                 errors (if (or (nil? (:strategy/process s))
+                                (contains? process-ids (:strategy/process s)))
+                          errors
+                          (conj errors (err :error/dangling-reference
+                                            (conj path :strategy/process)
+                                            (str "unknown process "
+                                                 (pr-str (:strategy/process s))))))]
+             (if (or (nil? (:strategy/account-route s))
+                     (contains? route-ids (:strategy/account-route s)))
+               errors
+               (conj errors (err :error/dangling-reference
+                                 (conj path :strategy/account-route)
+                                 (str "unknown route "
+                                      (pr-str (:strategy/account-route s))))))))
+         errors
+         (map-indexed vector (:control-plane/strategies manifest)))
+        errors
+        (reduce
+         (fn [errors [i r]]
+           (let [path [:control-plane/routes i]
+                 errors (if (or (nil? (:route/strategy-id r))
+                                (contains? strategy-ids (:route/strategy-id r)))
+                          errors
+                          (conj errors (err :error/dangling-reference
+                                            (conj path :route/strategy-id)
+                                            (str "unknown strategy "
+                                                 (pr-str (:route/strategy-id r))))))]
+             (if (or (nil? (:route/account-id r))
+                     (contains? account-ids (:route/account-id r)))
+               errors
+               (conj errors (err :error/dangling-reference
+                                 (conj path :route/account-id)
+                                 (str "unknown account "
+                                      (pr-str (:route/account-id r))))))))
+         errors
+         (map-indexed vector (:control-plane/routes manifest)))
+        errors
+        (reduce
+         (fn [errors [i p]]
+           (reduce (fn [errors sid]
+                     (if (contains? strategy-ids sid)
+                       errors
+                       (conj errors (err :error/dangling-reference
+                                         [:control-plane/processes i
+                                          :process/strategies]
+                                         (str "unknown strategy "
+                                              (pr-str sid))))))
+                   errors
+                   (:process/strategies p)))
+         errors
+         (map-indexed vector (:control-plane/processes manifest)))]
+    errors))
+
+;; ---------------------------------------------------------------------------
+;; §9.2 safety validation
+;; ---------------------------------------------------------------------------
+
+(defn- check-safety
+  "Per enabled strategy: resolve route → account + owning process and
+  reject unsafe bindings. Dangling references were already rejected
+  structurally; nil lookups here are skipped (one error per cause)."
+  [errors manifest]
+  (let [routes (into {} (map (fn [r] [(:route/id r) r])
+                             (:control-plane/routes manifest)))
+        accounts (into {} (map (fn [a] [(:account/id a) a])
+                               (:control-plane/accounts manifest)))
+        processes (into {} (map (fn [p] [(:process/id p) p])
+                                (:control-plane/processes manifest)))]
+    (reduce
+     (fn [errors [i s]]
+       (if-not (true? (:strategy/enabled? s))
+         errors
+         (let [path [:control-plane/strategies i]
+               mode (:strategy/mode s)
+               route (get routes (:strategy/account-route s))
+               account (when route (get accounts (:route/account-id route)))
+               process (get processes (:strategy/process s))
+               ;; strategies with no valid route: route must exist AND be
+               ;; declared for this strategy id
+               errors (if (and (some? route)
+                               (not= (:strategy/id s)
+                                     (:route/strategy-id route)))
+                        (conj errors (err :error/no-valid-route
+                                          (conj path :strategy/account-route)
+                                          (str "route " (:route/id route)
+                                               " is not declared for strategy "
+                                               (:strategy/id s))))
+                        errors)
+               ;; process mode mismatch
+               errors (if (and (some? process)
+                               (set? (:process/allowed-modes process))
+                               (not (contains? (:process/allowed-modes process)
+                                               mode)))
+                        (conj errors (err :error/process-mode-mismatch
+                                          (conj path :strategy/mode)
+                                          (str "process " (:process/id process)
+                                               " does not allow mode "
+                                               (pr-str mode))))
+                        errors)
+               ;; account mode mismatch (covers paper→live-only accounts)
+               errors (if (and (some? account)
+                               (set? (:account/allowed-modes account))
+                               (not (contains? (:account/allowed-modes account)
+                                               mode)))
+                        (conj errors (err :error/account-mode-mismatch
+                                          (conj path :strategy/mode)
+                                          (str "account " (:account/id account)
+                                               " does not allow mode "
+                                               (pr-str mode))))
+                        errors)
+               ;; live strategies on non-live-eligible accounts
+               errors (if (and (= :mode/live mode)
+                               (some? account)
+                               (not (true? (:account/live-enabled? account))))
+                        (conj errors (err :error/live-on-non-live-account
+                                          (conj path :strategy/account-route)
+                                          (str "live strategy routed to non-live account "
+                                               (:account/id account))))
+                        errors)
+               ;; route broker must match the account's broker
+               errors (if (and (some? route) (some? account)
+                               (some? (:route/broker route))
+                               (some? (:account/broker account))
+                               (not= (:route/broker route)
+                                     (:account/broker account)))
+                        (conj errors (err :error/route-broker-mismatch
+                                          (conj path :strategy/account-route)
+                                          (str "route broker "
+                                               (pr-str (:route/broker route))
+                                               " != account broker "
+                                               (pr-str (:account/broker account)))))
+                        errors)]
+           errors)))
+     errors
+     (map-indexed vector (:control-plane/strategies manifest)))))
+
+;; ---------------------------------------------------------------------------
+;; §9.3 policy validation (warnings)
+;; ---------------------------------------------------------------------------
+
+(def ^:private artifact-ref-re
+  #"^(model|feature)/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/v\d+$")
+
+(defn- check-policies
+  [warnings manifest]
+  (let [warnings
+        (reduce
+         (fn [warnings [i s]]
+           (let [path [:control-plane/strategies i :strategy/artifacts]
+                 model-ref (get-in s [:strategy/artifacts :model-ref])
+                 feature-ref (get-in s [:strategy/artifacts
+                                        :feature-manifest-ref])
+                 warnings (if (and (string? model-ref)
+                                   (nil? (re-matches artifact-ref-re
+                                                     model-ref)))
+                            (conj warnings
+                                  (err :warning/artifact-ref-format
+                                       (conj path :model-ref)
+                                       (str "model ref " (pr-str model-ref)
+                                            " is not a versioned model/.../vN ref")))
+                            warnings)]
+             (if (and (string? feature-ref)
+                      (nil? (re-matches artifact-ref-re feature-ref)))
+               (conj warnings
+                     (err :warning/artifact-ref-format
+                          (conj path :feature-manifest-ref)
+                          (str "feature manifest ref " (pr-str feature-ref)
+                               " is not a versioned feature/.../vN ref")))
+               warnings)))
+         warnings
+         (map-indexed vector (:control-plane/strategies manifest)))
+        ;; route order-class policy: an explicit empty allowed set can
+        ;; never route an order
+        warnings
+        (reduce
+         (fn [warnings [i r]]
+           (if (and (contains? r :route/allowed-order-classes)
+                    (empty? (:route/allowed-order-classes r)))
+             (conj warnings
+                   (err :warning/route-order-class-policy
+                        [:control-plane/routes i
+                         :route/allowed-order-classes]
+                        "route declares an EMPTY allowed-order-class set"))
+             warnings))
+         warnings
+         (map-indexed vector (:control-plane/routes manifest)))
+        ;; account environment vs broker consistency
+        env-for-broker {:broker/sim :environment/sim
+                        :broker/alpaca-paper :environment/paper
+                        :broker/alpaca-live :environment/live}
+        warnings
+        (reduce
+         (fn [warnings [i a]]
+           (let [expected (get env-for-broker (:account/broker a))]
+             (if (and (some? expected)
+                      (some? (:account/environment a))
+                      (not= expected (:account/environment a)))
+               (conj warnings
+                     (err :warning/environment-broker-mismatch
+                          [:control-plane/accounts i :account/environment]
+                          (str "broker " (pr-str (:account/broker a))
+                               " implies environment " (pr-str expected)
+                               ", manifest declares "
+                               (pr-str (:account/environment a)))))
+               warnings)))
+         warnings
+         (map-indexed vector (:control-plane/accounts manifest)))]
+    warnings))
+
+;; ---------------------------------------------------------------------------
+;; validate-manifest
+;; ---------------------------------------------------------------------------
+
+(defn validate-manifest
+  "Validate one control-plane manifest per §9. Returns
+  {:valid? bool :errors [..] :warnings [..]} — :valid? is true iff
+  :errors is empty (warnings never block)."
+  [manifest]
+  (if-not (map? manifest)
+    {:valid? false
+     :errors [(err :error/missing-field [] "manifest must be a map")]
+     :warnings []}
+    (let [errors []
+          errors (check-top-level errors manifest)
+          errors (reduce (fn [errors [i s]] (check-strategy errors i s))
+                         errors
+                         (map-indexed vector
+                                      (:control-plane/strategies manifest)))
+          errors (reduce (fn [errors [i a]] (check-account errors i a))
+                         errors
+                         (map-indexed vector
+                                      (:control-plane/accounts manifest)))
+          errors (reduce (fn [errors [i p]] (check-process errors i p))
+                         errors
+                         (map-indexed vector
+                                      (:control-plane/processes manifest)))
+          errors (reduce (fn [errors [i r]] (check-route errors i r))
+                         errors
+                         (map-indexed vector
+                                      (:control-plane/routes manifest)))
+          errors (reduce (fn [errors [i ks]] (check-kill-switch errors i ks))
+                         errors
+                         (map-indexed vector
+                                      (:control-plane/kill-switches manifest)))
+          errors (conflicting-kill-switches
+                  errors (:control-plane/kill-switches manifest))
+          errors (check-duplicates errors :control-plane/strategies
+                                   (map :strategy/id
+                                        (:control-plane/strategies manifest)))
+          errors (check-duplicates errors :control-plane/accounts
+                                   (map :account/id
+                                        (:control-plane/accounts manifest)))
+          errors (check-duplicates errors :control-plane/processes
+                                   (map :process/id
+                                        (:control-plane/processes manifest)))
+          errors (check-duplicates errors :control-plane/routes
+                                   (map :route/id
+                                        (:control-plane/routes manifest)))
+          errors (check-references errors manifest)
+          errors (check-safety errors manifest)
+          warnings (check-policies [] manifest)]
+      {:valid? (empty? errors)
+       :errors errors
+       :warnings warnings})))
+
+;; ---------------------------------------------------------------------------
+;; Kill-switch scope matching (§8)
+;; ---------------------------------------------------------------------------
+
+(defn kill-switch-active?
+  "First ACTIVE kill switch in the manifest matching the runtime scope
+  context, or nil. ctx (explicit map):
+    {:process-id \"engine-paper-main\"
+     :strategy-id \"strategy/...\"      ;; optional
+     :account-id \"account/...\"}       ;; optional
+
+  Matching: global matches every context; process/strategy/account
+  scopes match when the context carries that identity and it equals the
+  switch's :kill-switch/target."
+  [manifest ctx]
+  (let [matches?
+        (fn [ks]
+          (and (true? (:kill-switch/active? ks))
+               (let [scope (:kill-switch/scope ks)
+                     target (:kill-switch/target ks)]
+                 (case scope
+                   :kill-switch-scope/global true
+                   :kill-switch-scope/process (and (some? (:process-id ctx))
+                                                   (= target (:process-id ctx)))
+                   :kill-switch-scope/strategy (and (some? (:strategy-id ctx))
+                                                    (= target
+                                                       (:strategy-id ctx)))
+                   :kill-switch-scope/account (and (some? (:account-id ctx))
+                                                   (= target (:account-id ctx)))
+                   false))))]
+    (first (filter matches? (:control-plane/kill-switches manifest)))))

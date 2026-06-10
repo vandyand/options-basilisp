@@ -1,0 +1,63 @@
+(ns stevetrading.observability.protocol
+  "Observability boundary (OBSERVABILITY_AND_OPERATIONS_V0.1).
+
+  Protocol component — importable by anyone (POLYLITH §7). The JSON-lines
+  implementation lives in observability.structured-log (adapter; bases
+  only).
+
+  Audit events are the §4 structured pillar: machine-readable,
+  human-inspectable, and joinable back to canonical fact history through
+  the identifiers they carry (§11 — one event is enough to join to
+  deeper truth)."
+  (:require [stevetrading.domain.identifiers :as identifiers]))
+
+(def severities
+  #{:severity/info
+    :severity/warning
+    :severity/error
+    :severity/critical})
+
+(def required-audit-fields
+  "OBSERVABILITY §4.1 minimum audit fields. :audit/strategy-id,
+  :audit/account-id and :audit/correlation-id are 'when applicable' and
+  therefore optional keys."
+  [:audit/at
+   :audit/run-id
+   :audit/process-id
+   :audit/mode
+   :audit/severity
+   :audit/event-type
+   :audit/message
+   :audit/payload])
+
+(defprotocol AuditSink
+  "Structured observability sink (§4-§6)."
+  (emit-audit! [this event]
+    "Emit one structured audit event (a map carrying at least
+    required-audit-fields). Returns the event as emitted.")
+  (emit-metric! [this metric]
+    "Emit one metric sample {:metric/name kw :metric/value number-or-str
+    :metric/at iso-ts ...} (§5). Returns the metric as emitted.")
+  (health-view [this]
+    "Current health/observability view (§6): recent events, audit counts
+    by event type, last metric values. Health is explicit state, never
+    inferred from the absence of logs."))
+
+(defn audit-event
+  "Build one §4.1 audit event from a single map, filling :audit/id (fresh
+  ULID) and :audit/severity (:severity/info) when absent. Throws ex-info
+  when a required field is missing or the severity is unknown."
+  [m]
+  (let [event (merge {:audit/id (identifiers/new-record-id)
+                      :audit/severity :severity/info}
+                     m)
+        missing (vec (remove #(contains? event %) required-audit-fields))]
+    (when (seq missing)
+      (throw (ex-info "audit event missing required fields"
+                      {:error/code :error/invalid-audit-event
+                       :error/missing missing})))
+    (when-not (contains? severities (:audit/severity event))
+      (throw (ex-info "unknown audit severity"
+                      {:error/code :error/invalid-audit-event
+                       :error/severity (:audit/severity event)})))
+    event))

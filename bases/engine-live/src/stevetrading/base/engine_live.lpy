@@ -1,9 +1,532 @@
-(ns stevetrading.base.engine-live)
+(ns stevetrading.base.engine-live
+  "Live/paper runtime base (CONTROL_PLANE §11, OBSERVABILITY, BROKER_ADAPTER)
+  — the control-plane-gated assembly around the SHARED engine loop
+  (stevetrading.engine.loop; same cycle as engine-replay per POLYLITH
+  §10.5).
+
+  Startup sequence (run-live):
+    1. CONTROL-PLANE GATE FIRST (§11): load the active revision for the
+       deployment scope, validate it, validate this process id + run
+       mode + assigned strategies + routes, check kill switches. ANY
+       blocking violation → refuse to start, durably emitting
+       :fact/control-plane-violation-recorded into <out-dir>/facts.db
+       (plus an audit event) — no trading loop is ever entered.
+    2. STALE-FEED SAFETY GATE: when the manifest routes a NON-sim broker
+       (:broker/alpaca-paper) while the market-data source identifies as
+       :market-data/replay ((market-data.protocol/source-id source)),
+       refuse with reason :violation/replay-feed-with-real-broker unless
+       the operator passed the explicit --allow-replay-feed override.
+       Replay fixtures are stale data; pairing them with a real (even
+       paper) broker risks orders from fiction. In-spec E2E runs are
+       therefore sim-broker routes only.
+    3. Wire the routed broker (:broker/sim → broker.sim with
+       replay-position marks/clock, exactly like the replay base;
+       :broker/alpaca-paper → broker.alpaca — transport/credentials come
+       from the :alpaca opts; tests always inject a stub transport),
+       stores, observability (JSON-lines audit sink at
+       <out-dir>/audit.jsonl wired into the loop's :on-facts seam), and
+       recovery (resume auto-detection identical to engine-replay; for
+       live/paper modes recovery reconciles through the broker seam with
+       :reconcile/known-intent-ids recomputed from every
+       :fact/order-intent-created in the log — superset of unresolved,
+       safe for lineage recomputation).
+    4. Record the loaded revision: run-info carries
+       :run/control-plane-revision and a :fact/control-plane-activated
+       fact (dedupe-keyed per run) is appended + folded so state and
+       snapshots prove which revision was active (§13).
+    5. Run the shared loop.
+
+  Market-data scope (explicit deferral, documented in the plan): NO live
+  market-data adapter exists in this spec. The source is injected and is
+  always the replay fixture source (--fixture); this wiring point is the
+  seam where a future market-data.alpaca/market-data.thetadata adapter
+  plugs in. Live feeds need operator-owned credentials/terminals and
+  parity validation against the Python system — post-spec operator work.
+
+  v0.1 single-account processes (documented): all enabled strategies
+  assigned to one process must route to ONE broker and ONE account;
+  mixed routes refuse with :violation/mixed-broker-routes /
+  :violation/mixed-account-routes."
+  (:import os os.path sys)
+  (:require [stevetrading.artifact.file-store :as afs]
+            [stevetrading.broker.alpaca :as alpaca]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.broker.sim :as sim]
+            [stevetrading.control-plane.file-store :as cpfs]
+            [stevetrading.control-plane.protocol :as cpp]
+            [stevetrading.domain.identifiers :as identifiers]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.engine.loop :as eloop]
+            [stevetrading.engine.recovery :as rec]
+            [stevetrading.engine.state :as st]
+            [stevetrading.ledger.core :as ledger]
+            [stevetrading.market-data.protocol :as mdp]
+            [stevetrading.market-data.replay :as replay]
+            [stevetrading.observability.protocol :as op]
+            [stevetrading.observability.structured-log :as sl]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.persistence.snapshot-store :as ss]
+            [stevetrading.replay.fixture :as fixture]
+            [stevetrading.strategy.registry :as reg]))
 
 (def base-id :base/engine-live)
+
+(def snapshot-scope "runtime-main")
+
+(def default-strategy-paths
+  ["resources/strategies/simple-direction-sma-cross-v1.edn"])
+
+(def default-artifact-root "resources/artifacts")
 
 (defn describe-base
   []
   {:base/id base-id
-   :base/modes #{:mode/live :mode/paper}})
+   :base/modes #{:mode/live :mode/paper :mode/sim}})
 
+;; ---------------------------------------------------------------------------
+;; Control-plane gate
+;; ---------------------------------------------------------------------------
+
+(defn- violation-fact
+  "One durable :fact/control-plane-violation-recorded envelope."
+  [reason details revision process-id]
+  (let [ts (eloop/utc-now-str)]
+    (sch/fact-envelope
+     {:record/type :fact/control-plane-violation-recorded
+      :record/source-system base-id
+      :fact/occurred-at ts
+      :fact/recorded-at ts
+      :fact/payload (into {}
+                          (filter (comp some? val)
+                                  {:violation/reason reason
+                                   :violation/details details
+                                   :control-plane/revision revision
+                                   :process/id process-id}))})))
+
+(defn- gate-check
+  "CONTROL_PLANE §11 startup validation against the active revision.
+  Returns {:ok? true :manifest .. :process .. :strategies [..] :route ..
+           :account .. :broker-kw .. :run-mode ..}
+  or {:ok? false :reason kw :details {..} :manifest manifest-or-nil}."
+  [{:keys [manifest process-id mode]}]
+  (let [fail (fn [reason details]
+               {:ok? false :reason reason :details details
+                :manifest manifest})]
+    (if (nil? manifest)
+      (fail :violation/no-active-revision {:process/id process-id})
+      (let [validation (cpp/validate-manifest manifest)]
+        (if-not (:valid? validation)
+          (fail :violation/invalid-manifest {:errors (:errors validation)})
+          (let [process (first (filter #(= process-id (:process/id %))
+                                       (:control-plane/processes manifest)))]
+            (if (nil? process)
+              (fail :violation/unknown-process {:process/id process-id})
+              (let [allowed (:process/allowed-modes process)
+                    run-mode (or mode
+                                 (when (= 1 (count allowed)) (first allowed)))]
+                (cond
+                  (nil? run-mode)
+                  (fail :violation/ambiguous-mode
+                        {:process/allowed-modes allowed})
+
+                  (not (contains? allowed run-mode))
+                  (fail :violation/process-mode-mismatch
+                        {:run/mode run-mode :process/allowed-modes allowed})
+
+                  :else
+                  (let [strategies
+                        (filterv #(and (= process-id (:strategy/process %))
+                                       (true? (:strategy/enabled? %)))
+                                 (:control-plane/strategies manifest))
+                        routes (into {} (map (fn [r] [(:route/id r) r])
+                                             (:control-plane/routes manifest)))
+                        accounts (into {} (map (fn [a] [(:account/id a) a])
+                                               (:control-plane/accounts
+                                                manifest)))]
+                    (if (empty? strategies)
+                      (fail :violation/no-enabled-strategies
+                            {:process/id process-id})
+                      (let [strategy-routes (mapv #(get routes
+                                                        (:strategy/account-route %))
+                                                  strategies)
+                            brokers (set (map :route/broker strategy-routes))
+                            account-ids (set (map :route/account-id
+                                                  strategy-routes))
+                            ;; kill switches: global/process + any assigned
+                            ;; strategy/account (v0.1 coarse halt — a
+                            ;; switched runtime never starts; runtime
+                            ;; per-strategy halts are the fold's job)
+                            switch
+                            (or (cpp/kill-switch-active?
+                                 manifest {:process-id process-id})
+                                (some (fn [s]
+                                        (cpp/kill-switch-active?
+                                         manifest
+                                         {:strategy-id (:strategy/id s)
+                                          :account-id (:route/account-id
+                                                       (get routes
+                                                            (:strategy/account-route s)))}))
+                                      strategies))]
+                        (cond
+                          (some? switch)
+                          (fail :violation/kill-switch-active
+                                {:kill-switch (select-keys
+                                               switch
+                                               [:kill-switch/scope
+                                                :kill-switch/target
+                                                :kill-switch/reason])})
+
+                          (> (count brokers) 1)
+                          (fail :violation/mixed-broker-routes
+                                {:brokers brokers})
+
+                          (> (count account-ids) 1)
+                          (fail :violation/mixed-account-routes
+                                {:accounts account-ids})
+
+                          (not (contains? #{:broker/sim :broker/alpaca-paper}
+                                          (first brokers)))
+                          (fail :violation/unsupported-broker
+                                {:broker (first brokers)})
+
+                          :else
+                          {:ok? true
+                           :manifest manifest
+                           :process process
+                           :strategies strategies
+                           :route (first strategy-routes)
+                           :account (get accounts (first account-ids))
+                           :broker-kw (first brokers)
+                           :run-mode run-mode})))))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Refusal path (durable violation fact + audit)
+;; ---------------------------------------------------------------------------
+
+(defn- refuse!
+  [{:keys [out-dir process-id sink]} manifest reason details]
+  (os/makedirs out-dir ** :exist_ok true)
+  (let [fact-store (fs/make-fact-store (os.path/join out-dir "facts.db"))
+        fact (violation-fact reason details
+                             (:control-plane/revision manifest) process-id)]
+    (p/append-facts! fact-store [fact])
+    (when sink
+      (sl/emit-fact-audits! sink {:run-id nil :process-id process-id
+                                  :mode nil}
+                            [fact]))
+    {:live/started? false
+     :live/refusal reason
+     :live/refusal-details details
+     :live/violation-fact fact}))
+
+;; ---------------------------------------------------------------------------
+;; run-live
+;; ---------------------------------------------------------------------------
+
+(defn run-live
+  "Start one control-plane-gated live/paper/sim session. opts (explicit
+  map):
+    :control-plane-root  file control-plane store root (required)
+    :process-id          this process's manifest identity (required)
+    :out-dir             facts.db + snapshots/ + audit.jsonl (required)
+    :fixture-path        replay fixture (the in-spec market-data source;
+                         see ns docstring deferral) (required)
+    :scope               control-plane deployment scope
+                         (default \"deployment-main\")
+    :mode                run-mode override when the process allows
+                         several modes (optional)
+    :allow-replay-feed?  operator override for the stale-feed gate
+                         (default false)
+    :strategy-paths      strategy declaration EDN paths (default
+                         [resources/strategies/simple-direction-sma-cross-v1.edn])
+    :artifact-root       artifact store root (default resources/artifacts)
+    :snapshot-every      snapshot cadence (default 50)
+    :max-facts           simulated-crash stop (optional)
+    :resume?             override resume auto-detection (optional)
+    :alpaca              broker.alpaca/make-alpaca-broker opts when the
+                         route is :broker/alpaca-paper — {:base-url
+                         :key-id :secret :transport}; tests ALWAYS inject
+                         a stub :transport
+
+  Returns {:live/started? false :live/refusal reason ...} on a gate
+  refusal (after durably recording the violation fact), or the session
+  summary {:live/started? true :run/id .. :facts-appended n :orders {..}
+  :portfolio {..} :health-view {..} ...}."
+  [{:keys [control-plane-root process-id out-dir fixture-path scope mode
+           allow-replay-feed? strategy-paths artifact-root snapshot-every
+           max-facts resume? alpaca]}]
+  (let [strategy-paths (or strategy-paths default-strategy-paths)
+        artifact-root (or artifact-root default-artifact-root)
+        cp-store (cpfs/make-file-control-plane-store control-plane-root)
+        manifest (p/active-revision cp-store (or scope cpfs/default-scope))
+        _ (os/makedirs out-dir ** :exist_ok true)
+        sink (sl/make-structured-log-sink
+              {:path (os.path/join out-dir "audit.jsonl")})
+        refusal-ctx {:out-dir out-dir :process-id process-id :sink sink}
+        gate (gate-check {:manifest manifest :process-id process-id
+                          :mode mode})]
+    (if-not (:ok? gate)
+      ;; 1. control-plane gate refusal
+      (refuse! refusal-ctx manifest (:reason gate) (:details gate))
+      (let [{:keys [manifest strategies route account broker-kw run-mode]}
+            gate
+            revision (:control-plane/revision manifest)
+            account-id (:route/account-id route)
+            ;; market-data source (in-spec: always the replay fixture)
+            fixture* (fixture/load-fixture fixture-path)
+            source (replay/make-replay-source fixture*)
+            replay-feed? (= :market-data/replay (mdp/source-id source))]
+        ;; 2. stale-feed safety gate
+        (if (and (not= :broker/sim broker-kw)
+                 replay-feed?
+                 (not allow-replay-feed?))
+          (refuse! refusal-ctx manifest
+                   :violation/replay-feed-with-real-broker
+                   {:broker broker-kw
+                    :market-data/source (mdp/source-id source)
+                    :override "--allow-replay-feed"})
+          ;; 3. wire adapters + recovery + observability, then the loop
+          (let [fact-store (fs/make-fact-store
+                            (os.path/join out-dir "facts.db"))
+                snapshot-store (ss/make-snapshot-store
+                                (os.path/join out-dir "snapshots"))
+                artifact-store (afs/make-file-artifact-store artifact-root)
+                market-clock (atom (:input/at
+                                    (first (:fixture/inputs fixture*))))
+                marks (atom {})
+                broker (case broker-kw
+                         :broker/sim
+                         (sim/make-sim-broker {:marks (fn [] @marks)
+                                               :clock (fn [] @market-clock)})
+                         :broker/alpaca-paper
+                         (alpaca/make-alpaca-broker (or alpaca {})))
+                ;; strategy decls: load, then check the manifest's
+                ;; assignment + artifact refs against the declarations
+                decls (mapv #(eloop/load-strategy artifact-store run-mode %)
+                            strategy-paths)
+                decl-by-id (into {} (map (fn [s] [(:strategy/id (:decl s)) s])
+                                         decls))
+                assigned (mapv :strategy/id strategies)
+                missing (vec (remove #(contains? decl-by-id %) assigned))
+                mismatched
+                (vec (keep (fn [s]
+                             (let [decl (:decl (get decl-by-id
+                                                    (:strategy/id s)))
+                                   want (:strategy/artifacts s)]
+                               (when (and (some? decl)
+                                          (or (not= (:model-ref want)
+                                                    (get-in decl
+                                                            [:strategy/inference
+                                                             :artifact-ref]))
+                                              (not= (:feature-manifest-ref want)
+                                                    (get-in decl
+                                                            [:strategy/features
+                                                             :manifest-ref]))))
+                                 (:strategy/id s))))
+                           strategies))]
+            (cond
+              (seq missing)
+              (refuse! refusal-ctx manifest :violation/missing-strategy-decl
+                       {:strategy/ids missing})
+
+              (seq mismatched)
+              (refuse! refusal-ctx manifest :violation/artifact-mismatch
+                       {:strategy/ids mismatched})
+
+              :else
+              (let [loaded (mapv #(get decl-by-id %) assigned)
+                    _ (reg/build-registry (mapv :decl loaded))
+                    run-id (identifiers/new-record-id)
+                    run-info {:run/id run-id
+                              :run/engine-version st/engine-state-version
+                              :run/mode run-mode
+                              :run/started-at (eloop/utc-now-str)
+                              :run/control-plane-revision revision}
+                    audit-ctx {:run-id run-id :process-id process-id
+                               :mode run-mode}
+                    on-facts (fn [facts]
+                               (sl/emit-fact-audits! sink audit-ctx facts))
+                    ;; recovery (resume auto-detection like engine-replay);
+                    ;; known intent ids for broker lineage recomputation =
+                    ;; every intent ever created in this log (safe superset)
+                    known-intent-ids
+                    (fn []
+                      (vec (keep #(get-in % [:fact/payload :order-intent/id])
+                                 (p/facts-by fact-store
+                                             {:fact-type
+                                              :fact/order-intent-created}))))
+                    reconcile-seam
+                    {:open-orders
+                     (fn [acct]
+                       (bp/open-orders broker
+                                       {:broker/account-id acct
+                                        :reconcile/known-intent-ids
+                                        (known-intent-ids)}))
+                     :fills-since
+                     (fn [acct cursor]
+                       (bp/fills-since broker
+                                       {:broker/account-id acct
+                                        :reconcile/known-intent-ids
+                                        (known-intent-ids)}
+                                       cursor))}
+                    resume? (if (some? resume?)
+                              resume?
+                              (or (pos? (p/latest-offset fact-store))
+                                  (some? (p/latest-snapshot snapshot-store
+                                                            snapshot-scope))))
+                    recovery (when resume?
+                               (rec/run-recovery!
+                                {:fact-store fact-store
+                                 :snapshot-store snapshot-store
+                                 :run-mode run-mode
+                                 :scope snapshot-scope
+                                 :run-info run-info
+                                 :broker reconcile-seam}))
+                    _ (when (and recovery
+                                 (not (contains? #{:ready :degraded-ready}
+                                                 (:recovery/outcome recovery))))
+                        (throw (ex-info "live recovery did not reach a ready state"
+                                        {:error/code :error/recovery-not-ready
+                                         :recovery/outcome
+                                         (:recovery/outcome recovery)
+                                         :recovery/error
+                                         (:recovery/error recovery)})))
+                    state0 (if recovery
+                             (st/init-run (:engine/state recovery) run-info)
+                             (st/init-run (st/fresh-state) run-info))
+                    ledger0 (if recovery
+                              (:recovery/ledger recovery)
+                              ledger/empty-ledger)
+                    state0 (eloop/enable-strategies state0 loaded)
+                    cursor0 (or (st/cursor state0 :market-data) 0)
+                    _ (when-let [wm (get-in state0 [:engine/watermarks
+                                                    :watermark/market])]
+                        (reset! market-clock wm))
+                    _ (reset! marks (eloop/marks-at fixture* cursor0))
+                    ;; 4. record the loaded revision (durable + folded)
+                    activated-ts (eloop/utc-now-str)
+                    activated-fact
+                    (sch/fact-envelope
+                     {:record/type :fact/control-plane-activated
+                      :record/source-system base-id
+                      :record/mode run-mode
+                      :fact/occurred-at activated-ts
+                      :fact/recorded-at activated-ts
+                      :fact/dedupe-key (str "cp-loaded/" revision "/" run-id)
+                      :fact/payload {:control-plane/revision revision
+                                     :process/id process-id
+                                     :run/id run-id}})
+                    {:keys [appended]} (p/append-facts! fact-store
+                                                        [activated-fact])
+                    _ (when (seq appended) (on-facts [activated-fact]))
+                    state0 (:state (fold/fold-fact state0 activated-fact))
+                    ;; 5. the shared loop
+                    loop-result
+                    (eloop/run-loop
+                     {:fact-store fact-store
+                      :snapshot-store snapshot-store
+                      :broker broker
+                      :source source
+                      :strategies loaded
+                      :account-id account-id
+                      :run-id run-id
+                      :run-mode run-mode
+                      :state0 state0
+                      :ledger0 ledger0
+                      :cursor0 cursor0
+                      :snapshot-every snapshot-every
+                      :snapshot-scope snapshot-scope
+                      :max-facts max-facts
+                      :broker-route {:broker/source-system broker-kw}
+                      :on-facts on-facts
+                      :on-observation
+                      (fn [obs new?]
+                        (when new?
+                          (reset! market-clock (:fact/occurred-at obs)))
+                        (swap! marks eloop/apply-payload-marks
+                               (:record/type obs)
+                               (:record/instrument-id obs)
+                               (:fact/payload obs)))})]
+                {:live/started? true
+                 :run/id run-id
+                 :process/id process-id
+                 :run/mode run-mode
+                 :control-plane/revision revision
+                 :broker broker-kw
+                 :account/id account-id
+                 :resumed? (boolean recovery)
+                 :facts-appended (:appended loop-result)
+                 :cursor (:cursor loop-result)
+                 :stopped-early? (:stopped-early? loop-result)
+                 :orders (eloop/orders-summary (:state loop-result))
+                 :portfolio (:engine/portfolio (:state loop-result))
+                 :engine/state (:state loop-result)
+                 :ledger (:ledger loop-result)
+                 :skipped-ledger-fills (:skipped-fills loop-result)
+                 :health-view (op/health-view sink)}))))))))
+
+;; ---------------------------------------------------------------------------
+;; CLI
+;; ---------------------------------------------------------------------------
+
+(def ^:private boolean-flags
+  #{"--allow-replay-feed"})
+
+(defn- parse-args
+  "Parse --flag value pairs (+ boolean flags) into a map."
+  [args]
+  (loop [args (seq args) acc {}]
+    (if (nil? args)
+      acc
+      (let [flag (first args)]
+        (cond
+          (contains? boolean-flags flag)
+          (recur (next args) (assoc acc (keyword (subs flag 2)) true))
+
+          (and (string? flag) (.startswith flag "--") (some? (second args)))
+          (recur (nnext args) (assoc acc (keyword (subs flag 2))
+                                     (second args)))
+
+          :else (recur (next args) acc))))))
+
+(defn -main
+  "CLI entry:
+    basilisp run -n stevetrading.base.engine-live -- \\
+      --control-plane-root <dir> --process-id <id> --out-dir <dir> \\
+      --fixture <fixture.edn> [--scope <scope>] [--allow-replay-feed] \\
+      [--strategies p1,p2] [--artifact-root dir] [--snapshot-every n]
+
+  Exits 1 on a gate refusal (the violation fact is durably recorded
+  first)."
+  [& args]
+  (let [{:keys [control-plane-root process-id out-dir fixture scope
+                allow-replay-feed strategies artifact-root snapshot-every]}
+        (parse-args args)]
+    (when (some nil? [control-plane-root process-id out-dir fixture])
+      (println "usage: basilisp run -n stevetrading.base.engine-live --"
+               "--control-plane-root <dir> --process-id <id>"
+               "--out-dir <dir> --fixture <fixture.edn>"
+               "[--scope <scope>] [--allow-replay-feed]")
+      (throw (ex-info "missing required CLI args"
+                      {:error/code :error/missing-cli-args})))
+    (let [result (run-live
+                  {:control-plane-root control-plane-root
+                   :process-id process-id
+                   :out-dir out-dir
+                   :fixture-path fixture
+                   :scope scope
+                   :allow-replay-feed? (boolean allow-replay-feed)
+                   :strategy-paths (when strategies
+                                     (vec (.split strategies ",")))
+                   :artifact-root artifact-root
+                   :snapshot-every (when snapshot-every
+                                     (int snapshot-every))})]
+      (println (pr-str (dissoc result :engine/state :ledger)))
+      (when-not (:live/started? result)
+        (sys/exit 1))
+      result)))
+
+(when (= *main-ns* 'stevetrading.base.engine-live)
+  (apply -main *command-line-args*))

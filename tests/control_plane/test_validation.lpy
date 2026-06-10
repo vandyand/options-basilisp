@@ -1,0 +1,373 @@
+(ns control-plane.test-validation
+  "Phase 10 control-plane tests (CONTROL_PLANE_MANIFESTS §9-§10):
+  example-manifest validity, §9.1 structural + §9.2 safety rejections,
+  §9.3 policy warnings, kill-switch scope matching, file-store
+  revision/activation immutability, and the CLI exit contract."
+  (:import tempfile os.path)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.base.control-plane :as cpb]
+            [stevetrading.control-plane.file-store :as cpfs]
+            [stevetrading.control-plane.protocol :as cpp]
+            [stevetrading.persistence.protocol :as pp]))
+
+(def example-path "resources/control-plane/examples/paper-main-v0.1.edn")
+(def sim-example-path "resources/control-plane/examples/sim-main-v0.1.edn")
+
+(defn- example-manifest
+  []
+  (edn/read-string (slurp example-path)))
+
+(defn- error-codes
+  [validation]
+  (set (map :error/code (:errors validation))))
+
+;; ---------------------------------------------------------------------------
+;; Happy manifests
+;; ---------------------------------------------------------------------------
+
+(deftest example-manifests-valid
+  (testing "the shipped example manifests validate clean"
+    (let [v (cpp/validate-manifest (example-manifest))]
+      (is (true? (:valid? v)))
+      (is (empty? (:errors v)))
+      (is (empty? (:warnings v))))
+    (let [v (cpp/validate-manifest (edn/read-string (slurp sim-example-path)))]
+      (is (true? (:valid? v)))
+      (is (empty? (:errors v))))))
+
+;; ---------------------------------------------------------------------------
+;; §9.1 structural rejections
+;; ---------------------------------------------------------------------------
+
+(deftest structural-missing-required-field
+  (let [v (cpp/validate-manifest (dissoc (example-manifest)
+                                         :control-plane/strategies))]
+    (is (false? (:valid? v)))
+    (is (contains? (error-codes v) :error/missing-field))))
+
+(deftest structural-not-a-map
+  (is (false? (:valid? (cpp/validate-manifest nil)))))
+
+(deftest structural-malformed-ids
+  (testing "malformed strategy id"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/strategies 0 :strategy/id]
+                       "not-a-strategy-id"))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/malformed-id))))
+  (testing "malformed account id"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/accounts 0 :account/id]
+                       "nope"))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/malformed-id)))))
+
+(deftest structural-duplicate-ids
+  (let [m (example-manifest)
+        m (update m :control-plane/routes
+                  #(conj % (first %)))]
+    (let [v (cpp/validate-manifest m)]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/duplicate-id)))))
+
+(deftest structural-unknown-enum
+  (testing "unknown strategy mode"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/strategies 0 :strategy/mode]
+                       :mode/bogus))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/invalid-enum))))
+  (testing "unknown broker"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/accounts 0 :account/broker]
+                       :broker/ibkr))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/invalid-enum))))
+  (testing "unknown control-plane status"
+    (let [v (cpp/validate-manifest
+             (assoc (example-manifest)
+                    :control-plane/status :control-plane-status/wip))]
+      (is (false? (:valid? v))))))
+
+(deftest structural-dangling-references
+  (testing "route → unknown account"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/routes 0 :route/account-id]
+                       "account/alpaca/ghost"))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/dangling-reference))))
+  (testing "strategy → unknown process"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/strategies 0 :strategy/process]
+                       "engine-ghost"))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/dangling-reference))))
+  (testing "strategy → unknown route"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/strategies 0 :strategy/account-route]
+                       "route/ghost"))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/dangling-reference))))
+  (testing "process → unknown strategy"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/processes 0 :process/strategies]
+                       ["strategy/ghost/x/v1"]))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/dangling-reference)))))
+
+;; ---------------------------------------------------------------------------
+;; §9.2 safety rejections
+;; ---------------------------------------------------------------------------
+
+(deftest safety-live-strategy-on-non-live-account
+  (let [m (-> (example-manifest)
+              (assoc-in [:control-plane/strategies 0 :strategy/mode]
+                        :mode/live)
+              ;; let process + account allow live modes so ONLY the
+              ;; live-enabled? gate trips
+              (assoc-in [:control-plane/processes 0 :process/allowed-modes]
+                        #{:mode/live :mode/paper})
+              (assoc-in [:control-plane/accounts 0 :account/allowed-modes]
+                        #{:mode/live :mode/paper}))
+        v (cpp/validate-manifest m)]
+    (is (false? (:valid? v)))
+    (is (contains? (error-codes v) :error/live-on-non-live-account))))
+
+(deftest safety-paper-strategy-on-live-only-account
+  (let [m (assoc-in (example-manifest)
+                    [:control-plane/accounts 0 :account/allowed-modes]
+                    #{:mode/live})
+        v (cpp/validate-manifest m)]
+    (is (false? (:valid? v)))
+    (is (contains? (error-codes v) :error/account-mode-mismatch))))
+
+(deftest safety-process-mode-mismatch
+  (let [m (assoc-in (example-manifest)
+                    [:control-plane/processes 0 :process/allowed-modes]
+                    #{:mode/shadow})
+        v (cpp/validate-manifest m)]
+    (is (false? (:valid? v)))
+    (is (contains? (error-codes v) :error/process-mode-mismatch))))
+
+(deftest safety-strategy-with-no-valid-route
+  ;; the referenced route exists but is declared for a DIFFERENT strategy
+  (let [m (-> (example-manifest)
+              (update :control-plane/strategies conj
+                      (-> (first (:control-plane/strategies
+                                  (example-manifest)))
+                          (assoc :strategy/id
+                                 "strategy/spx-credit/other-entry/v1")))
+              (assoc-in [:control-plane/processes 0 :process/strategies]
+                        ["strategy/spx-credit/spread-entry/v1"
+                         "strategy/spx-credit/other-entry/v1"]))
+        v (cpp/validate-manifest m)]
+    (is (false? (:valid? v)))
+    (is (contains? (error-codes v) :error/no-valid-route))))
+
+(deftest safety-route-broker-mismatch
+  (let [m (assoc-in (example-manifest)
+                    [:control-plane/routes 0 :route/broker] :broker/sim)
+        v (cpp/validate-manifest m)]
+    (is (false? (:valid? v)))
+    (is (contains? (error-codes v) :error/route-broker-mismatch))))
+
+(deftest safety-conflicting-kill-switches
+  (testing "active non-global switch without a target"
+    (let [m (assoc (example-manifest) :control-plane/kill-switches
+                   [{:kill-switch/scope :kill-switch-scope/strategy
+                     :kill-switch/active? true
+                     :kill-switch/reason "halt"
+                     :kill-switch/activated-at "2026-06-10T14:00:00Z"
+                     :kill-switch/actor "ops"}])
+          v (cpp/validate-manifest m)]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/conflicting-kill-switch))))
+  (testing "same scope+target with conflicting active? flags"
+    (let [switch {:kill-switch/scope :kill-switch-scope/process
+                  :kill-switch/target "engine-paper-main"
+                  :kill-switch/reason "halt"
+                  :kill-switch/activated-at "2026-06-10T14:00:00Z"
+                  :kill-switch/actor "ops"}
+          m (assoc (example-manifest) :control-plane/kill-switches
+                   [(assoc switch :kill-switch/active? true)
+                    (assoc switch :kill-switch/active? false)])
+          v (cpp/validate-manifest m)]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v) :error/conflicting-kill-switch))))
+  (testing "active switch without reason/activated-at"
+    (let [m (assoc (example-manifest) :control-plane/kill-switches
+                   [{:kill-switch/scope :kill-switch-scope/global
+                     :kill-switch/active? true
+                     :kill-switch/reason nil
+                     :kill-switch/activated-at nil
+                     :kill-switch/actor nil}])
+          v (cpp/validate-manifest m)]
+      (is (false? (:valid? v))))))
+
+;; ---------------------------------------------------------------------------
+;; §9.3 policy warnings (never block)
+;; ---------------------------------------------------------------------------
+
+(deftest policy-warnings-do-not-block
+  (testing "environment/broker mismatch warns"
+    (let [m (assoc-in (example-manifest)
+                      [:control-plane/accounts 0 :account/environment]
+                      :environment/live)
+          v (cpp/validate-manifest m)]
+      (is (true? (:valid? v)))
+      (is (contains? (set (map :error/code (:warnings v)))
+                     :warning/environment-broker-mismatch))))
+  (testing "unversioned artifact ref warns"
+    (let [m (assoc-in (example-manifest)
+                      [:control-plane/strategies 0 :strategy/artifacts
+                       :model-ref]
+                      "model/spx-credit")
+          v (cpp/validate-manifest m)]
+      (is (true? (:valid? v)))
+      (is (contains? (set (map :error/code (:warnings v)))
+                     :warning/artifact-ref-format))))
+  (testing "empty allowed-order-class set warns"
+    (let [m (assoc-in (example-manifest)
+                      [:control-plane/routes 0
+                       :route/allowed-order-classes]
+                      #{})
+          v (cpp/validate-manifest m)]
+      (is (true? (:valid? v)))
+      (is (contains? (set (map :error/code (:warnings v)))
+                     :warning/route-order-class-policy)))))
+
+;; ---------------------------------------------------------------------------
+;; Kill-switch scope matching (§8)
+;; ---------------------------------------------------------------------------
+
+(defn- with-switch
+  [scope target]
+  (assoc (example-manifest) :control-plane/kill-switches
+         [{:kill-switch/scope scope
+           :kill-switch/target target
+           :kill-switch/active? true
+           :kill-switch/reason "halt"
+           :kill-switch/activated-at "2026-06-10T14:00:00Z"
+           :kill-switch/actor "ops"}]))
+
+(deftest kill-switch-scope-matching
+  (testing "global matches every context"
+    (is (some? (cpp/kill-switch-active? (with-switch
+                                          :kill-switch-scope/global nil)
+                                        {:process-id "anything"})))
+    (is (some? (cpp/kill-switch-active? (with-switch
+                                          :kill-switch-scope/global nil)
+                                        {}))))
+  (testing "process scope matches only its target process"
+    (let [m (with-switch :kill-switch-scope/process "engine-paper-main")]
+      (is (some? (cpp/kill-switch-active? m {:process-id "engine-paper-main"})))
+      (is (nil? (cpp/kill-switch-active? m {:process-id "engine-other"})))
+      (is (nil? (cpp/kill-switch-active? m {})))))
+  (testing "strategy scope"
+    (let [m (with-switch :kill-switch-scope/strategy
+              "strategy/spx-credit/spread-entry/v1")]
+      (is (some? (cpp/kill-switch-active?
+                  m {:strategy-id "strategy/spx-credit/spread-entry/v1"})))
+      (is (nil? (cpp/kill-switch-active?
+                 m {:strategy-id "strategy/other/x/v1"})))))
+  (testing "account scope"
+    (let [m (with-switch :kill-switch-scope/account
+              "account/alpaca/paper-ops")]
+      (is (some? (cpp/kill-switch-active?
+                  m {:account-id "account/alpaca/paper-ops"})))
+      (is (nil? (cpp/kill-switch-active?
+                 m {:account-id "account/alpaca/other"})))))
+  (testing "inactive switches never match"
+    (let [m (assoc-in (with-switch :kill-switch-scope/global nil)
+                      [:control-plane/kill-switches 0 :kill-switch/active?]
+                      false)]
+      (is (nil? (cpp/kill-switch-active? m {:process-id "x"}))))))
+
+;; ---------------------------------------------------------------------------
+;; File store: revision immutability + activation semantics (§3.2, §10)
+;; ---------------------------------------------------------------------------
+
+(deftest file-store-revision-immutability
+  (let [root (tempfile/mkdtemp)
+        store (cpfs/make-file-control-plane-store root)
+        manifest (example-manifest)]
+    (testing "first write succeeds; identical re-write is a no-op"
+      ;; NB: side-effecting calls are let-bound — basilisp.test's `is`
+      ;; can evaluate its form more than once
+      (let [w1 (cpfs/write-revision! store manifest)
+            w2 (cpfs/write-revision! store manifest)]
+        (is (false? (:revision/existing? w1)))
+        (is (true? (:revision/existing? w2)))))
+    (testing "writing different content under the same rev-id refuses"
+      (is (thrown? python/Exception
+                   (cpfs/write-revision!
+                    store (assoc manifest :control-plane/generated-at
+                                 "2026-06-11T00:00:00Z")))))
+    (testing "the stored revision is unchanged after the refused write"
+      (is (= manifest (pp/revision store
+                                   (:control-plane/revision manifest)))))))
+
+(deftest file-store-activation
+  (let [root (tempfile/mkdtemp)
+        store (cpfs/make-file-control-plane-store root)
+        manifest (example-manifest)]
+    (testing "activation validates, records, and flips the pointer"
+      (let [outcome (cpfs/activate! store manifest {:actor "test"})]
+        (is (true? (:activated? outcome)))
+        (is (= (:control-plane/revision manifest)
+               (:revision/id outcome))))
+      (let [active (pp/active-revision store nil)]
+        (is (= (:control-plane/revision manifest)
+               (:control-plane/revision active)))
+        (is (some? (:control-plane/activation active)))))
+    (testing "re-activating the same rev-id refuses (immutability)"
+      (let [outcome (cpfs/activate! store manifest {:actor "test"})]
+        (is (false? (:activated? outcome)))
+        (is (= :already-activated (:reason outcome)))))
+    (testing "an invalid manifest never activates"
+      (let [bad (-> manifest
+                    (assoc :control-plane/revision "cp-000099")
+                    (dissoc :control-plane/accounts))
+            outcome (cpfs/activate! store bad {})]
+        (is (false? (:activated? outcome)))
+        (is (= :validation-failed (:reason outcome)))
+        (is (nil? (pp/revision store "cp-000099")))))))
+
+;; ---------------------------------------------------------------------------
+;; Base CLI contract
+;; ---------------------------------------------------------------------------
+
+(deftest cli-contract
+  (testing "validate exits 0 on the example manifest"
+    (let [{:keys [exit result]} (cpb/run-cli ["validate" example-path])]
+      (is (zero? exit))
+      (is (true? (:valid? result)))))
+  (testing "validate exits 1 on an invalid manifest"
+    (let [root (tempfile/mkdtemp)
+          bad-path (os.path/join root "bad.edn")
+          _ (spit bad-path (pr-str (dissoc (example-manifest)
+                                           :control-plane/routes)))
+          {:keys [exit result]} (cpb/run-cli ["validate" bad-path])]
+      (is (= 1 exit))
+      (is (false? (:valid? result)))))
+  (testing "activate + show round-trip"
+    (let [root (tempfile/mkdtemp)
+          act (cpb/run-cli ["activate" example-path "--root" root])
+          show (cpb/run-cli ["show" "--root" root])]
+      (is (zero? (:exit act)))
+      (is (zero? (:exit show)))
+      (is (= "cp-000001" (get-in show [:result :control-plane/revision])))))
+  (testing "show without an active revision exits 1"
+    (let [{:keys [exit]} (cpb/run-cli ["show" "--root" (tempfile/mkdtemp)])]
+      (is (= 1 exit))))
+  (testing "unknown subcommand exits 1"
+    (is (= 1 (:exit (cpb/run-cli ["frobnicate"]))))))

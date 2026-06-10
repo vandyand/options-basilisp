@@ -1,0 +1,435 @@
+(ns broker.test-alpaca
+  "Phase 10 Alpaca adapter contract tests (BROKER_ADAPTER §4-§11) — ALL
+  through stub transports; nothing here touches the network.
+
+  Covers: single-leg request shape + ack normalization; multi-leg mleg
+  OCC symbols; 403 insufficient-buying-power rejection normalization;
+  transport exception → fault fact (never a raw exception); duplicate
+  submit idempotency (same client_order_id, one transport call);
+  open-orders/fills-since normalization; and the client_order_id lineage
+  contract: short-id → full-intent-id recomputation, unknown
+  client_order_id → anomaly (ENGINE_STATE case G, no guessed
+  attachment), artificial short-id collision → anomaly for BOTH intents
+  (never a silent pick).
+
+  NB: side-effecting calls are let-bound outside `is` — basilisp.test's
+  `is` can evaluate its form more than once."
+  (:import json)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.broker.alpaca :as alp]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]))
+
+(def account-id "account/alpaca/paper-main")
+
+(def oi-equity (str "oi_" (apply str (repeat 64 "a"))))
+(def oi-spread (str "oi_" (apply str (repeat 64 "b"))))
+
+;; ---------------------------------------------------------------------------
+;; Stub transport helpers
+;; ---------------------------------------------------------------------------
+
+(defn- json-str
+  "Basilisp map/vector (string keys) → JSON string."
+  [x]
+  (json/dumps (alp/clj->py x)))
+
+(defn- parse-body
+  [req]
+  (alp/py->clj (json/loads (:body req))))
+
+(defn- recording-stub
+  "Stub transport: records every request in the `requests` atom and
+  returns responses from `respond` (fn [req] resp)."
+  [requests respond]
+  (fn [req]
+    (swap! requests conj req)
+    (respond req)))
+
+(defn- make-broker
+  [transport]
+  (alp/make-alpaca-broker {:key-id "test-key"
+                           :secret "test-secret"
+                           :transport transport
+                           :clock (fn [] "2026-06-10T14:31:02Z")}))
+
+(defn- submit-cmd
+  "Canonical §4.1 submit command for an intent payload."
+  [oi intent]
+  (sch/command-envelope
+   {:record/type :command/submit-order-intent
+    :record/mode :mode/paper
+    :command/issued-at "2026-06-10T14:30:00Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key (str "submit/intent/" oi)
+    :command/payload {:order-intent/id oi
+                      :command/idempotency-key (str "submit/intent/" oi)
+                      :broker/account-id account-id
+                      :broker/route {:broker/source-system
+                                     :broker/alpaca-paper}
+                      :order-intent/payload intent}}))
+
+(def equity-intent
+  {:order-intent/id oi-equity
+   :order-intent/side :order-side/buy
+   :order-intent/effect :position-effect/open
+   :order-intent/order-type :order-type/market
+   :order-intent/time-in-force :tif/day
+   :order-intent/quantity "2"
+   :order-intent/limit-price nil
+   :order-intent/legs [{:instrument/id "equity/ARCA/SPY"
+                        :leg/side :order-side/buy
+                        :leg/quantity "2"}]})
+
+(def spread-intent
+  {:order-intent/id oi-spread
+   :order-intent/side :order-side/sell
+   :order-intent/effect :position-effect/open
+   :order-intent/order-type :order-type/limit
+   :order-intent/time-in-force :tif/day
+   :order-intent/quantity "1"
+   :order-intent/limit-price "1.25"
+   :order-intent/legs
+   [{:instrument/id "option/OPRA/SPY/2026-06-19/P/545.000"
+     :leg/side :order-side/buy
+     :leg/quantity "1"}
+    {:instrument/id "option/OPRA/SPY/2026-06-19/P/550.000"
+     :leg/side :order-side/sell
+     :leg/quantity "1"}]})
+
+(defn- accepted-response
+  [req boid]
+  (let [body (parse-body req)]
+    {:status 200
+     :body (json-str {"id" boid
+                      "client_order_id" (get body "client_order_id")
+                      "status" "accepted"})}))
+
+;; ---------------------------------------------------------------------------
+;; alpaca-client-order-id (pure)
+;; ---------------------------------------------------------------------------
+
+(deftest client-order-id-is-pure-truncation
+  (let [short (alp/alpaca-client-order-id oi-equity)]
+    (is (= 48 (count short)))
+    (is (= (subs oi-equity 0 48) short))
+    (is (= short (alp/alpaca-client-order-id oi-equity)))))
+
+;; ---------------------------------------------------------------------------
+;; Submit: single-leg equity request shape + ack normalization
+;; ---------------------------------------------------------------------------
+
+(deftest submit-single-leg-equity
+  (let [requests (atom [])
+        broker (make-broker (recording-stub
+                             requests #(accepted-response % "ord-1")))
+        facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                          equity-intent))
+        req (first @requests)
+        body (parse-body req)
+        ack (first facts)]
+    (testing "request shape (POST /v2/orders, auth headers, JSON body)"
+      (is (= 1 (count @requests)))
+      (is (= "POST" (:method req)))
+      (is (= "https://paper-api.alpaca.markets/v2/orders" (:url req)))
+      (is (= "test-key" (get (:headers req) "APCA-API-KEY-ID")))
+      (is (= "test-secret" (get (:headers req) "APCA-API-SECRET-KEY")))
+      (is (= "SPY" (get body "symbol")))
+      (is (= "2" (get body "qty")))
+      (is (= "buy" (get body "side")))
+      (is (= "market" (get body "type")))
+      (is (= "day" (get body "time_in_force")))
+      (is (= (alp/alpaca-client-order-id oi-equity)
+             (get body "client_order_id")))
+      (is (nil? (get body "order_class"))))
+    (testing "ack normalization (§5.1)"
+      (is (= 1 (count facts)))
+      (is (= :fact/broker-ack-accepted (:record/type ack)))
+      (is (true? (:valid? (v/validate-fact ack))))
+      (is (= "ord-1" (get-in ack [:fact/payload :broker/order-id])))
+      (is (= oi-equity (get-in ack [:fact/payload :order-intent/id])))
+      (is (= :broker/alpaca-paper
+             (get-in ack [:fact/payload :broker/source-system])))
+      (is (= :broker-status/accepted
+             (get-in ack [:fact/payload :broker/status]))))))
+
+;; ---------------------------------------------------------------------------
+;; Submit: multi-leg mleg with OCC symbols
+;; ---------------------------------------------------------------------------
+
+(deftest submit-multi-leg-occ
+  (let [requests (atom [])
+        broker (make-broker (recording-stub
+                             requests #(accepted-response % "ord-2")))
+        facts (bp/submit-order-intent! broker (submit-cmd oi-spread
+                                                          spread-intent))
+        body (parse-body (first @requests))
+        legs (get body "legs")]
+    (is (= "mleg" (get body "order_class")))
+    (is (= "1" (get body "qty")))
+    (is (= "limit" (get body "type")))
+    (is (= "1.25" (get body "limit_price")))
+    (is (= 2 (count legs)))
+    (testing "OCC symbols derived from canonical instrument ids"
+      (is (= #{"SPY260619P00545000" "SPY260619P00550000"}
+             (set (map #(get % "symbol") legs)))))
+    (testing "per-leg side + position intent from effect"
+      (let [by-symbol (into {} (map (fn [l] [(get l "symbol") l]) legs))]
+        (is (= "buy" (get-in by-symbol ["SPY260619P00545000" "side"])))
+        (is (= "buy_to_open"
+               (get-in by-symbol ["SPY260619P00545000" "position_intent"])))
+        (is (= "sell" (get-in by-symbol ["SPY260619P00550000" "side"])))
+        (is (= "sell_to_open"
+               (get-in by-symbol ["SPY260619P00550000" "position_intent"])))
+        (is (= "1" (get-in by-symbol ["SPY260619P00545000" "ratio_qty"])))))
+    (is (= :fact/broker-ack-accepted (:record/type (first facts))))))
+
+;; ---------------------------------------------------------------------------
+;; Rejection normalization (§5.1, §10)
+;; ---------------------------------------------------------------------------
+
+(deftest submit-rejected-insufficient-buying-power
+  (let [requests (atom [])
+        broker (make-broker
+                (recording-stub
+                 requests
+                 (fn [_]
+                   {:status 403
+                    :body (json-str {"code" 40310000
+                                     "message" "insufficient buying power"})})))
+        facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                          equity-intent))
+        rej (first facts)]
+    (is (= 1 (count facts)))
+    (is (= :fact/broker-ack-rejected (:record/type rej)))
+    (is (true? (:valid? (v/validate-fact rej))))
+    (is (= :broker-rejection/insufficient-buying-power
+           (get-in rej [:fact/payload :broker/rejection-code])))
+    (is (= oi-equity (get-in rej [:fact/payload :order-intent/id])))))
+
+(deftest submit-validation-failure-422
+  (let [broker (make-broker
+                (fn [_] {:status 422
+                         :body (json-str {"code" 42210000
+                                          "message" "asset not found"})}))
+        facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                          equity-intent))]
+    (is (= :fact/broker-ack-rejected (:record/type (first facts))))
+    (is (= :broker-rejection/request-validation-failed
+           (get-in (first facts) [:fact/payload :broker/rejection-code])))))
+
+;; ---------------------------------------------------------------------------
+;; Transport fault (§10) — normalized fact, never a raw exception
+;; ---------------------------------------------------------------------------
+
+(deftest transport-exception-becomes-fault-fact
+  (let [broker (make-broker (fn [_]
+                              (throw (python/ConnectionError
+                                      "connection refused"))))
+        facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                          equity-intent))
+        fault (first facts)]
+    (is (= 1 (count facts)))
+    (is (= :fact/fault-recorded (:record/type fault)))
+    (is (true? (:valid? (v/validate-fact fault))))
+    (is (= :fault/transport-unavailable
+           (get-in fault [:fact/payload :fault/category])))
+    (is (= oi-equity (get-in fault [:fact/payload :order-intent/id])))))
+
+(deftest http-fault-categories
+  (testing "401 → auth failure fault"
+    (let [broker (make-broker (fn [_] {:status 401 :body "{}"}))
+          facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                            equity-intent))]
+      (is (= :fault/auth-failure
+             (get-in (first facts) [:fact/payload :fault/category])))))
+  (testing "429 → rate limited fault"
+    (let [broker (make-broker (fn [_] {:status 429 :body "{}"}))
+          facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                            equity-intent))]
+      (is (= :fault/rate-limited
+             (get-in (first facts) [:fact/payload :fault/category])))))
+  (testing "5xx → ambiguous broker-unavailable fault (never journaled)"
+    (let [broker (make-broker (fn [_] {:status 503 :body "{}"}))
+          facts (bp/submit-order-intent! broker (submit-cmd oi-equity
+                                                            equity-intent))]
+      (is (= :fault/broker-unavailable
+             (get-in (first facts) [:fact/payload :fault/category]))))))
+
+;; ---------------------------------------------------------------------------
+;; Duplicate submit idempotency (§9)
+;; ---------------------------------------------------------------------------
+
+(deftest duplicate-submit-reuses-client-order-id
+  (let [requests (atom [])
+        broker (make-broker (recording-stub
+                             requests #(accepted-response % "ord-dup")))
+        cmd (submit-cmd oi-equity equity-intent)
+        facts1 (bp/submit-order-intent! broker cmd)
+        facts2 (bp/submit-order-intent! broker cmd)]
+    (testing "one transport call, identical stored ack"
+      (is (= 1 (count @requests)))
+      (is (= facts1 facts2))
+      (is (= (:record/id (first facts1)) (:record/id (first facts2)))))
+    (testing "the wire client_order_id is the deterministic short id"
+      (is (= (alp/alpaca-client-order-id oi-equity)
+             (get (parse-body (first @requests)) "client_order_id"))))))
+
+;; ---------------------------------------------------------------------------
+;; open-orders / fills-since normalization + lineage (§5.2/§5.3, §8)
+;; ---------------------------------------------------------------------------
+
+(deftest open-orders-normalization-and-lineage
+  (let [known-short (alp/alpaca-client-order-id oi-equity)
+        broker (make-broker
+                (fn [req]
+                  (is (= "GET" (:method req)))
+                  {:status 200
+                   :body (json-str
+                          [{"id" "ord-10"
+                            "client_order_id" known-short
+                            "status" "new"
+                            "symbol" "SPY"}
+                           {"id" "ord-11"
+                            "client_order_id" "someone-elses-order"
+                            "status" "accepted"
+                            "symbol" "SPY"}])}))
+        facts (bp/open-orders broker
+                              {:broker/account-id account-id
+                               :reconcile/known-intent-ids [oi-equity]})
+        by-type (group-by :record/type facts)]
+    (testing "known client_order_id maps back to the FULL intent id"
+      (let [status (first (:fact/broker-order-status-observed by-type))]
+        (is (some? status))
+        (is (true? (:valid? (v/validate-fact status))))
+        (is (= oi-equity (get-in status [:fact/payload :order-intent/id])))
+        (is (= "ord-10" (get-in status [:fact/payload :broker/order-id])))
+        (is (= :broker-status/accepted
+               (get-in status [:fact/payload :broker/status])))))
+    (testing "unknown client_order_id → anomaly fact, no guessed attachment (case G)"
+      (let [anomalies (:fact/fault-recorded by-type)]
+        (is (= 1 (count anomalies)))
+        (let [anomaly (first anomalies)]
+          (is (= :fault/reconciliation-anomaly
+                 (get-in anomaly [:fact/payload :fault/kind])))
+          (is (nil? (get-in anomaly [:fact/payload :order-intent/id])))
+          (is (= "someone-elses-order"
+                 (get-in anomaly [:fact/payload :broker/client-order-id]))))))
+    (testing "no status fact was emitted for the unknown order"
+      (is (= 1 (count (:fact/broker-order-status-observed by-type)))))))
+
+(deftest fills-since-normalization
+  (let [known-short (alp/alpaca-client-order-id oi-equity)
+        urls (atom [])
+        broker (make-broker
+                (fn [req]
+                  (swap! urls conj (:url req))
+                  {:status 200
+                   :body (json-str
+                          [{"id" "ord-20"
+                            "client_order_id" known-short
+                            "status" "filled"
+                            "symbol" "SPY"
+                            "filled_qty" "2"
+                            "filled_avg_price" "550.25"
+                            "filled_at" "2026-06-10T14:31:04+00:00"}])}))
+        facts (bp/fills-since broker
+                              {:broker/account-id account-id
+                               :reconcile/known-intent-ids [oi-equity]}
+                              "2026-06-10T14:00:00Z")
+        fill (first facts)]
+    (testing "cursor travels as the after= query param"
+      (is (>= (.find (first @urls) "status=closed") 0))
+      (is (>= (.find (first @urls) "after=2026-06-10T14:00:00Z") 0)))
+    (testing "normalized §5.3 fill fact with full lineage"
+      (is (= 1 (count facts)))
+      (is (= :fact/fill-observed (:record/type fill)))
+      (is (true? (:valid? (v/validate-fact fill))))
+      (is (= oi-equity (get-in fill [:fact/payload :order-intent/id])))
+      (is (= "ord-20" (get-in fill [:fact/payload :broker/order-id])))
+      (is (= "2" (get-in fill [:fact/payload :fill/quantity])))
+      (is (= "550.25" (get-in fill [:fact/payload :fill/price])))
+      (is (= "2026-06-10T14:31:04Z"
+             (get-in fill [:fact/payload :fill/occurred-at]))))))
+
+(deftest fills-since-unknown-lineage-is-anomaly
+  (let [broker (make-broker
+                (fn [_]
+                  {:status 200
+                   :body (json-str
+                          [{"id" "ord-30"
+                            "client_order_id" "mystery"
+                            "status" "filled"
+                            "symbol" "SPY"
+                            "filled_qty" "1"
+                            "filled_avg_price" "550.00"
+                            "filled_at" "2026-06-10T14:31:04Z"}])}))
+        facts (bp/fills-since broker
+                              {:broker/account-id account-id
+                               :reconcile/known-intent-ids [oi-equity]}
+                              nil)]
+    (is (= 1 (count facts)))
+    (is (= :fact/fault-recorded (:record/type (first facts))))
+    (is (= :fault/reconciliation-anomaly
+           (get-in (first facts) [:fact/payload :fault/kind])))
+    (is (nil? (get-in (first facts) [:fact/payload :order-intent/id])))))
+
+;; ---------------------------------------------------------------------------
+;; Short-id collision (artificial) → anomaly for BOTH, never a pick
+;; ---------------------------------------------------------------------------
+
+(deftest short-id-collision-orphans-both
+  ;; two artificial intent ids equal in their first 48 chars
+  (let [shared (str "oi_" (apply str (repeat 45 "c")))
+        oi-a (str shared (apply str (repeat 19 "1")))
+        oi-b (str shared (apply str (repeat 19 "2")))]
+    (testing "the pure index reports the collision"
+      (is (not= oi-a oi-b))
+      (is (= (alp/alpaca-client-order-id oi-a)
+             (alp/alpaca-client-order-id oi-b)))
+      (is (= {:resolution :collision :order-intent/ids [oi-a oi-b]}
+             (alp/resolve-client-order-id (alp/short-id-index [oi-a oi-b])
+                                          shared))))
+    (testing "reconciliation emits one anomaly per colliding intent"
+      (let [broker (make-broker
+                    (fn [_]
+                      {:status 200
+                       :body (json-str
+                              [{"id" "ord-40"
+                                "client_order_id" shared
+                                "status" "new"
+                                "symbol" "SPY"}])}))
+            facts (bp/open-orders broker
+                                  {:broker/account-id account-id
+                                   :reconcile/known-intent-ids [oi-a oi-b]})]
+        (is (= 2 (count facts)))
+        (is (every? #(= :fact/fault-recorded (:record/type %)) facts))
+        (is (every? #(= :fault/reconciliation-anomaly
+                        (get-in % [:fact/payload :fault/kind]))
+                    facts))
+        (is (= #{oi-a oi-b}
+               (set (map #(get-in % [:fact/payload :order-intent/id])
+                         facts))))))))
+
+;; ---------------------------------------------------------------------------
+;; Health (§11) — never submits orders, normalizes unreachability
+;; ---------------------------------------------------------------------------
+
+(deftest health-check-is-read-only
+  (let [requests (atom [])
+        broker (make-broker
+                (recording-stub requests
+                                (fn [_] {:status 200
+                                         :body (json-str {"cash" "100000"})})))
+        heartbeat (bp/health broker)]
+    (is (= :fact/health-heartbeat-recorded (:record/type heartbeat)))
+    (is (= :health/connected
+           (get-in heartbeat [:fact/payload :health/connectivity])))
+    (is (every? #(= "GET" (:method %)) @requests))
+    (is (every? #(>= (.find (:url %) "/v2/account") 0) @requests)))
+  (testing "transport failure → unreachable heartbeat, not an exception"
+    (let [broker (make-broker (fn [_] (throw (python/ConnectionError "down"))))
+          heartbeat (bp/health broker)]
+      (is (= :health/unreachable
+             (get-in heartbeat [:fact/payload :health/connectivity]))))))
