@@ -155,8 +155,9 @@ Implement in the POLYLITH_WORKSPACE §12 build order, one spec with phased deliv
 7. `strategy.registry`, `feature.core`, `inference.core`, `signal.core`, `risk.core`, `execution.core` — pipeline + simple direction strategy
 8. `base.engine-replay` — end-to-end happy path over `simple-paper-session-v0.1.edn` fixture + golden replay/restart tests
 9. Options execution path — multi-leg intents, spread strategy, sim fills for legs
-10. `broker.alpaca` + `market-data.polygon`-shaped live adapter skeleton + `control-plane.*` + `observability.structured-log` + `base.engine-live`, `base.control-plane`
-11. Recovery/parity validation suite (7 crash scenarios, golden properties) + `base.reports` + doc sync
+10. `broker.alpaca` (stub-transport contract tests; NO live market-data adapter — explicitly deferred to operator-phase work) + `control-plane.*` + `observability.structured-log` + `base.engine-live`, `base.control-plane`
+11. Recovery/parity validation suite (7 crash scenarios, golden properties) + `base.reports`
+12. Doc sync (NORTHSTAR status, repo README, spec index)
 
 ## Resolved Questions (verified during exploration)
 
@@ -166,11 +167,13 @@ Implement in the POLYLITH_WORKSPACE §12 build order, one spec with phased deliv
 
 ## Open Questions
 
-1. **Subdirectory test namespaces** — confirm `tests/domain/test_schemas.lpy` with ns `domain.test-schemas` is discovered (Phase 0 task; flat fallback is acceptable).
-2. **Canonical EDN serialization for hashing** — `basilisp.edn/write-string` key ordering is not guaranteed stable; the intent-identity algorithm needs an explicit canonicalizer (sorted keys, defined leg ordering). Decide: hand-rolled canonical serializer in `domain.schemas` (likely answer; ~50 lines).
-3. **Decimal handling in EDN** — EDN has no native decimal literal in basilisp's reader. Durable form is decimal *string* per CANONICAL_SCHEMAS §4.2, so payloads store strings and domain logic converts at the boundary — confirm ergonomics in Phase 1.
-4. **Engine step granularity** — one fact per step vs batch-per-cycle. Architecture says fold over events; recommend `step1(state, fact)` primitive + `cycle(state, facts)` batcher emitting commands once per cycle. Finalize in Phase 2 design.
-5. **Alpaca REST surface for the adapter** — order submit/cancel/list shapes for multi-leg options on paper API; capture from local Python reference (`alpaca_paper_broker.py`) rather than live docs, since that code is the proven behavioral reference. Phase 10 task.
+All initial open questions were resolved during init (decisions recorded in the README Key Decisions table):
+
+1. **Subdirectory test namespaces** — RESOLVED (verified at REPL): `tests/domain/test_schemas.lpy` with ns `domain.test-schemas` is discovered and passes.
+2. **Canonical EDN serialization for hashing** — RESOLVED (decision): hand-rolled canonical serializer in `domain.schemas` (sorted keys, canonical leg sort). `basilisp.edn/write-string` printed test maps stably, but printer internals are not a contract — do not rely on them for identity hashing.
+3. **Decimal handling in EDN** — RESOLVED (decision): durable form is decimal *string* per CANONICAL_SCHEMAS §4.2; payloads store strings, domain logic converts via `decimal/Decimal` at the boundary.
+4. **Engine step granularity** — RESOLVED (decision): `step1(state, fact)` pure primitive (named `fold-fact` in `engine.fold`) + cycle batcher; commands dispatched once per cycle at the shell.
+5. **Alpaca REST surface for the adapter** — RESOLVED (approach): capture shapes from the proven local Python reference (`alpaca_paper_broker.py`) during Phase 10; tests use a stub transport. Remaining unknowns (exact multi-leg response fields) are bounded inside Phase 10's tasks.
 
 ## References
 

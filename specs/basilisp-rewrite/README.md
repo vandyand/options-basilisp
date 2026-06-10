@@ -46,5 +46,6 @@ See [implementation-plan.md](implementation-plan.md). Phases:
 - Phase 7: Strategy pipeline (`strategy.registry`, `feature/inference/signal/risk/execution.core`, `artifact.*`)
 - Phase 8: Replay base end-to-end + golden tests (`engine.commands`, `base.engine-replay`)
 - Phase 9: Options execution path (multi-leg intents, spread strategy)
-- Phase 10: Control plane, observability, Alpaca adapter, live base
-- Phase 11: Recovery validation suite + reports + doc sync
+- Phase 10: Control plane, observability, Alpaca adapter, live base (live market-data adapter explicitly deferred — engine-live takes an injected source; replay source in this spec)
+- Phase 11: Recovery validation suite + reports
+- Phase 12: Doc sync (NORTHSTAR status, repo README, spec index)
