@@ -1,0 +1,38 @@
+;; venturevd paper-trading manifest — first live-data engine session.
+
+{:control-plane/revision "cp-vv-000001"
+ :control-plane/generated-at "2026-06-10T19:35:00Z"
+ :control-plane/status :control-plane-status/proposed
+ :control-plane/strategies
+ [{:strategy/id "strategy/simple-direction/sma-cross/v1"
+   :strategy/enabled? true
+   :strategy/mode :mode/paper
+   :strategy/process "engine-paper-main"
+   :strategy/account-route "route/venturevd-paper"
+   :strategy/artifacts {:model-ref "model/simple-direction/v1"
+                        :feature-manifest-ref "feature/simple-direction/v1"}
+   :strategy/schedule {:session :session/us-equities-regular}}]
+ :control-plane/accounts
+ [{:account/id "account/alpaca/venturevd-paper"
+   :account/broker :broker/alpaca-paper
+   :account/environment :environment/paper
+   :account/allowed-modes #{:mode/paper :mode/shadow}
+   :account/live-enabled? false}]
+ :control-plane/processes
+ [{:process/id "engine-paper-main"
+   :process/base :base/engine-live
+   :process/allowed-modes #{:mode/paper}
+   :process/strategies ["strategy/simple-direction/sma-cross/v1"]}]
+ :control-plane/routes
+ [{:route/id "route/venturevd-paper"
+   :route/strategy-id "strategy/simple-direction/sma-cross/v1"
+   :route/account-id "account/alpaca/venturevd-paper"
+   :route/broker :broker/alpaca-paper}]
+ :control-plane/kill-switches
+ [{:kill-switch/scope :kill-switch-scope/global
+   :kill-switch/active? false
+   :kill-switch/reason nil
+   :kill-switch/activated-at nil
+   :kill-switch/actor nil}]
+ :control-plane/policies
+ {:policy/default-degradation :degradation-policy/default-paper}}

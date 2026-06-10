@@ -1,0 +1,209 @@
+(ns stevetrading.market-data.alpaca
+  "Live Alpaca market-data source (MARKET_DATA_ADAPTER §4-§8).
+
+  ADAPTER component: polls Alpaca's stock bars REST API (data.alpaca.markets,
+  default IEX feed for paper entitlements) and emits the SAME canonical
+  observation fact shapes as the replay source — same field names, full
+  provenance, no live-only semantics.
+
+  Source contract notes:
+  - The loop (engine.loop/run-cycles!) ends the session on the first empty
+    observation batch, so `next-observations` BLOCKS internally
+    (poll + sleep) until a new bar lands or `:until` passes; it returns
+    {:observations [] :exhausted? true} only at/after `:until`.
+  - Cursor is an integer index into the internally accumulated,
+    timestamp-deduped, ascending bar list — re-reading an earlier cursor
+    re-emits the same fact (replay-capable pagination per §3; the bar list
+    only ever appends).
+  - On first use the source seeds `:warmup-bars` of recent history so
+    strategies can complete warmup immediately.
+  - OHLCV numerics are parsed with json parse_float=str so canonical
+    decimal STRINGS reach the payload untouched (no binary floats).
+
+  All tests inject :transport; the default transport uses stdlib
+  urllib.request. Never require broker.alpaca from here (adapter-to-adapter
+  reach-through is forbidden)."
+  (:import json
+           operator
+           time
+           urllib.request
+           urllib.error
+           datetime)
+  (:require [stevetrading.domain.schemas :as sch]
+            [stevetrading.market-data.protocol :as p]))
+
+(def provider :market-data/alpaca)
+
+(def default-data-url "https://data.alpaca.markets")
+
+(defn utc-now-str
+  []
+  (let [now (datetime.datetime/now (.-utc datetime/timezone))]
+    (str (.strftime now "%Y-%m-%dT%H:%M:%S.%f")
+         "Z")))
+
+(defn- default-transport
+  "GET the url with Alpaca auth headers → {:status n :body s}.
+  Transport errors surface as {:status 0 :error msg} (the poll loop
+  degrades + retries; it never throws across the source boundary)."
+  [{:keys [url key-id secret]}]
+  (try
+    (let [req (urllib.request/Request url)]
+      (.add-header req "APCA-API-KEY-ID" (or key-id ""))
+      (.add-header req "APCA-API-SECRET-KEY" (or secret ""))
+      (.add-header req "Accept" "application/json")
+      (let [resp (urllib.request/urlopen req ** :timeout 10)]
+        {:status (.-status resp)
+         :body (.decode (.read resp) "utf-8")}))
+    (catch python/Exception e
+      {:status 0 :error (str e)})))
+
+(defn- parse-bars
+  "Parse an Alpaca /v2/stocks/<sym>/bars JSON body into ascending
+  [{:t iso :o s :h s :l s :c s :v s} ...] with decimal-string numerics."
+  [body]
+  (let [data (json/loads body ** :parse_float python/str)
+        bars (or (get data "bars") [])]
+    (vec
+     (sort-by
+      :t
+      (map (fn [b]
+             {:t (let [t (get b "t")]
+                   ;; alpaca returns RFC3339 Z timestamps already
+                   t)
+              :o (str (get b "o"))
+              :h (str (get b "h"))
+              :l (str (get b "l"))
+              :c (str (get b "c"))
+              :v (str (get b "v"))})
+           bars)))))
+
+(defn- bars-url
+  [{:keys [data-url symbol feed limit start]}]
+  (str (or data-url default-data-url)
+       "/v2/stocks/" symbol "/bars?timeframe=1Min&feed=" (or feed "iex")
+       "&limit=" (or limit 100)
+       (when start (str "&start=" start))
+       "&sort=asc"))
+
+(defn- bar->fact
+  "Wrap one parsed bar in a canonical fact envelope (mirrors
+  market-data.replay/input->fact field-for-field, live provenance)."
+  [{:keys [instrument-id run-mode]} bar]
+  (let [at (:t bar)
+        pref (str "alpaca:bar:" instrument-id ":" at)
+        payload {:bar/time at
+                 :bar/timeframe :timeframe/1m
+                 :bar/open (:o bar)
+                 :bar/high (:h bar)
+                 :bar/low (:l bar)
+                 :bar/close (:c bar)
+                 :bar/volume (:v bar)
+                 :data/provider provider
+                 :data/provider-ref pref
+                 :data/received-at (utc-now-str)
+                 :data/quality {:quality/complete? true}}]
+    (sch/fact-envelope
+     {:record/type :fact/market-bar-observed
+      :record/mode (or run-mode :mode/paper)
+      :record/source-system provider
+      :record/instrument-id instrument-id
+      :fact/occurred-at at
+      :fact/recorded-at (utc-now-str)
+      :fact/source-ref pref
+      :fact/dedupe-key (str "md/alpaca/" instrument-id "/" at)
+      :fact/payload payload})))
+
+(defn- recent-start
+  "RFC3339 Z timestamp n-minutes ago — the seed-fetch window so warmup
+  history is the LATEST bars, not the day's first."
+  [n-minutes]
+  (let [now (datetime.datetime/now (.-utc datetime/timezone))
+        then (operator/sub now (datetime/timedelta ** :minutes n-minutes))]
+    (str (.strftime then "%Y-%m-%dT%H:%M:%S") "Z")))
+
+(defn- fetch-new-bars!
+  "Poll once; append any bars strictly newer than the newest held bar to
+  the state atom. Returns the count of new bars."
+  [{:keys [transport key-id secret] :as opts} state]
+  (let [last-t (or (:t (peek (:bars @state)))
+                   (recent-start (+ 3 (or (:warmup-bars opts) 8))))
+        url (bars-url (assoc opts :start last-t))
+        {:keys [status body error]} (transport {:url url :key-id key-id
+                                                :secret secret})]
+    (if (and (= 200 status) body)
+      (let [bars (parse-bars body)
+            fresh (vec (filter #(or (nil? last-t) (> (compare (:t %) last-t) 0))
+                               bars))]
+        (when (seq fresh)
+          (swap! state update :bars into fresh))
+        (swap! state assoc :last-poll-ok? true :last-poll-at (utc-now-str))
+        (count fresh))
+      (do (swap! state assoc :last-poll-ok? false
+                 :last-error (or error (str "http " status))
+                 :last-poll-at (utc-now-str))
+          0))))
+
+(defrecord AlpacaBarsSource [opts state]
+  p/MarketDataSource
+
+  (source-id [this] provider)
+
+  (next-observations [this cursor max-n]
+    (let [{:keys [until poll-seconds]} opts
+          cursor (max 0 (or cursor 0))]
+      ;; ensure warmup seed happened
+      (when-not (:seeded? @state)
+        (fetch-new-bars! opts state)
+        (swap! state assoc :seeded? true))
+      (loop []
+        (let [bars (:bars @state)
+              total (count bars)]
+          (cond
+            ;; emit what we hold
+            (< cursor total)
+            (let [end (min total (+ cursor (max 1 (or max-n 1))))
+                  facts (vec (map #(bar->fact opts (nth bars %))
+                                  (range cursor end)))]
+              {:observations facts :cursor end :exhausted? false})
+
+            ;; session over?
+            (and until (>= (compare (utc-now-str) until) 0))
+            {:observations [] :cursor cursor :exhausted? true}
+
+            ;; block-poll for the next bar
+            :else
+            (do (time/sleep (or poll-seconds 5))
+                (fetch-new-bars! opts state)
+                (recur)))))))
+
+  (source-health [this]
+    (let [{:keys [bars last-poll-ok? last-error last-poll-at]} @state]
+      {:source/provider provider
+       :source/healthy? (boolean (or last-poll-ok? (seq bars)))
+       :source/last-receipt-at (:t (peek bars))
+       :source/last-poll-at last-poll-at
+       :source/degradations (if last-poll-ok? [] (filterv some? [last-error]))
+       :source/subscription-status :subscription-status/polling
+       :source/bar-count (count bars)})))
+
+(defn make-alpaca-bars-source
+  "Live Alpaca 1-min bars source. Opts (explicit map — never kwargs):
+    :symbol         wire symbol, e.g. \"SPY\" (required)
+    :instrument-id  canonical id, e.g. \"equity/NASDAQ/SPY\" (required)
+    :key-id :secret Alpaca data credentials (required for live transport)
+    :feed           \"iex\" (default; paper entitlement) | \"sip\"
+    :data-url       default https://data.alpaca.markets
+    :until          RFC3339 Z end-of-session; next-observations reports
+                    exhausted at/after this instant (required for live)
+    :poll-seconds   poll cadence while blocked (default 5)
+    :warmup-bars    history depth seeded on first use (default 8)
+    :run-mode       envelope mode (default :mode/paper)
+    :transport      injectable (fn [{:url :key-id :secret}] {:status :body})"
+  [opts]
+  (let [opts (merge {:feed "iex" :poll-seconds 5 :warmup-bars 8
+                     :run-mode :mode/paper
+                     :transport default-transport
+                     :limit (max 8 (or (:warmup-bars opts) 8))}
+                    opts)]
+    (->AlpacaBarsSource opts (atom {:bars [] :seeded? false}))))

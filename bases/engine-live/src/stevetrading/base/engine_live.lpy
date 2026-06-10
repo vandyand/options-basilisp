@@ -261,7 +261,8 @@
   :portfolio {..} :health-view {..} ...}."
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
-           max-facts resume? alpaca crash-after-fact crash-before-fact]}]
+           max-facts resume? alpaca crash-after-fact crash-before-fact]
+    injected-source :source}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
         cp-store (cpfs/make-file-control-plane-store control-plane-root)
@@ -279,9 +280,10 @@
             gate
             revision (:control-plane/revision manifest)
             account-id (:route/account-id route)
-            ;; market-data source (in-spec: always the replay fixture)
-            fixture* (fixture/load-fixture fixture-path)
-            source (replay/make-replay-source fixture*)
+            ;; market-data source: injected live source wins; else the
+            ;; replay fixture (the original in-spec wiring)
+            fixture* (when fixture-path (fixture/load-fixture fixture-path))
+            source (or injected-source (replay/make-replay-source fixture*))
             replay-feed? (= :market-data/replay (mdp/source-id source))]
         ;; 2. stale-feed safety gate
         (if (and (not= :broker/sim broker-kw)
@@ -298,8 +300,9 @@
                 snapshot-store (ss/make-snapshot-store
                                 (os.path/join out-dir "snapshots"))
                 artifact-store (afs/make-file-artifact-store artifact-root)
-                market-clock (atom (:input/at
-                                    (first (:fixture/inputs fixture*))))
+                market-clock (atom (or (:input/at
+                                        (first (:fixture/inputs fixture*)))
+                                       (eloop/utc-now-str)))
                 marks (atom {})
                 broker (case broker-kw
                          :broker/sim
@@ -415,9 +418,10 @@
                     ;; observations must not roll them backward
                     seed-wm (get-in state0 [:engine/watermarks
                                             :watermark/market])
-                    _ (reset! marks (eloop/marks-at fixture*
-                                                    (eloop/observed-position
-                                                     fixture* state0 cursor0)))
+                    _ (when fixture*
+                        (reset! marks (eloop/marks-at fixture*
+                                                      (eloop/observed-position
+                                                       fixture* state0 cursor0))))
                     ;; 4. record the loaded revision (durable + folded)
                     activated-ts (eloop/utc-now-str)
                     activated-fact

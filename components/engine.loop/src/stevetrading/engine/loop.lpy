@@ -59,6 +59,7 @@
             [stevetrading.engine.machines :as m]
             [stevetrading.engine.recovery :as rec]
             [stevetrading.engine.state :as st]
+            [stevetrading.broker.protocol :as bp]
             [stevetrading.ledger.core :as ledger]
             [stevetrading.market-data.protocol :as mdp]
             [stevetrading.persistence.protocol :as p]
@@ -328,6 +329,45 @@
 ;; One strategy decision pass (§6 steps 4-10 for one strategy)
 ;; ---------------------------------------------------------------------------
 
+(defn- poll-broker-fills!
+  "Async-fill reconciliation step (one per cycle): when unresolved,
+  not-yet-filled intents exist, poll broker fills-since and run any
+  newly observed fills through the SAME fold → ledger derive/append/fold
+  → portfolio path as synchronous fills. Sync brokers (sim) return
+  already-known fills which the append layer dedupes to nothing — the
+  poll is harmless there and load-bearing for async brokers (alpaca),
+  whose submit returns only the ack. Returns {:state :ledger
+  :appended-count :skipped-fills}."
+  [{:keys [append! broker state ledger account-id since]}]
+  (let [open (into []
+                   (keep (fn [[oi entry]]
+                           (when-not (:order/resolved? entry) oi)))
+                   (:engine/unresolved-orders state))]
+    (if (empty? open)
+      {:state state :ledger ledger :appended-count 0 :skipped-fills []}
+      (let [facts (try
+                    (bp/fills-since broker
+                                    {:broker/account-id account-id
+                                     :reconcile/known-intent-ids open}
+                                    since)
+                    (catch python/Exception _ []))
+            {poll-new :new-facts poll-n :appended-count} (append! facts)
+            foldp (fold-new! append! state poll-new)
+            state (:state foldp)
+            fills (filterv #(= :fact/fill-observed (:record/type %))
+                           poll-new)
+            ledger-res (apply-fills-to-ledger! append! state ledger fills)
+            ledger' (:ledger ledger-res)
+            state (if (seq fills)
+                    (assoc state :engine/portfolio
+                           (portfolio/derive-portfolio ledger'))
+                    state)]
+        {:state state
+         :ledger ledger'
+         :appended-count (+ poll-n (:appended-count foldp)
+                            (:appended-count ledger-res))
+         :skipped-fills (:skipped-fills ledger-res)}))))
+
 (defn- run-strategy-cycle!
   "Pipeline → append+fold decision facts → derive/dispatch commands →
   append+fold outcomes → ledger derive/append/fold → portfolio refresh.
@@ -530,6 +570,15 @@
                 ledger (:ledger cycle-res)
                 cycle-n (:n cycle-res)
                 skipped-fills (into skipped-fills (:skipped cycle-res))
+                ;; async-fill reconciliation poll (no-op when nothing open)
+                poll-res (poll-broker-fills!
+                          {:append! append! :broker broker :state state
+                           :ledger ledger :account-id account-id
+                           :since (get-in state [:engine/run :run/started-at])})
+                state (:state poll-res)
+                ledger (:ledger poll-res)
+                cycle-n (+ cycle-n (:appended-count poll-res))
+                skipped-fills (into skipped-fills (:skipped-fills poll-res))
                 ;; cursor advance — the snapshot-carried resume point
                 state (st/record-cursor state :market-data next-cursor)
                 appended (+ appended cycle-n)

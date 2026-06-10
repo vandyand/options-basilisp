@@ -1,0 +1,33 @@
+;; One-shot launcher: venturevd paper session over live Alpaca IEX bars.
+(import os)
+(require '[stevetrading.base.engine-live :as live]
+         '[stevetrading.market-data.alpaca :as mda])
+
+(def until "2026-06-10T19:59:00Z")
+
+(def source
+  (mda/make-alpaca-bars-source
+   {:symbol "SPY"
+    :instrument-id "equity/NASDAQ/SPY"
+    :key-id (os/getenv "ALPACA_VENTUREVD_API_KEY")
+    :secret (os/getenv "ALPACA_VENTUREVD_API_SECRET")
+    :warmup-bars 8
+    :poll-seconds 5
+    :until until
+    :run-mode :mode/paper}))
+
+(def result
+  (live/run-live
+   {:control-plane-root "live_runtime/cp"
+    :process-id "engine-paper-main"
+    :out-dir "live_runtime/session-2026-06-10"
+    :source source
+    :mode :mode/paper
+    :snapshot-every 20
+    :alpaca {:key-id (os/getenv "ALPACA_VENTUREVD_API_KEY")
+             :secret (os/getenv "ALPACA_VENTUREVD_API_SECRET")}}))
+
+(println "=== SESSION RESULT ===")
+(prn (select-keys result [:live/started? :live/refusal :run/id :facts-appended
+                          :orders :cursor :stopped-early?]))
+(prn (:portfolio result))
