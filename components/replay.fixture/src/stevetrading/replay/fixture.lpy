@@ -1,0 +1,246 @@
+(ns stevetrading.replay.fixture
+  "Replay fixture v0.2 format: load, validate, write.
+
+  SUPPORT component — requires domain.* and basilisp.edn only; no adapter
+  or protocol dependencies. The market-data.replay adapter consumes loaded
+  fixtures to emit canonical observation facts.
+
+  Fixture v0.2 shape:
+
+    {:fixture/id \"fixture/replay/<name>/v0.2\"
+     :fixture/version 2
+     :fixture/mode :mode/replay
+     :fixture/description \"...\"
+     :fixture/inputs [{:input/at \"2026-06-10T14:30:00Z\"   ; RFC 3339 UTC
+                       :input/type :fact/market-bar-observed
+                       :input/instrument-id \"equity/NASDAQ/SPY\"
+                       :input/payload {...}}]
+     :fixture/expected-outputs [{:record/type :fact/...} ...]}
+
+  Format rules (validated by validate-fixture / load-fixture):
+  - :fixture/version must be exactly 2.
+  - :fixture/inputs must be sorted ascending by :input/at (string compare
+    is chronological for RFC 3339 UTC); unsorted fixtures are rejected.
+  - Each :input/type must be a known market observation fact type.
+  - Each :input/payload carries only the provenance-INDEPENDENT domain
+    payload fields for its type (e.g. a bar payload per CANONICAL_SCHEMAS
+    §11.1 minus provider: bar/time, timeframe, OHLCV). The replay adapter
+    adds the :data/* provenance fields (provider, provider-ref,
+    received-at, quality) at emission time — provenance describes the
+    SOURCE, and for a fixture the source is the replay adapter, not the
+    original recording.
+  - :input/instrument-id is REQUIRED for instrument-scoped observation
+    types (bars, quotes, option chains) — the bar/quote/chain domain
+    payloads carry no instrument field, so the envelope-level
+    :record/instrument-id must come from the fixture input. It is
+    optional for exchange-scoped types (calendar/session facts)."
+  (:require [basilisp.edn :as edn]
+            [stevetrading.domain.validation :as v])
+  (:import os os.path))
+
+(def fixture-version 2)
+
+(def ^:private required-fixture-keys
+  [:fixture/id :fixture/version :fixture/mode :fixture/inputs
+   :fixture/expected-outputs])
+
+;; Provenance-independent required domain payload fields per input type.
+;; (CANONICAL_SCHEMAS §11.1 for bars, MARKET_DATA_ADAPTER §4.2-§4.4 for
+;; the rest, minus the :data/* and provider fields the adapter supplies.)
+(def required-payload-fields
+  {:fact/market-bar-observed
+   [:bar/time :bar/timeframe :bar/open :bar/high :bar/low :bar/close
+    :bar/volume]
+
+   :fact/quote-observed
+   [:quote/time :quote/bid :quote/ask :quote/bid-size :quote/ask-size]
+
+   :fact/option-chain-observed
+   [:chain/observed-at :chain/underlying :chain/contracts]
+
+   :fact/calendar-session-observed
+   [:session/exchange :session/trading-date :session/state
+    :session/observed-at]})
+
+;; Input types whose observations are instrument-scoped and therefore
+;; require :input/instrument-id (the domain payloads carry no instrument
+;; field; the envelope :record/instrument-id comes from the input).
+(def instrument-scoped-input-types
+  #{:fact/market-bar-observed
+    :fact/quote-observed
+    :fact/option-chain-observed})
+
+(defn- err
+  [code path message]
+  {:error/code    code
+   :error/path    path
+   :error/message message})
+
+(defn- translate-fact-error-path
+  "Map a validate-fact error path on the synthetic envelope back onto the
+  fixture input at index i."
+  [i path]
+  (cond
+    (= :fact/payload (first path))
+    (into [:fixture/inputs i :input/payload] (rest path))
+
+    (= [:record/instrument-id] (vec path))
+    [:fixture/inputs i :input/instrument-id]
+
+    :else
+    (into [:fixture/inputs i] path)))
+
+(defn- check-input-as-fact
+  "Validate the input's payload as its declared fact type by wrapping it
+  in a synthetic fact envelope shaped exactly like the one the replay
+  adapter emits (same :data/* provenance fields) and running
+  domain.validation/validate-fact. Catches type-level payload faults the
+  field-presence checks cannot: floats in canonical decimal fields,
+  malformed timestamps, invalid enum values, malformed instrument ids."
+  [errors i input]
+  (let [at (:input/at input)
+        envelope (cond-> {:record/id      "fixture-validation"
+                          :record/type    (:input/type input)
+                          :record/version 1
+                          :record/mode    :mode/replay
+                          :fact/occurred-at at
+                          :fact/recorded-at at
+                          :fact/payload (merge (:input/payload input)
+                                               {:data/provider     :market-data/replay
+                                                :data/provider-ref "fixture-validation"
+                                                :data/received-at  at
+                                                :data/quality      {:quality/complete? true}})}
+                   (some? (:input/instrument-id input))
+                   (assoc :record/instrument-id (:input/instrument-id input)))
+        {:keys [valid?] fact-errors :errors} (v/validate-fact envelope)]
+    (if valid?
+      errors
+      (into errors
+            (map #(update % :error/path (partial translate-fact-error-path i))
+                 fact-errors)))))
+
+(defn- check-input
+  "Validation errors for one fixture input at index i."
+  [errors i input]
+  (let [path [:fixture/inputs i]
+        input-type (:input/type input)
+        errors (if (v/rfc3339-utc? (:input/at input))
+                 errors
+                 (conj errors (err :error/invalid-timestamp
+                                   (conj path :input/at)
+                                   (str ":input/at must be an RFC 3339 UTC timestamp ending in Z, got "
+                                        (pr-str (:input/at input))))))
+        errors (if (contains? required-payload-fields input-type)
+                 errors
+                 (conj errors (err :error/unknown-type
+                                   (conj path :input/type)
+                                   (str "unknown fixture input type: " (pr-str input-type)))))
+        errors (if (and (contains? instrument-scoped-input-types input-type)
+                        (not (string? (:input/instrument-id input))))
+                 (conj errors (err :error/missing-key
+                                   (conj path :input/instrument-id)
+                                   (str ":input/instrument-id is required for " (pr-str input-type))))
+                 errors)
+        payload (:input/payload input)
+        errors (if (map? payload)
+                 (reduce (fn [errs k]
+                           (if (some? (get payload k))
+                             errs
+                             (conj errs (err :error/missing-key
+                                             (conj path :input/payload k)
+                                             (str "input payload missing required field " k
+                                                  " for type " (pr-str input-type))))))
+                         errors
+                         (get required-payload-fields input-type []))
+                 (conj errors (err :error/missing-key
+                                   (conj path :input/payload)
+                                   ":input/payload must be a map")))
+        ;; Envelope-level validation (payload validates as its fact type):
+        ;; only when the input-level basics hold, so a bad :input/at or
+        ;; unknown type is reported once with a precise path.
+        errors (if (and (contains? required-payload-fields input-type)
+                        (v/rfc3339-utc? (:input/at input))
+                        (map? payload))
+                 (check-input-as-fact errors i input)
+                 errors)]
+    errors))
+
+(defn validate-fixture
+  "Validate a fixture v0.2 map. Returns {:valid? true} or
+  {:valid? false :errors [{:error/code .. :error/path .. :error/message ..}]}.
+  Checks: required keys, version exactly 2, inputs sorted ascending by
+  :input/at, per-input type/timestamp/instrument-id/payload-field rules,
+  and each payload validates as its declared fact type (wrapped in a
+  synthetic adapter-shaped envelope and run through validate-fact)."
+  [fixture]
+  (let [errors []
+        errors (reduce (fn [errs k]
+                         (if (some? (get fixture k))
+                           errs
+                           (conj errs (err :error/missing-key [k]
+                                           (str "required fixture key " k " is missing or nil")))))
+                       errors
+                       required-fixture-keys)
+        errors (if (or (nil? (:fixture/version fixture))
+                       (= fixture-version (:fixture/version fixture)))
+                 errors
+                 (conj errors (err :error/unsupported-version [:fixture/version]
+                                   (str "unsupported fixture version "
+                                        (pr-str (:fixture/version fixture))
+                                        "; expected " fixture-version))))
+        inputs (:fixture/inputs fixture)
+        errors (if (or (nil? inputs) (vector? inputs))
+                 errors
+                 (conj errors (err :error/invalid-shape [:fixture/inputs]
+                                   ":fixture/inputs must be a vector")))
+        errors (if (vector? inputs)
+                 (let [ats (mapv :input/at inputs)]
+                   (if (= ats (vec (sort ats)))
+                     errors
+                     (conj errors (err :error/unsorted-inputs [:fixture/inputs]
+                                       ":fixture/inputs must be sorted ascending by :input/at"))))
+                 errors)
+        errors (if (vector? inputs)
+                 (first
+                  (reduce (fn [[errs i] input]
+                            [(check-input errs i input) (inc i)])
+                          [errors 0]
+                          inputs))
+                 errors)]
+    (if (seq errors)
+      {:valid? false :errors (vec errors)}
+      {:valid? true})))
+
+(defn load-fixture
+  "Read and validate a fixture v0.2 EDN file. Returns the fixture map;
+  throws ex-info {:error/code :error/invalid-fixture :error/errors [...]}
+  when validation fails (replay fixture corruption is a normalized fault
+  category — MARKET_DATA_ADAPTER §10)."
+  [path]
+  (let [fixture (edn/read-string (slurp path))
+        {:keys [valid? errors]} (validate-fixture fixture)]
+    (if valid?
+      fixture
+      (throw (ex-info (str "invalid replay fixture: " path)
+                      {:error/code   :error/invalid-fixture
+                       :error/path   path
+                       :error/errors errors})))))
+
+(defn write-fixture
+  "Validate and write a fixture v0.2 map as EDN to path (atomic: tmp file
+  in the same directory + os.replace). Throws ex-info on an invalid
+  fixture so corrupt fixtures are never produced. Returns path."
+  [path fixture]
+  (let [{:keys [valid? errors]} (validate-fixture fixture)]
+    (when-not valid?
+      (throw (ex-info "refusing to write invalid replay fixture"
+                      {:error/code   :error/invalid-fixture
+                       :error/path   path
+                       :error/errors errors})))
+    (let [dir (os.path/dirname path)]
+      (when (and dir (not (= dir "")))
+        (os/makedirs dir ** :exist_ok true))
+      (let [tmp-path (str path ".tmp")]
+        (spit tmp-path (edn/write-string fixture))
+        (os/replace tmp-path path)
+        path))))

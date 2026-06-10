@@ -1,0 +1,142 @@
+;; Replay fixture v0.2 — one minimal SPY session for the end-to-end replay
+;; path: session open, then 10 one-minute bars whose closes make an SMA(3)
+;; cross above an SMA(5) at bar 6 and back below at bar 10 (verified:
+;; bar 5 SMA3 550.0667 < SMA5 550.10; bar 6 SMA3 550.20 > SMA5 550.14;
+;; bar 10 SMA3 550.20 < SMA5 550.32), so the Phase 7 SMA-crossover
+;; strategy enters long then flattens.
+;;
+;; Input payloads carry only the provenance-independent domain fields;
+;; the replay adapter adds :data/provider, :data/provider-ref,
+;; :data/received-at, and :data/quality at emission time.
+;; :fixture/expected-outputs is the EVENT_COMMAND_TAXONOMY §10.2 lineage
+;; subset, in lineage order.
+
+{:fixture/id "fixture/replay/simple-paper-session/v0.2"
+ :fixture/version 2
+ :fixture/mode :mode/replay
+ :fixture/description "Minimal one-session SPY replay: session open + 10 one-minute bars with an SMA(3)/SMA(5) cross above at bar 6 and back below at bar 10."
+ :fixture/inputs
+ [{:input/at "2026-06-10T13:30:00Z"
+   :input/type :fact/calendar-session-observed
+   :input/payload
+   {:session/exchange "XNYS"
+    :session/trading-date "2026-06-10"
+    :session/state :session-state/open
+    :session/observed-at "2026-06-10T13:30:00Z"}}
+  {:input/at "2026-06-10T14:30:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:30:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.15"
+    :bar/high "550.28"
+    :bar/low "550.10"
+    :bar/close "550.20"
+    :bar/volume "18234"}}
+  {:input/at "2026-06-10T14:31:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:31:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.20"
+    :bar/high "550.24"
+    :bar/low "550.05"
+    :bar/close "550.10"
+    :bar/volume "16410"}}
+  {:input/at "2026-06-10T14:32:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:32:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.10"
+    :bar/high "550.14"
+    :bar/low "549.95"
+    :bar/close "550.00"
+    :bar/volume "17522"}}
+  {:input/at "2026-06-10T14:33:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:33:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.00"
+    :bar/high "550.12"
+    :bar/low "549.98"
+    :bar/close "550.05"
+    :bar/volume "15287"}}
+  {:input/at "2026-06-10T14:34:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:34:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.05"
+    :bar/high "550.21"
+    :bar/low "550.02"
+    :bar/close "550.15"
+    :bar/volume "16830"}}
+  {:input/at "2026-06-10T14:35:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:35:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.15"
+    :bar/high "550.45"
+    :bar/low "550.12"
+    :bar/close "550.40"
+    :bar/volume "21904"}}
+  {:input/at "2026-06-10T14:36:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:36:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.40"
+    :bar/high "550.66"
+    :bar/low "550.38"
+    :bar/close "550.60"
+    :bar/volume "23461"}}
+  {:input/at "2026-06-10T14:37:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:37:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.60"
+    :bar/high "550.64"
+    :bar/low "550.44"
+    :bar/close "550.50"
+    :bar/volume "19075"}}
+  {:input/at "2026-06-10T14:38:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:38:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.50"
+    :bar/high "550.52"
+    :bar/low "550.16"
+    :bar/close "550.20"
+    :bar/volume "20688"}}
+  {:input/at "2026-06-10T14:39:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:39:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.20"
+    :bar/high "550.22"
+    :bar/low "549.86"
+    :bar/close "549.90"
+    :bar/volume "22340"}}]
+ :fixture/expected-outputs
+ [{:record/type :fact/prediction-produced}
+  {:record/type :fact/signal-decision-produced}
+  {:record/type :fact/risk-decision-recorded}
+  {:record/type :fact/order-intent-created}
+  {:record/type :fact/broker-ack-accepted}
+  {:record/type :fact/fill-observed}]}

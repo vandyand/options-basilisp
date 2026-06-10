@@ -1,0 +1,118 @@
+(ns stevetrading.market-data.replay
+  "Fixture-driven replay market-data source (MARKET_DATA_ADAPTER §9).
+
+  ADAPTER component: wraps a loaded replay.fixture v0.2 fixture and emits
+  the same canonical observation fact shapes as a live adapter — same
+  field names, full provenance, no replay-only semantics.
+
+  Emission rules (per input at index i in the fixture):
+  - :record/type            = the input's :input/type
+  - :record/mode            = :mode/replay
+  - :record/source-system   = :market-data/replay
+  - :record/instrument-id   = the input's :input/instrument-id (when present;
+                              bar/quote/chain domain payloads carry no
+                              instrument field, so the envelope identity
+                              comes from the fixture input)
+  - :fact/occurred-at       = :input/at (effective market timestamp)
+  - :fact/recorded-at       = :input/at (synthetic receive timing — §9
+                              allows replay to differ from live ONLY in
+                              timing, references, and pacing)
+  - :fact/source-ref        = \"<fixture-id>:<index>\" (fixture record ref)
+  - :fact/dedupe-key        = \"md/replay/<fixture-id>/<index>\"
+  - :fact/payload           = the input's domain payload PLUS adapter
+                              provenance (§5):
+                                :data/provider     :market-data/replay
+                                :data/provider-ref \"<fixture-id>:<index>\"
+                                :data/received-at  = :input/at (synthetic)
+                                :data/quality      {:quality/complete? true}
+
+  The cursor is the input index (0-based); next-observations is stateless
+  pagination over the fixture inputs, so re-reading any cursor is
+  replay-capable by construction (§3). A small atom tracks the high-water
+  cursor and last emitted market time for source-health reporting only —
+  it never affects emission."
+  (:require [stevetrading.domain.schemas :as sch]
+            [stevetrading.market-data.protocol :as p]))
+
+(def provider :market-data/replay)
+
+(defn- provider-ref
+  [fixture-id index]
+  (str fixture-id ":" index))
+
+(defn- dedupe-key
+  [fixture-id index]
+  (str "md/replay/" fixture-id "/" index))
+
+(defn input->fact
+  "Wrap fixture input (at index) in a canonical fact envelope with full
+  replay provenance."
+  [fixture-id index input]
+  (let [at (:input/at input)
+        pref (provider-ref fixture-id index)
+        payload (merge (:input/payload input)
+                       {:data/provider     provider
+                        :data/provider-ref pref
+                        :data/received-at  at
+                        :data/quality      {:quality/complete? true}})
+        base {:record/type          (:input/type input)
+              :record/mode          :mode/replay
+              :record/source-system provider
+              :fact/occurred-at     at
+              :fact/recorded-at     at
+              :fact/source-ref      pref
+              :fact/dedupe-key      (dedupe-key fixture-id index)
+              :fact/payload         payload}]
+    (sch/fact-envelope
+     (if (some? (:input/instrument-id input))
+       (assoc base :record/instrument-id (:input/instrument-id input))
+       base))))
+
+(defrecord ReplaySource [fixture progress]
+  p/MarketDataSource
+
+  (source-id [this] provider)
+
+  (next-observations [this cursor max-n]
+    (let [inputs (:fixture/inputs fixture)
+          total (count inputs)
+          fixture-id (:fixture/id fixture)
+          start (max 0 (or cursor 0))
+          end (min total (+ start (max 0 (or max-n 0))))
+          taken (if (< start end) (subvec inputs start end) [])
+          facts (vec (map-indexed
+                      (fn [offset input]
+                        (input->fact fixture-id (+ start offset) input))
+                      taken))
+          next-cursor (if (< start end) end start)]
+      (when (seq facts)
+        (swap! progress
+               (fn [prog]
+                 (if (> next-cursor (:cursor-high-water prog 0))
+                   {:cursor-high-water next-cursor
+                    :last-emitted-at (:input/at (peek taken))}
+                   prog))))
+      {:observations facts
+       :cursor       next-cursor
+       :exhausted?   (>= next-cursor total)}))
+
+  (source-health [this]
+    (let [{:keys [cursor-high-water last-emitted-at]} @progress
+          total (count (:fixture/inputs fixture))]
+      {:source/provider            provider
+       :source/healthy?            true
+       :source/last-receipt-at     last-emitted-at
+       :source/lag-ms              0
+       :source/subscription-status :subscription-status/replay
+       :source/degradations        []
+       :source/fixture-id          (:fixture/id fixture)
+       :source/cursor-high-water   cursor-high-water
+       :source/input-count         total
+       :source/exhausted?          (>= cursor-high-water total)})))
+
+(defn make-replay-source
+  "Build a ReplaySource over a LOADED (validated) fixture v0.2 map — see
+  stevetrading.replay.fixture/load-fixture."
+  [fixture]
+  (->ReplaySource fixture (atom {:cursor-high-water 0
+                                 :last-emitted-at nil})))

@@ -1,0 +1,263 @@
+(ns market-data.test-replay
+  "Phase 5 market-data replay tests:
+  - provenance completeness on every emitted fact (validate-fact passes;
+    :data/provider / :data/provider-ref / :data/received-at present)
+  - cursor pagination and replay-capable cursors (re-read = same facts)
+  - exhaustion semantics
+  - fixture validation rejects unsorted inputs and missing
+    provenance-required fields (instrument-id, payload domain fields,
+    market timestamps, decimal strings)"
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.market-data.protocol :as p]
+            [stevetrading.market-data.replay :as r]
+            [stevetrading.replay.fixture :as fx])
+  (:import os.path tempfile))
+
+(def fixture-path "resources/fixtures/replay/simple-paper-session-v0.2.edn")
+
+(def fixture (fx/load-fixture fixture-path))
+
+(defn make-source [] (r/make-replay-source fixture))
+
+(defn pull-all
+  [src]
+  (:observations (p/next-observations src 0 (count (:fixture/inputs fixture)))))
+
+(defn provider-refs
+  [facts]
+  (mapv #(get-in % [:fact/payload :data/provider-ref]) facts))
+
+;; ---------------------------------------------------------------------------
+;; Fixture loading
+;; ---------------------------------------------------------------------------
+
+(deftest load-fixture-happy-path
+  (is (= "fixture/replay/simple-paper-session/v0.2" (:fixture/id fixture)))
+  (is (= 2 (:fixture/version fixture)))
+  (is (= :mode/replay (:fixture/mode fixture)))
+  (testing "10+ inputs: 1 session fact + 10 one-minute bars, sorted by :input/at"
+    (is (= 11 (count (:fixture/inputs fixture))))
+    (is (= 1 (count (filter #(= :fact/calendar-session-observed (:input/type %))
+                            (:fixture/inputs fixture)))))
+    (is (= 10 (count (filter #(= :fact/market-bar-observed (:input/type %))
+                             (:fixture/inputs fixture)))))
+    (let [ats (mapv :input/at (:fixture/inputs fixture))]
+      (is (= ats (vec (sort ats))))))
+  (testing "expected outputs list the v0.1 lineage fact types in order"
+    (is (= [:fact/prediction-produced
+            :fact/signal-decision-produced
+            :fact/risk-decision-recorded
+            :fact/order-intent-created
+            :fact/broker-ack-accepted
+            :fact/fill-observed]
+           (mapv :record/type (:fixture/expected-outputs fixture))))))
+
+;; ---------------------------------------------------------------------------
+;; Provenance completeness on every emitted fact
+;; ---------------------------------------------------------------------------
+
+(deftest every-emitted-fact-is-valid-with-full-provenance
+  (let [src (make-source)
+        facts (pull-all src)
+        fixture-id (:fixture/id fixture)]
+    (is (= (count (:fixture/inputs fixture)) (count facts)))
+    (doseq [[i [input fact]] (map-indexed vector
+                                          (map vector (:fixture/inputs fixture) facts))]
+      (testing (str "input " i " (" (:input/type input) ")")
+        (is (= {:valid? true} (v/validate-fact fact)))
+        (let [payload (:fact/payload fact)]
+          (is (= :market-data/replay (:data/provider payload)))
+          (is (= (p/source-id src) (:data/provider payload)))
+          (is (= (str fixture-id ":" i) (:data/provider-ref payload)))
+          (is (= (:input/at input) (:data/received-at payload)))
+          (is (map? (:data/quality payload))))
+        (is (= (:input/type input) (:record/type fact)))
+        (is (= :mode/replay (:record/mode fact)))
+        (is (= (:input/at input) (:fact/occurred-at fact)))
+        (is (= (:input/at input) (:fact/recorded-at fact)))
+        (is (string? (:record/id fact)))
+        (is (string? (:fact/dedupe-key fact)))
+        (when (contains? fx/instrument-scoped-input-types (:input/type input))
+          (is (= (:input/instrument-id input) (:record/instrument-id fact))))))))
+
+(deftest payload-domain-fields-survive-emission
+  (let [src (make-source)
+        facts (pull-all src)
+        bar-fact (second facts)
+        bar-input (get-in fixture [:fixture/inputs 1 :input/payload])]
+    (is (= :fact/market-bar-observed (:record/type bar-fact)))
+    (doseq [k [:bar/time :bar/timeframe :bar/open :bar/high :bar/low
+               :bar/close :bar/volume]]
+      (is (= (get bar-input k) (get-in bar-fact [:fact/payload k]))))))
+
+;; ---------------------------------------------------------------------------
+;; Cursor pagination
+;; ---------------------------------------------------------------------------
+
+(deftest cursor-pagination
+  (let [src (make-source)
+        total (count (:fixture/inputs fixture))
+        page1 (p/next-observations src 0 3)
+        page2 (p/next-observations src (:cursor page1) 3)]
+    (testing "first page: 3 facts, cursor advances to 3, not exhausted"
+      (is (= 3 (count (:observations page1))))
+      (is (= 3 (:cursor page1)))
+      (is (false? (:exhausted? page1))))
+    (testing "resuming from the returned cursor continues without gap or duplicate"
+      (is (= 6 (:cursor page2)))
+      (is (= (mapv #(str (:fixture/id fixture) ":" %) [3 4 5])
+             (provider-refs (:observations page2)))))
+    (testing "cursors are replay-capable: re-reading a cursor yields the same facts"
+      (is (= (provider-refs (:observations page1))
+             (provider-refs (:observations (p/next-observations src 0 3))))))
+    (testing "paginating to the end equals one full pull"
+      (let [paged (loop [cursor 0 acc []]
+                    (let [{:keys [observations cursor exhausted?]}
+                          (p/next-observations src cursor 4)]
+                      (if exhausted?
+                        (into acc observations)
+                        (recur cursor (into acc observations)))))]
+        (is (= total (count paged)))
+        (is (= (provider-refs (pull-all src)) (provider-refs paged)))))))
+
+;; ---------------------------------------------------------------------------
+;; Exhaustion
+;; ---------------------------------------------------------------------------
+
+(deftest exhaustion
+  (let [src (make-source)
+        total (count (:fixture/inputs fixture))
+        all (p/next-observations src 0 (+ total 50))]
+    (testing "over-asking returns everything and reports exhausted"
+      (is (= total (count (:observations all))))
+      (is (= total (:cursor all)))
+      (is (true? (:exhausted? all))))
+    (testing "reading at the end cursor returns no facts, stays exhausted"
+      (let [end (p/next-observations src total 5)]
+        (is (= [] (:observations end)))
+        (is (= total (:cursor end)))
+        (is (true? (:exhausted? end)))))
+    (testing "max-n 0 returns no facts without advancing or exhausting"
+      (let [none (p/next-observations src 0 0)]
+        (is (= [] (:observations none)))
+        (is (= 0 (:cursor none)))
+        (is (false? (:exhausted? none)))))))
+
+;; ---------------------------------------------------------------------------
+;; Source health
+;; ---------------------------------------------------------------------------
+
+(deftest source-health-includes-provider-identity
+  (let [src (make-source)]
+    (is (= :market-data/replay (p/source-id src)))
+    (let [health (p/source-health src)]
+      (is (= (p/source-id src) (:source/provider health))))
+    (p/next-observations src 0 3)
+    (let [health (p/source-health src)]
+      (is (= (p/source-id src) (:source/provider health)))
+      (is (= "2026-06-10T14:31:00Z" (:source/last-receipt-at health)))
+      (is (false? (:source/exhausted? health))))))
+
+;; ---------------------------------------------------------------------------
+;; Fixture validation rejections
+;; ---------------------------------------------------------------------------
+
+(defn error-codes
+  [result]
+  (set (map :error/code (:errors result))))
+
+(deftest validate-fixture-rejects-unsorted-inputs
+  (let [unsorted (update fixture :fixture/inputs (comp vec reverse))
+        result (fx/validate-fixture unsorted)]
+    (is (false? (:valid? result)))
+    (is (contains? (error-codes result) :error/unsorted-inputs))))
+
+(deftest validate-fixture-rejects-missing-provenance-required-fields
+  (testing "missing :input/instrument-id on an instrument-scoped input"
+    (let [result (fx/validate-fixture
+                  (update-in fixture [:fixture/inputs 1] dissoc :input/instrument-id))]
+      (is (false? (:valid? result)))
+      (is (= [[:fixture/inputs 1 :input/instrument-id]]
+             (mapv :error/path (:errors result))))))
+  (testing "missing required domain payload field (:bar/close)"
+    (let [result (fx/validate-fixture
+                  (update-in fixture [:fixture/inputs 1 :input/payload] dissoc :bar/close))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/missing-key))))
+  (testing "missing effective market timestamp on a session fact"
+    (let [result (fx/validate-fixture
+                  (update-in fixture [:fixture/inputs 0 :input/payload]
+                             dissoc :session/observed-at))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/missing-key))))
+  (testing "malformed :input/at"
+    (let [result (fx/validate-fixture
+                  (assoc-in fixture [:fixture/inputs 1 :input/at] "2026-06-10 14:30"))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/invalid-timestamp)))))
+
+(deftest validate-fixture-rejects-payloads-that-fail-fact-validation
+  (testing "float in a canonical decimal field"
+    (let [result (fx/validate-fixture
+                  (assoc-in fixture [:fixture/inputs 1 :input/payload :bar/open] 550.10))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/invalid-decimal))
+      (is (= [[:fixture/inputs 1 :input/payload :bar/open]]
+             (mapv :error/path (:errors result))))))
+  (testing "malformed payload timestamp"
+    (let [result (fx/validate-fixture
+                  (assoc-in fixture [:fixture/inputs 1 :input/payload :bar/time] "noon"))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/invalid-timestamp))))
+  (testing "malformed instrument id"
+    (let [result (fx/validate-fixture
+                  (assoc-in fixture [:fixture/inputs 1 :input/instrument-id] "SPY"))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/malformed-id))))
+  (testing "unknown input type"
+    (let [result (fx/validate-fixture
+                  (assoc-in fixture [:fixture/inputs 1 :input/type] :fact/not-a-thing))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/unknown-type)))))
+
+(deftest validate-fixture-rejects-bad-envelope
+  (testing "missing required fixture keys"
+    (let [result (fx/validate-fixture (dissoc fixture :fixture/id :fixture/expected-outputs))]
+      (is (false? (:valid? result)))
+      (is (= 2 (count (:errors result))))))
+  (testing "wrong version"
+    (let [result (fx/validate-fixture (assoc fixture :fixture/version 1))]
+      (is (false? (:valid? result)))
+      (is (contains? (error-codes result) :error/unsupported-version)))))
+
+;; ---------------------------------------------------------------------------
+;; load-fixture / write-fixture round-trip and corruption handling
+;; ---------------------------------------------------------------------------
+
+(deftest write-and-load-round-trip
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "round-trip-v0.2.edn")]
+    (is (= path (fx/write-fixture path fixture)))
+    (is (= fixture (fx/load-fixture path)))))
+
+(deftest load-fixture-throws-on-corrupt-fixture
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "unsorted-v0.2.edn")
+        unsorted (update fixture :fixture/inputs (comp vec reverse))]
+    (spit path (pr-str unsorted))
+    (let [thrown (try
+                   (do (fx/load-fixture path) nil)
+                   (catch python/Exception e e))]
+      (is (some? thrown))
+      (is (= :error/invalid-fixture (:error/code (ex-data thrown)))))))
+
+(deftest write-fixture-refuses-invalid-fixture
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "never-written-v0.2.edn")
+        thrown (try
+                 (do (fx/write-fixture path (assoc fixture :fixture/version 99)) nil)
+                 (catch python/Exception e e))]
+    (is (some? thrown))
+    (is (= :error/invalid-fixture (:error/code (ex-data thrown))))
+    (is (false? (os.path/exists path)))))

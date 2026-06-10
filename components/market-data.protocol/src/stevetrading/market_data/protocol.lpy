@@ -1,4 +1,11 @@
-(ns stevetrading.market-data.protocol)
+(ns stevetrading.market-data.protocol
+  "Market-data adapter boundary (MARKET_DATA_ADAPTER_CONTRACTS_V0.1).
+
+  Adapters are source translators, not feature engines (§2-§3): they
+  normalize source payloads into canonical observation facts with explicit
+  provenance (:data/provider, :data/provider-ref, :data/received-at,
+  :data/quality — §5) and surface source health (§10). The engine never
+  sees transport details (§8).")
 
 (def market-observation-types
   #{:fact/market-bar-observed
@@ -19,4 +26,29 @@
 (defn market-command?
   [record-type]
   (contains? market-command-types record-type))
+
+(defprotocol MarketDataSource
+  "Market-data source boundary. All observations cross this boundary as
+  canonical fact envelopes (built via domain.schemas/fact-envelope) whose
+  payloads carry full provenance per §4-§5 — raw source/SDK payloads never
+  cross. Transport (streaming, polling, file replay) is an implementation
+  detail (§8)."
+  (source-id [this]
+    "Stable provider identity keyword for this source (e.g.
+    :market-data/replay, :market-data/polygon). REQUIRED identity
+    contract — consumed by the stale-feed gate and stamped as
+    :data/provider on every observation this source emits.")
+  (next-observations [this cursor max-n]
+    "Pull up to max-n canonical observation facts at/after cursor.
+    Returns {:observations [facts] :cursor next-cursor :exhausted? bool}.
+    Cursors are source-defined, opaque to the engine, and replay-capable
+    where possible (§3): passing the returned :cursor back continues the
+    stream without gaps or duplicates. :exhausted? true means no further
+    observations exist at this cursor (a live source may produce more
+    later; a replay source is finished).")
+  (source-health [this]
+    "Source health report (§10). Returns a map that MUST include
+    :source/provider = (source-id this), and should include last
+    successful data receipt time, observed source lag, current
+    subscription/polling status, and active degradation flags."))
 
