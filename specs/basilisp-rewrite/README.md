@@ -1,6 +1,6 @@
 ---
 title: "Basilisp Rewrite"
-status: in-progress
+status: completed
 date: 2026-06-10
 priority: 1
 ---
