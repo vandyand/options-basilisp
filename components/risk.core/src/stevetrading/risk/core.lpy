@@ -10,7 +10,24 @@
     portfolio already holds a non-zero net position in the instrument
   - ALLOW :posture/flatten always; approved quantity is the absolute net
     open position (\"0\" when flat — execution then plans no orders)
-  - approved quantity for entries is the signal's requested quantity"
+  - approved quantity for entries is the signal's requested quantity
+
+  Phase 9 policy :risk/defined-risk-spread (vertical credit spreads):
+  - account-ctx carries the policy inputs (signature-stable stage
+    contract): :risk/params (the strategy declaration's
+    [:strategy/risk :params], e.g. {:max-spreads 1 :max-risk \"5.00\"})
+    and :risk/spread (the domain.instruments/vertical-spread-context map
+    derived from the feature manifest's :spread params)
+  - max 1 spread (the v0.1 :max-spreads param is recorded but fixed at 1):
+    DENY entry when EITHER leg instrument already has a non-zero net
+    position
+  - defined-risk cap: DENY entry when strike-width x quantity exceeds
+    :max-risk (the spread's maximum structural loss bound; the contract
+    multiplier is not modeled in v0.1 — quantities are unit-based
+    throughout the ledger)
+  - ALLOW :posture/flatten always; approved quantity is the largest
+    absolute net leg position (\"0\" when flat — execution then plans no
+    orders)"
   (:import decimal))
 
 (defn- ->dec
@@ -52,10 +69,57 @@
        :risk/reason-codes [:reason/no-action-requested]
        :risk/approved-quantity "0"})))
 
+(defn- defined-risk-spread
+  [signal portfolio-view account-ctx]
+  (let [spread (:risk/spread account-ctx)
+        params (:risk/params account-ctx)]
+    (when (nil? spread)
+      (throw (ex-info ":risk/defined-risk-spread requires :risk/spread in account-ctx"
+                      {:error/code :error/missing-risk-context
+                       :error/policy :risk/defined-risk-spread})))
+    (let [near-net (net-position portfolio-view
+                                 (:spread/near-instrument-id spread))
+          far-net (net-position portfolio-view
+                                (:spread/far-instrument-id spread))]
+      (case (:decision/posture signal)
+        :posture/enter-long
+        (let [qty (->dec (or (:decision/requested-quantity signal) "1"))
+              width (->dec (:spread/width spread))
+              max-risk (->dec (or (:max-risk params) "0"))]
+          (cond
+            (or (not (zero? near-net)) (not (zero? far-net)))
+            {:risk/decision :risk/deny
+             :risk/reason-codes [:reason/position-exists]
+             :risk/approved-quantity "0"}
+
+            (> (* width qty) max-risk)
+            {:risk/decision :risk/deny
+             :risk/reason-codes [:reason/risk-cap-exceeded]
+             :risk/approved-quantity "0"}
+
+            :else
+            {:risk/decision :risk/allow
+             :risk/reason-codes [:reason/risk-allowed]
+             :risk/approved-quantity (str qty)}))
+
+        :posture/flatten
+        (let [open-qty (max (abs near-net) (abs far-net))]
+          {:risk/decision :risk/allow
+           :risk/reason-codes (if (zero? open-qty)
+                                [:reason/risk-allowed :reason/no-open-position]
+                                [:reason/risk-allowed])
+           :risk/approved-quantity (str open-qty)})
+
+        {:risk/decision :risk/deny
+         :risk/reason-codes [:reason/no-action-requested]
+         :risk/approved-quantity "0"}))))
+
 (defn evaluate-risk
   "Evaluate a signal decision under a risk policy. signal is the canonical
   signal decision map enriched with :decision/instrument-id and (for
-  entries) :decision/requested-quantity. Returns
+  entries) :decision/requested-quantity. account-ctx carries the account
+  id plus optional policy inputs (:risk/params, :risk/spread — see ns
+  docstring). Returns
 
   {:risk/decision :risk/allow|:risk/deny
    :risk/policy-id policy
@@ -67,6 +131,8 @@
   (let [result (case policy
                  :risk/simple-direction-default
                  (simple-direction-default signal portfolio-view account-ctx)
+                 :risk/defined-risk-spread
+                 (defined-risk-spread signal portfolio-view account-ctx)
                  (throw (ex-info (str "unknown risk policy: " (pr-str policy))
                                  {:error/code :error/unknown-risk-policy
                                   :error/policy policy})))]

@@ -1,0 +1,273 @@
+(ns options.test-spread-e2e
+  "Phase 9 options execution path tests:
+
+  - leg ordering (CANONICAL_SCHEMAS §12.3): the same leg SET in any
+    declaration order yields the same order-intent-id; a different leg
+    set yields a different id; planned intents store canonically sorted
+    legs
+  - full options fixture replay (resources/fixtures/replay/
+    options-session-v0.1.edn) through bases/engine-replay: the credit
+    spread is opened as TWO lots (one short from the sell leg, one long
+    from the buy leg) and flattened on the second chain snapshot; the
+    portfolio nets to zero with realized P&L = credit - debit - fees
+  - 4-leg iron condor: a single intent with 4 canonical legs that
+    round-trips the sim broker (one ack + one per-leg fill sharing the
+    broker order id, per-leg marks)"
+  (:import os.path tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.base.engine-replay :as er]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.broker.sim :as sim]
+            [stevetrading.domain.instruments :as ins]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.execution.core :as exe]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]))
+
+(def acct "account/sim/main")
+(def underlying "equity/NASDAQ/SPY")
+(def fixture-path "resources/fixtures/replay/options-session-v0.1.edn")
+(def strategy-path "resources/strategies/simple-vol-credit-spread-v1.edn")
+
+(def put-near "option/OPRA/SPY/2026-06-19/P/550.000")
+(def put-far "option/OPRA/SPY/2026-06-19/P/545.000")
+(def call-near "option/OPRA/SPY/2026-06-19/C/560.000")
+(def call-far "option/OPRA/SPY/2026-06-19/C/565.000")
+
+(def spread-ctx
+  (ins/vertical-spread-context {:venue "OPRA"
+                                :underlying-symbol "SPY"
+                                :expiry "2026-06-19"
+                                :right :option-right/put
+                                :near-strike "550.000"
+                                :far-strike "545.000"}))
+
+(defn- entry-ras
+  "A risk-approved entry signal for direct plan-execution calls."
+  [net-credit]
+  {:decision/id "dec_options_test"
+   :decision/posture :posture/enter-long
+   :decision/net-credit net-credit
+   :risk/approved-quantity "1"})
+
+(defn- spread-identity
+  [legs]
+  {:identity/version 1
+   :identity/decision-id "dec_options_test"
+   :identity/intent-slot 0
+   :identity/account-id acct
+   :identity/role :intent-role/entry
+   :identity/order-shape {:side :order-side/sell
+                          :effect :position-effect/open
+                          :order-type :order-type/limit
+                          :time-in-force :tif/day
+                          :quantity "1"
+                          :limit-price "1.20"
+                          :stop-price nil
+                          :legs legs}})
+
+;; ---------------------------------------------------------------------------
+;; Leg ordering and intent identity (§12.3)
+;; ---------------------------------------------------------------------------
+
+(deftest leg-ordering-identity
+  (let [plan (exe/plan-execution :execution/vertical-credit-spread-v1
+                                 (entry-ras "1.20")
+                                 {:instrument/id underlying
+                                  :execution/spread spread-ctx}
+                                 acct)
+        intent (first (:execution/order-intents plan))
+        legs (:order-intent/legs intent)]
+    (testing "the planned spread intent has 2 canonically sorted legs"
+      (is (= 1 (count (:execution/order-intents plan))))
+      (is (= 2 (count legs)))
+      (is (= legs (ins/canonical-leg-sort legs)))
+      (is (= #{[put-near :order-side/sell] [put-far :order-side/buy]}
+             (set (map (juxt :instrument/id :leg/side) legs)))))
+
+    (testing "same legs in shuffled declaration order -> same intent id"
+      (is (= (:order-intent/id intent)
+             (sch/order-intent-id (spread-identity (vec legs)))
+             (sch/order-intent-id (spread-identity (vec (reverse legs)))))))
+
+    (testing "replanning the same inputs -> same intent id (replay-stable)"
+      (is (= (:order-intent/id intent)
+             (-> (exe/plan-execution :execution/vertical-credit-spread-v1
+                                     (entry-ras "1.20")
+                                     {:instrument/id underlying
+                                      :execution/spread spread-ctx}
+                                     acct)
+                 :execution/order-intents first :order-intent/id))))
+
+    (testing "a different leg set -> a different intent id"
+      (let [other-ctx (ins/vertical-spread-context
+                       {:venue "OPRA"
+                        :underlying-symbol "SPY"
+                        :expiry "2026-06-19"
+                        :right :option-right/put
+                        :near-strike "550.000"
+                        :far-strike "540.000"})
+            other (-> (exe/plan-execution :execution/vertical-credit-spread-v1
+                                          (entry-ras "1.20")
+                                          {:instrument/id underlying
+                                           :execution/spread other-ctx}
+                                          acct)
+                      :execution/order-intents first)]
+        (is (not= (:order-intent/id intent) (:order-intent/id other)))))))
+
+;; ---------------------------------------------------------------------------
+;; Full options fixture replay (entry + flatten round trip)
+;; ---------------------------------------------------------------------------
+
+(deftest options-session-replay
+  (let [out-dir (tempfile/mkdtemp)
+        res (er/run-replay {:fixture-path fixture-path
+                            :out-dir out-dir
+                            :strategy-paths [strategy-path]})]
+    (testing "session completes with the full 2-leg lifecycle, in order"
+      (is (true? (:expected-outputs-satisfied? res)))
+      (is (false? (:stopped-early? res)))
+      (is (empty? (:skipped-ledger-fills res))))
+
+    (testing "entry (sell/open) and exit (buy/close) spread intents, both filled"
+      (let [orders (vals (get-in res [:orders :order/by-intent]))]
+        (is (= 2 (get-in res [:orders :order/count])))
+        (is (every? #(and (= :filled (:order/lifecycle %))
+                          (true? (:order/resolved? %))
+                          (= "1" (:order/filled-quantity %)))
+                    orders))
+        (is (= #{[:order-side/sell :position-effect/open]
+                 [:order-side/buy :position-effect/close]}
+               (set (map (juxt :order/side :order/effect) orders))))))
+
+    (testing "intent facts carry 2 canonical legs and validate"
+      (let [store (fs/make-fact-store (os.path/join out-dir "facts.db"))
+            intents (p/facts-by store {:fact-type :fact/order-intent-created})]
+        (is (= 2 (count intents)))
+        (doseq [fact intents]
+          (is (:valid? (v/validate-fact (dissoc fact :fact-log/offset))))
+          (let [legs (get-in fact [:fact/payload :order-intent/legs])]
+            (is (= 2 (count legs)))
+            (is (= legs (ins/canonical-leg-sort legs)))
+            (is (= #{put-near put-far} (set (map :instrument/id legs))))))))
+
+    (testing "the spread opened as one SHORT lot (sell leg) and one LONG lot (buy leg)"
+      (let [lots (vals (get-in res [:ledger :ledger/lots]))]
+        (is (= 2 (count lots)))
+        (is (= #{[put-near :order-side/sell "2.15"]
+                 [put-far :order-side/buy "0.95"]}
+               (set (map (juxt :lot/instrument-id :lot/side :lot/price) lots))))
+        ;; both lots fully consumed by the flatten
+        (is (every? #(= "0" (:lot/remaining-quantity %)) lots))))
+
+    (testing "flatten closes both lots; portfolio nets to zero"
+      (let [portfolio (:portfolio res)
+            closed (get-in res [:ledger :ledger/closed-lots])]
+        (is (= 2 (count closed)))
+        (is (empty? (:portfolio/open-lots portfolio)))
+        (is (empty? (:portfolio/positions portfolio)))
+        ;; short near: 2.15 -> 1.00 = +1.15; long far: 0.95 -> 0.60 = -0.35
+        (is (= #{"1.15" "-0.35"}
+               (set (map :lot-close/realized-pnl closed))))))
+
+    (testing "realized P&L = credit - debit - fees = 1.20 - 0.40 - 0"
+      (let [portfolio (:portfolio res)]
+        (is (= "0.80" (:portfolio/realized-pnl portfolio)))
+        (is (= "0" (:portfolio/fees portfolio)))
+        (is (= "0.80" (get-in portfolio [:portfolio/cash acct])))))))
+
+;; ---------------------------------------------------------------------------
+;; Iron condor: 4 canonical legs, sim broker round trip
+;; ---------------------------------------------------------------------------
+
+(def condor-ctx
+  {:condor/put-spread spread-ctx
+   :condor/call-spread (ins/vertical-spread-context
+                        {:venue "OPRA"
+                         :underlying-symbol "SPY"
+                         :expiry "2026-06-19"
+                         :right :option-right/call
+                         :near-strike "560.000"
+                         :far-strike "565.000"})})
+
+(def condor-marks
+  {put-near "2.15" put-far "0.95" call-near "1.10" call-far "0.30"})
+
+(defn- condor-submit-cmd
+  [intent]
+  (let [oi (:order-intent/id intent)
+        idem-key (str "submit/intent/" oi)]
+    (sch/command-envelope
+     {:record/type :command/submit-order-intent
+      :record/mode :mode/sim
+      :record/account-id acct
+      :command/issued-at "2026-06-10T14:32:00Z"
+      :command/target-adapter :adapter/broker
+      :command/idempotency-key idem-key
+      :command/payload {:order-intent/id oi
+                        :command/idempotency-key idem-key
+                        :broker/account-id acct
+                        :broker/route {:broker/source-system :broker/sim}
+                        :order-intent/payload intent}})))
+
+(deftest iron-condor-round-trip
+  (let [plan (exe/plan-execution :execution/iron-condor-v1
+                                 (entry-ras "2.00")
+                                 {:instrument/id underlying
+                                  :execution/condor condor-ctx}
+                                 acct)
+        intent (first (:execution/order-intents plan))
+        legs (:order-intent/legs intent)]
+    (testing "a single entry intent with 4 canonically sorted legs"
+      (is (= 1 (count (:execution/order-intents plan))))
+      (is (= 4 (count legs)))
+      (is (= legs (ins/canonical-leg-sort legs)))
+      (is (= #{[put-near :order-side/sell] [put-far :order-side/buy]
+               [call-near :order-side/sell] [call-far :order-side/buy]}
+             (set (map (juxt :instrument/id :leg/side) legs))))
+      (is (= :position-effect/open (:order-intent/effect intent)))
+      (is (= "2.00" (:order-intent/limit-price intent))))
+
+    (testing "leg shuffle invariance holds for the 4-leg set too"
+      (let [ident (fn [ls]
+                    {:identity/version 1
+                     :identity/decision-id (:order-intent/decision-id intent)
+                     :identity/intent-slot 0
+                     :identity/account-id acct
+                     :identity/role :intent-role/entry
+                     :identity/order-shape {:side :order-side/sell
+                                            :effect :position-effect/open
+                                            :order-type :order-type/limit
+                                            :time-in-force :tif/day
+                                            :quantity "1"
+                                            :limit-price "2.00"
+                                            :stop-price nil
+                                            :legs ls}})]
+        (is (= (:order-intent/id intent)
+               (sch/order-intent-id (ident (vec (shuffle legs))))))))
+
+    (testing "the sim broker acks once and fills each leg (shared broker order id)"
+      (let [broker (sim/make-sim-broker {:marks condor-marks})
+            facts (bp/submit-order-intent! broker (condor-submit-cmd intent))
+            ack (first facts)
+            fills (rest facts)]
+        (is (= :fact/broker-ack-accepted (:record/type ack)))
+        (is (every? #(= :fact/fill-observed (:record/type %)) fills))
+        (is (= 4 (count fills)))
+        (doseq [fact facts]
+          (is (:valid? (v/validate-fact fact))))
+        ;; one fill per leg instrument, all sharing the ack's broker order id
+        (is (= (set (map :instrument/id legs))
+               (set (map #(get-in % [:fact/payload :fill/instrument-id]) fills))))
+        (is (= 1 (count (set (map #(get-in % [:fact/payload :broker/order-id])
+                                  facts)))))
+        ;; per-leg marks price each leg (zero slippage)
+        (is (= condor-marks
+               (into {}
+                     (map (fn [f]
+                            [(get-in f [:fact/payload :fill/instrument-id])
+                             (get-in f [:fact/payload :fill/price])])
+                          fills))))
+        ;; duplicate submit: same ack content, no new fills (§9)
+        (is (= [ack] (bp/submit-order-intent! broker (condor-submit-cmd intent))))))))

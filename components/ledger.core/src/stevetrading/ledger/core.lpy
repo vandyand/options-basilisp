@@ -36,6 +36,18 @@
   - Opening vs closing effect comes from the originating intent's
     :order-intent/effect, supplied via intent-ctx at derivation time (the
     fill payload itself carries no effect).
+  - PER-LEG side (Phase 9, BROKER_ADAPTER §5.3): the fill payload carries
+    no side either. For multi-leg intents the side of each leg fill is
+    resolved from the intent-ctx :order-intent/legs entry whose
+    :instrument/id matches the fill's instrument (envelope
+    :record/instrument-id, falling back to the payload's
+    :fill/instrument-id). A sell+open leg therefore opens a SHORT
+    (negative-exposure) lot while the buy+open leg of the same intent
+    opens a LONG lot, and the mirrored close intent consumes both. When
+    no leg matches (single-leg intents, legacy ctx without legs) the
+    intent-level :order-intent/side is used, preserving Phase 6 behavior.
+    Legs sharing one instrument id on both sides are out of scope for
+    v0.1 (first match wins — canonical leg sort makes it deterministic).
   - FIFO close scope: closes consume open lots matching [account-id,
     instrument-id] whose side is OPPOSITE the closing fill's side, in lot
     open order, with partial-close splitting. Strategy attribution of the
@@ -175,6 +187,18 @@
                    (= open-side (:lot/side %)))
              (open-lots ledger))))
 
+(defn- fill-leg-side
+  "Side of THIS fill: the side of the intent-ctx leg whose :instrument/id
+  matches the fill's instrument (multi-leg, per-leg sides), falling back
+  to the intent-level :order-intent/side (single-leg / legacy ctx)."
+  [intent-ctx fill-fact]
+  (let [iid (or (:record/instrument-id fill-fact)
+                (get-in fill-fact [:fact/payload :fill/instrument-id]))
+        legs (:order-intent/legs intent-ctx)]
+    (or (when (and (some? iid) (seq legs))
+          (some #(when (= iid (:instrument/id %)) (:leg/side %)) legs))
+        (:order-intent/side intent-ctx))))
+
 (defn- cash-fact
   [fill-fact fk category amount-str strategy-id account-id instrument-id
    occurred-at]
@@ -219,7 +243,7 @@
   (check-intent-ctx! intent-ctx fill-fact)
   (let [payload (:fact/payload fill-fact)
         effect (:order-intent/effect intent-ctx)
-        side (:order-intent/side intent-ctx)
+        side (fill-leg-side intent-ctx fill-fact)
         account-id (:order-intent/account-id intent-ctx)
         strategy-id (or (:order-intent/strategy-id intent-ctx)
                         (:record/strategy-id fill-fact))

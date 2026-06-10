@@ -1,0 +1,13 @@
+;; Model artifact reference (STRATEGY_PIPELINE §7.2) for the simple-vol
+;; credit-spread strategy. The "model" is a deterministic threshold rule
+;; (:model.type/threshold) over the chain-derived net-credit mid: direction
+;; up (credit attractive -> enter the spread) when the feature value is at
+;; or above :threshold, direction down (flatten) otherwise.
+
+{:model/id "model/simple-vol/v1"
+ :model/version 1
+ :model/type :model.type/threshold
+ :model/params {:feature :feature/chain-mid-width
+                :threshold "1.00"}
+ :model/feature-manifest-ref "feature/simple-vol/v1"
+ :model/prediction-schema-version 1}

@@ -19,6 +19,11 @@
       arriving before the first poll therefore wins (order cancelled, no
       fills); a cancel after fills exist is rejected (§7 — fill truth
       wins).
+  - Marks (Phase 9 extension): :marks may be a static map
+    {instrument-id price-str} OR a zero-arg fn returning such a map,
+    resolved at each pricing moment (submit / fills-since) — the replay
+    base injects a fn over its replay-position marks atom so option legs
+    fill at the chain mids current AT FILL TIME, deterministically.
   - Per-leg pricing (one :fact/fill-observed per leg per tranche; fill
     ids \"<broker-order-id>-fill-<n>\" with n monotonic across the order):
     * single leg: limit price or the leg's mark, preference ordered by
@@ -59,6 +64,12 @@
   (if (instance? decimal/Decimal x) x (decimal/Decimal x)))
 
 (def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn- resolve-marks
+  "Resolve the configured :marks to a map: a zero-arg fn is called at the
+  pricing moment, a plain map is used as is."
+  [marks]
+  (if (fn? marks) (marks) (or marks {})))
 
 ;; ---------------------------------------------------------------------------
 ;; Deterministic clock
@@ -376,6 +387,7 @@
 
   (submit-order-intent! [this cmd]
     (let [{:keys [fill-policy marks clock reject-next]} opts
+          marks (resolve-marks marks)
           payload (:command/payload cmd)
           idem-key (:command/idempotency-key payload)
           intent (:order-intent/payload payload)
@@ -481,7 +493,8 @@
              (open-status-fact e ts)))))
 
   (fills-since [this account-id cursor]
-    (let [{:keys [fill-policy marks clock]} opts]
+    (let [{:keys [fill-policy marks clock]} opts
+          marks (resolve-marks marks)]
       ;; materialize pending :on-poll fills for this account
       (doseq [e (filter :pending-fill? (entries-in-order @journal account-id))]
         (let [fills (fill-facts-for e fill-policy marks clock)]
@@ -535,7 +548,7 @@
                  :price-source :limit|:mark
                  :slippage \"0.00\"
                  :tranches [\"1\" \"2\"]}   ;; :partial mode only
-   :marks {instrument-id price-str}
+   :marks {instrument-id price-str} | (fn [] {instrument-id price-str})
    :clock (fn [] iso-ts)        ;; default: synthetic counter clock
    :reject-next (atom false)}   ;; test hook: reject the next submit"
   ([] (make-sim-broker {}))

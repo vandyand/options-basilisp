@@ -6,24 +6,65 @@
   :fact/order-intent-created payloads (CANONICAL_SCHEMAS §11.3) whose ids
   come from the deterministic order-intent identity algorithm
   (domain.schemas/order-intent-id, §12) — replay-stable, never random.
+  Legs are ALWAYS stored canonically sorted (§12.3) regardless of
+  declaration order, and the identity algorithm canonicalizes legs
+  independently, so the same leg SET always yields the same intent id.
 
   v0.1 policy :execution/market-equity-v1: single-leg equity market order,
   :tif/day, quantity from the risk stage.
   - :posture/enter-long -> buy/open, role :intent-role/entry
   - :posture/flatten    -> sell/close, role :intent-role/exit
   - approved quantity of zero (e.g. flatten with no open position) plans
-    NO intents (empty :execution/order-intents)."
-  (:require [stevetrading.domain.schemas :as schemas])
+    NO intents (empty :execution/order-intents)
+
+  Phase 9 multi-leg policies (instrument-ctx carries the leg
+  configuration; the risk-approved signal carries :decision/net-credit —
+  the current spread mid from the chain feature — used as the net
+  credit/debit limit price):
+
+  :execution/vertical-credit-spread-v1 — TWO legs in ONE intent:
+  sell the near strike, buy the far strike (same expiry, same right).
+  instrument-ctx :execution/spread is a
+  domain.instruments/vertical-spread-context map.
+  - :posture/enter-long -> entry: intent side :order-side/sell (net
+    credit), effect :position-effect/open, limit order at the net-credit
+    mid, legs [near SELL, far BUY]
+  - :posture/flatten -> exit: intent side :order-side/buy (net debit),
+    effect :position-effect/close, limit at the current mid, legs
+    mirrored [near BUY, far SELL]
+
+  :execution/iron-condor-v1 — FOUR legs in ONE intent: a put credit
+  spread + a call credit spread. instrument-ctx :execution/condor is
+  {:condor/put-spread <vertical-spread-context> :condor/call-spread
+  <vertical-spread-context>}.
+  - :posture/enter-long -> entry: sell both near strikes, buy both far
+    strikes; side sell/open, net-credit limit
+  - :posture/flatten -> exit: all four legs mirrored; side buy/close
+
+  Position-effect convention for spreads (documented; consumed by the
+  ledger derivation): the ENTRY intent uses :position-effect/open with
+  per-leg sides — the sell legs open SHORT lots, the buy legs open LONG
+  lots. The EXIT intent uses :position-effect/close with mirrored per-leg
+  sides, closing both lot kinds. The per-leg side travels on the legs
+  themselves; ledger.core resolves each fill's side from the intent leg
+  matching the fill's instrument."
+  (:require [stevetrading.domain.instruments :as instruments]
+            [stevetrading.domain.schemas :as schemas])
   (:import decimal))
 
 (defn- order-intent
   "Build one full :fact/order-intent-created payload (§11.3) with its
-  deterministic id (§12.1 identity input)."
+  deterministic id (§12.1 identity input). Accepts EITHER :legs (explicit
+  multi-leg vector) or :instrument-id (single-leg convenience, leg side =
+  intent side). Legs are canonically sorted (§12.3) before identity
+  hashing and payload storage."
   [{:keys [decision-id intent-slot role side effect order-type tif
-           quantity instrument-id account-id]}]
-  (let [legs [{:instrument/id instrument-id
-               :leg/side side
-               :leg/quantity quantity}]
+           quantity instrument-id legs limit-price account-id]}]
+  (let [legs (instruments/canonical-leg-sort
+              (or legs
+                  [{:instrument/id instrument-id
+                    :leg/side side
+                    :leg/quantity quantity}]))
         intent-id (schemas/order-intent-id
                    {:identity/version 1
                     :identity/decision-id decision-id
@@ -35,7 +76,7 @@
                                            :order-type order-type
                                            :time-in-force tif
                                            :quantity quantity
-                                           :limit-price nil
+                                           :limit-price limit-price
                                            :stop-price nil
                                            :legs legs}})]
     {:order-intent/id intent-id
@@ -48,9 +89,25 @@
      :order-intent/order-type order-type
      :order-intent/time-in-force tif
      :order-intent/quantity quantity
-     :order-intent/limit-price nil
+     :order-intent/limit-price limit-price
      :order-intent/stop-price nil
      :order-intent/legs legs}))
+
+(defn- zero-qty?
+  [quantity]
+  (zero? (decimal/Decimal (or quantity "0"))))
+
+(defn- unplannable-posture!
+  [policy posture]
+  (throw (ex-info (str "no " policy " expression for posture "
+                       (pr-str posture))
+                  {:error/code :error/unplannable-posture
+                   :error/policy policy
+                   :error/posture posture})))
+
+;; ---------------------------------------------------------------------------
+;; :execution/market-equity-v1
+;; ---------------------------------------------------------------------------
 
 (defn- market-equity-v1
   [risk-approved-signal instrument-ctx account-id]
@@ -58,7 +115,7 @@
         posture (:decision/posture risk-approved-signal)
         quantity (:risk/approved-quantity risk-approved-signal)
         instrument-id (:instrument/id instrument-ctx)]
-    (if (zero? (decimal/Decimal (or quantity "0")))
+    (if (zero-qty? quantity)
       []
       (case posture
         :posture/enter-long
@@ -70,6 +127,7 @@
                         :order-type :order-type/market
                         :tif :tif/day
                         :quantity quantity
+                        :limit-price nil
                         :instrument-id instrument-id
                         :account-id account-id})]
 
@@ -82,19 +140,109 @@
                         :order-type :order-type/market
                         :tif :tif/day
                         :quantity quantity
+                        :limit-price nil
                         :instrument-id instrument-id
                         :account-id account-id})]
 
-        (throw (ex-info (str "no market-equity-v1 expression for posture "
-                             (pr-str posture))
-                        {:error/code :error/unplannable-posture
-                         :error/posture posture}))))))
+        (unplannable-posture! :execution/market-equity-v1 posture)))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-leg helpers
+;; ---------------------------------------------------------------------------
+
+(defn- spread-legs
+  "Entry legs for one vertical credit spread: sell near, buy far.
+  exit? mirrors both sides (buy near, sell far)."
+  [spread-ctx quantity exit?]
+  [{:instrument/id (:spread/near-instrument-id spread-ctx)
+    :leg/side (if exit? :order-side/buy :order-side/sell)
+    :leg/quantity quantity}
+   {:instrument/id (:spread/far-instrument-id spread-ctx)
+    :leg/side (if exit? :order-side/sell :order-side/buy)
+    :leg/quantity quantity}])
+
+(defn- require-ctx
+  [instrument-ctx k policy]
+  (or (get instrument-ctx k)
+      (throw (ex-info (str policy " requires " k " in instrument-ctx")
+                      {:error/code :error/missing-execution-context
+                       :error/policy policy
+                       :error/key k}))))
+
+(defn- multi-leg-intent
+  [{:keys [risk-approved-signal account-id legs policy]}]
+  (let [posture (:decision/posture risk-approved-signal)
+        base {:decision-id (:decision/id risk-approved-signal)
+              :intent-slot 0
+              :order-type :order-type/limit
+              :tif :tif/day
+              :quantity (:risk/approved-quantity risk-approved-signal)
+              :limit-price (:decision/net-credit risk-approved-signal)
+              :legs legs
+              :account-id account-id}]
+    (case posture
+      :posture/enter-long
+      [(order-intent (assoc base
+                            :role :intent-role/entry
+                            :side :order-side/sell
+                            :effect :position-effect/open))]
+
+      :posture/flatten
+      [(order-intent (assoc base
+                            :role :intent-role/exit
+                            :side :order-side/buy
+                            :effect :position-effect/close))]
+
+      (unplannable-posture! policy posture))))
+
+;; ---------------------------------------------------------------------------
+;; :execution/vertical-credit-spread-v1
+;; ---------------------------------------------------------------------------
+
+(defn- vertical-credit-spread-v1
+  [risk-approved-signal instrument-ctx account-id]
+  (let [spread (require-ctx instrument-ctx :execution/spread
+                            :execution/vertical-credit-spread-v1)
+        quantity (:risk/approved-quantity risk-approved-signal)
+        exit? (= :posture/flatten (:decision/posture risk-approved-signal))]
+    (if (zero-qty? quantity)
+      []
+      (multi-leg-intent {:risk-approved-signal risk-approved-signal
+                         :account-id account-id
+                         :legs (spread-legs spread quantity exit?)
+                         :policy :execution/vertical-credit-spread-v1}))))
+
+;; ---------------------------------------------------------------------------
+;; :execution/iron-condor-v1
+;; ---------------------------------------------------------------------------
+
+(defn- iron-condor-v1
+  [risk-approved-signal instrument-ctx account-id]
+  (let [condor (require-ctx instrument-ctx :execution/condor
+                            :execution/iron-condor-v1)
+        quantity (:risk/approved-quantity risk-approved-signal)
+        exit? (= :posture/flatten (:decision/posture risk-approved-signal))]
+    (if (zero-qty? quantity)
+      []
+      (multi-leg-intent {:risk-approved-signal risk-approved-signal
+                         :account-id account-id
+                         :legs (into (spread-legs (:condor/put-spread condor)
+                                                  quantity exit?)
+                                     (spread-legs (:condor/call-spread condor)
+                                                  quantity exit?))
+                         :policy :execution/iron-condor-v1}))))
+
+;; ---------------------------------------------------------------------------
+;; plan-execution
+;; ---------------------------------------------------------------------------
 
 (defn plan-execution
   "Plan order expression for a risk-approved signal under an execution
   policy. risk-approved-signal is the signal decision map merged with the
   risk result (needs :decision/id, :decision/posture,
-  :risk/approved-quantity). instrument-ctx is {:instrument/id ..}.
+  :risk/approved-quantity; multi-leg policies also read
+  :decision/net-credit). instrument-ctx is {:instrument/id ..} plus the
+  policy's leg configuration (:execution/spread or :execution/condor).
 
   Returns {:execution/plan {:execution/policy-id ..
                             :execution/decision-id ..
@@ -106,6 +254,10 @@
   (let [intents (case policy
                   :execution/market-equity-v1
                   (market-equity-v1 risk-approved-signal instrument-ctx account-id)
+                  :execution/vertical-credit-spread-v1
+                  (vertical-credit-spread-v1 risk-approved-signal instrument-ctx account-id)
+                  :execution/iron-condor-v1
+                  (iron-condor-v1 risk-approved-signal instrument-ctx account-id)
                   (throw (ex-info (str "unknown execution policy: " (pr-str policy))
                                   {:error/code :error/unknown-execution-policy
                                    :error/policy policy})))]

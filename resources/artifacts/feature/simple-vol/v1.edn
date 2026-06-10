@@ -1,0 +1,24 @@
+;; Feature manifest artifact (STRATEGY_PIPELINE §7.1) for the simple-vol
+;; credit-spread strategy. :feature-manifest/params :spread is the SINGLE
+;; SOURCE OF TRUTH for the spread's strike configuration: the chain feature
+;; (:feature/chain-mid-width), the risk policy (:risk/defined-risk-spread),
+;; and the execution policy (:execution/vertical-credit-spread-v1) all
+;; derive their leg instrument ids and strike width from this map via
+;; domain.instruments/vertical-spread-context.
+
+{:feature-manifest/id "feature/simple-vol/v1"
+ :feature-manifest/version 1
+ :feature-manifest/features
+ [:feature/chain-mid-width]
+ :feature-manifest/params
+ {:spread {:venue "OPRA"
+           :underlying-symbol "SPY"
+           :expiry "2026-06-19"
+           :right :option-right/put
+           :near-strike "550.000"
+           :far-strike "545.000"}}
+ :feature-manifest/required-inputs
+ [:input/bar-1m :input/option-chain]
+ :feature-manifest/compatibility
+ {:strategy-family :strategy-family/simple-vol
+  :prediction-schema-version 1}}

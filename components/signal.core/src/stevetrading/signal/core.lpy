@@ -2,12 +2,13 @@
   "Signal decision stage (STRATEGY_PIPELINE §5.4, ARCHITECTURE §19).
 
   Pure pipeline component: turns a canonical prediction + market slice +
-  strategy-local state into a posture decision. Strategy-local state is
-  explicit and replay-safe (§6) — the crossover posture memory lives under
+  strategy-local state into a posture decision, dispatched on the
+  strategy declaration's [:strategy/signal :fn-id]. Strategy-local state
+  is explicit and replay-safe (§6) — the posture memory lives under
   :last-direction in the strategy-local state map, never in closures.
 
-  v0.1 signal fn :signal/sma-crossover-v1 semantics — posture changes ONLY
-  on crossover state change:
+  Both v0.1 signal fns share the same direction-change semantics —
+  posture changes ONLY on a prediction-direction state change:
 
     direction == (:last-direction local-state)  -> :posture/hold
     changed to :direction/up                    -> :posture/enter-long
@@ -16,11 +17,25 @@
   A nil :last-direction (first decision after warmup) counts as a distinct
   state, so the first decided direction always produces a posture.
 
-  Determinism: :decision/market-time is the slice's last bar time (never
-  wall clock); :decision/id is the deterministic hash of the canonical
+  Signal fns:
+
+    :signal/sma-crossover-v1 — direction from the SMA crossover model;
+      :decision/market-time is the slice's LAST BAR time (bar-driven).
+
+    :signal/credit-threshold-v1 (Phase 9) — direction from the threshold
+      model over a chain feature (up = credit at/above threshold ->
+      enter the spread; down = credit below threshold -> flatten).
+      :decision/market-time is the slice's :last-time (the chain
+      snapshot's observed-at when the chain was the latest observation) —
+      REQUIRED so two chain snapshots between bars produce DISTINCT
+      decision ids. The decision also carries :decision/net-credit (the
+      prediction value, i.e. the current spread mid) for the execution
+      stage's net-credit/net-debit limit price.
+
+  Determinism: :decision/id is the deterministic hash of the canonical
   decision seed (CANONICAL_SCHEMAS §5.2.6) over strategy-id, decision
   scope (the slice instrument), the source watermark tuple
-  [instrument-id last-bar-time], the decision timestamp, and the decision
+  [instrument-id market-time], the decision timestamp, and the decision
   slot (0 — one decision per source event set in v0.1)."
   (:require [stevetrading.domain.schemas :as schemas]))
 
@@ -31,8 +46,21 @@
     (= :direction/up direction)     :posture/enter-long
     :else                           :posture/flatten))
 
-(defn- reason-codes
-  [posture last-direction direction]
+(defn- decision-id-for
+  [strategy-decl instrument-id market-time]
+  (schemas/decision-id
+   {:decision/strategy-id (:strategy/id strategy-decl)
+    :decision/scope instrument-id
+    :decision/source-watermark [instrument-id market-time]
+    :decision/at market-time
+    :decision/slot 0}))
+
+;; ---------------------------------------------------------------------------
+;; :signal/sma-crossover-v1
+;; ---------------------------------------------------------------------------
+
+(defn- sma-reason-codes
+  [posture direction]
   (case posture
     :posture/hold       [:reason/no-crossover-change]
     :posture/enter-long [:reason/sma-cross-up]
@@ -40,10 +68,59 @@
                           [:reason/sma-flat]
                           [:reason/sma-cross-down])))
 
+(defn- sma-crossover-decision
+  [strategy-decl prediction market-slice strategy-local-state]
+  (let [instrument-id (first (:strategy/instruments strategy-decl))
+        market-time (or (:bar/time (peek (vec (:bars market-slice))))
+                        (:last-time market-slice))
+        last-direction (:last-direction strategy-local-state)
+        direction (:prediction/direction prediction)
+        posture (posture-for last-direction direction)]
+    {:decision/id (decision-id-for strategy-decl instrument-id market-time)
+     :decision/posture posture
+     :decision/reason-codes (sma-reason-codes posture direction)
+     :decision/market-time market-time
+     :decision/instrument-id instrument-id}))
+
+;; ---------------------------------------------------------------------------
+;; :signal/credit-threshold-v1
+;; ---------------------------------------------------------------------------
+
+(defn- credit-reason-codes
+  [posture]
+  (case posture
+    :posture/hold       [:reason/no-threshold-change]
+    :posture/enter-long [:reason/credit-above-threshold]
+    :posture/flatten    [:reason/credit-below-threshold]))
+
+(defn- credit-threshold-decision
+  [strategy-decl prediction market-slice strategy-local-state]
+  (let [instrument-id (first (:strategy/instruments strategy-decl))
+        ;; :last-time FIRST: the chain snapshot's observed-at when the
+        ;; chain was the latest observation (distinct decision ids per
+        ;; snapshot); bar-time fallback for bar-only slices.
+        market-time (or (:last-time market-slice)
+                        (:bar/time (peek (vec (:bars market-slice)))))
+        last-direction (:last-direction strategy-local-state)
+        direction (:prediction/direction prediction)
+        posture (posture-for last-direction direction)]
+    {:decision/id (decision-id-for strategy-decl instrument-id market-time)
+     :decision/posture posture
+     :decision/reason-codes (credit-reason-codes posture)
+     :decision/market-time market-time
+     :decision/instrument-id instrument-id
+     :decision/net-credit (:prediction/value prediction)}))
+
+;; ---------------------------------------------------------------------------
+;; Dispatch
+;; ---------------------------------------------------------------------------
+
 (defn decide-signal
-  "Decide the strategy posture from a prediction. Returns the canonical
-  signal decision map (CANONICAL_SCHEMAS §11.2 payload shape plus
-  :decision/instrument-id):
+  "Decide the strategy posture from a prediction, dispatching on the
+  declaration's [:strategy/signal :fn-id]. Returns the canonical signal
+  decision map (CANONICAL_SCHEMAS §11.2 payload shape plus
+  :decision/instrument-id, and :decision/net-credit for the
+  credit-threshold fn):
 
   {:decision/id \"dec_...\"
    :decision/posture :posture/enter-long|:posture/flatten|:posture/hold
@@ -53,22 +130,20 @@
 
   Posture memory (:last-direction) is read from strategy-local-state; the
   composing pipeline owns writing the updated memory back (registry
-  run-pipeline returns :strategy-local-state')."
+  run-pipeline returns :strategy-local-state'). Throws ex-info on an
+  unknown signal fn id."
   [strategy-decl prediction market-slice strategy-local-state]
-  (let [instrument-id (first (:strategy/instruments strategy-decl))
-        market-time (or (:bar/time (peek (vec (:bars market-slice))))
-                        (:last-time market-slice))
-        last-direction (:last-direction strategy-local-state)
-        direction (:prediction/direction prediction)
-        posture (posture-for last-direction direction)
-        decision-id (schemas/decision-id
-                     {:decision/strategy-id (:strategy/id strategy-decl)
-                      :decision/scope instrument-id
-                      :decision/source-watermark [instrument-id market-time]
-                      :decision/at market-time
-                      :decision/slot 0})]
-    {:decision/id decision-id
-     :decision/posture posture
-     :decision/reason-codes (reason-codes posture last-direction direction)
-     :decision/market-time market-time
-     :decision/instrument-id instrument-id}))
+  (let [fn-id (get-in strategy-decl [:strategy/signal :fn-id])]
+    (case fn-id
+      :signal/sma-crossover-v1
+      (sma-crossover-decision strategy-decl prediction market-slice
+                              strategy-local-state)
+
+      :signal/credit-threshold-v1
+      (credit-threshold-decision strategy-decl prediction market-slice
+                                 strategy-local-state)
+
+      (throw (ex-info (str "unknown signal fn: " (pr-str fn-id))
+                      {:error/code :error/unknown-signal-fn
+                       :error/fn-id fn-id
+                       :error/strategy-id (:strategy/id strategy-decl)})))))

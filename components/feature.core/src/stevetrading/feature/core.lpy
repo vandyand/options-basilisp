@@ -5,19 +5,40 @@
   canonical feature map for one strategy market-state slice under a
   feature manifest (artifact.protocol §7.1 shape).
 
-  Supported v0.1 features (all over the slice's bar closes, Decimal
-  arithmetic on the canonical decimal strings):
+  Supported v0.1 features (Decimal arithmetic on the canonical decimal
+  strings):
 
-    :feature/sma-fast   simple moving average, window from
-                        [:feature-manifest/params :sma-fast :window]
-    :feature/sma-slow   simple moving average, window from
-                        [:feature-manifest/params :sma-slow :window]
-    :feature/last-close most recent bar close
-    :feature/bar-count  number of bars in the slice
+    :feature/sma-fast        simple moving average over bar closes, window
+                             from [:feature-manifest/params :sma-fast :window]
+    :feature/sma-slow        simple moving average over bar closes, window
+                             from [:feature-manifest/params :sma-slow :window]
+    :feature/last-close      most recent bar close
+    :feature/bar-count       number of bars in the slice
+    :feature/chain-mid-width (Phase 9) net credit mid of a configured
+                             vertical spread from the slice's latest option
+                             chain snapshot: mid(near) - mid(far), where
+                             mid = (bid+ask)/2 of the contract whose
+                             :instrument/id matches the configured leg.
+                             Strike configuration lives in the manifest
+                             params under :spread (see
+                             domain.instruments/vertical-spread-context).
+
+  Insufficiency contract: a slice that cannot support the manifest returns
+  {:feature/insufficient? true :feature/needed n} — for chain-dependent
+  manifests this includes a missing/incomplete chain snapshot (the
+  configured leg contracts must be present with both bid and ask), reported
+  with :feature/missing-input :input/option-chain.
+
+  :feature/as-of (documented decision): chain-dependent manifests stamp the
+  chain's :chain/observed-at (decisions are keyed to the chain snapshot,
+  not the last bar); bar-only manifests stamp the last bar time as before.
 
   Market slice shape (engine.state per-instrument slice):
-  {:bars [{:bar/time .. :bar/close .. ...} ...] :last-time ts}."
-  (:import decimal))
+  {:bars [{:bar/time .. :bar/close .. ...} ...]
+   :chain {:chain/observed-at .. :chain/contracts [..] ..}
+   :last-time ts}."
+  (:import decimal)
+  (:require [stevetrading.domain.instruments :as instruments]))
 
 (defn- ->dec
   [s]
@@ -40,13 +61,56 @@
                        :error/feature feature-kw
                        :error/manifest-id (:feature-manifest/id manifest)}))))
 
+;; ---------------------------------------------------------------------------
+;; Chain features
+;; ---------------------------------------------------------------------------
+
+(defn- spread-params
+  [manifest]
+  (or (get-in manifest [:feature-manifest/params :spread])
+      (throw (ex-info "feature manifest missing :spread params for chain feature"
+                      {:error/code :error/missing-feature-param
+                       :error/feature :feature/chain-mid-width
+                       :error/manifest-id (:feature-manifest/id manifest)}))))
+
+(defn- contract-mid
+  "Mid price Decimal of one chain contract, nil when bid/ask incomplete."
+  [contract]
+  (when (and (some? (:quote/bid contract)) (some? (:quote/ask contract)))
+    (/ (+ (->dec (:quote/bid contract)) (->dec (:quote/ask contract)))
+       (->dec "2"))))
+
+(defn- chain-mid-width
+  "Net credit mid decimal string for the manifest's configured spread from
+  the slice's chain snapshot, or nil when the chain is missing or either
+  configured leg contract lacks a two-sided quote."
+  [manifest market-slice]
+  (let [spread-ctx (instruments/vertical-spread-context (spread-params manifest))
+        contracts (into {}
+                        (map (fn [c] [(:instrument/id c) c])
+                             (get-in market-slice [:chain :chain/contracts])))
+        near-mid (contract-mid (get contracts (:spread/near-instrument-id spread-ctx)))
+        far-mid (contract-mid (get contracts (:spread/far-instrument-id spread-ctx)))]
+    (when (and (some? near-mid) (some? far-mid))
+      (str (- near-mid far-mid)))))
+
+(defn- chain-required?
+  [manifest]
+  (boolean (some #{:feature/chain-mid-width}
+                 (:feature-manifest/features manifest))))
+
+;; ---------------------------------------------------------------------------
+;; Derivation
+;; ---------------------------------------------------------------------------
+
 (defn- derive-feature
-  [manifest bars feature-kw]
+  [manifest market-slice bars feature-kw]
   (case feature-kw
     :feature/sma-fast   (sma bars (feature-window manifest feature-kw :sma-fast))
     :feature/sma-slow   (sma bars (feature-window manifest feature-kw :sma-slow))
     :feature/last-close (:bar/close (peek bars))
     :feature/bar-count  (str (count bars))
+    :feature/chain-mid-width (chain-mid-width manifest market-slice)
     (throw (ex-info (str "unknown feature: " feature-kw)
                     {:error/code :error/unknown-feature
                      :error/feature feature-kw
@@ -70,17 +134,31 @@
 
   Returns {:feature/values {feature-kw decimal-str}
            :feature/manifest-id ..
-           :feature/as-of last-bar-time}
-  or, when the slice lacks history, {:feature/insufficient? true
-                                     :feature/needed n}."
+           :feature/as-of last-bar-time | chain-observed-at}
+  or, when the slice lacks history (or a chain-dependent manifest lacks a
+  usable chain snapshot), {:feature/insufficient? true :feature/needed n
+  [:feature/missing-input :input/option-chain]}."
   [manifest market-slice]
   (let [bars (vec (:bars market-slice))
         needed (required-bars manifest)]
-    (if (< (count bars) needed)
+    (cond
+      (< (count bars) needed)
       {:feature/insufficient? true
        :feature/needed needed}
+
+      (and (chain-required? manifest)
+           (nil? (chain-mid-width manifest market-slice)))
+      {:feature/insufficient? true
+       :feature/needed needed
+       :feature/missing-input :input/option-chain}
+
+      :else
       {:feature/values (into {}
-                             (map (fn [kw] [kw (derive-feature manifest bars kw)])
+                             (map (fn [kw]
+                                    [kw (derive-feature manifest market-slice
+                                                        bars kw)])
                                   (:feature-manifest/features manifest)))
        :feature/manifest-id (:feature-manifest/id manifest)
-       :feature/as-of (:bar/time (peek bars))})))
+       :feature/as-of (if (chain-required? manifest)
+                        (get-in market-slice [:chain :chain/observed-at])
+                        (:bar/time (peek bars)))})))

@@ -11,7 +11,13 @@
     :model.type/sma-crossover — direction :direction/up when
       :feature/sma-fast > :feature/sma-slow, :direction/down when fast <
       slow, :direction/flat when equal. :prediction/value is the
-      fast-minus-slow spread as a decimal string."
+      fast-minus-slow spread as a decimal string.
+
+    :model.type/threshold (Phase 9) — scores ONE feature against a fixed
+      threshold: :model/params {:feature kw :threshold decimal-str}.
+      Direction :direction/up when feature value >= threshold (the
+      condition holds — e.g. spread credit attractive), :direction/down
+      otherwise. :prediction/value is the feature value itself."
   (:import decimal))
 
 (defn- ->dec
@@ -24,6 +30,22 @@
       (throw (ex-info (str "features missing " kw)
                       {:error/code :error/missing-feature
                        :error/feature kw}))))
+
+(defn- threshold-prediction
+  [model-artifact features]
+  (let [feature-kw (get-in model-artifact [:model/params :feature])
+        threshold-str (get-in model-artifact [:model/params :threshold])]
+    (when (or (nil? feature-kw) (nil? threshold-str))
+      (throw (ex-info "threshold model requires :feature and :threshold params"
+                      {:error/code :error/missing-model-param
+                       :error/model-id (:model/id model-artifact)
+                       :error/params (:model/params model-artifact)})))
+    (let [value (->dec (require-feature features feature-kw))
+          threshold (->dec threshold-str)]
+      {:prediction/value (str value)
+       :prediction/direction (if (>= value threshold)
+                               :direction/up
+                               :direction/down)})))
 
 (defn- sma-crossover-prediction
   [features]
@@ -55,6 +77,7 @@
   (let [model-type (:model/type model-artifact)
         scored (case model-type
                  :model.type/sma-crossover (sma-crossover-prediction features)
+                 :model.type/threshold (threshold-prediction model-artifact features)
                  (throw (ex-info (str "unknown model type: " (pr-str model-type))
                                  {:error/code :error/unknown-model-type
                                   :error/model-type model-type

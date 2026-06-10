@@ -44,9 +44,15 @@
     position (never of broker-instance call history) — required for
     restart convergence, since a restarted run constructs a fresh sim
     broker.
-  - Sim broker marks are static per run: each instrument's LAST bar close
-    in the fixture (market orders need a mark to price; P&L realism is
-    not a Phase 8 goal).
+  - Sim broker marks track replay position (Phase 9 revision of the
+    Phase 8 static-marks decision — multi-leg options fills need per-leg
+    marks current AT FILL TIME so an entry credit and a later exit debit
+    differ): a marks atom maps instrument-id -> latest price (bar close
+    for bars; (bid+ask)/2 per contract for option-chain snapshots),
+    updated as each observation is processed and rebuilt from the fixture
+    prefix [0, cursor) on resume — marks are a pure function of replay
+    position, preserving restart convergence. The sim broker receives
+    (fn [] @marks) and resolves it at each pricing moment.
   - The portfolio cache is derived WITHOUT runtime marks
     ((derive-portfolio ledger)) to match the recovery rebuild exactly;
     mark-based unrealized P&L is a reporting concern (Phase 11).
@@ -61,7 +67,7 @@
     instrument's bar count reaches :strategy/warmup :required-bars.
   - :facts-appended counts THIS run's loop appends (recovery bookkeeping
     facts are appended by run-recovery! itself and not counted)."
-  (:import datetime os os.path)
+  (:import datetime decimal os os.path)
   (:require [basilisp.edn :as edn]
             [stevetrading.artifact.file-store :as afs]
             [stevetrading.artifact.protocol :as ap]
@@ -142,17 +148,44 @@
                 state)]
     {:state state :appended-count appended-count}))
 
-(defn- fixture-marks
-  "Static sim-broker marks: each bar instrument's LAST close in the
-  fixture."
-  [fixture*]
+(defn- mid-str
+  [bid ask]
+  (str (/ (+ (decimal/Decimal bid) (decimal/Decimal ask))
+          (decimal/Decimal "2"))))
+
+(defn- apply-payload-marks
+  "Fold one observation into the marks map (replay-position pricing):
+  bars mark the bar instrument at its close; option-chain snapshots mark
+  every two-sided contract at its (bid+ask)/2 mid. Works for both fixture
+  inputs and emitted fact envelopes (same payload shapes)."
+  [marks fact-type instrument-id payload]
+  (cond
+    (and (= :fact/market-bar-observed fact-type) (some? instrument-id))
+    (assoc marks instrument-id (:bar/close payload))
+
+    (= :fact/option-chain-observed fact-type)
+    (reduce (fn [m contract]
+              (if (and (some? (:instrument/id contract))
+                       (some? (:quote/bid contract))
+                       (some? (:quote/ask contract)))
+                (assoc m (:instrument/id contract)
+                       (mid-str (:quote/bid contract) (:quote/ask contract)))
+                m))
+            marks
+            (:chain/contracts payload))
+
+    :else marks))
+
+(defn- marks-at
+  "Marks map after processing the first n fixture inputs — the pure
+  rebuild used on resume so marks stay a function of replay position."
+  [fixture* n]
   (reduce (fn [marks input]
-            (if (= :fact/market-bar-observed (:input/type input))
-              (assoc marks (:input/instrument-id input)
-                     (get-in input [:input/payload :bar/close]))
-              marks))
+            (apply-payload-marks marks (:input/type input)
+                                 (:input/instrument-id input)
+                                 (:input/payload input)))
           {}
-          (:fixture/inputs fixture*)))
+          (take n (:fixture/inputs fixture*))))
 
 ;; ---------------------------------------------------------------------------
 ;; Strategy wiring
@@ -437,7 +470,8 @@
         snapshot-store (ss/make-snapshot-store (os.path/join out-dir "snapshots"))
         artifact-store (afs/make-file-artifact-store artifact-root)
         market-clock (atom (:input/at (first (:fixture/inputs fixture*))))
-        broker (sim/make-sim-broker {:marks (fixture-marks fixture*)
+        marks (atom {})
+        broker (sim/make-sim-broker {:marks (fn [] @marks)
                                      :clock (fn [] @market-clock)})
         ;; 2. strategies + engine state (fresh or recovered)
         strategies (mapv #(load-strategy artifact-store %) strategy-paths)
@@ -472,7 +506,10 @@
         state0 (enable-strategies state0 strategies)
         cursor0 (or (st/cursor state0 :market-data) 0)
         _ (when-let [wm (get-in state0 [:engine/watermarks :watermark/market])]
-            (reset! market-clock wm))]
+            (reset! market-clock wm))
+        ;; marks are a pure function of replay position: rebuild the
+        ;; prefix [0, cursor0) on resume, then advance per observation
+        _ (reset! marks (marks-at fixture* cursor0))]
     ;; 3. the loop — one observation per cycle
     (loop [state state0
            ledger ledger0
@@ -500,6 +537,10 @@
                 cycle-n (+ obs-n (:appended-count obs-fold))
                 _ (when (seq obs-new)
                     (reset! market-clock (:fact/occurred-at obs)))
+                ;; advance replay-position marks (unconditional — marks
+                ;; depend on position, not on append acceptance)
+                _ (swap! marks apply-payload-marks (:record/type obs)
+                         (:record/instrument-id obs) (:fact/payload obs))
                 ;; lifecycle: warmup advancement from accumulated history
                 state (advance-warmups state strategies)
                 ;; §6 steps 4-10 per active + relevant strategy

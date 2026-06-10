@@ -218,7 +218,12 @@
      :order-intent/side (:order/side entry)
      :order-intent/account-id (:order/account-id entry)
      :order-intent/strategy-id (:order/strategy-id entry)
-     :order-intent/instrument-id (:order/instrument-id entry)}))
+     :order-intent/instrument-id (:order/instrument-id entry)
+     ;; Phase 9: per-leg sides for multi-leg intents — ledger derivation
+     ;; resolves each fill's side from the intent leg matching the fill's
+     ;; instrument (nil for entries recovered from pre-Phase-9 state;
+     ;; derivation then falls back to the intent-level side).
+     :order-intent/legs (:order/legs entry)}))
 
 (defn- ledger-stream
   "All fills + derived ledger facts in the log, in offset order — the

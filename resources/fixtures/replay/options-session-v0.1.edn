@@ -1,0 +1,108 @@
+;; Replay fixture v0.2 format — options session for the Phase 9 credit
+;; spread path: session open, two SPY bars (warmup + a hold cycle), then
+;; TWO option-chain snapshots over the configured 550/545 put vertical
+;; (expiry 2026-06-19):
+;;
+;;   chain 1 (14:32): near mid 2.15, far mid 0.95 -> net credit 1.20
+;;     >= threshold 1.00 -> ENTER (sell near / buy far, 2-leg intent,
+;;     per-leg fills at the chain mids: short lot 2.15, long lot 0.95)
+;;   bar  (14:33): hold cycle — direction unchanged, no facts
+;;   chain 2 (14:35): near mid 1.00, far mid 0.60 -> spread mid 0.40
+;;     < threshold -> FLATTEN (buy near / sell far, closes both lots)
+;;
+;; Expected round trip: realized P&L = credit - debit - fees
+;;   = 1.20 - 0.40 - 0 = 0.80 per spread; positions net to zero.
+;;
+;; Chain payloads follow MARKET_DATA_ADAPTER §4.3 minus the :data/*
+;; provenance fields the replay adapter adds at emission time.
+
+{:fixture/id "fixture/replay/options-session/v0.1"
+ :fixture/version 2
+ :fixture/mode :mode/replay
+ :fixture/description "SPY put credit spread session: entry-attractive chain snapshot (credit 1.20 >= 1.00) then exit snapshot (0.40 < 1.00) — full 2-leg intent lifecycle."
+ :fixture/inputs
+ [{:input/at "2026-06-10T13:30:00Z"
+   :input/type :fact/calendar-session-observed
+   :input/payload
+   {:session/exchange "XNYS"
+    :session/trading-date "2026-06-10"
+    :session/state :session-state/open
+    :session/observed-at "2026-06-10T13:30:00Z"}}
+  {:input/at "2026-06-10T14:30:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:30:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.15"
+    :bar/high "550.28"
+    :bar/low "550.10"
+    :bar/close "550.20"
+    :bar/volume "18234"}}
+  {:input/at "2026-06-10T14:31:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:31:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.20"
+    :bar/high "550.24"
+    :bar/low "550.05"
+    :bar/close "550.10"
+    :bar/volume "16410"}}
+  {:input/at "2026-06-10T14:32:00Z"
+   :input/type :fact/option-chain-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:chain/observed-at "2026-06-10T14:32:00Z"
+    :chain/underlying "equity/NASDAQ/SPY"
+    :chain/contracts
+    [{:instrument/id "option/OPRA/SPY/2026-06-19/P/550.000"
+      :quote/bid "2.10"
+      :quote/ask "2.20"}
+     {:instrument/id "option/OPRA/SPY/2026-06-19/P/545.000"
+      :quote/bid "0.90"
+      :quote/ask "1.00"}]}}
+  {:input/at "2026-06-10T14:33:00Z"
+   :input/type :fact/market-bar-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:bar/time "2026-06-10T14:33:00Z"
+    :bar/timeframe :timeframe/1m
+    :bar/open "550.10"
+    :bar/high "550.18"
+    :bar/low "550.02"
+    :bar/close "550.12"
+    :bar/volume "15287"}}
+  {:input/at "2026-06-10T14:35:00Z"
+   :input/type :fact/option-chain-observed
+   :input/instrument-id "equity/NASDAQ/SPY"
+   :input/payload
+   {:chain/observed-at "2026-06-10T14:35:00Z"
+    :chain/underlying "equity/NASDAQ/SPY"
+    :chain/contracts
+    [{:instrument/id "option/OPRA/SPY/2026-06-19/P/550.000"
+      :quote/bid "0.95"
+      :quote/ask "1.05"}
+     {:instrument/id "option/OPRA/SPY/2026-06-19/P/545.000"
+      :quote/bid "0.55"
+      :quote/ask "0.65"}]}}]
+ :fixture/expected-outputs
+ [{:record/type :fact/prediction-produced}
+  {:record/type :fact/signal-decision-produced}
+  {:record/type :fact/risk-decision-recorded}
+  {:record/type :fact/order-intent-created}
+  {:record/type :fact/broker-ack-accepted}
+  {:record/type :fact/fill-observed}
+  {:record/type :fact/fill-observed}
+  {:record/type :fact/position-lot-opened}
+  {:record/type :fact/position-lot-opened}
+  {:record/type :fact/prediction-produced}
+  {:record/type :fact/signal-decision-produced}
+  {:record/type :fact/risk-decision-recorded}
+  {:record/type :fact/order-intent-created}
+  {:record/type :fact/broker-ack-accepted}
+  {:record/type :fact/fill-observed}
+  {:record/type :fact/fill-observed}
+  {:record/type :fact/position-lot-closed}
+  {:record/type :fact/position-lot-closed}]}

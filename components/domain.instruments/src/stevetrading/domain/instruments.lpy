@@ -135,3 +135,32 @@
                                  (pr-str (:leg/side leg))
                                  (str (:leg/quantity leg))]))
                 legs)))
+
+(defn vertical-spread-context
+  "Canonical leg/width context for a two-leg vertical spread, derived from
+  a spread params map (the shape carried by a feature manifest's
+  :feature-manifest/params :spread — single source of truth for strike
+  configuration, shared by the chain feature, the risk policy, and the
+  execution policy):
+
+    {:venue \"OPRA\" :underlying-symbol \"SPY\" :expiry \"2026-06-19\"
+     :right :option-right/put :near-strike \"550.000\" :far-strike \"545.000\"}
+
+  Returns {:spread/near-instrument-id .. :spread/far-instrument-id ..
+           :spread/right .. :spread/expiry ..
+           :spread/width strike-distance-decimal-str}.
+  Throws ex-info (via instrument-id) on malformed params."
+  [{:keys [venue underlying-symbol expiry right near-strike far-strike]}]
+  (let [leg-id (fn [strike]
+                 (instrument-id {:instrument/asset-class :asset-class/option
+                                 :instrument/venue venue
+                                 :instrument/underlying underlying-symbol
+                                 :instrument/expiry expiry
+                                 :instrument/right right
+                                 :instrument/strike strike}))]
+    {:spread/near-instrument-id (leg-id near-strike)
+     :spread/far-instrument-id (leg-id far-strike)
+     :spread/right right
+     :spread/expiry expiry
+     :spread/width (str (abs (- (decimal/Decimal (str near-strike))
+                                (decimal/Decimal (str far-strike)))))}))

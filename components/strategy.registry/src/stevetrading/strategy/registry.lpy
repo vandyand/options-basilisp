@@ -31,6 +31,7 @@
     order-intent <- plan"
   (:require [stevetrading.domain.enums :as enums]
             [stevetrading.domain.identifiers :as identifiers]
+            [stevetrading.domain.instruments :as instruments]
             [stevetrading.domain.schemas :as schemas]
             [stevetrading.execution.core :as execution]
             [stevetrading.feature.core :as feature]
@@ -252,11 +253,24 @@
                 requested-qty (get-in strategy
                                       [:strategy/execution :params :quantity]
                                       "1")
+                ;; Spread strike configuration lives in the feature
+                ;; manifest params (single source of truth); the derived
+                ;; leg/width context is threaded to the risk and execution
+                ;; stages through their existing ctx arguments.
+                spread-ctx (when-let [spread-params
+                                      (get-in artifacts
+                                              [:feature-manifest
+                                               :feature-manifest/params
+                                               :spread])]
+                             (instruments/vertical-spread-context spread-params))
                 risk-result (risk/evaluate-risk
                              (get-in strategy [:strategy/risk :policy-id])
                              (assoc decision :decision/requested-quantity requested-qty)
                              portfolio-view
-                             {:account/id account-id})
+                             (cond-> {:account/id account-id
+                                      :risk/params (get-in strategy
+                                                           [:strategy/risk :params])}
+                               (some? spread-ctx) (assoc :risk/spread spread-ctx)))
                 risk-fact
                 (pipeline-fact ctx :fact/risk-decision-recorded
                                [(:record/id signal-fact)]
@@ -274,7 +288,8 @@
                     (execution/plan-execution
                      (get-in strategy [:strategy/execution :policy-id])
                      (merge decision risk-result)
-                     {:instrument/id instrument-id}
+                     (cond-> {:instrument/id instrument-id}
+                       (some? spread-ctx) (assoc :execution/spread spread-ctx))
                      account-id)]
                 (if (empty? order-intents)
                   {:facts base-facts

@@ -182,6 +182,11 @@
              ;; retained for ledger derivation (Phase 6): opening vs closing
              ;; effect of every fill comes from the originating intent
              :order/effect (:order-intent/effect payload)
+             ;; retained for ledger derivation (Phase 9): multi-leg fills
+             ;; resolve their PER-LEG side from the intent leg matching the
+             ;; fill's instrument; per-leg fill progress tracked below
+             :order/legs (vec (:order-intent/legs payload))
+             :order/leg-fills {}
              :order/route (or (:order-intent/route payload)
                               (:record/source-system fact))
              :order/broker-order-id nil
@@ -270,9 +275,42 @@
           ;; duplicate fill → state unchanged, nothing emitted
           (result state)
           (let [fill-qty (m/->decimal (:fill/quantity payload))
-                cumulative (+ (m/->decimal (or (:order/filled-quantity entry)
-                                               "0"))
-                              fill-qty)
+                ;; Phase 9 multi-leg semantics (documented): for an intent
+                ;; with >1 legs, :order/quantity counts SPREAD UNITS, while
+                ;; each :fact/fill-observed reports one LEG's quantity
+                ;; (BROKER_ADAPTER §5.3 — one fill fact per leg). Filled
+                ;; spread units = min over legs of (leg filled qty / leg
+                ;; qty per unit), tracked in :order/leg-fills keyed by leg
+                ;; instrument-id. Single-leg intents (and leg fills that
+                ;; carry no resolvable instrument id) keep the cumulative
+                ;; quantity-sum behavior.
+                legs (:order/legs entry)
+                leg-iid (or (:fill/instrument-id payload)
+                            (:record/instrument-id fact))
+                multi-leg? (and (> (count legs) 1) (some? leg-iid))
+                leg-fills (when multi-leg?
+                            (assoc (or (:order/leg-fills entry) {})
+                                   leg-iid
+                                   (str (+ (m/->decimal
+                                            (get (:order/leg-fills entry)
+                                                 leg-iid "0"))
+                                           fill-qty))))
+                cumulative (if multi-leg?
+                             (reduce
+                              (fn [lo leg]
+                                (let [per-unit (m/->decimal (:leg/quantity leg))
+                                      filled (m/->decimal
+                                              (get leg-fills
+                                                   (:instrument/id leg) "0"))
+                                      units (if (zero? per-unit)
+                                              dec-zero
+                                              (/ filled per-unit))]
+                                  (if (or (nil? lo) (< units lo)) units lo)))
+                              nil
+                              legs)
+                             (+ (m/->decimal (or (:order/filled-quantity entry)
+                                                 "0"))
+                                fill-qty))
                 remaining (- (m/->decimal (:order/quantity entry)) cumulative)
                 ;; clamp overfill to zero — treated as complete (documented)
                 remaining (if (< remaining dec-zero) dec-zero remaining)
@@ -291,6 +329,7 @@
                (-> entry
                    (mark-resolved to)
                    (assoc :order/filled-quantity (str cumulative))
+                   (cond-> multi-leg? (assoc :order/leg-fills leg-fills))
                    (update :order/fill-fact-ids conj (:record/id fact))
                    (update :order/fill-keys conj fill-key)))
              {:broker-watermark? true})))))))
