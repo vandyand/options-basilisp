@@ -1,7 +1,7 @@
 # Specifications
 
-*Auto-generated on 2026-06-10 01:53*
+*Auto-generated on 2026-06-10 02:09*
 
-## Planned
+## In Progress
 
 - [Basilisp Rewrite](basilisp-rewrite/README.md)
