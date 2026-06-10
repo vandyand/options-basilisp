@@ -1,18 +1,172 @@
-(ns stevetrading.engine.state)
+(ns stevetrading.engine.state
+  "Canonical engine state shape + constructors/accessors.
+
+  Normative: ENGINE_STATE_AND_RECOVERY_V0.1 §3-§7.
+
+  Layout decisions (documented for later phases):
+  - Resolved (terminal) orders are NOT moved to a separate map. The entry
+    stays under :engine/unresolved-orders keyed by order-intent-id, with
+    :order/resolved? true and its terminal :order/lifecycle. Later phases
+    (ledger derivation, recovery lineage lookup) read intent context from
+    the same place regardless of resolution.
+  - Market observations live in a single global :engine/market map keyed by
+    instrument-id: {instrument-id {:bars [...] :chain ... :quote ...
+    :last-time ts}}. Bars are capped at `market-bar-cap` (most recent kept).
+    Strategies slice from this map in later phases.")
 
 (def engine-state-version 1)
 
+(def market-bar-cap
+  "Maximum bars retained per instrument in :engine/market."
+  200)
+
 (def empty-engine-state
   {:engine/version engine-state-version
+   ;; §4.1 engine metadata — populated by init-run
    :engine/run nil
+   ;; control-plane view (latest activated revision, kill-switch view)
    :engine/control-plane nil
+   ;; §4.2 strategy state map, keyed by strategy-id
    :engine/strategies {}
+   ;; §4.3 unresolved order state, keyed by order-intent-id
    :engine/unresolved-orders {}
+   ;; §4.4 derived portfolio cache (not canonical truth)
    :engine/portfolio {}
-   :engine/watermarks {}
-   :engine/health {:health/status :health/starting}})
+   ;; global market observation map, keyed by instrument-id
+   :engine/market {}
+   ;; §4.5 watermarks and cursors
+   :engine/watermarks {:watermark/fact-log nil
+                       :watermark/market nil
+                       :watermark/broker nil
+                       :watermark/control-plane nil}
+   ;; §4.6 health and degradation state
+   :engine/health {:health/level :starting
+                   :health/degradations []}})
 
 (defn fresh-state
   []
   empty-engine-state)
 
+;; ---------------------------------------------------------------------------
+;; §4.1 Engine metadata
+;; ---------------------------------------------------------------------------
+
+(defn init-run
+  "Stamp engine run metadata onto state. run-info keys: :run/id, :run/mode,
+  :run/started-at, optional :run/engine-version and
+  :run/control-plane-revision."
+  [state run-info]
+  (assoc state :engine/run
+         {:run/id (:run/id run-info)
+          :run/engine-version (:run/engine-version run-info)
+          :run/mode (:run/mode run-info)
+          :run/started-at (:run/started-at run-info)
+          :run/control-plane-revision (:run/control-plane-revision run-info)}))
+
+;; ---------------------------------------------------------------------------
+;; §4.2 Strategy state map
+;; ---------------------------------------------------------------------------
+
+(def empty-strategy-state
+  {:strategy/id nil
+   :strategy/lifecycle :inactive
+   :strategy/signal-state {}
+   :strategy/last-market-time nil
+   :strategy/last-decision-time nil
+   :strategy/posture nil})
+
+(defn register-strategy
+  "Register a strategy under strategy-id (lifecycle :inactive). Optional
+  overrides map is merged onto the empty strategy state. Idempotent: an
+  already-registered strategy is left untouched."
+  ([state strategy-id] (register-strategy state strategy-id {}))
+  ([state strategy-id overrides]
+   (if (get-in state [:engine/strategies strategy-id])
+     state
+     (assoc-in state [:engine/strategies strategy-id]
+               (merge empty-strategy-state
+                      {:strategy/id strategy-id}
+                      overrides)))))
+
+(defn strategy-state
+  [state strategy-id]
+  (get-in state [:engine/strategies strategy-id]))
+
+(defn update-strategy
+  "Apply f (fn [strategy-state] -> strategy-state') to the entry for
+  strategy-id. No-op when the strategy is not registered."
+  [state strategy-id f]
+  (if (get-in state [:engine/strategies strategy-id])
+    (update-in state [:engine/strategies strategy-id] f)
+    state))
+
+;; ---------------------------------------------------------------------------
+;; §4.3 Unresolved order state
+;; ---------------------------------------------------------------------------
+
+(defn unresolved-order
+  [state order-intent-id]
+  (get-in state [:engine/unresolved-orders order-intent-id]))
+
+(defn assoc-unresolved-order
+  [state order-intent-id entry]
+  (assoc-in state [:engine/unresolved-orders order-intent-id] entry))
+
+(defn update-unresolved-order
+  "Apply f to the unresolved-order entry. No-op when absent."
+  [state order-intent-id f]
+  (if (unresolved-order state order-intent-id)
+    (update-in state [:engine/unresolved-orders order-intent-id] f)
+    state))
+
+;; ---------------------------------------------------------------------------
+;; §4.5 Watermarks
+;; ---------------------------------------------------------------------------
+
+(defn record-watermark
+  [state watermark-key value]
+  (assoc-in state [:engine/watermarks watermark-key] value))
+
+;; ---------------------------------------------------------------------------
+;; Market observation map
+;; ---------------------------------------------------------------------------
+
+(defn record-bar
+  "Append a bar payload for instrument-id, capped at market-bar-cap (most
+  recent bars kept). Also stamps :last-time."
+  [state instrument-id bar-payload observed-at]
+  (update-in state [:engine/market instrument-id]
+             (fn [slice]
+               (let [bars (conj (vec (:bars slice)) bar-payload)
+                     bars (if (> (count bars) market-bar-cap)
+                            (vec (take-last market-bar-cap bars))
+                            bars)]
+                 (assoc slice :bars bars :last-time observed-at)))))
+
+(defn record-chain
+  "Store the latest option-chain payload for instrument-id."
+  [state instrument-id chain-payload observed-at]
+  (update-in state [:engine/market instrument-id]
+             (fn [slice]
+               (assoc slice :chain chain-payload :last-time observed-at))))
+
+(defn record-quote
+  "Store the latest quote payload for instrument-id."
+  [state instrument-id quote-payload observed-at]
+  (update-in state [:engine/market instrument-id]
+             (fn [slice]
+               (assoc slice :quote quote-payload :last-time observed-at))))
+
+(defn market-slice
+  [state instrument-id]
+  (get-in state [:engine/market instrument-id]))
+
+;; ---------------------------------------------------------------------------
+;; §4.6 Health
+;; ---------------------------------------------------------------------------
+
+(defn record-health
+  [state level degradations]
+  (assoc state :engine/health
+         {:health/level level
+          :health/degradations (vec degradations)}))

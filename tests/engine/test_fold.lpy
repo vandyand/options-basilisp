@@ -1,0 +1,421 @@
+(ns engine.test-fold
+  "Pure fact-fold tests (ENGINE_STATE_AND_RECOVERY §4/§6,
+  ENGINE_STATE_MACHINES §5.2/§8)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.fold :as f]
+            [stevetrading.engine.state :as st]))
+
+(def oi "oi_testintent00000000000000000000000000000000000000")
+
+(defn ffact
+  [fact-type payload occurred-at]
+  (sch/fact-envelope
+   {:record/type fact-type
+    :record/mode :mode/sim
+    :record/strategy-id "strategy/simple-direction/sma-cross/v1"
+    :record/account-id "account/sim/test"
+    :record/instrument-id "equity/ARCA/SPY"
+    :record/source-system :broker/sim
+    :fact/occurred-at occurred-at
+    :fact/recorded-at occurred-at
+    :fact/payload payload}))
+
+(defn intent-fact
+  ([] (intent-fact oi "2"))
+  ([order-intent-id quantity]
+   (ffact :fact/order-intent-created
+          {:order-intent/id order-intent-id
+           :order-intent/decision-id "dec_x"
+           :order-intent/intent-slot 0
+           :order-intent/role :intent-role/entry
+           :order-intent/side :order-side/buy
+           :order-intent/effect :position-effect/open
+           :order-intent/order-type :order-type/market
+           :order-intent/time-in-force :tif/day
+           :order-intent/quantity quantity
+           :order-intent/legs [{:instrument/id "equity/ARCA/SPY"
+                                :leg/side :order-side/buy
+                                :leg/quantity quantity}]}
+          "2026-06-10T14:30:00Z")))
+
+(defn submit-dispatched-fact
+  []
+  (ffact :fact/command-dispatched
+         {:command/type :command/submit-order-intent
+          :order-intent/id oi}
+         "2026-06-10T14:30:01Z"))
+
+(defn cancel-dispatched-fact
+  []
+  (ffact :fact/command-dispatched
+         {:command/type :command/cancel-broker-order
+          :order-intent/id oi}
+         "2026-06-10T14:30:02.500Z"))
+
+(defn ack-fact
+  []
+  (ffact :fact/broker-ack-accepted
+         {:order-intent/id oi
+          :broker/source-system :broker/sim
+          :broker/order-id "sim-1"
+          :broker/status :broker-status/accepted
+          :broker/observed-at "2026-06-10T14:30:02Z"}
+         "2026-06-10T14:30:02Z"))
+
+(defn reject-fact
+  []
+  (ffact :fact/broker-ack-rejected
+         {:order-intent/id oi
+          :broker/source-system :broker/sim
+          :broker/status :broker-status/rejected
+          :broker/rejection-code :broker-rejection/insufficient-buying-power}
+         "2026-06-10T14:30:02Z"))
+
+(defn fill-fact
+  [fill-id quantity occurred-at]
+  (ffact :fact/fill-observed
+         {:order-intent/id oi
+          :broker/source-system :broker/sim
+          :broker/order-id "sim-1"
+          :fill/id fill-id
+          :fill/occurred-at occurred-at
+          :fill/quantity quantity
+          :fill/price "550.00"
+          :fill/liquidity :liquidity/taker}
+         occurred-at))
+
+(defn cancel-ack-fact
+  []
+  (ffact :fact/cancel-ack-accepted
+         {:order-intent/id oi
+          :broker/source-system :broker/sim
+          :broker/order-id "sim-1"
+          :broker/status :broker-status/cancelled}
+         "2026-06-10T14:30:05Z"))
+
+(defn bar-fact
+  [minute close]
+  (ffact :fact/market-bar-observed
+         {:bar/time (str "2026-06-10T14:" (format "%02d" minute) ":00Z")
+          :bar/timeframe :timeframe/1m
+          :bar/open close :bar/high close :bar/low close :bar/close close
+          :bar/volume "1000"
+          :bar/provider :market-data/replay}
+         (str "2026-06-10T14:" (format "%02d" minute) ":00Z")))
+
+(def happy-sequence
+  [(intent-fact)
+   (submit-dispatched-fact)
+   (ack-fact)
+   (fill-fact "t1" "1" "2026-06-10T14:30:03Z")
+   (fill-fact "t2" "1" "2026-06-10T14:30:04Z")])
+
+(defn fold-all
+  [facts]
+  (f/fold-facts (st/fresh-state) facts))
+
+;; ---------------------------------------------------------------------------
+;; Happy path
+;; ---------------------------------------------------------------------------
+
+(deftest happy-path-lifecycle
+  (let [lifecycles (->> (range 1 6)
+                        (map #(take % happy-sequence))
+                        (map #(:order/lifecycle
+                               (st/unresolved-order (:state (fold-all %)) oi))))]
+    (is (= [:intent-created :submit-requested :acknowledged
+            :partially-filled :filled]
+           lifecycles)))
+  (let [res (fold-all happy-sequence)
+        entry (st/unresolved-order (:state res) oi)]
+    (testing "no facts or commands emitted on the happy path"
+      (is (= [] (:emitted-facts res)))
+      (is (= [] (:pending-commands res))))
+    (testing "§4.3 unresolved-order entry fields"
+      (is (= oi (:order/intent-id entry)))
+      (is (= "strategy/simple-direction/sma-cross/v1" (:order/strategy-id entry)))
+      (is (= "account/sim/test" (:order/account-id entry)))
+      (is (= "equity/ARCA/SPY" (:order/instrument-id entry)))
+      (is (= "2" (:order/quantity entry)))
+      (is (= :order-side/buy (:order/side entry)))
+      (is (= "sim-1" (:order/broker-order-id entry)))
+      (is (= :filled (:order/lifecycle entry)))
+      (is (string? (:order/creation-fact-id entry)))
+      (is (string? (:order/latest-broker-update-fact-id entry)))
+      (is (= 2 (count (:order/fill-fact-ids entry))))
+      (is (= "2" (:order/filled-quantity entry)))
+      (is (false? (:order/cancel-requested? entry)))
+      (is (true? (:order/resolved? entry))))
+    (testing "broker watermark advanced to the last broker fact"
+      (is (= "2026-06-10T14:30:04Z"
+             (get-in (:state res) [:engine/watermarks :watermark/broker]))))))
+
+(deftest duplicate-intent-fact-converges
+  (let [once (fold-all [(intent-fact)])
+        twice (f/fold-fact (:state once) (intent-fact))]
+    (is (= (:state once) (:state twice)))
+    (is (= [] (:emitted-facts twice)))))
+
+;; ---------------------------------------------------------------------------
+;; Fill dedupe
+;; ---------------------------------------------------------------------------
+
+(deftest duplicate-fill-fact-is-idempotent
+  (let [fill (fill-fact "t1" "1" "2026-06-10T14:30:03Z")
+        base (fold-all [(intent-fact) (submit-dispatched-fact) (ack-fact)])
+        once (f/fold-fact (:state base) fill)
+        twice (f/fold-fact (:state once) fill)]
+    (testing "duplicate fill folds to identical state with no emissions"
+      (is (= (:state once) (:state twice)))
+      (is (= [] (:emitted-facts twice)))
+      (is (= "1" (:order/filled-quantity
+                  (st/unresolved-order (:state twice) oi)))))))
+
+(deftest distinct-fill-ids-accumulate
+  (let [res (fold-all happy-sequence)
+        entry (st/unresolved-order (:state res) oi)]
+    (is (= "2" (:order/filled-quantity entry)))
+    (is (= 2 (count (:order/fill-keys entry))))))
+
+;; ---------------------------------------------------------------------------
+;; Out-of-order / illegal
+;; ---------------------------------------------------------------------------
+
+(deftest ack-after-fill-is-illegal-and-faults
+  (let [filled (fold-all happy-sequence)
+        res (f/fold-fact (:state filled) (ack-fact))
+        fault (first (:emitted-facts res))]
+    (testing "state unchanged"
+      (is (= (:state filled) (:state res)))
+      (is (= :filled (:order/lifecycle (st/unresolved-order (:state res) oi)))))
+    (testing "fault fact emitted per §8.3"
+      (is (= 1 (count (:emitted-facts res))))
+      (is (= :fact/fault-recorded (:record/type fault)))
+      (is (= {:fault/reason :invariant/illegal-transition
+              :fault/machine :machine/order
+              :fault/from :filled
+              :fault/trigger :fact/broker-ack-accepted
+              :order-intent/id oi}
+             (:fact/payload fault))))))
+
+(deftest fill-for-unknown-intent-faults
+  (let [res (f/fold-fact (st/fresh-state)
+                         (fill-fact "t1" "1" "2026-06-10T14:30:03Z"))
+        fault (first (:emitted-facts res))]
+    (is (= (st/fresh-state) (:state res)))
+    (is (= :fact/fault-recorded (:record/type fault)))
+    (is (= :invariant/unknown-order-intent
+           (get-in fault [:fact/payload :fault/reason])))))
+
+;; ---------------------------------------------------------------------------
+;; Rejection path
+;; ---------------------------------------------------------------------------
+
+(deftest broker-rejection-resolves-order
+  (let [res (fold-all [(intent-fact) (submit-dispatched-fact) (reject-fact)])
+        entry (st/unresolved-order (:state res) oi)]
+    (is (= :rejected (:order/lifecycle entry)))
+    (is (true? (:order/resolved? entry)))
+    (is (= [] (:emitted-facts res)))))
+
+;; ---------------------------------------------------------------------------
+;; Cancel paths (races per §5.2)
+;; ---------------------------------------------------------------------------
+
+(deftest clean-cancel-resolves-cancelled
+  (let [res (fold-all [(intent-fact) (submit-dispatched-fact) (ack-fact)
+                       (cancel-dispatched-fact) (cancel-ack-fact)])
+        entry (st/unresolved-order (:state res) oi)]
+    (is (= :cancelled (:order/lifecycle entry)))
+    (is (true? (:order/cancel-requested? entry)))
+    (is (true? (:order/resolved? entry)))))
+
+(deftest cancel-race-fill-wins
+  (let [base (fold-all [(intent-fact) (submit-dispatched-fact) (ack-fact)
+                        (cancel-dispatched-fact)])
+        _ (is (= :cancel-requested
+                 (:order/lifecycle (st/unresolved-order (:state base) oi))))
+        filled (f/fold-fact (:state base)
+                            (fill-fact "t1" "2" "2026-06-10T14:30:03Z"))
+        entry (st/unresolved-order (:state filled) oi)]
+    (testing "fill during cancel-requested resolves from fill truth"
+      (is (= :filled (:order/lifecycle entry)))
+      (is (= "2" (:order/filled-quantity entry))))
+    (testing "late cancel ack after fill converges, stays filled, no fault"
+      (let [late (f/fold-fact (:state filled) (cancel-ack-fact))]
+        (is (= (:state filled) (:state late)))
+        (is (= [] (:emitted-facts late)))
+        (is (= :filled
+               (:order/lifecycle (st/unresolved-order (:state late) oi))))))))
+
+(deftest cancel-race-partial-fill
+  ;; §5.2: a partial fill during cancel-requested moves the order back to
+  ;; partially-filled (apply cancel race rule). The table has NO row for
+  ;; partially-filled + cancel-ack-accepted, so a late cancel ack converges
+  ;; as a no-op: the order stays partially-filled and unresolved, with the
+  ;; fill kept and the cancellation-requested flag still set.
+  (let [res (fold-all [(intent-fact) (submit-dispatched-fact) (ack-fact)
+                       (cancel-dispatched-fact)
+                       (fill-fact "t1" "1" "2026-06-10T14:30:03Z")
+                       (cancel-ack-fact)])
+        entry (st/unresolved-order (:state res) oi)]
+    (testing "partial fill during cancel-requested keeps fill truth"
+      (is (= :partially-filled (:order/lifecycle entry)))
+      (is (= "1" (:order/filled-quantity entry)))
+      (is (true? (:order/cancel-requested? entry)))
+      (is (false? (:order/resolved? entry)))
+      (is (= [] (:emitted-facts res))))))
+
+;; ---------------------------------------------------------------------------
+;; Reconciliation anomaly → orphaned → reconciled
+;; ---------------------------------------------------------------------------
+
+(defn anomaly-fact
+  []
+  (ffact :fact/fault-recorded
+         {:fault/kind :fault/reconciliation-anomaly
+          :order-intent/id oi
+          :fault/reason :anomaly/ack-status-ambiguous}
+         "2026-06-10T14:30:02Z"))
+
+(deftest reconciliation-anomaly-orphans-then-restores
+  (let [orphaned (fold-all [(intent-fact) (submit-dispatched-fact)
+                            (anomaly-fact)])
+        _ (is (= :orphaned-needs-reconcile
+                 (:order/lifecycle
+                  (st/unresolved-order (:state orphaned) oi))))
+        restored (f/fold-fact
+                  (:state orphaned)
+                  (ffact :fact/broker-order-status-observed
+                         {:order-intent/id oi
+                          :broker/source-system :broker/sim
+                          :broker/order-id "sim-1"
+                          :broker/status :broker-status/open}
+                         "2026-06-10T14:30:06Z"))
+        entry (st/unresolved-order (:state restored) oi)]
+    (testing "reconciled open status restores acknowledged"
+      (is (= :acknowledged (:order/lifecycle entry)))
+      (is (false? (:order/resolved? entry))))))
+
+(deftest reconciled-fill-resolves-orphaned-order
+  (let [orphaned (fold-all [(intent-fact) (submit-dispatched-fact)
+                            (anomaly-fact)])
+        res (f/fold-fact (:state orphaned)
+                         (fill-fact "t9" "2" "2026-06-10T14:30:07Z"))
+        entry (st/unresolved-order (:state res) oi)]
+    (is (= :filled (:order/lifecycle entry)))
+    (is (= "2" (:order/filled-quantity entry)))
+    (is (true? (:order/resolved? entry)))))
+
+;; ---------------------------------------------------------------------------
+;; Market observation facts
+;; ---------------------------------------------------------------------------
+
+(deftest market-bars-update-watermark-and-slice
+  (let [res (fold-all [(bar-fact 30 "550.00")
+                       (bar-fact 31 "550.10")
+                       (bar-fact 32 "550.20")])
+        slice (st/market-slice (:state res) "equity/ARCA/SPY")]
+    (is (= "2026-06-10T14:32:00Z"
+           (get-in (:state res) [:engine/watermarks :watermark/market])))
+    (is (= 3 (count (:bars slice))))
+    (is (= "550.20" (:bar/close (last (:bars slice)))))
+    (is (= "2026-06-10T14:32:00Z" (:last-time slice)))))
+
+(deftest market-bars-are-capped
+  (let [bars (map #(bar-fact (mod % 60) (str %)) (range 205))
+        res (fold-all bars)
+        slice (st/market-slice (:state res) "equity/ARCA/SPY")]
+    (is (= st/market-bar-cap (count (:bars slice))))
+    (is (= "204" (:bar/close (last (:bars slice)))))
+    (is (= "5" (:bar/close (first (:bars slice)))))))
+
+(deftest option-chain-stores-latest
+  (let [chain1 (ffact :fact/option-chain-observed
+                      {:chain/underlying "equity/ARCA/SPY" :chain/rows [1]}
+                      "2026-06-10T14:30:00Z")
+        chain2 (ffact :fact/option-chain-observed
+                      {:chain/underlying "equity/ARCA/SPY" :chain/rows [2]}
+                      "2026-06-10T14:31:00Z")
+        res (fold-all [chain1 chain2])
+        slice (st/market-slice (:state res) "equity/ARCA/SPY")]
+    (is (= [2] (get-in slice [:chain :chain/rows])))
+    (is (= "2026-06-10T14:31:00Z" (:last-time slice)))))
+
+;; ---------------------------------------------------------------------------
+;; Control facts
+;; ---------------------------------------------------------------------------
+
+(deftest control-plane-activation-updates-view-and-watermark
+  (let [fact (ffact :fact/control-plane-activated
+                    {:control-plane/revision "cp-000014"}
+                    "2026-06-10T13:00:00Z")
+        res (f/fold-fact (st/fresh-state) fact)]
+    (is (= "cp-000014"
+           (get-in (:state res)
+                   [:engine/control-plane :control-plane/revision])))
+    (is (= "cp-000014"
+           (get-in (:state res)
+                   [:engine/watermarks :watermark/control-plane])))))
+
+(deftest global-kill-switch-halts-all-strategies
+  (let [state (-> (st/fresh-state)
+                  (st/register-strategy "strategy/a/x/v1")
+                  (st/register-strategy "strategy/b/y/v1"))
+        fact (ffact :fact/kill-switch-activated
+                    {:kill-switch/scope :scope/global
+                     :kill-switch/reason :reason/operator}
+                    "2026-06-10T14:45:00Z")
+        res (f/fold-fact state fact)]
+    (is (= :halted (:strategy/lifecycle
+                    (st/strategy-state (:state res) "strategy/a/x/v1"))))
+    (is (= :halted (:strategy/lifecycle
+                    (st/strategy-state (:state res) "strategy/b/y/v1"))))
+    (is (true? (get-in (:state res)
+                       [:engine/control-plane :control-plane/kill-switch
+                        :kill-switch/active?])))))
+
+(deftest strategy-scoped-kill-switch-halts-only-target
+  (let [state (-> (st/fresh-state)
+                  (st/register-strategy "strategy/a/x/v1")
+                  (st/register-strategy "strategy/b/y/v1"))
+        fact (ffact :fact/kill-switch-activated
+                    {:kill-switch/scope :scope/strategy
+                     :kill-switch/strategy-id "strategy/a/x/v1"}
+                    "2026-06-10T14:45:00Z")
+        res (f/fold-fact state fact)]
+    (is (= :halted (:strategy/lifecycle
+                    (st/strategy-state (:state res) "strategy/a/x/v1"))))
+    (is (= :inactive (:strategy/lifecycle
+                      (st/strategy-state (:state res) "strategy/b/y/v1"))))))
+
+(deftest kill-switch-cleared-does-not-unhalt
+  (let [state (-> (st/fresh-state)
+                  (st/register-strategy "strategy/a/x/v1"))
+        activated (f/fold-fact state
+                               (ffact :fact/kill-switch-activated
+                                      {:kill-switch/scope :scope/global}
+                                      "2026-06-10T14:45:00Z"))
+        cleared (f/fold-fact (:state activated)
+                             (ffact :fact/kill-switch-cleared
+                                    {:kill-switch/scope :scope/global}
+                                    "2026-06-10T14:50:00Z"))]
+    (is (false? (get-in (:state cleared)
+                        [:engine/control-plane :control-plane/kill-switch
+                         :kill-switch/active?])))
+    (is (= :halted (:strategy/lifecycle
+                    (st/strategy-state (:state cleared)
+                                       "strategy/a/x/v1"))))))
+
+;; ---------------------------------------------------------------------------
+;; Unrecognized facts
+;; ---------------------------------------------------------------------------
+
+(deftest unrecognized-fact-types-fold-to-unchanged-state
+  (let [fact (ffact :fact/health-heartbeat-recorded
+                    {:health/level :healthy}
+                    "2026-06-10T14:30:00Z")
+        res (f/fold-fact (st/fresh-state) fact)]
+    (is (= (st/fresh-state) (:state res)))
+    (is (= [] (:emitted-facts res)))))

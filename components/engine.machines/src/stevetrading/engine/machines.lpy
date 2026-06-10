@@ -1,4 +1,34 @@
-(ns stevetrading.engine.machines)
+(ns stevetrading.engine.machines
+  "The four engine state machines as data-driven transition tables.
+
+  Normative: ENGINE_STATE_MACHINES_V0.1 — §4.2 (strategy), §5.2 (order),
+  §6.2 (recovery), §7.2 (health) transition tables transcribed completely;
+  §5.3/§5.4 (order terminal states + illegal transitions); §8 (duplicate /
+  out-of-order / illegal handling).
+
+  Representation:
+  - `transition-table` is a vector of row maps
+    {:machine :from :trigger :guard :to :effects}.
+  - Triggers are canonical fact types (`:fact/...`) where the tables name a
+    fact, control-event keywords (`:event/...`) where they name a control
+    event, and `:reconciled/...` keywords for the §5.2 reconciliation-result
+    triggers (\"reconciled open status\" etc.).
+  - Where one table row names two trigger spellings (\"broker cancel
+    acknowledgement or cancelled status\") it is transcribed as two rows,
+    one per concrete trigger.
+  - Guards are keywords resolved in `guard-fns`; each guard fn takes a
+    single guard-ctx map. A nil guard means unconditional.
+  - Quantities in guard-ctx may be Decimal or decimal strings; they are
+    coerced at the edge of guard logic.
+
+  `transition` result reasons:
+  - :no-row       — no table row for (machine, from, trigger)
+  - :guard-failed — rows exist but every guard rejected the ctx
+  - :duplicate    — trigger arrived in a terminal state the table already
+                    resolved (§8.1): converge, no effects
+  - :illegal      — a §5.4 explicitly-forbidden transition; the fold layer
+                    emits a fault fact for these (§8.3)"
+  (:import decimal))
 
 (def lifecycle-machine-ids
   #{:machine/strategy
@@ -10,3 +40,492 @@
   [machine-id]
   (contains? lifecycle-machine-ids machine-id))
 
+;; ---------------------------------------------------------------------------
+;; Decimal coercion (guard-logic edge)
+;; ---------------------------------------------------------------------------
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn ->decimal
+  "Coerce a Decimal or decimal string to Decimal; nil passes through."
+  [v]
+  (cond
+    (nil? v) nil
+    (instance? decimal/Decimal v) v
+    :else (decimal/Decimal (str v))))
+
+(defn- dec-pos?
+  [v]
+  (let [d (->decimal v)]
+    (and (some? d) (> d dec-zero))))
+
+(defn- dec-zero?
+  [v]
+  (let [d (->decimal v)]
+    (and (some? d) (= d dec-zero))))
+
+;; ---------------------------------------------------------------------------
+;; Guard registry — every guard takes one guard-ctx map
+;; ---------------------------------------------------------------------------
+
+(def guard-fns
+  {;; --- order machine (§5.2) ---
+   ;; Schema validity / lineage default to true: the fold layer validates
+   ;; payloads and routes facts to a machine instance by order-intent-id
+   ;; before calling transition, so absence of the ctx key means "proven".
+   :guard/schema-valid
+   (fn [ctx] (get ctx :schema-valid? true))
+
+   :guard/lineage-proven
+   (fn [ctx] (get ctx :lineage-proven? true))
+
+   :guard/submit-idempotency-valid
+   (fn [ctx] (and (= :command-kind/submit (:command/kind ctx))
+                  (get ctx :idempotency-valid? true)))
+
+   :guard/cancel-allowed
+   (fn [ctx] (and (= :command-kind/cancel (:command/kind ctx))
+                  (get ctx :cancel-allowed? true)))
+
+   :guard/cancel-remaining-qty-positive
+   (fn [ctx] (and (= :command-kind/cancel (:command/kind ctx))
+                  (dec-pos? (:remaining-qty ctx))))
+
+   :guard/remaining-qty-positive
+   (fn [ctx] (dec-pos? (:remaining-qty ctx)))
+
+   :guard/remaining-qty-zero
+   (fn [ctx] (dec-zero? (:remaining-qty ctx)))
+
+   :guard/broker-cancelled-no-fill-qty
+   (fn [ctx] (and (= :broker-status/cancelled (:broker/status ctx))
+                  (dec-zero? (:filled-qty ctx))))
+
+   ;; §5.2 cancel-requested row guard "remaining quantity positive or zero
+   ;; and not filled": cancellation is acceptable for any remaining quantity
+   ;; as long as the order did not fully fill — i.e. remaining qty positive.
+   :guard/not-filled
+   (fn [ctx] (dec-pos? (:remaining-qty ctx)))
+
+   :guard/broker-cancelled-not-filled
+   (fn [ctx] (and (= :broker-status/cancelled (:broker/status ctx))
+                  (dec-pos? (:remaining-qty ctx))))
+
+   :guard/ack-status-ambiguous
+   (fn [ctx] (get ctx :ambiguous? true))
+
+   :guard/external-truth-ambiguous
+   (fn [ctx] (get ctx :ambiguous? true))
+
+   ;; §5.4 "cancelled to filled without new lineage proving the prior state
+   ;; was wrong" — the exception requires explicit proof.
+   :guard/new-lineage-proof
+   (fn [ctx] (true? (:lineage/new-proof? ctx)))
+
+   ;; --- strategy machine (§4.2) — conservative: explicit ctx required ---
+   :guard/control-plane-route-valid
+   (fn [ctx] (boolean (get ctx :route-valid? false)))
+
+   :guard/dependencies-healthy-history-loaded
+   (fn [ctx] (and (get ctx :dependencies-healthy? false)
+                  (get ctx :history-loaded? false)))
+
+   :guard/degradation-policy-allows-continue
+   (fn [ctx] (boolean (get ctx :degradation-policy-allows-continue? false)))
+
+   :guard/may-continue-within-risk-policy
+   (fn [ctx] (boolean (get ctx :may-continue? false)))
+
+   :guard/warmup-and-dependencies-healthy
+   (fn [ctx] (and (get ctx :warmup-satisfied? false)
+                  (get ctx :dependencies-healthy? false)))
+
+   :guard/explicit-recovery-authorization
+   (fn [ctx] (boolean (get ctx :recovery-authorized? false)))
+
+   ;; --- recovery machine (§6.2) ---
+   :guard/fallback-allowed
+   (fn [ctx] (boolean (get ctx :fallback-allowed? false)))
+
+   :guard/no-reconciliation-required
+   (fn [ctx] (not (get ctx :reconciliation-required? false)))
+
+   :guard/reconciliation-required
+   (fn [ctx] (boolean (get ctx :reconciliation-required? false)))
+
+   :guard/no-material-degradation
+   (fn [ctx] (not (get ctx :degradation-remains? false)))
+
+   :guard/non-fatal-degradation-remains
+   (fn [ctx] (boolean (get ctx :degradation-remains? false)))
+
+   :guard/all-blocking-checks-pass
+   (fn [ctx] (boolean (get ctx :blocking-checks-pass? false)))
+
+   ;; --- health machine (§7.2) ---
+   :guard/recovery-ready-or-allowed-degraded
+   (fn [ctx] (let [rs (:recovery-state ctx)]
+               (or (= :ready rs)
+                   (and (= :degraded-ready rs)
+                        (get ctx :degraded-ready-allowed? false)))))
+
+   :guard/all-required-dependencies-healthy
+   (fn [ctx] (boolean (get ctx :dependencies-healthy? false)))})
+
+;; ---------------------------------------------------------------------------
+;; Transition tables
+;; ---------------------------------------------------------------------------
+
+(def strategy-transition-table
+  "ENGINE_STATE_MACHINES §4.2 — complete transcription.
+  The table rows \"kill switch or control violation\" / \"kill switch or
+  invariant violation\" share the trigger :event/kill-switch-or-violation."
+  [{:machine :machine/strategy :from :inactive
+    :trigger :event/strategy-enabled
+    :guard :guard/control-plane-route-valid
+    :to :warming-up :effects [:effect/emit-lifecycle-fact]}
+   {:machine :machine/strategy :from :warming-up
+    :trigger :event/warmup-satisfied
+    :guard :guard/dependencies-healthy-history-loaded
+    :to :active :effects [:effect/emit-lifecycle-fact]}
+   {:machine :machine/strategy :from :warming-up
+    :trigger :event/dependency-degradation
+    :guard :guard/degradation-policy-allows-continue
+    :to :degraded :effects [:effect/emit-degradation-fact]}
+   {:machine :machine/strategy :from :active
+    :trigger :event/dependency-degradation
+    :guard :guard/may-continue-within-risk-policy
+    :to :degraded :effects [:effect/emit-degradation-fact]}
+   {:machine :machine/strategy :from :degraded
+    :trigger :event/degradation-cleared
+    :guard :guard/warmup-and-dependencies-healthy
+    :to :active :effects [:effect/emit-recovery-fact]}
+   {:machine :machine/strategy :from :inactive
+    :trigger :event/kill-switch-or-violation
+    :guard nil
+    :to :halted :effects [:effect/emit-control-violation-fact]}
+   {:machine :machine/strategy :from :warming-up
+    :trigger :event/kill-switch-or-violation
+    :guard nil
+    :to :halted :effects [:effect/emit-halt-fact]}
+   {:machine :machine/strategy :from :active
+    :trigger :event/kill-switch-or-violation
+    :guard nil
+    :to :halted :effects [:effect/emit-halt-fact]}
+   {:machine :machine/strategy :from :degraded
+    :trigger :event/kill-switch-or-violation
+    :guard nil
+    :to :halted :effects [:effect/emit-halt-fact]}
+   {:machine :machine/strategy :from :halted
+    :trigger :event/operator-reset
+    :guard :guard/explicit-recovery-authorization
+    :to :inactive :effects [:effect/emit-reset-fact]}])
+
+(def order-transition-table
+  "ENGINE_STATE_MACHINES §5.2 — complete transcription (every row, including
+  cancel races and orphaned-needs-reconcile rows). The single table row
+  \"broker cancel acknowledgement or cancelled status\" appears as two rows
+  (:fact/cancel-ack-accepted and :fact/broker-order-status-observed)."
+  [{:machine :machine/order :from :absent
+    :trigger :fact/order-intent-created
+    :guard :guard/schema-valid
+    :to :intent-created :effects [:effect/register-unresolved-lineage]}
+   {:machine :machine/order :from :intent-created
+    :trigger :fact/command-dispatched
+    :guard :guard/submit-idempotency-valid
+    :to :submit-requested :effects [:effect/record-dispatch-metadata]}
+   {:machine :machine/order :from :intent-created
+    :trigger :fact/broker-ack-accepted
+    :guard :guard/lineage-proven
+    :to :acknowledged :effects [:effect/record-external-correlation]}
+   {:machine :machine/order :from :intent-created
+    :trigger :fact/broker-ack-rejected
+    :guard :guard/lineage-proven
+    :to :rejected :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :submit-requested
+    :trigger :fact/broker-ack-accepted
+    :guard :guard/lineage-proven
+    :to :acknowledged :effects [:effect/record-external-correlation]}
+   {:machine :machine/order :from :submit-requested
+    :trigger :fact/broker-ack-rejected
+    :guard :guard/lineage-proven
+    :to :rejected :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :submit-requested
+    :trigger :event/reconciliation-anomaly
+    :guard :guard/ack-status-ambiguous
+    :to :orphaned-needs-reconcile :effects [:effect/emit-anomaly-fact]}
+   {:machine :machine/order :from :acknowledged
+    :trigger :fact/fill-observed
+    :guard :guard/remaining-qty-positive
+    :to :partially-filled :effects [:effect/update-fill-lineage]}
+   {:machine :machine/order :from :acknowledged
+    :trigger :fact/fill-observed
+    :guard :guard/remaining-qty-zero
+    :to :filled :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :acknowledged
+    :trigger :fact/command-dispatched
+    :guard :guard/cancel-allowed
+    :to :cancel-requested :effects [:effect/record-cancel-dispatch]}
+   {:machine :machine/order :from :acknowledged
+    :trigger :fact/broker-order-status-observed
+    :guard :guard/broker-cancelled-no-fill-qty
+    :to :cancelled :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :partially-filled
+    :trigger :fact/fill-observed
+    :guard :guard/remaining-qty-positive
+    :to :partially-filled :effects [:effect/accumulate-fill-facts]}
+   {:machine :machine/order :from :partially-filled
+    :trigger :fact/fill-observed
+    :guard :guard/remaining-qty-zero
+    :to :filled :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :partially-filled
+    :trigger :fact/command-dispatched
+    :guard :guard/cancel-remaining-qty-positive
+    :to :cancel-requested :effects [:effect/record-cancel-dispatch]}
+   {:machine :machine/order :from :cancel-requested
+    :trigger :fact/fill-observed
+    :guard :guard/remaining-qty-positive
+    :to :partially-filled :effects [:effect/apply-cancel-race-rule]}
+   {:machine :machine/order :from :cancel-requested
+    :trigger :fact/fill-observed
+    :guard :guard/remaining-qty-zero
+    :to :filled :effects [:effect/resolve-order-from-fill-truth]}
+   {:machine :machine/order :from :cancel-requested
+    :trigger :fact/cancel-ack-accepted
+    :guard :guard/not-filled
+    :to :cancelled :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :cancel-requested
+    :trigger :fact/broker-order-status-observed
+    :guard :guard/broker-cancelled-not-filled
+    :to :cancelled :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :cancel-requested
+    :trigger :event/reconciliation-anomaly
+    :guard :guard/external-truth-ambiguous
+    :to :orphaned-needs-reconcile :effects [:effect/emit-anomaly-fact]}
+   {:machine :machine/order :from :orphaned-needs-reconcile
+    :trigger :reconciled/open-status
+    :guard :guard/lineage-proven
+    :to :acknowledged :effects [:effect/restore-unresolved-state]}
+   {:machine :machine/order :from :orphaned-needs-reconcile
+    :trigger :reconciled/partial-fill
+    :guard :guard/lineage-proven
+    :to :partially-filled :effects [:effect/restore-fill-lineage]}
+   {:machine :machine/order :from :orphaned-needs-reconcile
+    :trigger :reconciled/complete-fill
+    :guard :guard/lineage-proven
+    :to :filled :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :orphaned-needs-reconcile
+    :trigger :reconciled/reject
+    :guard :guard/lineage-proven
+    :to :rejected :effects [:effect/resolve-order]}
+   {:machine :machine/order :from :orphaned-needs-reconcile
+    :trigger :reconciled/cancel
+    :guard :guard/lineage-proven
+    :to :cancelled :effects [:effect/resolve-order]}])
+
+(def recovery-transition-table
+  "ENGINE_STATE_MACHINES §6.2 — complete transcription."
+  [{:machine :machine/recovery :from :not-started
+    :trigger :event/engine-boot
+    :guard nil
+    :to :loading-snapshot :effects [:effect/emit-recovery-started]}
+   {:machine :machine/recovery :from :loading-snapshot
+    :trigger :event/snapshot-accepted
+    :guard nil
+    :to :replaying-facts :effects [:effect/load-snapshot-state]}
+   {:machine :machine/recovery :from :loading-snapshot
+    :trigger :event/no-valid-snapshot
+    :guard :guard/fallback-allowed
+    :to :replaying-facts
+    :effects [:effect/begin-fact-replay-from-origin-or-watermark]}
+   {:machine :machine/recovery :from :loading-snapshot
+    :trigger :event/snapshot-parse-failure-no-fallback
+    :guard nil
+    :to :recovery-failed :effects [:effect/emit-fault]}
+   {:machine :machine/recovery :from :replaying-facts
+    :trigger :event/fact-replay-complete
+    :guard :guard/no-reconciliation-required
+    :to :ready :effects [:effect/emit-recovery-completed]}
+   {:machine :machine/recovery :from :replaying-facts
+    :trigger :event/fact-replay-complete
+    :guard :guard/reconciliation-required
+    :to :reconciling-broker :effects [:effect/issue-broker-query-commands]}
+   {:machine :machine/recovery :from :replaying-facts
+    :trigger :event/replay-ambiguity-violates-safety
+    :guard nil
+    :to :blocked :effects [:effect/emit-anomaly-fact]}
+   {:machine :machine/recovery :from :reconciling-broker
+    :trigger :event/reconciliation-complete
+    :guard :guard/no-material-degradation
+    :to :ready :effects [:effect/emit-recovery-completed]}
+   {:machine :machine/recovery :from :reconciling-broker
+    :trigger :event/reconciliation-complete
+    :guard :guard/non-fatal-degradation-remains
+    :to :degraded-ready :effects [:effect/emit-degradation-fact]}
+   {:machine :machine/recovery :from :reconciling-broker
+    :trigger :event/ambiguity-unsafe-exposure
+    :guard nil
+    :to :blocked :effects [:effect/emit-anomaly-fact]}
+   {:machine :machine/recovery :from :reconciling-broker
+    :trigger :event/unrecoverable-fault
+    :guard nil
+    :to :recovery-failed :effects [:effect/emit-fault]}
+   {:machine :machine/recovery :from :degraded-ready
+    :trigger :event/degradation-cleared-before-trading
+    :guard :guard/all-blocking-checks-pass
+    :to :ready :effects [:effect/emit-recovery-fact]}])
+
+(def health-transition-table
+  "ENGINE_STATE_MACHINES §7.2 — complete transcription."
+  [{:machine :machine/health :from :starting
+    :trigger :event/startup-checks-pass
+    :guard :guard/recovery-ready-or-allowed-degraded
+    :to :healthy :effects [:effect/emit-heartbeat]}
+   {:machine :machine/health :from :starting
+    :trigger :event/startup-checks-partially-fail
+    :guard :guard/degradation-policy-allows-continue
+    :to :degraded :effects [:effect/emit-degradation-fact]}
+   {:machine :machine/health :from :healthy
+    :trigger :event/dependency-degradation
+    :guard :guard/degradation-policy-allows-continue
+    :to :degraded :effects [:effect/emit-degradation-fact]}
+   {:machine :machine/health :from :degraded
+    :trigger :event/degradations-cleared
+    :guard :guard/all-required-dependencies-healthy
+    :to :healthy :effects [:effect/emit-recovery-fact]}
+   {:machine :machine/health :from :healthy
+    :trigger :event/shutdown-requested
+    :guard nil
+    :to :stopping :effects [:effect/emit-heartbeat]}
+   {:machine :machine/health :from :degraded
+    :trigger :event/shutdown-requested
+    :guard nil
+    :to :stopping :effects [:effect/emit-heartbeat]}
+   {:machine :machine/health :from :starting
+    :trigger :event/shutdown-requested
+    :guard nil
+    :to :stopping :effects [:effect/emit-heartbeat]}
+   {:machine :machine/health :from :stopping
+    :trigger :event/process-shutdown-complete
+    :guard nil
+    :to :stopped :effects [:effect/emit-final-heartbeat]}])
+
+(def transition-table
+  "All four machines' rows in one vector."
+  (vec (concat strategy-transition-table
+               order-transition-table
+               recovery-transition-table
+               health-transition-table)))
+
+;; ---------------------------------------------------------------------------
+;; Terminal states (§5.3 for order; §7.3 \"stopped is terminal\"; the
+;; recovery end states have no outgoing rows except degraded-ready)
+;; ---------------------------------------------------------------------------
+
+(def terminal-states
+  {:machine/order #{:filled :cancelled :rejected}
+   :machine/strategy #{}
+   :machine/recovery #{:ready :blocked :recovery-failed}
+   :machine/health #{:stopped}})
+
+(defn terminal?
+  [machine-id state]
+  (contains? (get terminal-states machine-id #{}) state))
+
+;; ---------------------------------------------------------------------------
+;; §5.4 explicitly illegal order transitions, as data
+;; ---------------------------------------------------------------------------
+
+(def illegal-transition-rows
+  "ENGINE_STATE_MACHINES §5.4. Each row marks (machine, from, trigger) as
+  illegal; an optional :unless guard keyword names the exception (\"without
+  new lineage proving the prior state was wrong\"). The fourth §5.4 rule —
+  any transition that changes order-intent-id — is enforced via the
+  :order-intent-id-changed? guard-ctx flag in `transition`."
+  [;; filled → any non-terminal state
+   {:machine :machine/order :from :filled :trigger :fact/order-intent-created}
+   {:machine :machine/order :from :filled :trigger :fact/command-dispatched}
+   {:machine :machine/order :from :filled :trigger :fact/broker-ack-accepted}
+   {:machine :machine/order :from :filled :trigger :event/reconciliation-anomaly}
+   {:machine :machine/order :from :filled :trigger :reconciled/open-status}
+   {:machine :machine/order :from :filled :trigger :reconciled/partial-fill}
+   ;; cancelled → filled without new lineage proving the prior state wrong
+   {:machine :machine/order :from :cancelled :trigger :fact/fill-observed
+    :unless :guard/new-lineage-proof}
+   {:machine :machine/order :from :cancelled :trigger :reconciled/complete-fill
+    :unless :guard/new-lineage-proof}
+   ;; rejected → acknowledged for the same order intent
+   {:machine :machine/order :from :rejected :trigger :fact/broker-ack-accepted}
+   {:machine :machine/order :from :rejected :trigger :reconciled/open-status}])
+
+(defn- illegal-transition?
+  [machine-id from trigger guard-ctx]
+  (some (fn [row]
+          (and (= machine-id (:machine row))
+               (= from (:from row))
+               (= trigger (:trigger row))
+               (let [exception-guard (:unless row)]
+                 (or (nil? exception-guard)
+                     (not ((get guard-fns exception-guard) guard-ctx))))))
+        illegal-transition-rows))
+
+;; ---------------------------------------------------------------------------
+;; Transition evaluation
+;; ---------------------------------------------------------------------------
+
+(defn- guard-passes?
+  [guard-kw guard-ctx]
+  (if (nil? guard-kw)
+    true
+    (if-let [guard-fn (get guard-fns guard-kw)]
+      (boolean (guard-fn guard-ctx))
+      (throw (ex-info "Unknown guard keyword" {:guard guard-kw})))))
+
+(defn transition
+  "Evaluate one transition: (transition machine-id current-state trigger
+  guard-ctx) →
+
+    {:transition/applied? true
+     :transition/from current-state
+     :transition/to next-state
+     :transition/effects [...]}
+
+  or
+
+    {:transition/applied? false
+     :transition/reason :no-row | :guard-failed | :duplicate | :illegal}
+
+  Resolution order: §5.4 illegal check → matching table rows (first row
+  whose guard passes wins, in table order) → terminal-state duplicate
+  convergence (§8.1) → :no-row."
+  [machine-id current-state trigger guard-ctx]
+  (when-not (known-machine? machine-id)
+    (throw (ex-info "Unknown machine" {:machine machine-id})))
+  (let [guard-ctx (or guard-ctx {})]
+    (cond
+      ;; §5.4: any transition that changes order-intent-id
+      (true? (:order-intent-id-changed? guard-ctx))
+      {:transition/applied? false :transition/reason :illegal}
+
+      (illegal-transition? machine-id current-state trigger guard-ctx)
+      {:transition/applied? false :transition/reason :illegal}
+
+      :else
+      (let [rows (filter (fn [row]
+                           (and (= machine-id (:machine row))
+                                (= current-state (:from row))
+                                (= trigger (:trigger row))))
+                         transition-table)]
+        (if (seq rows)
+          (if-let [row (first (filter #(guard-passes? (:guard %) guard-ctx)
+                                      rows))]
+            {:transition/applied? true
+             :transition/from current-state
+             :transition/to (:to row)
+             :transition/effects (:effects row)}
+            {:transition/applied? false :transition/reason :guard-failed})
+          (if (terminal? machine-id current-state)
+            ;; §8.1: duplicate observation in a state the table already
+            ;; resolved — converge without re-transitioning.
+            {:transition/applied? false :transition/reason :duplicate}
+            {:transition/applied? false :transition/reason :no-row}))))))

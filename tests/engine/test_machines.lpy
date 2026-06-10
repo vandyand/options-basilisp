@@ -1,0 +1,199 @@
+(ns engine.test-machines
+  "Table-driven tests for the four engine state machines
+  (ENGINE_STATE_MACHINES_V0.1 §4.2/§5.2/§6.2/§7.2, §5.3-§5.4, §8)."
+  (:import decimal)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.enums :as enums]
+            [stevetrading.engine.machines :as m]))
+
+(def passing-ctx
+  "For each guard keyword, a guard-ctx that satisfies it. Where two rows
+  share (machine, from, trigger), the ctx for the later row's guard must
+  fail the earlier row's guard — verified by the every-row test landing on
+  each row's own :to."
+  {nil {}
+   :guard/schema-valid {}
+   :guard/lineage-proven {}
+   :guard/submit-idempotency-valid {:command/kind :command-kind/submit}
+   :guard/cancel-allowed {:command/kind :command-kind/cancel}
+   :guard/cancel-remaining-qty-positive {:command/kind :command-kind/cancel
+                                         :remaining-qty "1"}
+   :guard/remaining-qty-positive {:remaining-qty "1"}
+   :guard/remaining-qty-zero {:remaining-qty "0"}
+   :guard/broker-cancelled-no-fill-qty {:broker/status :broker-status/cancelled
+                                        :filled-qty "0"}
+   :guard/not-filled {:remaining-qty "1"}
+   :guard/broker-cancelled-not-filled {:broker/status :broker-status/cancelled
+                                       :remaining-qty "1"}
+   :guard/ack-status-ambiguous {}
+   :guard/external-truth-ambiguous {}
+   :guard/control-plane-route-valid {:route-valid? true}
+   :guard/dependencies-healthy-history-loaded {:dependencies-healthy? true
+                                               :history-loaded? true}
+   :guard/degradation-policy-allows-continue
+   {:degradation-policy-allows-continue? true}
+   :guard/may-continue-within-risk-policy {:may-continue? true}
+   :guard/warmup-and-dependencies-healthy {:warmup-satisfied? true
+                                           :dependencies-healthy? true}
+   :guard/explicit-recovery-authorization {:recovery-authorized? true}
+   :guard/fallback-allowed {:fallback-allowed? true}
+   :guard/no-reconciliation-required {}
+   :guard/reconciliation-required {:reconciliation-required? true}
+   :guard/no-material-degradation {}
+   :guard/non-fatal-degradation-remains {:degradation-remains? true}
+   :guard/all-blocking-checks-pass {:blocking-checks-pass? true}
+   :guard/recovery-ready-or-allowed-degraded {:recovery-state :ready}
+   :guard/all-required-dependencies-healthy {:dependencies-healthy? true}})
+
+(deftest table-completeness
+  (testing "every §4.2/§5.2/§6.2/§7.2 row is transcribed"
+    (is (= 10 (count m/strategy-transition-table)))
+    (is (= 24 (count m/order-transition-table)))
+    (is (= 12 (count m/recovery-transition-table)))
+    (is (= 8 (count m/health-transition-table)))
+    (is (= 54 (count m/transition-table))))
+  (testing "every row references known machines, states, and guards"
+    (let [state-sets {:machine/strategy enums/strategy-lifecycle-states
+                      :machine/order (conj enums/order-lifecycle-states :absent)
+                      :machine/recovery enums/recovery-states
+                      :machine/health enums/health-states}]
+      (doseq [row m/transition-table]
+        (is (m/known-machine? (:machine row)) (pr-str row))
+        (is (contains? (get state-sets (:machine row)) (:from row))
+            (pr-str row))
+        (is (contains? (get state-sets (:machine row)) (:to row))
+            (pr-str row))
+        (is (or (nil? (:guard row))
+                (contains? m/guard-fns (:guard row)))
+            (pr-str row))
+        (is (vector? (:effects row)) (pr-str row))))))
+
+(deftest every-legal-row-applies
+  (doseq [row m/transition-table]
+    (let [ctx (get passing-ctx (:guard row) ::missing)
+          _ (is (not= ::missing ctx)
+                (str "no passing ctx for guard " (:guard row)))
+          res (m/transition (:machine row) (:from row) (:trigger row) ctx)]
+      (is (true? (:transition/applied? res)) (pr-str row))
+      (is (= (:to row) (:transition/to res)) (pr-str row))
+      (is (= (:effects row) (:transition/effects res)) (pr-str row)))))
+
+(deftest guard-failure-and-no-row
+  (testing "rows exist but guards reject"
+    (is (= {:transition/applied? false :transition/reason :guard-failed}
+           (m/transition :machine/order :acknowledged :fact/fill-observed {})))
+    (is (= {:transition/applied? false :transition/reason :guard-failed}
+           (m/transition :machine/strategy :inactive :event/strategy-enabled
+                         {:route-valid? false}))))
+  (testing "no row at all"
+    (is (= {:transition/applied? false :transition/reason :no-row}
+           (m/transition :machine/order :intent-created :fact/fill-observed
+                         {:remaining-qty "1"})))
+    (is (= {:transition/applied? false :transition/reason :no-row}
+           (m/transition :machine/health :stopping :event/dependency-degradation
+                         {})))))
+
+(deftest illegal-transitions-are-rejected
+  (testing "§5.4: filled → any non-terminal state"
+    (doseq [trigger [:fact/order-intent-created
+                     :fact/command-dispatched
+                     :fact/broker-ack-accepted
+                     :event/reconciliation-anomaly
+                     :reconciled/open-status
+                     :reconciled/partial-fill]]
+      (is (= {:transition/applied? false :transition/reason :illegal}
+             (m/transition :machine/order :filled trigger {}))
+          (str trigger))))
+  (testing "§5.4: cancelled → filled without new lineage"
+    (is (= {:transition/applied? false :transition/reason :illegal}
+           (m/transition :machine/order :cancelled :fact/fill-observed
+                         {:remaining-qty "0"})))
+    (is (= {:transition/applied? false :transition/reason :illegal}
+           (m/transition :machine/order :cancelled :reconciled/complete-fill
+                         {}))))
+  (testing "cancelled → filled WITH new lineage proof is not illegal
+            (converges as duplicate — no table row authorizes it)"
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/order :cancelled :fact/fill-observed
+                         {:lineage/new-proof? true}))))
+  (testing "§5.4: rejected → acknowledged"
+    (is (= {:transition/applied? false :transition/reason :illegal}
+           (m/transition :machine/order :rejected :fact/broker-ack-accepted {})))
+    (is (= {:transition/applied? false :transition/reason :illegal}
+           (m/transition :machine/order :rejected :reconciled/open-status {}))))
+  (testing "§5.4: any transition that changes order-intent-id"
+    (is (= {:transition/applied? false :transition/reason :illegal}
+           (m/transition :machine/order :acknowledged :fact/fill-observed
+                         {:remaining-qty "0"
+                          :order-intent-id-changed? true})))))
+
+(deftest duplicate-convergence
+  (testing "§8.1: triggers arriving in a resolved terminal state converge"
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/order :filled :fact/fill-observed
+                         {:remaining-qty "0"})))
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/order :filled :fact/cancel-ack-accepted
+                         {:remaining-qty "0"})))
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/order :cancelled :fact/cancel-ack-accepted
+                         {})))
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/order :rejected :fact/broker-ack-rejected
+                         {})))
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/health :stopped
+                         :event/process-shutdown-complete {})))))
+
+(deftest cancel-race-rows
+  (testing "fill during cancel-requested wins per fill truth"
+    (is (= :partially-filled
+           (:transition/to
+            (m/transition :machine/order :cancel-requested :fact/fill-observed
+                          {:remaining-qty (decimal/Decimal "1")}))))
+    (is (= :filled
+           (:transition/to
+            (m/transition :machine/order :cancel-requested :fact/fill-observed
+                          {:remaining-qty (decimal/Decimal "0")})))))
+  (testing "cancel ack while unfilled cancels"
+    (is (= :cancelled
+           (:transition/to
+            (m/transition :machine/order :cancel-requested
+                          :fact/cancel-ack-accepted
+                          {:remaining-qty "2"})))))
+  (testing "cancel ack after the order already filled stays filled"
+    (is (= {:transition/applied? false :transition/reason :duplicate}
+           (m/transition :machine/order :filled :fact/cancel-ack-accepted
+                         {:remaining-qty "0"})))))
+
+(deftest orphaned-reconciliation-rows
+  (doseq [[trigger expected] {:reconciled/open-status :acknowledged
+                              :reconciled/partial-fill :partially-filled
+                              :reconciled/complete-fill :filled
+                              :reconciled/reject :rejected
+                              :reconciled/cancel :cancelled}]
+    (let [res (m/transition :machine/order :orphaned-needs-reconcile trigger {})]
+      (is (true? (:transition/applied? res)) (str trigger))
+      (is (= expected (:transition/to res)) (str trigger)))))
+
+(deftest decimal-string-coercion-at-guard-edge
+  (testing "guards accept Decimal and decimal strings interchangeably"
+    (is (= :filled
+           (:transition/to
+            (m/transition :machine/order :acknowledged :fact/fill-observed
+                          {:remaining-qty (decimal/Decimal "0")}))))
+    (is (= :filled
+           (:transition/to
+            (m/transition :machine/order :acknowledged :fact/fill-observed
+                          {:remaining-qty "0.0"}))))
+    (is (= :partially-filled
+           (:transition/to
+            (m/transition :machine/order :acknowledged :fact/fill-observed
+                          {:remaining-qty "0.5"}))))))
+
+(deftest terminal-state-sets
+  (is (= #{:filled :cancelled :rejected} (:machine/order m/terminal-states)))
+  (is (= #{:stopped} (:machine/health m/terminal-states)))
+  (is (m/terminal? :machine/order :filled))
+  (is (not (m/terminal? :machine/order :partially-filled)))
+  (is (not (m/terminal? :machine/strategy :halted))))

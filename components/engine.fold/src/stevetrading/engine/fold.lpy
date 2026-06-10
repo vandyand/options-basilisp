@@ -1,0 +1,522 @@
+(ns stevetrading.engine.fold
+  "Pure fact fold: (fold-fact state fact) → {:state state'
+  :emitted-facts [...] :pending-commands [...]}.
+
+  Normative: ENGINE_STATE_AND_RECOVERY_V0.1 §4 (state shape), §6 (decision
+  cycle); ENGINE_STATE_MACHINES_V0.1 (transition tables, §8 handling rules).
+
+  Conventions (documented decisions):
+  - Resolved (terminal) orders stay in :engine/unresolved-orders with
+    :order/resolved? true — later phases need lineage lookup of intent
+    context for ledger derivation (see engine.state docstring).
+  - Fill dedupe key: [source-system account-id broker-order-id fill-id]
+    (CANONICAL_SCHEMAS §5.2.5 broker context). A duplicate fill fact folds
+    to a state `=` to the input state with no emissions.
+  - Illegal transitions (§5.4) emit a :fact/fault-recorded envelope with
+    payload {:fault/reason :invariant/illegal-transition :fault/machine
+    :fault/from :fault/trigger :order-intent/id}; state is otherwise
+    unchanged. Lifecycle facts for an unknown order-intent-id emit a fault
+    with reason :invariant/unknown-order-intent.
+  - :no-row / :guard-failed / :duplicate transition results converge as
+    no-ops (§8.1/§8.2): state unchanged, nothing emitted.
+  - :fact/command-dispatched payloads are expected to carry :command/type
+    and :order-intent/id; only submit/cancel trading commands drive the
+    order machine.
+  - A reconciliation anomaly arrives as :fact/fault-recorded with payload
+    :fault/kind :fault/reconciliation-anomaly + :order-intent/id and maps
+    to the :event/reconciliation-anomaly trigger.
+  - While an order is :orphaned-needs-reconcile, broker status / fill facts
+    map to the §5.2 :reconciled/* triggers.
+  - The broker watermark (:watermark/broker) advances to the fact's
+    occurred-at when a broker-originated fact applies a transition; the
+    market watermark (:watermark/market) advances on every market
+    observation fact."
+  (:import decimal)
+  (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.machines :as m]
+            [stevetrading.engine.state :as st]))
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn- result
+  ([state] (result state []))
+  ([state emitted]
+   {:state state :emitted-facts (vec emitted) :pending-commands []}))
+
+;; ---------------------------------------------------------------------------
+;; Fault emission (§8.3)
+;; ---------------------------------------------------------------------------
+
+(defn- fault-fact
+  [trigger-fact machine from trigger order-intent-id reason]
+  (sch/fact-envelope
+   (merge
+    (into {}
+          (filter (comp some? val)
+                  {:record/mode (:record/mode trigger-fact)
+                   :record/correlation-id (:record/correlation-id trigger-fact)
+                   :record/strategy-id (:record/strategy-id trigger-fact)
+                   :record/account-id (:record/account-id trigger-fact)}))
+    {:record/type :fact/fault-recorded
+     :record/source-system :engine/core
+     :record/causation-ids [(:record/id trigger-fact)]
+     :fact/occurred-at (:fact/recorded-at trigger-fact)
+     :fact/recorded-at (:fact/recorded-at trigger-fact)
+     :fact/payload {:fault/reason reason
+                    :fault/machine machine
+                    :fault/from from
+                    :fault/trigger trigger
+                    :order-intent/id order-intent-id}})))
+
+;; ---------------------------------------------------------------------------
+;; Order-machine helpers
+;; ---------------------------------------------------------------------------
+
+(defn- entry-remaining-qty
+  "Intent quantity minus cumulative filled quantity (Decimal)."
+  [entry]
+  (- (m/->decimal (:order/quantity entry))
+     (m/->decimal (or (:order/filled-quantity entry) "0"))))
+
+(defn- mark-resolved
+  [entry to]
+  (cond-> (assoc entry :order/lifecycle to)
+    (m/terminal? :machine/order to) (assoc :order/resolved? true)))
+
+(defn- fold-order-trigger
+  "Common order-machine fold: look up the entry for order-intent-id, run the
+  transition, apply (on-applied entry to) when it applies, emit a fault on
+  :illegal, converge as no-op otherwise. opts: {:broker-watermark? bool}."
+  [state fact order-intent-id trigger ctx on-applied opts]
+  (let [entry (st/unresolved-order state order-intent-id)]
+    (if (nil? entry)
+      (result state [(fault-fact fact :machine/order nil trigger
+                                 order-intent-id
+                                 :invariant/unknown-order-intent)])
+      (let [from (:order/lifecycle entry)
+            res (m/transition :machine/order from trigger ctx)]
+        (cond
+          (:transition/applied? res)
+          (let [state' (st/assoc-unresolved-order
+                        state order-intent-id
+                        (on-applied entry (:transition/to res)))
+                state' (if (:broker-watermark? opts)
+                         (st/record-watermark state' :watermark/broker
+                                              (:fact/occurred-at fact))
+                         state')]
+            (result state'))
+
+          (= :illegal (:transition/reason res))
+          (result state [(fault-fact fact :machine/order from trigger
+                                     order-intent-id
+                                     :invariant/illegal-transition)])
+
+          ;; :duplicate / :no-row / :guard-failed converge (§8.1/§8.2)
+          :else
+          (result state))))))
+
+;; ---------------------------------------------------------------------------
+;; Market observation facts
+;; ---------------------------------------------------------------------------
+
+(defn- fold-market
+  [state fact]
+  (let [fact-type (:record/type fact)
+        payload (:fact/payload fact)
+        instrument-id (:record/instrument-id fact)
+        at (:fact/occurred-at fact)
+        state (st/record-watermark state :watermark/market at)
+        state (cond
+                (and (= :fact/market-bar-observed fact-type)
+                     (some? instrument-id))
+                (st/record-bar state instrument-id payload at)
+
+                (and (= :fact/quote-observed fact-type)
+                     (some? instrument-id))
+                (st/record-quote state instrument-id payload at)
+
+                (and (= :fact/option-chain-observed fact-type)
+                     (some? instrument-id))
+                (st/record-chain state instrument-id payload at)
+
+                ;; :fact/calendar-session-observed advances the watermark only
+                :else state)]
+    (result state)))
+
+;; ---------------------------------------------------------------------------
+;; Order lifecycle facts
+;; ---------------------------------------------------------------------------
+
+(defn- fold-intent-created
+  [state fact]
+  (let [payload (:fact/payload fact)
+        order-intent-id (:order-intent/id payload)]
+    (cond
+      (nil? order-intent-id)
+      (result state [(fault-fact fact :machine/order :absent
+                                 :fact/order-intent-created nil
+                                 :invariant/unknown-order-intent)])
+
+      ;; duplicate intent fact for an already-registered intent → converge
+      (some? (st/unresolved-order state order-intent-id))
+      (result state)
+
+      :else
+      (let [res (m/transition :machine/order :absent
+                              :fact/order-intent-created
+                              {:schema-valid? true})]
+        (if (:transition/applied? res)
+          (result
+           (st/assoc-unresolved-order
+            state order-intent-id
+            {:order/intent-id order-intent-id
+             :order/strategy-id (:record/strategy-id fact)
+             :order/account-id (:record/account-id fact)
+             :order/instrument-id (or (:record/instrument-id fact)
+                                      (get-in payload
+                                              [:order-intent/legs 0
+                                               :instrument/id]))
+             :order/quantity (:order-intent/quantity payload)
+             :order/side (:order-intent/side payload)
+             :order/route (or (:order-intent/route payload)
+                              (:record/source-system fact))
+             :order/broker-order-id nil
+             :order/lifecycle (:transition/to res)
+             :order/creation-fact-id (:record/id fact)
+             :order/latest-broker-update-fact-id nil
+             :order/fill-fact-ids []
+             :order/fill-keys #{}
+             :order/filled-quantity "0"
+             :order/cancel-requested? false
+             :order/resolved? false}))
+          (result state))))))
+
+(defn- fold-command-dispatched
+  [state fact]
+  (let [payload (:fact/payload fact)
+        command-type (:command/type payload)
+        order-intent-id (:order-intent/id payload)]
+    (cond
+      (= :command/submit-order-intent command-type)
+      (fold-order-trigger
+       state fact order-intent-id :fact/command-dispatched
+       {:command/kind :command-kind/submit}
+       (fn [entry to]
+         (assoc entry
+                :order/lifecycle to
+                :order/dispatch-fact-id (:record/id fact)))
+       {})
+
+      (= :command/cancel-broker-order command-type)
+      (let [entry (st/unresolved-order state order-intent-id)]
+        (fold-order-trigger
+         state fact order-intent-id :fact/command-dispatched
+         {:command/kind :command-kind/cancel
+          :remaining-qty (when entry (entry-remaining-qty entry))}
+         (fn [entry to]
+           (assoc entry
+                  :order/lifecycle to
+                  :order/cancel-requested? true
+                  :order/cancel-dispatch-fact-id (:record/id fact)))
+         {}))
+
+      ;; non-trading command dispatches do not drive the order machine
+      :else
+      (result state))))
+
+(defn- fold-broker-ack-accepted
+  [state fact]
+  (let [payload (:fact/payload fact)]
+    (fold-order-trigger
+     state fact (:order-intent/id payload) :fact/broker-ack-accepted
+     {:lineage-proven? true}
+     (fn [entry to]
+       (assoc entry
+              :order/lifecycle to
+              :order/broker-order-id (:broker/order-id payload)
+              :order/latest-broker-update-fact-id (:record/id fact)))
+     {:broker-watermark? true})))
+
+(defn- fold-broker-ack-rejected
+  [state fact]
+  (let [payload (:fact/payload fact)]
+    (fold-order-trigger
+     state fact (:order-intent/id payload) :fact/broker-ack-rejected
+     {:lineage-proven? true}
+     (fn [entry to]
+       (-> entry
+           (mark-resolved to)
+           (assoc :order/latest-broker-update-fact-id (:record/id fact))))
+     {:broker-watermark? true})))
+
+(defn- fold-fill-observed
+  [state fact]
+  (let [payload (:fact/payload fact)
+        order-intent-id (:order-intent/id payload)
+        entry (st/unresolved-order state order-intent-id)]
+    (if (nil? entry)
+      (result state [(fault-fact fact :machine/order nil :fact/fill-observed
+                                 order-intent-id
+                                 :invariant/unknown-order-intent)])
+      (let [fill-key [(:broker/source-system payload)
+                      (:order/account-id entry)
+                      (:broker/order-id payload)
+                      (:fill/id payload)]]
+        (if (contains? (:order/fill-keys entry) fill-key)
+          ;; duplicate fill → state unchanged, nothing emitted
+          (result state)
+          (let [fill-qty (m/->decimal (:fill/quantity payload))
+                cumulative (+ (m/->decimal (or (:order/filled-quantity entry)
+                                               "0"))
+                              fill-qty)
+                remaining (- (m/->decimal (:order/quantity entry)) cumulative)
+                ;; clamp overfill to zero — treated as complete (documented)
+                remaining (if (< remaining dec-zero) dec-zero remaining)
+                from (:order/lifecycle entry)
+                ;; reconciled fills restore lineage via the §5.2
+                ;; orphaned-needs-reconcile reconciliation rows
+                trigger (if (= :orphaned-needs-reconcile from)
+                          (if (> remaining dec-zero)
+                            :reconciled/partial-fill
+                            :reconciled/complete-fill)
+                          :fact/fill-observed)]
+            (fold-order-trigger
+             state fact order-intent-id trigger
+             {:remaining-qty remaining :lineage-proven? true}
+             (fn [entry to]
+               (-> entry
+                   (mark-resolved to)
+                   (assoc :order/filled-quantity (str cumulative))
+                   (update :order/fill-fact-ids conj (:record/id fact))
+                   (update :order/fill-keys conj fill-key)))
+             {:broker-watermark? true})))))))
+
+(defn- broker-status->reconciled-trigger
+  [status]
+  (cond
+    (contains? #{:broker-status/new :broker-status/accepted
+                 :broker-status/open}
+               status)
+    :reconciled/open-status
+
+    (= :broker-status/partially-filled status) :reconciled/partial-fill
+    (= :broker-status/filled status) :reconciled/complete-fill
+    (= :broker-status/rejected status) :reconciled/reject
+
+    (contains? #{:broker-status/cancelled :broker-status/expired} status)
+    :reconciled/cancel
+
+    :else nil))
+
+(defn- fold-broker-status-observed
+  [state fact]
+  (let [payload (:fact/payload fact)
+        order-intent-id (:order-intent/id payload)
+        entry (st/unresolved-order state order-intent-id)
+        status (:broker/status payload)]
+    (if (and (some? entry)
+             (= :orphaned-needs-reconcile (:order/lifecycle entry)))
+      (if-let [trigger (broker-status->reconciled-trigger status)]
+        (fold-order-trigger
+         state fact order-intent-id trigger
+         {:lineage-proven? true}
+         (fn [entry to]
+           (-> entry
+               (mark-resolved to)
+               (assoc :order/latest-broker-update-fact-id (:record/id fact))))
+         {:broker-watermark? true})
+        (result state))
+      (fold-order-trigger
+       state fact order-intent-id :fact/broker-order-status-observed
+       {:broker/status status
+        :filled-qty (when entry (or (:order/filled-quantity entry) "0"))
+        :remaining-qty (when entry (entry-remaining-qty entry))}
+       (fn [entry to]
+         (-> entry
+             (mark-resolved to)
+             (assoc :order/latest-broker-update-fact-id (:record/id fact))))
+       {:broker-watermark? true}))))
+
+(defn- fold-cancel-ack-accepted
+  [state fact]
+  (let [payload (:fact/payload fact)
+        order-intent-id (:order-intent/id payload)
+        entry (st/unresolved-order state order-intent-id)]
+    (fold-order-trigger
+     state fact order-intent-id :fact/cancel-ack-accepted
+     {:remaining-qty (when entry (entry-remaining-qty entry))}
+     (fn [entry to]
+       (-> entry
+           (mark-resolved to)
+           (assoc :order/latest-broker-update-fact-id (:record/id fact))))
+     {:broker-watermark? true})))
+
+(defn- fold-cancel-ack-rejected
+  "§5.2 has no row for a cancel rejection: the order continues on its
+  current path (a later fill or status fact resolves it). No-op, but the
+  cancellation-requested flag stays true for operator visibility."
+  [state _fact]
+  (result state))
+
+;; ---------------------------------------------------------------------------
+;; Fault facts (reconciliation anomaly routing)
+;; ---------------------------------------------------------------------------
+
+(defn- fold-fault-recorded
+  [state fact]
+  (let [payload (:fact/payload fact)]
+    (if (and (= :fault/reconciliation-anomaly (:fault/kind payload))
+             (some? (:order-intent/id payload)))
+      (fold-order-trigger
+       state fact (:order-intent/id payload) :event/reconciliation-anomaly
+       {:ambiguous? true}
+       (fn [entry to] (assoc entry :order/lifecycle to))
+       {})
+      (result state))))
+
+;; ---------------------------------------------------------------------------
+;; Control facts
+;; ---------------------------------------------------------------------------
+
+(defn- fold-control-plane-activated
+  [state fact]
+  (let [payload (:fact/payload fact)
+        revision (:control-plane/revision payload)]
+    (result
+     (-> state
+         (update :engine/control-plane merge
+                 {:control-plane/revision revision
+                  :control-plane/activated-at (:fact/occurred-at fact)
+                  :control-plane/activation-fact-id (:record/id fact)})
+         (st/record-watermark :watermark/control-plane revision)))))
+
+(defn- halt-strategy
+  [state strategy-id]
+  (let [lifecycle (:strategy/lifecycle (st/strategy-state state strategy-id))
+        res (when lifecycle
+              (m/transition :machine/strategy lifecycle
+                            :event/kill-switch-or-violation {}))]
+    (if (and res (:transition/applied? res))
+      (st/update-strategy state strategy-id
+                          #(assoc % :strategy/lifecycle (:transition/to res)))
+      state)))
+
+(defn- kill-switch-scope-strategy-ids
+  "Strategy ids affected by a kill-switch payload. :scope/strategy halts the
+  named strategy; any other (or absent) scope is treated as global —
+  unknown scopes halt everything rather than nothing (safe default)."
+  [state payload]
+  (if (and (= :scope/strategy (:kill-switch/scope payload))
+           (some? (:kill-switch/strategy-id payload)))
+    [(:kill-switch/strategy-id payload)]
+    (keys (:engine/strategies state))))
+
+(defn- fold-kill-switch-activated
+  [state fact]
+  (let [payload (:fact/payload fact)
+        state (update state :engine/control-plane assoc
+                      :control-plane/kill-switch
+                      {:kill-switch/active? true
+                       :kill-switch/scope (get payload :kill-switch/scope
+                                               :scope/global)
+                       :kill-switch/strategy-id (:kill-switch/strategy-id
+                                                 payload)
+                       :kill-switch/fact-id (:record/id fact)})
+        state (reduce halt-strategy state
+                      (kill-switch-scope-strategy-ids state payload))]
+    (result state)))
+
+(defn- fold-kill-switch-cleared
+  "Clearing the switch does not un-halt strategies — that requires the
+  explicit operator-reset transition (§4.2 last row)."
+  [state fact]
+  (result
+   (update state :engine/control-plane assoc
+           :control-plane/kill-switch
+           {:kill-switch/active? false
+            :kill-switch/fact-id (:record/id fact)})))
+
+;; ---------------------------------------------------------------------------
+;; Strategy decision facts (§4.2 posture / last-decision tracking)
+;; ---------------------------------------------------------------------------
+
+(defn- fold-signal-decision
+  [state fact]
+  (let [payload (:fact/payload fact)]
+    (result
+     (st/update-strategy state (:record/strategy-id fact)
+                         #(assoc %
+                                 :strategy/posture (:decision/posture payload)
+                                 :strategy/last-decision-time
+                                 (:fact/occurred-at fact))))))
+
+;; ---------------------------------------------------------------------------
+;; Entry point
+;; ---------------------------------------------------------------------------
+
+(defn fold-fact
+  "Pure fold of one canonical fact into engine state. Returns
+  {:state state' :emitted-facts [...] :pending-commands [...]}.
+  Unrecognized fact types fold to the unchanged state."
+  [state fact]
+  (let [fact-type (:record/type fact)]
+    (cond
+      (contains? enums/market-fact-types fact-type)
+      (fold-market state fact)
+
+      (= :fact/order-intent-created fact-type)
+      (fold-intent-created state fact)
+
+      (= :fact/command-dispatched fact-type)
+      (fold-command-dispatched state fact)
+
+      (= :fact/broker-ack-accepted fact-type)
+      (fold-broker-ack-accepted state fact)
+
+      (= :fact/broker-ack-rejected fact-type)
+      (fold-broker-ack-rejected state fact)
+
+      (= :fact/fill-observed fact-type)
+      (fold-fill-observed state fact)
+
+      (= :fact/broker-order-status-observed fact-type)
+      (fold-broker-status-observed state fact)
+
+      (= :fact/cancel-ack-accepted fact-type)
+      (fold-cancel-ack-accepted state fact)
+
+      (= :fact/cancel-ack-rejected fact-type)
+      (fold-cancel-ack-rejected state fact)
+
+      (= :fact/fault-recorded fact-type)
+      (fold-fault-recorded state fact)
+
+      (= :fact/control-plane-activated fact-type)
+      (fold-control-plane-activated state fact)
+
+      (= :fact/kill-switch-activated fact-type)
+      (fold-kill-switch-activated state fact)
+
+      (= :fact/kill-switch-cleared fact-type)
+      (fold-kill-switch-cleared state fact)
+
+      (= :fact/signal-decision-produced fact-type)
+      (fold-signal-decision state fact)
+
+      :else
+      (result state))))
+
+(defn fold-facts
+  "Fold a sequence of facts. Returns {:state final-state
+  :emitted-facts [all emitted, in order] :pending-commands [...]}."
+  [state facts]
+  (reduce (fn [acc fact]
+            (let [res (fold-fact (:state acc) fact)]
+              {:state (:state res)
+               :emitted-facts (into (:emitted-facts acc)
+                                    (:emitted-facts res))
+               :pending-commands (into (:pending-commands acc)
+                                       (:pending-commands res))}))
+          {:state state :emitted-facts [] :pending-commands []}
+          facts))
