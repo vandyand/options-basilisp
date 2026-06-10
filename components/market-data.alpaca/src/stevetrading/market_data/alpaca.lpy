@@ -127,6 +127,8 @@
   the state atom. Returns the count of new bars."
   [{:keys [transport key-id secret] :as opts} state]
   (let [last-t (or (:t (peek (:bars @state)))
+                   (:seed-anchor @state)
+                   (:seed-start opts)
                    (recent-start (+ 3 (or (:warmup-bars opts) 8))))
         url (bars-url (assoc opts :start last-t))
         {:keys [status body error]} (transport {:url url :key-id key-id
@@ -144,28 +146,60 @@
                  :last-poll-at (utc-now-str))
           0))))
 
+(defn- emit-index
+  "First index in the held bar list to emit for a cursor.
+
+  Cursor semantics (TIMESTAMP-ANCHORED — the restart-gap fix): the
+  durable cursor is the LAST EMITTED BAR'S TIMESTAMP string, not a
+  positional index. A fresh source instance seeded after restart holds a
+  different bar list than the crashed instance, so positional cursors
+  can silently skip the bars between the seed start and the recovered
+  position; timestamps anchor resume to market time instead, and the
+  seed fetch itself starts at the cursor so no bar in between is lost.
+
+  Accepted cursor values (all map to 'first bar strictly newer than'):
+  - nil / 0           → emit everything held (fresh start)
+  - RFC3339 string    → first bar with t > cursor
+  - integer n > 0     → legacy positional fallback (pre-fix snapshots):
+                        treated as an index into the held list, capped"
+  [bars cursor]
+  (cond
+    (or (nil? cursor) (= 0 cursor)) 0
+    (string? cursor) (loop [i 0]
+                       (if (or (>= i (count bars))
+                               (> (compare (:t (nth bars i)) cursor) 0))
+                         i
+                         (recur (inc i))))
+    (int? cursor) (min cursor (count bars))
+    :else 0))
+
 (defrecord AlpacaBarsSource [opts state]
   p/MarketDataSource
 
   (source-id [this] provider)
 
   (next-observations [this cursor max-n]
-    (let [{:keys [until poll-seconds]} opts
-          cursor (max 0 (or cursor 0))]
-      ;; ensure warmup seed happened
+    (let [{:keys [until poll-seconds]} opts]
+      ;; warmup seed — anchored to the cursor timestamp when resuming so
+      ;; the fetch window starts where the previous instance left off
       (when-not (:seeded? @state)
+        (when (string? cursor)
+          (swap! state assoc :seed-anchor cursor))
         (fetch-new-bars! opts state)
         (swap! state assoc :seeded? true))
       (loop []
         (let [bars (:bars @state)
-              total (count bars)]
+              total (count bars)
+              start (emit-index bars cursor)]
           (cond
             ;; emit what we hold
-            (< cursor total)
-            (let [end (min total (+ cursor (max 1 (or max-n 1))))
+            (< start total)
+            (let [end (min total (+ start (max 1 (or max-n 1))))
                   facts (vec (map #(bar->fact opts (nth bars %))
-                                  (range cursor end)))]
-              {:observations facts :cursor end :exhausted? false})
+                                  (range start end)))]
+              {:observations facts
+               :cursor (:t (nth bars (dec end)))
+               :exhausted? false})
 
             ;; session over?
             (and until (>= (compare (utc-now-str) until) 0))
@@ -196,6 +230,9 @@
     :data-url       default https://data.alpaca.markets
     :until          RFC3339 Z end-of-session; next-observations reports
                     exhausted at/after this instant (required for live)
+    :seed-start     RFC3339 Z explicit seed-fetch start (optional; a
+                    string resume cursor takes precedence, then this,
+                    then now-minus-warmup)
     :poll-seconds   poll cadence while blocked (default 5)
     :warmup-bars    history depth seeded on first use (default 8)
     :run-mode       envelope mode (default :mode/paper)

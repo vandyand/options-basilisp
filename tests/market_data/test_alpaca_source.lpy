@@ -1,0 +1,87 @@
+(ns market-data.test-alpaca-source
+  "Live Alpaca bars source — restart-gap regression (timestamp-anchored
+  cursors) and emission contract, all against a stub transport.
+
+  The bug class under test: with positional (integer) cursors, a fresh
+  post-restart source instance holds a different bar list than the
+  crashed instance, so resuming at the recovered index silently skips
+  the bars between the new seed start and the old position. Timestamp
+  cursors anchor resume to market time; the seed fetch starts at the
+  cursor, so nothing in between is lost."
+  (:import json)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.market-data.alpaca :as mda]
+            [stevetrading.market-data.protocol :as mdp]))
+
+(def all-bars
+  "Scripted tape: six 1-min SPY bars."
+  (vec (map (fn [i]
+              {"t" (str "2026-06-10T19:3" i ":00Z")
+               "o" 725.0 "h" 726.0 "l" 724.0 "c" (+ 725.0 i)
+               "v" 1000 "n" 10 "vw" 725.5})
+            (range 6))))
+
+(defn- stub-transport
+  "Serve bars from `available` (an atom holding a subvec of all-bars),
+  honoring the url's start= param (inclusive, like Alpaca)."
+  [available]
+  (fn [{:keys [url]}]
+    (let [start (second (re-find #"start=([^&]+)" url))
+          bars (filterv #(or (nil? start)
+                             (>= (compare (get % "t") start) 0))
+                        @available)]
+      {:status 200
+       :body (json/dumps (python/dict {"bars" (python/list
+                                               (map python/dict bars))
+                                       "symbol" "SPY"}))})))
+
+(defn- make-source
+  [available]
+  (mda/make-alpaca-bars-source
+   {:symbol "SPY"
+    :instrument-id "equity/NASDAQ/SPY"
+    :key-id "k" :secret "s"
+    :warmup-bars 8
+    :poll-seconds 0
+    :seed-start "2026-06-10T19:29:00Z"
+    :until "2026-06-10T19:36:00Z"
+    :transport (stub-transport available)}))
+
+(deftest timestamp-cursor-closes-restart-gap
+  (let [available (atom (subvec all-bars 0 3))
+        src-a (make-source available)
+        ;; instance A consumes the first three bars
+        ra (mdp/next-observations src-a 0 99)
+        cursor-a (:cursor ra)]
+    (testing "cursor is the last emitted bar's timestamp, not an index"
+      (is (= 3 (count (:observations ra))))
+      (is (= "2026-06-10T19:32:00Z" cursor-a)))
+    (testing "fresh instance resumes at the timestamp with no gap and no dup"
+      ;; the tape grew while we were down; instance B is brand new
+      (reset! available all-bars)
+      (let [src-b (make-source available)
+            rb (mdp/next-observations src-b cursor-a 99)
+            times (mapv #(get-in % [:fact/payload :bar/time])
+                        (:observations rb))]
+        (is (= ["2026-06-10T19:33:00Z"
+                "2026-06-10T19:34:00Z"
+                "2026-06-10T19:35:00Z"] times))
+        (is (= "2026-06-10T19:35:00Z" (:cursor rb)))
+        (is (every? #(:valid? (v/validate-fact %)) (:observations rb)))))
+    (testing "re-reading the same timestamp cursor re-emits identically"
+      (let [src-c (make-source available)
+            r1 (mdp/next-observations src-c cursor-a 99)
+            r2 (mdp/next-observations src-c cursor-a 99)]
+        (is (= (mapv :fact/dedupe-key (:observations r1))
+               (mapv :fact/dedupe-key (:observations r2))))))))
+
+(deftest legacy-integer-cursor-still-accepted
+  (let [available (atom all-bars)
+        src (make-source available)
+        ;; integer cursors (pre-fix snapshots) fall back to positional
+        r (mdp/next-observations src 4 99)]
+    (is (= ["2026-06-10T19:34:00Z" "2026-06-10T19:35:00Z"]
+           (mapv #(get-in % [:fact/payload :bar/time]) (:observations r))))
+    (testing "but the RETURNED cursor is always a timestamp"
+      (is (= "2026-06-10T19:35:00Z" (:cursor r))))))
