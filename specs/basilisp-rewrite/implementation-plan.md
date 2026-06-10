@@ -263,9 +263,9 @@ Goal: operational boundary + paper-capable assembly. **Status: COMPLETE (commit 
 
 ## Phase 11: Recovery Validation Suite + Reports
 
-Goal: prove the golden properties; close the loop. Normative: ENGINE_STATE_AND_RECOVERY §17, TESTING §7–8.
+Goal: prove the golden properties; close the loop. **Status: COMPLETE (commit 25c496f)** — crash suite surfaced and fixed 2 real engine bugs: (1) scenario-2 lineage loss (no machine row for fill on :submit-requested) fixed via recovery-time orphan marking (mark-ambiguous-acks!); (2) stale-mark repricing after mid-cycle crash fixed via monotone observed-position mark rebuild. Normative: ENGINE_STATE_AND_RECOVERY §17, TESTING §7–8.
 
-- [ ] `tests/recovery/test_crash_scenarios.lpy` — the 7 acceptance scenarios as deterministic tests using the replay base with injected crash points (crash = stop loop, drop in-memory state, `run-recovery!` from disk, continue):
+- [x] `tests/recovery/test_crash_scenarios.lpy` — the 7 acceptance scenarios as deterministic tests using the replay base with injected crash points (crash = stop loop, drop in-memory state, `run-recovery!` from disk, continue):
   1. crash after `order-intent-created`, before submit dispatch → recovery resubmits exactly once (submit-dedupe proves not-yet-accepted)
   2. crash after dispatch, before ack handling → reconciliation via broker `open-orders`/`fills-since` resolves without duplicate submit
   3. crash after ack, before fill → fill recovered via reconciliation
@@ -273,11 +273,11 @@ Goal: prove the golden properties; close the loop. Normative: ENGINE_STATE_AND_R
   5. duplicate broker status/fill replay after restart → state converges, single lot
   6. replayed recovery converges to uninterrupted-run state (`=` on final state minus run metadata)
   7. unresolved-order ambiguity (broker returns unknown-lineage fill) → `:blocked`, no exposure change
-- [ ] `tests/recovery/test_golden_properties.lpy` — TESTING §8: one logical decision → one stable intent id (across replay + restart); duplicate observations never duplicate fills/positions; replay and live-normalized inputs share fact shapes (validate replay facts against the same `validate-fact` used by live adapters); control-plane violation prevents startup.
-- [ ] `bases/reports/src/stevetrading/base/reports.lpy` (extend stub): `-main --facts <db> --out <dir>`: daily summary from the fact store — orders submitted/filled/cancelled/rejected, fills with prices, realized P&L per strategy/account (via ledger fold), recovery events, faults; writes `summary.edn` + human-readable `summary.md`.
-- [ ] `tests/reports/test_reports.lpy` — summary over a completed replay session: counts match fact log; P&L matches portfolio derivation.
-- [ ] Repo `README.md`: rewrite for implemented reality — quick start (venv, scripts, replay a fixture, run tests), workspace map, operator notes (how to run engine-live against sim; what's required before real paper use: operator-run live smoke + control-plane activation).
-- [ ] `development/README.md`: REPL workflow (nrepl.sh, clj-nrepl-eval, sys.path note).
+- [x] `tests/recovery/test_golden_properties.lpy` — TESTING §8: one logical decision → one stable intent id (across replay + restart); duplicate observations never duplicate fills/positions; replay and live-normalized inputs share fact shapes (validate replay facts against the same `validate-fact` used by live adapters); control-plane violation prevents startup.
+- [x] `bases/reports/src/stevetrading/base/reports.lpy` (extend stub): `-main --facts <db> --out <dir>`: daily summary from the fact store — orders submitted/filled/cancelled/rejected, fills with prices, realized P&L per strategy/account (via ledger fold), recovery events, faults; writes `summary.edn` + human-readable `summary.md`.
+- [x] `tests/reports/test_reports.lpy` — summary over a completed replay session: counts match fact log; P&L matches portfolio derivation.
+- [x] Repo `README.md`: rewrite for implemented reality — quick start (venv, scripts, replay a fixture, run tests), workspace map, operator notes (how to run engine-live against sim; what's required before real paper use: operator-run live smoke + control-plane activation).
+- [x] `development/README.md`: REPL workflow (nrepl.sh, clj-nrepl-eval, sys.path note).
 
 ## Phase 12: Doc Sync
 
