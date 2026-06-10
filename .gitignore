@@ -26,3 +26,6 @@ htmlcov/
 .nrepl-port
 .nrepl-pythonpath
 
+
+# Runtime session state (facts, snapshots, control-plane runtime root)
+live_runtime/
