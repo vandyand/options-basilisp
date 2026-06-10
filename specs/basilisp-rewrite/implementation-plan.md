@@ -118,16 +118,16 @@ Goal: durable fact log, snapshots, watermarks, recovery planner. **Status: COMPL
 
 ## Phase 4: Sim Broker
 
-Goal: full broker protocol + deterministic simulator. Normative: BROKER_ADAPTER_CONTRACTS (whole doc).
+Goal: full broker protocol + deterministic simulator. **Status: COMPLETE (commit 558fc2e)** — :fact/broker-account-observed added to enums fact-types (taxonomy §6.1/§8 gap); recovery-seam in broker.protocol wraps Broker → Phase 3 fn-map. Normative: BROKER_ADAPTER_CONTRACTS (whole doc).
 
-- [ ] `components/broker.protocol/src/stevetrading/broker/protocol.lpy` (extend stub): `defprotocol Broker` — `(submit-order-intent! [this cmd])`, `(cancel-broker-order! [this cmd])`, `(open-orders [this account-id])`, `(fills-since [this account-id cursor])`, `(account-state [this account-id])`, `(health [this])`. ALL return values are canonical **facts** (or vectors of facts) built via `domain.schemas/fact-envelope` — never SDK/raw maps. Keep the existing type-set vars.
-- [ ] `components/broker.sim/src/stevetrading/broker/sim.lpy` (new): `make-sim-broker` taking `{:fill-policy {:mode :immediate|:on-poll :price-source :limit|:mark :slippage "0.00"} :marks {instrument-id price-str} :clock (fn [] iso-ts)}`. Behavior:
+- [x] `components/broker.protocol/src/stevetrading/broker/protocol.lpy` (extend stub): `defprotocol Broker` — `(submit-order-intent! [this cmd])`, `(cancel-broker-order! [this cmd])`, `(open-orders [this account-id])`, `(fills-since [this account-id cursor])`, `(account-state [this account-id])`, `(health [this])`. ALL return values are canonical **facts** (or vectors of facts) built via `domain.schemas/fact-envelope` — never SDK/raw maps. Keep the existing type-set vars.
+- [x] `components/broker.sim/src/stevetrading/broker/sim.lpy` (new): `make-sim-broker` taking `{:fill-policy {:mode :immediate|:on-poll :price-source :limit|:mark :slippage "0.00"} :marks {instrument-id price-str} :clock (fn [] iso-ts)}`. Behavior:
   - submit → validates cmd payload; deterministic `broker-order-id` = `"sim-" + (subs order-intent-id 3 19)`; emits `:fact/broker-ack-accepted` (or `:fact/broker-ack-rejected` when intent invalid / kill-switched via `:reject-next` test hook); fill per policy: emits `:fact/fill-observed` per leg (fill-id `"<broker-order-id>-fill-<n>"`, price from limit or mark ± slippage, Decimal strings).
   - duplicate submit for an already-accepted idempotency key → returns the SAME ack fact content (no new broker order) per §9.
   - cancel → if unfilled: `:fact/broker-order-status-observed` with `:broker-status/cancelled`; if already filled: cancel-reject + the fill stands (cancel-race per §7).
   - partial-fill support: `:fill-policy {:mode :partial :tranches ["1" "2"]}` splits quantity.
   - internal journal (atom) answers `open-orders` / `fills-since` for reconciliation; journal is NOT canonical truth (engine appends the facts it receives).
-- [ ] Tests `tests/broker/test_sim.lpy` — the six TESTING §6 broker contract cases: submit accepted; submit rejected; duplicate submit idempotent (same broker-order-id, no double fill); partial then full fill (quantities sum, lifecycle correct when folded via engine.fold); cancel race (fill before cancel → filled + cancel rejected); reconciliation: after submits, `open-orders`/`fills-since` return normalized facts that fold cleanly.
+- [x] Tests `tests/broker/test_sim.lpy` — the six TESTING §6 broker contract cases: submit accepted; submit rejected; duplicate submit idempotent (same broker-order-id, no double fill); partial then full fill (quantities sum, lifecycle correct when folded via engine.fold); cancel race (fill before cancel → filled + cancel rejected); reconciliation: after submits, `open-orders`/`fills-since` return normalized facts that fold cleanly.
 
 **REPL checkpoints:**
 - build sim broker, submit a sample intent command → vector of facts `[:fact/broker-ack-accepted :fact/fill-observed]` with Decimal-string prices
