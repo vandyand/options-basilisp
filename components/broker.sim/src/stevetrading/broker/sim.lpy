@@ -1,0 +1,547 @@
+(ns stevetrading.broker.sim
+  "Deterministic in-memory broker simulator (BROKER_ADAPTER_CONTRACTS_V0.1).
+
+  Implements broker.protocol/Broker. Every return value is a canonical
+  fact envelope built via domain.schemas/fact-envelope — never raw maps.
+
+  Documented behavior decisions:
+  - Determinism: the default clock is synthetic — a monotonic counter of
+    seconds added to a fixed base timestamp (2026-06-10T14:30:00Z), NEVER
+    wall clock. broker-order-id = \"sim-\" + chars 3..19 of the
+    order-intent-id (pure function of the intent identity).
+  - Fill modes (:fill-policy :mode):
+    * :immediate — fills are generated and returned with the submit ack.
+    * :partial   — like :immediate but quantity is split across
+      :tranches (decimal strings; they should sum to the intent
+      quantity). One clock timestamp per tranche.
+    * :on-poll   — the order rests open at the broker until the first
+      fills-since poll for its account materializes the fills. A cancel
+      arriving before the first poll therefore wins (order cancelled, no
+      fills); a cancel after fills exist is rejected (§7 — fill truth
+      wins).
+  - Per-leg pricing (one :fact/fill-observed per leg per tranche; fill
+    ids \"<broker-order-id>-fill-<n>\" with n monotonic across the order):
+    * single leg: limit price or the leg's mark, preference ordered by
+      :price-source (:limit default | :mark);
+    * multi-leg: each leg fills at its mark when one exists; otherwise
+      the intent's net limit price is split evenly (limit / leg-count);
+    * no resolvable price for any leg → the submit is REJECTED with
+      :broker-rejection/no-price-source (no magic default prices);
+    * :slippage (decimal string, default \"0.00\") is applied
+      directionally: buy legs pay +slippage, sell legs receive -slippage.
+  - Idempotency (§9): submits are journaled by the payload
+    :command/idempotency-key. A duplicate submit returns the SAME stored
+    ack fact (same broker-order-id, same record id) and never new fills.
+    Rejected submits are journaled too, so retrying a rejected key
+    returns the same rejection. Cancels are idempotent: cancelling an
+    already-cancelled order returns the stored cancelled status fact.
+    Invalid submits missing both order-intent id and idempotency key
+    cannot be journaled and are re-rejected on every call (documented).
+  - Fact envelope metadata: :record/source-system :broker/sim;
+    :record/mode from the command; :record/causation-ids = [command's
+    :record/id]; :record/correlation-id = command's correlation id,
+    falling back to the command's record id. Dedupe keys:
+    acks \"ack/sim/<broker-order-id>/<accepted|rejected|cancelled|cancel-rejected>\",
+    fills \"fill/sim/<account>/<broker-order-id>/<fill-id>\",
+    open-order status observations \"status/sim/<broker-order-id>/<status>\".
+  - The internal journal (atom) answers open-orders / fills-since for
+    reconciliation; it is NOT canonical truth — the engine appends the
+    facts it receives. The simulator is single-threaded by design (test
+    infrastructure); journal updates are read-modify-reset."
+  (:import datetime decimal)
+  (:require [stevetrading.broker.protocol :as p]
+            [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]))
+
+(defn- ->dec
+  [x]
+  (if (instance? decimal/Decimal x) x (decimal/Decimal x)))
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+;; ---------------------------------------------------------------------------
+;; Deterministic clock
+;; ---------------------------------------------------------------------------
+
+(defn default-clock
+  "Synthetic deterministic clock: each call returns the fixed base
+  timestamp 2026-06-10T14:30:00Z advanced by one more second."
+  []
+  (let [counter (atom -1)
+        base (datetime/datetime 2026 6 10 14 30 0)]
+    (fn []
+      (let [i (swap! counter inc)]
+        (.strftime (+ base (datetime/timedelta ** :seconds i))
+                   "%Y-%m-%dT%H:%M:%SZ")))))
+
+;; ---------------------------------------------------------------------------
+;; Identity + envelope helpers
+;; ---------------------------------------------------------------------------
+
+(defn broker-order-id
+  "Deterministic sim broker order id for an order-intent id:
+  \"sim-\" + 16 chars of the intent hash (chars 3..19)."
+  [order-intent-id]
+  (str "sim-" (subs order-intent-id 3 19)))
+
+(defn- broker-fact
+  "Build a canonical broker fact envelope. cmd-meta carries the
+  originating command's :record/id / :record/correlation-id /
+  :record/mode / :record/strategy-id ({} for direct queries with no
+  originating command). Top-level nil values are stripped."
+  [cmd-meta ts m]
+  (sch/fact-envelope
+   (into {}
+         (filter (comp some? val)
+                 (merge {:record/mode (:record/mode cmd-meta)
+                         :record/strategy-id (:record/strategy-id cmd-meta)
+                         :record/correlation-id (or (:record/correlation-id cmd-meta)
+                                                    (:record/id cmd-meta))
+                         :record/causation-ids (when (some? (:record/id cmd-meta))
+                                                 [(:record/id cmd-meta)])
+                         :record/source-system :broker/sim
+                         :fact/occurred-at ts
+                         :fact/recorded-at ts}
+                        m)))))
+
+(defn- cmd-meta-of
+  [cmd]
+  (select-keys cmd [:record/id :record/correlation-id
+                    :record/mode :record/strategy-id]))
+
+(defn- compact
+  "Drop nil-valued keys from a payload map."
+  [m]
+  (into {} (filter (comp some? val) m)))
+
+;; ---------------------------------------------------------------------------
+;; Pricing
+;; ---------------------------------------------------------------------------
+
+(defn- leg-price
+  "Resolve one leg's fill price (Decimal) per the documented pricing
+  rules, or nil when unpriceable."
+  [fill-policy marks intent leg leg-count]
+  (let [mark (get marks (:instrument/id leg))
+        limit (:order-intent/limit-price intent)
+        base (cond
+               (= 1 leg-count)
+               (if (= :mark (:price-source fill-policy))
+                 (or mark limit)
+                 (or limit mark))
+
+               (some? mark) mark
+               (some? limit) (/ (->dec limit) (->dec (str leg-count)))
+               :else nil)]
+    (when (some? base)
+      (let [slip (->dec (or (:slippage fill-policy) "0.00"))]
+        (if (= :order-side/sell (:leg/side leg))
+          (- (->dec base) slip)
+          (+ (->dec base) slip))))))
+
+(defn- unpriceable?
+  [fill-policy marks intent]
+  (let [legs (:order-intent/legs intent)]
+    (boolean
+     (some #(nil? (leg-price fill-policy marks intent % (count legs)))
+           legs))))
+
+;; ---------------------------------------------------------------------------
+;; Fill materialization
+;; ---------------------------------------------------------------------------
+
+(defn- fill-facts-for
+  "Build the canonical :fact/fill-observed facts for one journal entry:
+  one fact per leg per tranche; one clock timestamp per tranche (legs in
+  a tranche share it). Per-leg tranche quantity scales the leg quantity
+  by tranche/intent-quantity (exact Decimal math)."
+  [entry fill-policy marks clock]
+  (let [intent (:order/intent entry)
+        legs (vec (:order-intent/legs intent))
+        leg-count (count legs)
+        qty (->dec (:order-intent/quantity intent))
+        boid (:broker/order-id entry)
+        account (:broker/account-id entry)
+        tranches (if (= :partial (:mode fill-policy))
+                   (vec (:tranches fill-policy))
+                   [(:order-intent/quantity intent)])]
+    (loop [tranches (seq tranches)
+           n 0
+           facts []]
+      (if (nil? tranches)
+        facts
+        (let [tranche (->dec (first tranches))
+              ts (clock)
+              [n facts]
+              (reduce
+               (fn [[n facts] leg]
+                 (let [n (inc n)
+                       fill-id (str boid "-fill-" n)
+                       leg-qty (/ (* (->dec (:leg/quantity leg)) tranche) qty)
+                       price (leg-price fill-policy marks intent leg leg-count)]
+                   [n
+                    (conj facts
+                          (broker-fact
+                           (:cmd-meta entry) ts
+                           {:record/type :fact/fill-observed
+                            :record/account-id account
+                            :record/instrument-id (:instrument/id leg)
+                            :fact/dedupe-key (str "fill/sim/" account "/" boid
+                                                  "/" fill-id)
+                            :fact/payload
+                            {:order-intent/id (:order-intent/id entry)
+                             :broker/source-system :broker/sim
+                             :broker/account-id account
+                             :broker/order-id boid
+                             :fill/id fill-id
+                             :fill/instrument-id (:instrument/id leg)
+                             :fill/occurred-at ts
+                             :fill/quantity (str leg-qty)
+                             :fill/price (str price)
+                             :fill/liquidity :liquidity/taker}}))]))
+               [n facts]
+               legs)]
+          (recur (next tranches) n facts))))))
+
+(defn- filled-status
+  "Order status after fills: tranche quantities are compared against the
+  intent quantity."
+  [entry fill-policy]
+  (let [qty (->dec (get-in entry [:order/intent :order-intent/quantity]))
+        filled (if (= :partial (:mode fill-policy))
+                 (reduce + dec-zero (map ->dec (:tranches fill-policy)))
+                 qty)]
+    (cond
+      (>= filled qty) :filled
+      (> filled dec-zero) :partially-filled
+      :else :accepted)))
+
+;; ---------------------------------------------------------------------------
+;; Submit validation
+;; ---------------------------------------------------------------------------
+
+(defn- submit-validation-error
+  "nil when the §4.1 submit payload is well-formed, else an error message."
+  [payload]
+  (let [intent (:order-intent/payload payload)
+        legs (:order-intent/legs intent)]
+    (cond
+      (not (string? (:order-intent/id payload)))
+      "payload missing :order-intent/id"
+
+      (not (string? (:command/idempotency-key payload)))
+      "payload missing :command/idempotency-key"
+
+      (not (string? (:broker/account-id payload)))
+      "payload missing :broker/account-id"
+
+      (not (map? intent))
+      "payload missing :order-intent/payload"
+
+      (not (contains? enums/order-sides (:order-intent/side intent)))
+      "intent :order-intent/side is not a canonical order side"
+
+      (not (v/decimal-string? (:order-intent/quantity intent)))
+      "intent :order-intent/quantity must be a decimal string"
+
+      (not (seq legs))
+      "intent requires at least one leg"
+
+      (some #(not (v/decimal-string? (:leg/quantity %))) legs)
+      "every :leg/quantity must be a decimal string"
+
+      :else nil)))
+
+;; ---------------------------------------------------------------------------
+;; Fact constructors
+;; ---------------------------------------------------------------------------
+
+(defn- accepted-ack
+  [cmd-meta ts payload boid]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/broker-ack-accepted
+                :record/account-id (:broker/account-id payload)
+                :fact/dedupe-key (str "ack/sim/" boid "/accepted")
+                :fact/payload
+                {:order-intent/id (:order-intent/id payload)
+                 :broker/source-system :broker/sim
+                 :broker/account-id (:broker/account-id payload)
+                 :broker/order-id boid
+                 :broker/status :broker-status/accepted
+                 :broker/observed-at ts}}))
+
+(defn- rejected-ack
+  [cmd-meta ts payload boid code message]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/broker-ack-rejected
+                :record/account-id (:broker/account-id payload)
+                :fact/dedupe-key (when (some? boid)
+                                   (str "ack/sim/" boid "/rejected"))
+                :fact/payload
+                (compact
+                 {:order-intent/id (:order-intent/id payload)
+                  :broker/source-system :broker/sim
+                  :broker/account-id (:broker/account-id payload)
+                  :broker/rejection-code code
+                  :broker/rejection-message message
+                  :broker/observed-at ts})}))
+
+(defn- cancelled-status-fact
+  [cmd-meta ts entry]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/broker-order-status-observed
+                :record/account-id (:broker/account-id entry)
+                :fact/dedupe-key (str "ack/sim/" (:broker/order-id entry)
+                                      "/cancelled")
+                :fact/payload
+                {:order-intent/id (:order-intent/id entry)
+                 :broker/source-system :broker/sim
+                 :broker/account-id (:broker/account-id entry)
+                 :broker/order-id (:broker/order-id entry)
+                 :broker/status :broker-status/cancelled
+                 :broker/observed-at ts}}))
+
+(defn- cancel-rejected-fact
+  [cmd-meta ts payload code message]
+  (broker-fact cmd-meta ts
+               {:record/type :fact/cancel-ack-rejected
+                :record/account-id (:broker/account-id payload)
+                :fact/dedupe-key (when (some? (:broker/order-id payload))
+                                   (str "ack/sim/" (:broker/order-id payload)
+                                        "/cancel-rejected"))
+                :fact/payload
+                (compact
+                 {:order-intent/id (:order-intent/id payload)
+                  :broker/source-system :broker/sim
+                  :broker/account-id (:broker/account-id payload)
+                  :broker/order-id (:broker/order-id payload)
+                  :broker/rejection-code code
+                  :broker/rejection-message message
+                  :broker/observed-at ts})}))
+
+(defn- open-status-fact
+  [entry ts]
+  (let [status (if (= :partially-filled (:status entry))
+                 :broker-status/partially-filled
+                 :broker-status/accepted)]
+    (broker-fact (:cmd-meta entry) ts
+                 {:record/type :fact/broker-order-status-observed
+                  :record/account-id (:broker/account-id entry)
+                  :fact/dedupe-key (str "status/sim/" (:broker/order-id entry)
+                                        "/" (name status))
+                  :fact/payload
+                  {:order-intent/id (:order-intent/id entry)
+                   :broker/source-system :broker/sim
+                   :broker/account-id (:broker/account-id entry)
+                   :broker/order-id (:broker/order-id entry)
+                   :broker/status status
+                   :broker/observed-at ts}})))
+
+;; ---------------------------------------------------------------------------
+;; Journal helpers
+;; ---------------------------------------------------------------------------
+
+(def ^:private empty-journal
+  {:orders {}      ;; broker-order-id → entry
+   :by-key {}      ;; idempotency key → broker-order-id
+   :order-seq []}) ;; broker-order-ids in submit order (determinism)
+
+(defn- journal-entry
+  [journal boid]
+  (get-in @journal [:orders boid]))
+
+(defn- journal-put!
+  [journal idem-key boid entry]
+  (swap! journal
+         (fn [j]
+           (-> j
+               (assoc-in [:orders boid] entry)
+               (assoc-in [:by-key idem-key] boid)
+               (update :order-seq conj boid)))))
+
+(defn- entries-in-order
+  [j account-id]
+  (for [boid (:order-seq j)
+        :let [e (get-in j [:orders boid])]
+        :when (= account-id (:broker/account-id e))]
+    e))
+
+;; ---------------------------------------------------------------------------
+;; SimBroker
+;; ---------------------------------------------------------------------------
+
+(defrecord SimBroker [journal opts]
+  p/Broker
+
+  (submit-order-intent! [this cmd]
+    (let [{:keys [fill-policy marks clock reject-next]} opts
+          payload (:command/payload cmd)
+          idem-key (:command/idempotency-key payload)
+          intent (:order-intent/payload payload)
+          dup-boid (get-in @journal [:by-key idem-key])]
+      (if (some? dup-boid)
+        ;; §9 — duplicate submit: same stored ack content, no new fills
+        [(:ack-fact (journal-entry journal dup-boid))]
+        (let [cmd-meta (cmd-meta-of cmd)
+              ts (clock)
+              oi (:order-intent/id payload)
+              boid (when (string? oi) (broker-order-id oi))
+              validation-error (submit-validation-error payload)
+              forced? (and (some? reject-next) @reject-next)
+              _ (when forced? (reset! reject-next false))
+              rejection
+              (cond
+                (some? validation-error)
+                [:broker-rejection/request-validation-failed validation-error]
+
+                forced?
+                [:broker-rejection/simulated-reject
+                 "rejected by :reject-next test hook"]
+
+                (unpriceable? fill-policy marks intent)
+                [:broker-rejection/no-price-source
+                 "no mark or limit price resolves a fill price for every leg"])]
+          (if (some? rejection)
+            (let [ack (rejected-ack cmd-meta ts payload boid
+                                    (first rejection) (second rejection))]
+              ;; journal rejected submits too, so retries of the same key
+              ;; return the same rejection (§9)
+              (when (and (string? idem-key) (some? boid))
+                (journal-put! journal idem-key boid
+                              {:broker/order-id boid
+                               :order-intent/id oi
+                               :broker/account-id (:broker/account-id payload)
+                               :command/idempotency-key idem-key
+                               :cmd-meta cmd-meta
+                               :order/intent intent
+                               :ack-fact ack
+                               :status :rejected
+                               :fill-facts []
+                               :pending-fill? false}))
+              [ack])
+            (let [ack (accepted-ack cmd-meta ts payload boid)
+                  entry {:broker/order-id boid
+                         :order-intent/id oi
+                         :broker/account-id (:broker/account-id payload)
+                         :command/idempotency-key idem-key
+                         :cmd-meta cmd-meta
+                         :order/intent intent
+                         :ack-fact ack
+                         :status :accepted
+                         :fill-facts []
+                         :pending-fill? (= :on-poll (:mode fill-policy))}
+                  entry (if (= :on-poll (:mode fill-policy))
+                          entry
+                          (assoc entry
+                                 :fill-facts (fill-facts-for entry fill-policy
+                                                             marks clock)
+                                 :status (filled-status entry fill-policy)))]
+              (journal-put! journal idem-key boid entry)
+              (into [ack] (:fill-facts entry))))))))
+
+  (cancel-broker-order! [this cmd]
+    (let [{:keys [clock]} opts
+          payload (:command/payload cmd)
+          cmd-meta (cmd-meta-of cmd)
+          ts (clock)
+          boid (:broker/order-id payload)
+          entry (when (some? boid) (journal-entry journal boid))]
+      (cond
+        (nil? entry)
+        [(cancel-rejected-fact cmd-meta ts payload
+                               :broker-rejection/unknown-order
+                               "no broker order with proven lineage")]
+
+        ;; idempotent retry (§9.3)
+        (= :cancelled (:status entry))
+        [(:cancel-fact entry)]
+
+        ;; cancel race lost — fill truth wins (§7)
+        (= :filled (:status entry))
+        [(cancel-rejected-fact cmd-meta ts payload
+                               :broker-rejection/cancel-after-fill
+                               "order already filled; fills stand")]
+
+        ;; open (or partially filled) — the remainder cancels; pending
+        ;; on-poll fills are discarded (never materialized)
+        :else
+        (let [fact (cancelled-status-fact cmd-meta ts entry)]
+          (swap! journal update-in [:orders boid] assoc
+                 :status :cancelled
+                 :pending-fill? false
+                 :cancel-fact fact)
+          [fact]))))
+
+  (open-orders [this account-id]
+    (let [{:keys [clock]} opts
+          ts (clock)]
+      (vec (for [e (entries-in-order @journal account-id)
+                 :when (contains? #{:accepted :partially-filled} (:status e))]
+             (open-status-fact e ts)))))
+
+  (fills-since [this account-id cursor]
+    (let [{:keys [fill-policy marks clock]} opts]
+      ;; materialize pending :on-poll fills for this account
+      (doseq [e (filter :pending-fill? (entries-in-order @journal account-id))]
+        (let [fills (fill-facts-for e fill-policy marks clock)]
+          (swap! journal update-in [:orders (:broker/order-id e)] assoc
+                 :fill-facts fills
+                 :pending-fill? false
+                 :status (filled-status e fill-policy))))
+      (vec (for [e (entries-in-order @journal account-id)
+                 fact (:fill-facts e)
+                 :when (or (nil? cursor)
+                           (>= (compare (:fact/occurred-at fact) cursor) 0))]
+             fact))))
+
+  (account-state [this account-id]
+    (let [{:keys [clock]} opts
+          ts (clock)
+          open (count (filter #(contains? #{:accepted :partially-filled}
+                                          (:status %))
+                              (entries-in-order @journal account-id)))]
+      (broker-fact {} ts
+                   {:record/type :fact/broker-account-observed
+                    :record/account-id account-id
+                    :fact/payload
+                    {:broker/account-id account-id
+                     :broker/source-system :broker/sim
+                     :broker/observed-at ts
+                     :account/open-order-count open}})))
+
+  (health [this]
+    (let [{:keys [clock]} opts
+          ts (clock)]
+      (broker-fact {} ts
+                   {:record/type :fact/health-heartbeat-recorded
+                    :fact/payload
+                    {:health/source-system :broker/sim
+                     :health/connectivity :health/connected
+                     :health/last-interaction-at ts}}))))
+
+;; ---------------------------------------------------------------------------
+;; Constructor
+;; ---------------------------------------------------------------------------
+
+(def ^:private default-fill-policy
+  {:mode :immediate
+   :price-source :limit
+   :slippage "0.00"})
+
+(defn make-sim-broker
+  "Build a deterministic sim broker. opts:
+  {:fill-policy {:mode :immediate|:on-poll|:partial
+                 :price-source :limit|:mark
+                 :slippage \"0.00\"
+                 :tranches [\"1\" \"2\"]}   ;; :partial mode only
+   :marks {instrument-id price-str}
+   :clock (fn [] iso-ts)        ;; default: synthetic counter clock
+   :reject-next (atom false)}   ;; test hook: reject the next submit"
+  ([] (make-sim-broker {}))
+  ([opts]
+   (->SimBroker (atom empty-journal)
+                {:fill-policy (merge default-fill-policy (:fill-policy opts))
+                 :marks (or (:marks opts) {})
+                 :clock (or (:clock opts) (default-clock))
+                 :reject-next (or (:reject-next opts) (atom false))})))

@@ -1,4 +1,10 @@
-(ns stevetrading.broker.protocol)
+(ns stevetrading.broker.protocol
+  "Broker boundary protocol (BROKER_ADAPTER_CONTRACTS_V0.1).
+
+  The same protocol applies to live, paper, and sim adapters (§12); the
+  canonical command and fact language stays stable across all of them.
+  Every protocol method returns canonical fact envelopes (built via
+  domain.schemas/fact-envelope) — never SDK/raw maps (§5, §13.3).")
 
 (def broker-command-types
   #{:command/submit-order-intent
@@ -23,3 +29,45 @@
   [record-type]
   (contains? broker-fact-types record-type))
 
+;; ---------------------------------------------------------------------------
+;; Broker protocol (BROKER_ADAPTER_CONTRACTS §4-§5, §8, §11)
+;; ---------------------------------------------------------------------------
+
+(defprotocol Broker
+  "Broker adapter boundary. All methods return canonical fact envelopes
+  (single fact or vector of facts), normalized per BROKER_ADAPTER §5 —
+  raw broker/SDK payloads never cross this boundary."
+  (submit-order-intent! [this cmd]
+    "Submit one canonical :command/submit-order-intent envelope (§4.1).
+    Returns a vector of canonical facts: :fact/broker-ack-accepted or
+    :fact/broker-ack-rejected, plus any immediately-observed
+    :fact/fill-observed facts. Duplicate submits for an already-processed
+    idempotency key return the SAME ack content with no new fills (§9).")
+  (cancel-broker-order! [this cmd]
+    "Request cancellation via a canonical :command/cancel-broker-order
+    envelope (§4.2). Returns a vector of canonical facts:
+    :fact/broker-order-status-observed with :broker-status/cancelled when
+    the order was still open, or :fact/cancel-ack-rejected when a fill won
+    the race (§7 — fill truth wins). Idempotent across retries (§9.3).")
+  (open-orders [this account-id]
+    "Currently-open broker orders for one account (§4.3, §8). Returns a
+    vector of canonical :fact/broker-order-status-observed facts (§5.2).")
+  (fills-since [this account-id cursor]
+    "Fills after a broker cursor (§4.4, §8). Cursor is an RFC 3339 UTC
+    timestamp string (fills with :fill/occurred-at >= cursor are returned)
+    or nil for all fills. Returns a vector of canonical
+    :fact/fill-observed facts (§5.3).")
+  (account-state [this account-id]
+    "Broker account truth for observation/diagnostics (§4.5, §5.4).
+    Returns one canonical :fact/broker-account-observed fact.")
+  (health [this]
+    "Adapter connectivity/health (§4.6, §11). Returns one canonical
+    :fact/health-heartbeat-recorded fact; never submits orders."))
+
+(defn recovery-seam
+  "Adapt a Broker protocol instance into the fn-map seam consumed by
+  engine.recovery/run-recovery! ({:open-orders (fn [account-id] [facts])
+  :fills-since (fn [account-id cursor] [facts])})."
+  [broker]
+  {:open-orders (fn [account-id] (open-orders broker account-id))
+   :fills-since (fn [account-id cursor] (fills-since broker account-id cursor))})

@@ -1,0 +1,449 @@
+(ns broker.test-sim
+  "Sim broker contract tests — the six TESTING_AND_VERIFICATION §6 broker
+  contract cases (submit accepted; submit rejected; duplicate submit /
+  duplicate observation; partial then full fill; cancel race;
+  reconciliation with unresolved orders), plus fold integration through
+  engine.fold and the recovery-seam adapter."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.broker.protocol :as p]
+            [stevetrading.broker.sim :as sim]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.engine.fold :as f]
+            [stevetrading.engine.state :as st]))
+
+(def acct "account/sim/test")
+(def strategy-id "strategy/simple-direction/sma-cross/v1")
+(def spy "equity/ARCA/SPY")
+(def qqq "equity/NASDAQ/QQQ")
+
+(defn intent-identity
+  [legs quantity]
+  {:identity/version 1
+   :identity/decision-id "dec_test"
+   :identity/intent-slot 0
+   :identity/account-id acct
+   :identity/role :intent-role/entry
+   :identity/order-shape {:side :order-side/buy
+                          :effect :position-effect/open
+                          :order-type :order-type/limit
+                          :time-in-force :tif/day
+                          :quantity quantity
+                          :limit-price "550.00"
+                          :legs legs}})
+
+(defn single-leg
+  [quantity]
+  [{:instrument/id spy :leg/side :order-side/buy :leg/quantity quantity}])
+
+(defn intent-payload
+  [oi legs quantity limit-price]
+  {:order-intent/id oi
+   :order-intent/side :order-side/buy
+   :order-intent/effect :position-effect/open
+   :order-intent/order-type :order-type/limit
+   :order-intent/time-in-force :tif/day
+   :order-intent/quantity quantity
+   :order-intent/limit-price limit-price
+   :order-intent/legs legs})
+
+(defn submit-cmd
+  "Canonical :command/submit-order-intent envelope (BROKER_ADAPTER §4.1)."
+  [oi legs quantity]
+  (sch/command-envelope
+   {:record/type :command/submit-order-intent
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id acct
+    :command/issued-at "2026-06-10T14:29:59Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key (str "submit/intent/" oi)
+    :command/payload
+    {:order-intent/id oi
+     :command/idempotency-key (str "submit/intent/" oi)
+     :broker/account-id acct
+     :broker/route {:broker/source-system :broker/sim}
+     :order-intent/payload (intent-payload oi legs quantity "550.00")}}))
+
+(defn cancel-cmd
+  [oi]
+  (sch/command-envelope
+   {:record/type :command/cancel-broker-order
+    :record/mode :mode/sim
+    :record/account-id acct
+    :command/issued-at "2026-06-10T14:31:00Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key (str "cancel/intent/" oi)
+    :command/payload {:order-intent/id oi
+                      :broker/account-id acct
+                      :broker/order-id (sim/broker-order-id oi)
+                      :command/idempotency-key (str "cancel/intent/" oi)}}))
+
+(defn fresh-oi
+  "A real order-intent id; quantity participates in the identity so
+  distinct quantities give distinct intents."
+  ([] (fresh-oi "2"))
+  ([quantity] (sch/order-intent-id (intent-identity (single-leg quantity)
+                                                    quantity))))
+
+(defn intent-created-fact
+  "The engine-side :fact/order-intent-created fact preceding a submit
+  (used to fold sim broker outcomes through engine.fold)."
+  [oi legs quantity]
+  (sch/fact-envelope
+   {:record/type :fact/order-intent-created
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id acct
+    :record/instrument-id (:instrument/id (first legs))
+    :record/source-system :engine/core
+    :fact/occurred-at "2026-06-10T14:29:58Z"
+    :fact/recorded-at "2026-06-10T14:29:58Z"
+    :fact/payload (intent-payload oi legs quantity "550.00")}))
+
+(defn dispatch-fact
+  [oi]
+  (sch/fact-envelope
+   {:record/type :fact/command-dispatched
+    :record/mode :mode/sim
+    :record/source-system :engine/core
+    :fact/occurred-at "2026-06-10T14:29:59Z"
+    :fact/recorded-at "2026-06-10T14:29:59Z"
+    :fact/payload {:command/type :command/submit-order-intent
+                   :order-intent/id oi}}))
+
+(defn fold-lifecycle
+  "Fold engine facts + broker facts; return [lifecycle-state filled-qty
+  emitted-fact-types]."
+  [oi legs quantity broker-facts]
+  (let [res (f/fold-facts (st/fresh-state)
+                          (into [(intent-created-fact oi legs quantity)
+                                 (dispatch-fact oi)]
+                                broker-facts))
+        entry (st/unresolved-order (:state res) oi)]
+    [(:order/lifecycle entry)
+     (:order/filled-quantity entry)
+     (mapv :record/type (:emitted-facts res))]))
+
+(defn all-valid?
+  [facts]
+  (every? #(:valid? (v/validate-fact %)) facts))
+
+;; ---------------------------------------------------------------------------
+;; §6 case 1 — submit accepted
+;; ---------------------------------------------------------------------------
+
+(deftest submit-accepted
+  (let [oi (fresh-oi)
+        cmd (submit-cmd oi (single-leg "2") "2")
+        broker (sim/make-sim-broker {})
+        res (p/submit-order-intent! broker cmd)
+        [ack fill] res
+        boid (sim/broker-order-id oi)]
+    (testing "ack + immediate fill, all canonical and valid"
+      (is (= [:fact/broker-ack-accepted :fact/fill-observed]
+             (mapv :record/type res)))
+      (is (all-valid? res)))
+    (testing "§5.1 ack payload"
+      (is (= oi (get-in ack [:fact/payload :order-intent/id])))
+      (is (= :broker/sim (get-in ack [:fact/payload :broker/source-system])))
+      (is (= acct (get-in ack [:fact/payload :broker/account-id])))
+      (is (= boid (get-in ack [:fact/payload :broker/order-id])))
+      (is (= :broker-status/accepted (get-in ack [:fact/payload :broker/status])))
+      (is (= (str "ack/sim/" boid "/accepted") (:fact/dedupe-key ack))))
+    (testing "§5.3 fill payload with Decimal-string price/quantity"
+      (is (= (str boid "-fill-1") (get-in fill [:fact/payload :fill/id])))
+      (is (= "2" (get-in fill [:fact/payload :fill/quantity])))
+      (is (= "550.00" (get-in fill [:fact/payload :fill/price])))
+      (is (= (str "fill/sim/" acct "/" boid "/" boid "-fill-1")
+             (:fact/dedupe-key fill))))
+    (testing "envelope metadata: source-system, mode, correlation, causation"
+      (doseq [fact res]
+        (is (= :broker/sim (:record/source-system fact)))
+        (is (= :mode/sim (:record/mode fact)))
+        (is (= (:record/id cmd) (:record/correlation-id fact)))
+        (is (= [(:record/id cmd)] (:record/causation-ids fact)))))))
+
+(deftest submit-accepted-slippage-and-marks
+  (testing "mark price source with directional slippage (buy pays up)"
+    (let [oi (fresh-oi)
+          broker (sim/make-sim-broker {:fill-policy {:price-source :mark
+                                                     :slippage "0.05"}
+                                       :marks {spy "551.00"}})
+          [_ fill] (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))]
+      (is (= "551.05" (get-in fill [:fact/payload :fill/price]))))))
+
+(deftest submit-accepted-multi-leg
+  (testing "one fill per leg, same broker-order-id, per-leg mark prices"
+    (let [legs [{:instrument/id spy :leg/side :order-side/buy :leg/quantity "1"}
+                {:instrument/id qqq :leg/side :order-side/sell :leg/quantity "1"}]
+          oi (sch/order-intent-id (intent-identity legs "1"))
+          broker (sim/make-sim-broker {:marks {spy "550.00" qqq "480.00"}})
+          res (p/submit-order-intent! broker (submit-cmd oi legs "1"))
+          fills (rest res)
+          boid (sim/broker-order-id oi)]
+      (is (= [:fact/broker-ack-accepted :fact/fill-observed :fact/fill-observed]
+             (mapv :record/type res)))
+      (is (all-valid? res))
+      (is (= [(str boid "-fill-1") (str boid "-fill-2")]
+             (mapv #(get-in % [:fact/payload :fill/id]) fills)))
+      (is (= [boid boid]
+             (mapv #(get-in % [:fact/payload :broker/order-id]) fills)))
+      (is (= [spy qqq]
+             (mapv #(get-in % [:fact/payload :fill/instrument-id]) fills)))
+      (is (= ["550.00" "480.00"]
+             (mapv #(get-in % [:fact/payload :fill/price]) fills))))))
+
+;; ---------------------------------------------------------------------------
+;; §6 case 2 — submit rejected
+;; ---------------------------------------------------------------------------
+
+(deftest submit-rejected
+  (testing ":reject-next hook forces one rejection, then clears"
+    (let [reject-next (atom true)
+          broker (sim/make-sim-broker {:reject-next reject-next})
+          oi1 (fresh-oi "1")
+          oi2 (fresh-oi "2")
+          [rej] (p/submit-order-intent! broker (submit-cmd oi1 (single-leg "1") "1"))
+          res2 (p/submit-order-intent! broker (submit-cmd oi2 (single-leg "2") "2"))]
+      (is (= :fact/broker-ack-rejected (:record/type rej)))
+      (is (:valid? (v/validate-fact rej)))
+      (is (= :broker-rejection/simulated-reject
+             (get-in rej [:fact/payload :broker/rejection-code])))
+      (is (string? (get-in rej [:fact/payload :broker/rejection-message])))
+      (is (= (str "ack/sim/" (sim/broker-order-id oi1) "/rejected")
+             (:fact/dedupe-key rej)))
+      (is (false? @reject-next))
+      (is (= :fact/broker-ack-accepted (:record/type (first res2))))))
+  (testing "invalid intent payload → request-validation rejection"
+    (let [broker (sim/make-sim-broker {})
+          oi (fresh-oi)
+          cmd (update-in (submit-cmd oi (single-leg "2") "2")
+                         [:command/payload :order-intent/payload]
+                         dissoc :order-intent/quantity)
+          [rej] (p/submit-order-intent! broker cmd)]
+      (is (= :fact/broker-ack-rejected (:record/type rej)))
+      (is (= :broker-rejection/request-validation-failed
+             (get-in rej [:fact/payload :broker/rejection-code])))))
+  (testing "no mark and no limit → no-price-source rejection"
+    (let [broker (sim/make-sim-broker {})
+          oi (fresh-oi)
+          cmd (update-in (submit-cmd oi (single-leg "2") "2")
+                         [:command/payload :order-intent/payload]
+                         assoc :order-intent/limit-price nil)
+          [rej] (p/submit-order-intent! broker cmd)]
+      (is (= :broker-rejection/no-price-source
+             (get-in rej [:fact/payload :broker/rejection-code])))))
+  (testing "rejected order never fills and is not open"
+    (let [broker (sim/make-sim-broker {:reject-next (atom true)})
+          oi (fresh-oi)
+          res (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))]
+      (is (= 1 (count res)))
+      (is (= [] (p/fills-since broker acct nil)))
+      (is (= [] (p/open-orders broker acct))))))
+
+;; ---------------------------------------------------------------------------
+;; §6 case 3 — duplicate submit idempotent (§9)
+;; ---------------------------------------------------------------------------
+
+(deftest duplicate-submit-idempotent
+  (let [oi (fresh-oi)
+        broker (sim/make-sim-broker {})
+        cmd1 (submit-cmd oi (single-leg "2") "2")
+        ;; a RETRY: new command envelope (new record id), same idempotency key
+        cmd2 (submit-cmd oi (single-leg "2") "2")
+        res1 (p/submit-order-intent! broker cmd1)
+        res2 (p/submit-order-intent! broker cmd2)]
+    (testing "same ack content, same broker-order-id"
+      (is (= (first res1) (first res2)))
+      (is (= (get-in (first res1) [:fact/payload :broker/order-id])
+             (get-in (first res2) [:fact/payload :broker/order-id]))))
+    (testing "no double fill"
+      (is (= 1 (count res2)))
+      (is (= 1 (count (p/fills-since broker acct nil))))))
+  (testing "duplicate of a rejected submit returns the same rejection"
+    (let [oi (fresh-oi)
+          broker (sim/make-sim-broker {:reject-next (atom true)})
+          [rej1] (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))
+          [rej2] (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))]
+      (is (= :fact/broker-ack-rejected (:record/type rej1)))
+      (is (= rej1 rej2)))))
+
+;; ---------------------------------------------------------------------------
+;; §6 case 4 — partial then full fill (+ engine.fold integration)
+;; ---------------------------------------------------------------------------
+
+(deftest partial-then-full-fill
+  (let [oi (fresh-oi "3")
+        broker (sim/make-sim-broker {:fill-policy {:mode :partial
+                                                   :tranches ["1" "2"]}})
+        res (p/submit-order-intent! broker (submit-cmd oi (single-leg "3") "3"))
+        fills (rest res)
+        boid (sim/broker-order-id oi)]
+    (testing "tranche quantities, distinct fill ids, increasing timestamps"
+      (is (= 2 (count fills)))
+      (is (all-valid? res))
+      (is (= ["1" "2"] (mapv #(get-in % [:fact/payload :fill/quantity]) fills)))
+      (is (= [(str boid "-fill-1") (str boid "-fill-2")]
+             (mapv #(get-in % [:fact/payload :fill/id]) fills)))
+      (is (neg? (compare (:fact/occurred-at (first fills))
+                         (:fact/occurred-at (second fills))))))
+    (testing "fold integration: partially-filled after tranche 1, :filled final"
+      (let [partial (fold-lifecycle oi (single-leg "3") "3"
+                                    [(first res) (first fills)])
+            full (fold-lifecycle oi (single-leg "3") "3" res)]
+        (is (= [:partially-filled "1" []] partial))
+        (is (= [:filled "3" []] full))))))
+
+;; ---------------------------------------------------------------------------
+;; §6 case 5 — cancel race
+;; ---------------------------------------------------------------------------
+
+(deftest cancel-race-fill-wins
+  (let [oi (fresh-oi)
+        broker (sim/make-sim-broker {})
+        res (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))
+        cancel-res (p/cancel-broker-order! broker (cancel-cmd oi))]
+    (testing "fill before cancel → cancel rejected, fill stands (§7)"
+      (is (= [:fact/cancel-ack-rejected] (mapv :record/type cancel-res)))
+      (is (all-valid? cancel-res))
+      (is (= :broker-rejection/cancel-after-fill
+             (get-in (first cancel-res) [:fact/payload :broker/rejection-code])))
+      (is (= 1 (count (p/fills-since broker acct nil)))))
+    (testing "folded outcome stays :filled (fill truth wins for portfolio)"
+      (let [[lifecycle filled-qty emitted]
+            (fold-lifecycle oi (single-leg "2") "2"
+                            (into (vec res) cancel-res))]
+        (is (= :filled lifecycle))
+        (is (= "2" filled-qty))
+        (is (= [] emitted))))))
+
+(deftest cancel-before-fill-cancels
+  (let [oi (fresh-oi)
+        broker (sim/make-sim-broker {:fill-policy {:mode :on-poll}})
+        _ (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))
+        cancel-res (p/cancel-broker-order! broker (cancel-cmd oi))]
+    (testing "open order cancels: cancelled status fact, no fills ever"
+      (is (= [:fact/broker-order-status-observed] (mapv :record/type cancel-res)))
+      (is (= :broker-status/cancelled
+             (get-in (first cancel-res) [:fact/payload :broker/status])))
+      (is (= (str "ack/sim/" (sim/broker-order-id oi) "/cancelled")
+             (:fact/dedupe-key (first cancel-res))))
+      (is (= [] (p/fills-since broker acct nil)))
+      (is (= [] (p/open-orders broker acct))))
+    (testing "cancel retry is idempotent (§9.3): same stored fact"
+      (is (= cancel-res (p/cancel-broker-order! broker (cancel-cmd oi)))))
+    (testing "unknown broker order → cancel rejected, no guessing"
+      (let [other (fresh-oi "9")
+            [rej] (p/cancel-broker-order! broker (cancel-cmd other))]
+        (is (= :fact/cancel-ack-rejected (:record/type rej)))
+        (is (= :broker-rejection/unknown-order
+               (get-in rej [:fact/payload :broker/rejection-code])))))))
+
+;; ---------------------------------------------------------------------------
+;; §6 case 6 — reconciliation with unresolved orders
+;; ---------------------------------------------------------------------------
+
+(deftest reconciliation-queries
+  (let [oi1 (fresh-oi "1")
+        oi2 (fresh-oi "2")
+        broker (sim/make-sim-broker {:fill-policy {:mode :on-poll}})
+        [ack1] (p/submit-order-intent! broker (submit-cmd oi1 (single-leg "1") "1"))
+        [ack2] (p/submit-order-intent! broker (submit-cmd oi2 (single-leg "2") "2"))
+        open (p/open-orders broker acct)]
+    (testing "open-orders returns §5.2 status facts for unresolved orders"
+      (is (= 2 (count open)))
+      (is (all-valid? open))
+      (is (= [:fact/broker-order-status-observed :fact/broker-order-status-observed]
+             (mapv :record/type open)))
+      (is (= [oi1 oi2] (mapv #(get-in % [:fact/payload :order-intent/id]) open)))
+      (is (= [:broker-status/accepted :broker-status/accepted]
+             (mapv #(get-in % [:fact/payload :broker/status]) open))))
+    (testing "fills-since materializes on-poll fills as §5.3 facts"
+      (let [fills (p/fills-since broker acct nil)]
+        (is (= 2 (count fills)))
+        (is (all-valid? fills))
+        (is (= [oi1 oi2]
+               (mapv #(get-in % [:fact/payload :order-intent/id]) fills)))
+        (testing "cursor filter is >= on ISO timestamps; nil means all"
+          (is (= fills (p/fills-since broker acct "2026-06-10T14:30:00Z")))
+          (is (= [(second fills)]
+                 (p/fills-since broker acct (:fact/occurred-at (second fills)))))
+          (is (= [] (p/fills-since broker acct "2027-01-01T00:00:00Z"))))
+        (testing "filled orders are no longer open"
+          (is (= [] (p/open-orders broker acct))))
+        (testing "reconciliation facts fold cleanly through engine.fold"
+          (let [[lifecycle filled-qty emitted]
+                (fold-lifecycle oi1 (single-leg "1") "1"
+                                [ack1 (first fills)])]
+            (is (= :filled lifecycle))
+            (is (= "1" filled-qty))
+            (is (= [] emitted)))
+          (let [fill2 (second fills)
+                base (f/fold-facts (st/fresh-state)
+                                   [(intent-created-fact oi2 (single-leg "2") "2")
+                                    (dispatch-fact oi2)
+                                    ack2 fill2])
+                redup (f/fold-fact (:state base) fill2)]
+            (testing "duplicate broker observation folds to identical state"
+              (is (= (:state base) (:state redup)))
+              (is (= [] (:emitted-facts redup))))))))))
+
+(deftest recovery-seam-adapts-broker
+  (let [oi (fresh-oi)
+        broker (sim/make-sim-broker {:fill-policy {:mode :on-poll}})
+        _ (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))
+        seam (p/recovery-seam broker)]
+    (testing "fn-map shape matches the Phase 3 recovery broker seam"
+      (is (fn? (:open-orders seam)))
+      (is (fn? (:fills-since seam))))
+    (testing "seam fns answer with the broker's canonical facts"
+      (let [open ((:open-orders seam) acct)]
+        (is (= 1 (count open)))
+        (is (= oi (get-in (first open) [:fact/payload :order-intent/id]))))
+      (let [fills ((:fills-since seam) acct nil)]
+        (is (= 1 (count fills)))
+        (is (= :fact/fill-observed (:record/type (first fills))))
+        (is (all-valid? fills))))))
+
+;; ---------------------------------------------------------------------------
+;; Account state + health (§4.5, §4.6, §11)
+;; ---------------------------------------------------------------------------
+
+(deftest account-state-and-health
+  (let [broker (sim/make-sim-broker {:fill-policy {:mode :on-poll}})
+        oi (fresh-oi)
+        _ (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))
+        account-fact (p/account-state broker acct)
+        health-fact (p/health broker)]
+    (testing "account observation fact (§5.4 minimum fields)"
+      ;; note: :fact/broker-account-observed is in broker.protocol's fact
+      ;; set (taxonomy §6.1) but absent from the strict §8 list, so it is
+      ;; not run through validate-fact here.
+      (is (= :fact/broker-account-observed (:record/type account-fact)))
+      (is (= acct (get-in account-fact [:fact/payload :broker/account-id])))
+      (is (= :broker/sim (get-in account-fact [:fact/payload :broker/source-system])))
+      (is (string? (get-in account-fact [:fact/payload :broker/observed-at])))
+      (is (= 1 (get-in account-fact [:fact/payload :account/open-order-count]))))
+    (testing "health heartbeat fact, no orders submitted by health checks"
+      (is (= :fact/health-heartbeat-recorded (:record/type health-fact)))
+      (is (:valid? (v/validate-fact health-fact)))
+      (is (= :health/connected
+             (get-in health-fact [:fact/payload :health/connectivity])))
+      (is (= 1 (count (p/open-orders broker acct)))))))
+
+;; ---------------------------------------------------------------------------
+;; Determinism
+;; ---------------------------------------------------------------------------
+
+(deftest deterministic-by-default
+  (testing "two brokers with default opts produce identical fact content"
+    (let [oi (fresh-oi)
+          run (fn []
+                (let [b (sim/make-sim-broker {})]
+                  (mapv #(-> %
+                             (dissoc :record/id)
+                             (update :record/causation-ids (constantly nil))
+                             (update :record/correlation-id (constantly nil)))
+                        (p/submit-order-intent! b (submit-cmd oi (single-leg "2") "2")))))]
+      (is (= (run) (run))))))
