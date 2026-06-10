@@ -1,0 +1,11 @@
+{
+  "lint_command": "scripts/lint.sh",
+  "test_command": "scripts/test.sh",
+  "max_rounds": 5,
+  "adversary": {
+    "command": "codex exec -m gpt-5.5 -c model_reasoning_effort=xhigh --color never",
+    "prompt_file": ".claude/skills/feature/polish-adversary.prompt.md",
+    "max_rounds": 3,
+    "timeout_ms": 300000
+  }
+}
