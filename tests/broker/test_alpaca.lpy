@@ -353,6 +353,130 @@
       (is (= "2026-06-10T14:31:04Z"
              (get-in fill [:fact/payload :fill/occurred-at]))))))
 
+;; ---------------------------------------------------------------------------
+;; parse-occ-symbol: pure inverse of occ-symbol (leg identity without journal)
+;; ---------------------------------------------------------------------------
+
+(deftest parse-occ-symbol-is-pure-inverse-of-occ-symbol
+  (testing "compact OCC option symbols round-trip"
+    (is (= "option/OPRA/SPY/2026-06-19/C/550.000"
+           (alp/parse-occ-symbol "SPY260619C00550000")))
+    (is (= "option/OPRA/SPY/2026-06-19/P/545.000"
+           (alp/parse-occ-symbol "SPY260619P00545000")))
+    (is (= "SPY260619C00550000"
+           (alp/occ-symbol (alp/parse-occ-symbol "SPY260619C00550000"))))
+    (testing "fractional strikes survive"
+      (is (= "option/OPRA/SPY/2026-06-19/P/549.500"
+             (alp/parse-occ-symbol "SPY260619P00549500")))))
+  (testing "bare equity tickers map to the canonical equity id"
+    (is (= "equity/NASDAQ/SPY" (alp/parse-occ-symbol "SPY"))))
+  (testing "junk parses to nil, never throws"
+    (is (nil? (alp/parse-occ-symbol "???")))
+    (is (nil? (alp/parse-occ-symbol "")))
+    (is (nil? (alp/parse-occ-symbol nil)))))
+
+;; ---------------------------------------------------------------------------
+;; Restart scenario: FRESH broker (empty submit journal) must still
+;; recover per-leg instrument identity for multi-leg fills (Finding 2)
+;; ---------------------------------------------------------------------------
+
+(deftest fresh-broker-multi-leg-fills-keep-leg-identity
+  (let [known-short (alp/alpaca-client-order-id oi-spread)
+        ;; fresh broker: nothing ever submitted through it, journal empty
+        broker (make-broker
+                (fn [_]
+                  {:status 200
+                   :body (json-str
+                          [{"id" "ord-70"
+                            "client_order_id" known-short
+                            "status" "filled"
+                            "filled_qty" "1"
+                            "legs"
+                            [{"id" "leg-1"
+                              "symbol" "SPY260619P00545000"
+                              "filled_qty" "1"
+                              "filled_avg_price" "0.90"
+                              "filled_at" "2026-06-10T14:31:04+00:00"}
+                             {"id" "leg-2"
+                              "symbol" "SPY260619P00550000"
+                              "filled_qty" "1"
+                              "filled_avg_price" "1.40"
+                              "filled_at" "2026-06-10T14:31:04+00:00"}]}])}))
+        facts (bp/fills-since broker
+                              {:broker/account-id account-id
+                               :reconcile/known-intent-ids [oi-spread]}
+                              nil)]
+    (is (= 2 (count facts)))
+    (is (every? #(= :fact/fill-observed (:record/type %)) facts))
+    (is (every? #(true? (:valid? (v/validate-fact %))) facts))
+    (testing "each normalized fill carries the correct :fill/instrument-id"
+      (is (= {"SPY260619P00545000" "option/OPRA/SPY/2026-06-19/P/545.000"
+              "SPY260619P00550000" "option/OPRA/SPY/2026-06-19/P/550.000"}
+             (into {}
+                   (map (fn [f]
+                          [(get-in f [:fact/payload :fill/symbol])
+                           (get-in f [:fact/payload :fill/instrument-id])])
+                        facts)))))
+    (testing "envelope instrument-id matches the leg"
+      (is (= #{"option/OPRA/SPY/2026-06-19/P/545.000"
+               "option/OPRA/SPY/2026-06-19/P/550.000"}
+             (set (map :record/instrument-id facts)))))
+    (testing "intent lineage recomputed from known-intent-ids"
+      (is (every? #(= oi-spread (get-in % [:fact/payload :order-intent/id]))
+                  facts)))))
+
+;; ---------------------------------------------------------------------------
+;; Malformed external numerics → fault fact, never an exception (Finding 3)
+;; ---------------------------------------------------------------------------
+
+(deftest fills-since-garbage-numerics-become-fault-facts
+  (testing "garbage order-level filled_qty → ambiguous-response fault"
+    (let [known-short (alp/alpaca-client-order-id oi-equity)
+          broker (make-broker
+                  (fn [_]
+                    {:status 200
+                     :body (json-str
+                            [{"id" "ord-80"
+                              "client_order_id" known-short
+                              "status" "filled"
+                              "symbol" "SPY"
+                              "filled_qty" "garbage"
+                              "filled_avg_price" "550.00"
+                              "filled_at" "2026-06-10T14:31:04Z"}])}))
+          facts (bp/fills-since broker
+                                {:broker/account-id account-id
+                                 :reconcile/known-intent-ids [oi-equity]}
+                                nil)
+          fault (first facts)]
+      (is (= 1 (count facts)))
+      (is (= :fact/fault-recorded (:record/type fault)))
+      (is (true? (:valid? (v/validate-fact fault))))
+      (is (= :fault/ambiguous-response
+             (get-in fault [:fact/payload :fault/category])))
+      (is (= "ord-80" (get-in fault [:fact/payload :broker/order-id])))))
+  (testing "garbage leg-level filled_avg_price → ambiguous-response fault"
+    (let [known-short (alp/alpaca-client-order-id oi-equity)
+          broker (make-broker
+                  (fn [_]
+                    {:status 200
+                     :body (json-str
+                            [{"id" "ord-81"
+                              "client_order_id" known-short
+                              "status" "filled"
+                              "symbol" "SPY"
+                              "filled_qty" "2"
+                              "filled_avg_price" "NaN"
+                              "filled_at" "2026-06-10T14:31:04Z"}])}))
+          facts (bp/fills-since broker
+                                {:broker/account-id account-id
+                                 :reconcile/known-intent-ids [oi-equity]}
+                                nil)
+          fault (first facts)]
+      (is (= 1 (count facts)))
+      (is (= :fact/fault-recorded (:record/type fault)))
+      (is (= :fault/ambiguous-response
+             (get-in fault [:fact/payload :fault/category]))))))
+
 (deftest fills-since-unknown-lineage-is-anomaly
   (let [broker (make-broker
                 (fn [_]

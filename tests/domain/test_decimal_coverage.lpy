@@ -1,0 +1,221 @@
+(ns domain.test-decimal-coverage
+  "Decimal-string coverage across ALL canonical numeric payload fields
+  (CANONICAL_SCHEMAS §4.2: decimal strings durable, binary floats
+  forbidden) — quote facts, option-chain contract quotes, ledger cash
+  movements, position lots, and position marks. Adversarial-review
+  Finding 1: validation previously only covered order/fill/bar fields,
+  so floats in quote/chain/cash/lot/mark payloads slipped through."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.ledger.core :as led]))
+
+(def ts "2026-06-10T14:30:00Z")
+
+(defn- invalid-decimal-at?
+  "True when the validation result is invalid AND carries an
+  :error/invalid-decimal error whose path ends in field-key."
+  [{:keys [valid? errors]} field-key]
+  (and (false? valid?)
+       (some #(and (= :error/invalid-decimal (:error/code %))
+                   (= field-key (last (:error/path %))))
+             errors)))
+
+;; ---------------------------------------------------------------------------
+;; Canonical fact builders (string decimals — the valid baseline)
+;; ---------------------------------------------------------------------------
+
+(defn quote-fact
+  []
+  (sch/fact-envelope
+   {:record/type :fact/quote-observed
+    :record/mode :mode/replay
+    :record/instrument-id "equity/NASDAQ/SPY"
+    :record/source-system :market-data/replay
+    :fact/occurred-at ts
+    :fact/recorded-at ts
+    :fact/payload {:quote/time ts
+                   :quote/bid "550.01"
+                   :quote/ask "550.03"
+                   :quote/bid-size "5"
+                   :quote/ask-size "7"}}))
+
+(defn chain-fact
+  []
+  (sch/fact-envelope
+   {:record/type :fact/option-chain-observed
+    :record/mode :mode/replay
+    :record/instrument-id "equity/NASDAQ/SPY"
+    :record/source-system :market-data/replay
+    :fact/occurred-at ts
+    :fact/recorded-at ts
+    :fact/payload {:chain/observed-at ts
+                   :chain/underlying "equity/NASDAQ/SPY"
+                   :chain/contracts
+                   [{:instrument/id "option/OPRA/SPY/2026-06-19/C/550.000"
+                     :quote/bid "2.10"
+                     :quote/ask "2.15"}
+                    {:instrument/id "option/OPRA/SPY/2026-06-19/P/545.000"
+                     :quote/bid "0.90"
+                     :quote/ask "0.95"}]}}))
+
+(defn cash-fact
+  []
+  (sch/fact-envelope
+   {:record/type :fact/cash-movement-recorded
+    :record/mode :mode/sim
+    :record/account-id "account/sim/test"
+    :record/source-system :engine/core
+    :fact/occurred-at ts
+    :fact/recorded-at ts
+    :fact/payload {:cash/category :cash/trade-principal
+                   :cash/amount "-1100.00"
+                   :cash/account-id "account/sim/test"
+                   :cash/occurred-at ts}}))
+
+(defn mark-fact
+  []
+  (sch/fact-envelope
+   {:record/type :fact/position-mark-recorded
+    :record/mode :mode/sim
+    :record/account-id "account/sim/test"
+    :record/instrument-id "equity/NASDAQ/SPY"
+    :record/source-system :engine/core
+    :fact/occurred-at ts
+    :fact/recorded-at ts
+    :fact/payload {:mark/instrument-id "equity/NASDAQ/SPY"
+                   :mark/price "551.25"
+                   :mark/at ts}}))
+
+;; ---------------------------------------------------------------------------
+;; String decimals validate; binary floats are rejected
+;; ---------------------------------------------------------------------------
+
+(deftest quote-fact-decimal-coverage
+  (testing "decimal-string quote payload is valid"
+    (is (= {:valid? true} (v/validate-fact (quote-fact)))))
+  (testing "float bid rejected"
+    (is (invalid-decimal-at?
+         (v/validate-fact (assoc-in (quote-fact)
+                                    [:fact/payload :quote/bid] 550.01))
+         :quote/bid)))
+  (testing "float ask-size rejected"
+    (is (invalid-decimal-at?
+         (v/validate-fact (assoc-in (quote-fact)
+                                    [:fact/payload :quote/ask-size] 7.0))
+         :quote/ask-size))))
+
+(deftest chain-contract-decimal-coverage
+  (testing "decimal-string contract quotes are valid"
+    (is (= {:valid? true} (v/validate-fact (chain-fact)))))
+  (testing "float ask inside a :chain/contracts entry rejected"
+    (is (invalid-decimal-at?
+         (v/validate-fact
+          (assoc-in (chain-fact)
+                    [:fact/payload :chain/contracts 0 :quote/ask] 2.15))
+         :quote/ask)))
+  (testing "float bid inside a later contract rejected"
+    (is (invalid-decimal-at?
+         (v/validate-fact
+          (assoc-in (chain-fact)
+                    [:fact/payload :chain/contracts 1 :quote/bid] 0.90))
+         :quote/bid)))
+  (testing "a contract with absent quotes is still valid (one-sided books)"
+    (is (= {:valid? true}
+           (v/validate-fact
+            (update-in (chain-fact) [:fact/payload :chain/contracts] conj
+                       {:instrument/id
+                        "option/OPRA/SPY/2026-06-19/P/540.000"}))))))
+
+(deftest cash-movement-decimal-coverage
+  (testing "decimal-string amount is valid"
+    (is (= {:valid? true} (v/validate-fact (cash-fact)))))
+  (testing "float amount rejected"
+    (is (invalid-decimal-at?
+         (v/validate-fact (assoc-in (cash-fact)
+                                    [:fact/payload :cash/amount] -1100.0))
+         :cash/amount))))
+
+(deftest position-mark-decimal-coverage
+  (testing "decimal-string mark price is valid"
+    (is (= {:valid? true} (v/validate-fact (mark-fact)))))
+  (testing "float mark price rejected"
+    (is (invalid-decimal-at?
+         (v/validate-fact (assoc-in (mark-fact)
+                                    [:fact/payload :mark/price] 551.25))
+         :mark/price))))
+
+;; ---------------------------------------------------------------------------
+;; Position-lot fields + the real emitter: ledger.core derive-ledger-facts
+;; emits decimal STRINGS, so everything it produces still validates with
+;; the extended coverage; a hand-built float lot payload is rejected.
+;; ---------------------------------------------------------------------------
+
+(def strategy-id "strategy/simple-direction/sma-cross/v1")
+(def account-id "account/sim/test")
+(def instrument-id "equity/NASDAQ/SPY")
+
+(defn- fill-fact
+  [fill-id qty price intent-id]
+  (sch/fact-envelope
+   {:record/type :fact/fill-observed
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id account-id
+    :record/instrument-id instrument-id
+    :record/source-system :broker/sim
+    :fact/occurred-at ts
+    :fact/recorded-at ts
+    :fact/payload {:order-intent/id intent-id
+                   :broker/source-system :broker/sim
+                   :broker/order-id "sim-1"
+                   :fill/id fill-id
+                   :fill/occurred-at ts
+                   :fill/quantity qty
+                   :fill/price price
+                   :fill/fees "1.50"
+                   :fill/liquidity :liquidity/taker}}))
+
+(defn- ctx
+  [effect side intent-id]
+  {:order-intent/id intent-id
+   :order-intent/effect effect
+   :order-intent/side side
+   :order-intent/account-id account-id
+   :order-intent/strategy-id strategy-id
+   :order-intent/instrument-id instrument-id})
+
+(deftest ledger-emitted-facts-still-validate
+  (let [open-fill (fill-fact "t1" "2" "550.00" "oi_a")
+        open-ctx (ctx :position-effect/open :order-side/buy "oi_a")
+        opened (led/derive-ledger-facts led/empty-ledger open-fill open-ctx)
+        ledger (led/fold-ledger-facts led/empty-ledger opened)
+        close-fill (fill-fact "t2" "2" "551.00" "oi_b")
+        close-ctx (ctx :position-effect/close :order-side/sell "oi_b")
+        closed (led/derive-ledger-facts ledger close-fill close-ctx)]
+    (testing "lot-open + cash facts (decimal strings) validate"
+      (is (pos? (count opened)))
+      (is (every? #(true? (:valid? (v/validate-fact %))) opened)))
+    (testing "lot-close + cash facts (decimal strings) validate"
+      (is (pos? (count closed)))
+      (is (every? #(true? (:valid? (v/validate-fact %))) closed)))
+    (testing "a float smuggled into an emitted lot payload IS rejected"
+      (let [lot-open (first opened)]
+        (is (= :fact/position-lot-opened (:record/type lot-open)))
+        (is (invalid-decimal-at?
+             (v/validate-fact (assoc-in lot-open
+                                        [:fact/payload :lot/quantity] 2.0))
+             :lot/quantity))
+        (is (invalid-decimal-at?
+             (v/validate-fact (assoc-in lot-open
+                                        [:fact/payload :lot/cost-basis]
+                                        1100.0))
+             :lot/cost-basis))))
+    (testing "a float smuggled into an emitted lot-close payload IS rejected"
+      (let [lot-close (first closed)]
+        (is (= :fact/position-lot-closed (:record/type lot-close)))
+        (is (invalid-decimal-at?
+             (v/validate-fact
+              (assoc-in lot-close
+                        [:fact/payload :lot-close/realized-pnl] 2.0))
+             :lot-close/realized-pnl))))))

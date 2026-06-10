@@ -213,18 +213,33 @@
 
 (defn load-fixture
   "Read and validate a fixture v0.2 EDN file. Returns the fixture map;
-  throws ex-info {:error/code :error/invalid-fixture :error/errors [...]}
-  when validation fails (replay fixture corruption is a normalized fault
-  category — MARKET_DATA_ADAPTER §10)."
+  throws ex-info {:error/code :error/invalid-fixture ...} when the file
+  is missing or unreadable, the contents are not parseable EDN
+  (:error/cause carries the IO/parse failure summary), or validation
+  fails (:error/errors) — replay fixture corruption is a normalized
+  fault category (MARKET_DATA_ADAPTER §10), never a raw IO/parse
+  exception."
   [path]
-  (let [fixture (edn/read-string (slurp path))
-        {:keys [valid? errors]} (validate-fixture fixture)]
-    (if valid?
-      fixture
-      (throw (ex-info (str "invalid replay fixture: " path)
+  (let [read-result (try
+                      {:fixture (edn/read-string (slurp path))}
+                      (catch python/Exception e
+                        {:cause (str (.-__name__ (python/type e)) ": "
+                                     (str e))}))]
+    (when (contains? read-result :cause)
+      (throw (ex-info (str "unreadable replay fixture: " path)
                       {:error/code   :error/invalid-fixture
                        :error/path   path
-                       :error/errors errors})))))
+                       :fixture/path path
+                       :error/cause  (:cause read-result)})))
+    (let [fixture (:fixture read-result)
+          {:keys [valid? errors]} (validate-fixture fixture)]
+      (if valid?
+        fixture
+        (throw (ex-info (str "invalid replay fixture: " path)
+                        {:error/code   :error/invalid-fixture
+                         :error/path   path
+                         :fixture/path path
+                         :error/errors errors}))))))
 
 (defn write-fixture
   "Validate and write a fixture v0.2 map as EDN to path (atomic: tmp file

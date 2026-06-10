@@ -252,6 +252,33 @@
       (is (some? thrown))
       (is (= :error/invalid-fixture (:error/code (ex-data thrown)))))))
 
+(deftest load-fixture-nonexistent-path-is-invalid-fixture
+  ;; Finding 4: IO failures normalize to the documented ex-info contract,
+  ;; never a raw FileNotFoundError across the boundary.
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "no-such-fixture-v0.2.edn")
+        thrown (try
+                 (do (fx/load-fixture path) nil)
+                 (catch python/Exception e e))]
+    (is (some? thrown))
+    (is (= :error/invalid-fixture (:error/code (ex-data thrown))))
+    (is (= path (:fixture/path (ex-data thrown))))
+    (is (string? (:error/cause (ex-data thrown))))))
+
+(deftest load-fixture-garbage-edn-is-invalid-fixture
+  ;; Finding 4: parse failures normalize to the documented ex-info
+  ;; contract, never a raw reader exception across the boundary.
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "garbage-v0.2.edn")]
+    (spit path "{:fixture/id \"broken\" :fixture/inputs [")
+    (let [thrown (try
+                   (do (fx/load-fixture path) nil)
+                   (catch python/Exception e e))]
+      (is (some? thrown))
+      (is (= :error/invalid-fixture (:error/code (ex-data thrown))))
+      (is (= path (:fixture/path (ex-data thrown))))
+      (is (string? (:error/cause (ex-data thrown)))))))
+
 (deftest write-fixture-refuses-invalid-fixture
   (let [dir (tempfile/mkdtemp)
         path (os.path/join dir "never-written-v0.2.edn")

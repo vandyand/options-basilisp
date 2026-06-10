@@ -86,7 +86,7 @@
   Health (§11): GET /v2/account only — health checks never submit
   orders. Transport failure → heartbeat with :health/unreachable, not an
   exception."
-  (:import datetime json urllib.error urllib.request)
+  (:import datetime decimal json urllib.error urllib.request)
   (:require [stevetrading.broker.protocol :as p]
             [stevetrading.domain.instruments :as instruments]
             [stevetrading.domain.schemas :as sch]))
@@ -161,6 +161,44 @@
                       {:error/code :error/unsupported-asset-class
                        :instrument/id instrument-id})))))
 
+;; Wire symbols carry no venue. Reconstruction uses the repo's canonical
+;; default venues: OPRA for listed US options, NASDAQ for equities.
+(def default-option-venue "OPRA")
+(def default-equity-venue "NASDAQ")
+
+(def ^:private occ-symbol-re
+  ;; compact OCC: underlying + yymmdd + C|P + strike×1000 zero-padded to 8
+  #"^([A-Z][A-Z0-9.]*?)(\d{6})([CP])(\d{8})$")
+
+(def ^:private equity-symbol-re
+  #"^[A-Z][A-Z0-9._-]*$")
+
+(defn parse-occ-symbol
+  "Pure inverse of occ-symbol: map an Alpaca order/leg symbol back to a
+  canonical instrument id with NO journal state — leg identity survives
+  process restarts (a fresh broker has an empty submit journal).
+    \"SPY260619C00550000\" → \"option/OPRA/SPY/2026-06-19/C/550.000\"
+    \"SPY\"                → \"equity/NASDAQ/SPY\"
+  Returns nil for symbols matching neither shape."
+  [symbol]
+  (when (string? symbol)
+    (if-let [[_ underlying yymmdd right millis] (re-matches occ-symbol-re
+                                                            symbol)]
+      (instruments/instrument-id
+       {:instrument/asset-class :asset-class/option
+        :instrument/venue default-option-venue
+        :instrument/underlying underlying
+        :instrument/expiry (str "20" (subs yymmdd 0 2) "-"
+                                (subs yymmdd 2 4) "-"
+                                (subs yymmdd 4 6))
+        :instrument/right (if (= "C" right)
+                            :option-right/call
+                            :option-right/put)
+        :instrument/strike (/ (decimal/Decimal millis)
+                              (decimal/Decimal "1000"))})
+      (when (re-matches equity-symbol-re symbol)
+        (str "equity/" default-equity-venue "/" symbol)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Wire-shape helpers
 ;; ---------------------------------------------------------------------------
@@ -217,6 +255,21 @@
     (if (.endswith ts "+00:00")
       (str (subs ts 0 (- (count ts) 6)) "Z")
       ts)))
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn- parse-decimal
+  "External broker numeric → finite Decimal, or nil when missing /
+  unparseable / non-finite. Malformed broker values normalize to §10
+  fault facts downstream — never a raw exception across the boundary,
+  never a binary float."
+  [x]
+  (when (some? x)
+    (let [d (try
+              (decimal/Decimal (str x))
+              (catch python/Exception _ nil))]
+      (when (and (some? d) (.is_finite d))
+        d))))
 
 ;; ---------------------------------------------------------------------------
 ;; Python interop helpers
@@ -524,54 +577,83 @@
                    :broker/observed-at ts}})))
 
 (defn- leg-instrument-id
-  "Map a broker order symbol back to a canonical instrument id via this
-  process's journal (intent legs keyed by their OCC/wire symbol). nil for
-  orders submitted by another process — the fill still carries
-  :fill/symbol; ledger derivation resolves the leg from intent context."
+  "Map a broker order symbol back to a canonical instrument id. PRIMARY:
+  pure parse-occ-symbol (no process state — survives restarts; a fresh
+  broker has an empty submit journal, so journal-only mapping would lose
+  spread-leg identity after recovery). FALLBACK: this process's submit
+  journal (intent legs keyed by their OCC/wire symbol). nil when neither
+  resolves — the fill still carries :fill/symbol; ledger derivation
+  resolves the leg from intent context."
   [journal client-order-id symbol]
-  (get-in @journal [:by-client-id client-order-id :symbol->instrument
-                    symbol]))
+  (or (parse-occ-symbol symbol)
+      (get-in @journal [:by-client-id client-order-id :symbol->instrument
+                        symbol])))
 
 (defn- fill-facts-of-order
   "Normalized :fact/fill-observed facts for one CLOSED broker order JSON
-  (simple order → one fill; mleg → one per filled leg)."
+  (simple order → one fill; mleg → one per filled leg). Rows whose
+  filled_qty / filled_avg_price are present but unparseable as finite
+  decimals normalize to a §10 :fault/ambiguous-response fault fact —
+  never a raw exception, never a binary float."
   [journal account-id order oi-id ts]
   (let [coid (get order "client_order_id")
+        boid (get order "id")
         rows (if (seq (get order "legs"))
                (get order "legs")
                [order])]
     (vec
-     (for [row rows
-           :let [filled-qty (get row "filled_qty")
-                 price (get row "filled_avg_price")]
-           :when (and (some? filled-qty) (some? price)
-                      (pos? (python/float (str filled-qty))))]
-       (let [boid (get order "id")
-             fill-id (get row "id")
-             symbol (get row "symbol")
-             occurred (normalize-ts (or (get row "filled_at")
-                                        (get order "filled_at")
-                                        ts))]
-         (broker-fact {} occurred
-                      {:record/type :fact/fill-observed
-                       :record/account-id account-id
-                       :record/instrument-id (leg-instrument-id journal coid
-                                                                symbol)
-                       :fact/dedupe-key (str "fill/alpaca/" account-id "/"
-                                             boid "/" fill-id)
-                       :fact/payload
-                       (compact
-                        {:order-intent/id oi-id
-                         :broker/source-system source-system
-                         :broker/account-id account-id
-                         :broker/order-id boid
-                         :fill/id fill-id
-                         :fill/instrument-id (leg-instrument-id journal coid
-                                                                symbol)
-                         :fill/symbol symbol
-                         :fill/occurred-at occurred
-                         :fill/quantity (str filled-qty)
-                         :fill/price (str price)})}))))))
+     (mapcat
+      (fn [row]
+        (let [filled-qty (get row "filled_qty")
+              price (get row "filled_avg_price")]
+          (if-not (and (some? filled-qty) (some? price))
+            []
+            (let [qty-dec (parse-decimal filled-qty)
+                  price-dec (parse-decimal price)]
+              (cond
+                (or (nil? qty-dec) (nil? price-dec))
+                [(fault-fact {} ts :fault/ambiguous-response
+                             (str "unparseable fill numerics on broker order "
+                                  boid ": filled_qty=" (pr-str filled-qty)
+                                  " filled_avg_price=" (pr-str price))
+                             (compact
+                              {:order-intent/id oi-id
+                               :broker/account-id account-id
+                               :broker/order-id boid
+                               :fill/id (get row "id")
+                               :fill/symbol (get row "symbol")
+                               :fault/during :reconcile/fills-since}))]
+
+                (not (> qty-dec dec-zero))
+                []
+
+                :else
+                (let [fill-id (get row "id")
+                      symbol (get row "symbol")
+                      instrument-id (leg-instrument-id journal coid symbol)
+                      occurred (normalize-ts (or (get row "filled_at")
+                                                 (get order "filled_at")
+                                                 ts))]
+                  [(broker-fact {} occurred
+                                {:record/type :fact/fill-observed
+                                 :record/account-id account-id
+                                 :record/instrument-id instrument-id
+                                 :fact/dedupe-key (str "fill/alpaca/"
+                                                       account-id "/"
+                                                       boid "/" fill-id)
+                                 :fact/payload
+                                 (compact
+                                  {:order-intent/id oi-id
+                                   :broker/source-system source-system
+                                   :broker/account-id account-id
+                                   :broker/order-id boid
+                                   :fill/id fill-id
+                                   :fill/instrument-id instrument-id
+                                   :fill/symbol symbol
+                                   :fill/occurred-at occurred
+                                   :fill/quantity (str qty-dec)
+                                   :fill/price (str price-dec)})})]))))))
+      rows))))
 
 ;; ---------------------------------------------------------------------------
 ;; Clock
@@ -814,14 +896,31 @@
           (vec
            (mapcat
             (fn [order]
-              (let [filled-qty (get order "filled_qty")]
-                (if-not (and (some? filled-qty)
-                             (pos? (python/float (str filled-qty))))
+              (let [filled-qty (get order "filled_qty")
+                    qty-dec (parse-decimal filled-qty)]
+                (cond
+                  (nil? filled-qty)
                   []
+
+                  ;; present but unparseable → §10 ambiguous response,
+                  ;; never a raw exception across the boundary
+                  (nil? qty-dec)
+                  [(fault-fact {} ts :fault/ambiguous-response
+                               (str "unparseable filled_qty on broker order "
+                                    (get order "id") ": "
+                                    (pr-str filled-qty))
+                               {:broker/account-id account-id
+                                :broker/order-id (get order "id")
+                                :fault/during :reconcile/fills-since})]
+
+                  (not (> qty-dec dec-zero))
+                  []
+
+                  :else
                   (let [evidence {:broker/order-id (get order "id")
                                   :broker/account-id account-id
                                   :broker/raw-status (get order "status")
-                                  :fill/quantity (str filled-qty)}
+                                  :fill/quantity (str qty-dec)}
                         lineage (resolve-lineage
                                  idx (get order "client_order_id")
                                  evidence ts)]

@@ -65,17 +65,45 @@
     :leg/quantity
     :fill/quantity
     :fill/price
+    :fill/fees
     :bar/open
     :bar/high
     :bar/low
     :bar/close
-    :bar/volume})
+    :bar/volume
+    ;; quote facts (MARKET_DATA_ADAPTER §4.2) AND per-contract quotes inside
+    ;; :chain/contracts (§4.3) — walk-value applies field checks at every
+    ;; nesting depth, so these cover both
+    :quote/bid
+    :quote/ask
+    :quote/bid-size
+    :quote/ask-size
+    ;; ledger cash movements (:fact/cash-movement-recorded, ledger.core)
+    :cash/amount
+    ;; position lots (:fact/position-lot-opened / -closed, ledger.core)
+    :lot/quantity
+    :lot/price
+    :lot/cost-basis
+    :lot/remaining-quantity
+    :lot-close/quantity
+    :lot-close/price
+    :lot-close/basis
+    :lot-close/proceeds
+    :lot-close/realized-pnl
+    ;; durable position marks (:fact/position-mark-recorded, ledger.core fold)
+    :mark/price})
 
 ;; Decimal fields where nil is acceptable (price params only apply to some
-;; order types).
+;; order types; chain contracts may carry one-sided/absent quotes — both
+;; engine.loop and feature.core nil-guard contract bids/asks).
 (def ^:private nilable-decimal-fields
   #{:order-intent/limit-price
-    :order-intent/stop-price})
+    :order-intent/stop-price
+    :fill/fees
+    :quote/bid
+    :quote/ask
+    :quote/bid-size
+    :quote/ask-size})
 
 (def ^:private timestamp-fields
   #{:fact/occurred-at
