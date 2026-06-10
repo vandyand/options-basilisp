@@ -1,0 +1,273 @@
+(ns stevetrading.market-data.thetadata
+  "Live ThetaData option-chain source (MARKET_DATA_ADAPTER §4.3, §5-§9).
+
+  ADAPTER component: polls a local ThetaData Terminal v3 (default
+  http://127.0.0.1:25503 — the terminal is a separate Java process whose
+  lifecycle the operator owns; the account allows ONE terminal session,
+  see the Python repo's thetadata_lifecycle.sh) and emits canonical
+  `:fact/option-chain-observed` snapshots.
+
+  Quality semantics: `:quality/dropped-contracts` counts only rows the
+  adapter could not parse (bad strike/right) — silent data loss per §6.
+  Strike-range exclusions are intentional configuration, not loss, and
+  do not affect quality flags.
+
+  Wire-shape notes (verified live against Terminal v3 + the proven
+  Python reference `scripts_5yr/live/thetadata_fetcher.py`):
+  - GET /v3/option/list/expirations?symbol=SPY&format=json
+      → columnar {\"symbol\" [...] \"expiration\" [\"2012-06-01\" ...]}
+      (includes HISTORICAL expirations — callers must filter >= today)
+  - GET /v3/option/snapshot/quote?symbol=SPY&expiration=YYYYMMDD&format=json
+      (expiration is COMPACT in the url, dashed in responses)
+      → columnar parallel arrays: strike (dollars), right (\"PUT\"/\"CALL\"),
+        bid/ask (floats — parsed with parse_float=str so canonical decimal
+        STRINGS reach payloads untouched), bid_size/ask_size, expiration
+        (dashed), timestamp (NAIVE America/New_York local time —
+        normalized here to RFC3339 UTC Z)
+
+  Cursor semantics: TIMESTAMP-ANCHORED from day one (the alpaca-source
+  restart-gap lesson): the cursor is the last emitted snapshot's
+  observed-at; a fresh post-restart instance resumes correctly because
+  emission is 'snapshot strictly fresher than cursor'. next-observations
+  BLOCKS (poll + sleep) until a fresher snapshot exists or :until passes."
+  (:import json
+           time
+           urllib.request
+           zoneinfo
+           datetime)
+  (:require [stevetrading.domain.instruments :as ins]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.market-data.protocol :as p]))
+
+(def provider :market-data/thetadata)
+
+(def default-base-url "http://127.0.0.1:25503")
+
+(def ^:private eastern (zoneinfo/ZoneInfo "America/New_York"))
+
+(defn utc-now-str
+  []
+  (let [now (datetime.datetime/now (.-utc datetime/timezone))]
+    (str (.strftime now "%Y-%m-%dT%H:%M:%S.%f") "Z")))
+
+(defn et->utc
+  "Naive ET terminal timestamp \"2026-06-10T16:14:56.020\" → RFC3339 UTC Z.
+  nil-safe (nil → nil)."
+  [ts]
+  (when ts
+    (let [naive (datetime.datetime/fromisoformat ts)
+          localized (.replace naive ** :tzinfo eastern)
+          utc (.astimezone localized (.-utc datetime/timezone))]
+      (str (.strftime utc "%Y-%m-%dT%H:%M:%S.%f") "Z"))))
+
+(defn- default-transport
+  [{:keys [url]}]
+  (try
+    (let [req (urllib.request/Request url)]
+      (.add-header req "Accept" "application/json")
+      (let [resp (urllib.request/urlopen req ** :timeout 20)]
+        {:status (.-status resp)
+         :body (.decode (.read resp) "utf-8")}))
+    (catch python/Exception e
+      {:status 0 :error (str e)})))
+
+(defn- get-json
+  "Transport + parse with parse_float=str. → parsed | {:error ..}"
+  [transport url]
+  (let [{:keys [status body error]} (transport {:url url})]
+    (if (and (= 200 status) body)
+      (try
+        (json/loads body ** :parse_float python/str)
+        (catch python/Exception e
+          {:error (str "unparseable body: " e)}))
+      {:error (or error (str "http " status))})))
+
+(defn nearest-expiration
+  "First expiration >= on-or-after (dashed YYYY-MM-DD) from the
+  terminal's expiration list. → dashed date string | {:error ..}"
+  [{:keys [transport base-url symbol]} on-or-after]
+  (let [url (str (or base-url default-base-url)
+                 "/v3/option/list/expirations?symbol=" symbol "&format=json")
+        data (get-json transport url)]
+    (if (:error data)
+      data
+      (let [exps (sort (filter #(>= (compare % on-or-after) 0)
+                               (get data "expiration")))]
+        (if (seq exps)
+          (first exps)
+          {:error (str "no expiration on/after " on-or-after)})))))
+
+(defn- right-kw
+  [right]
+  (case (str right)
+    ("CALL" "C" "call" "c") :option-right/call
+    ("PUT" "P" "put" "p") :option-right/put
+    nil))
+
+(defn rows->contracts
+  "Columnar snapshot arrays → {:contracts [...] :unparseable n}.
+  Contracts are MARKET_DATA §4.3 maps with canonical option instrument
+  ids and decimal-string quotes. `:unparseable` counts rows with bad
+  strike/right (real data loss); strike-range exclusions are intentional
+  and NOT counted. `strike-range` [lo hi] (decimal strings) bounds
+  payload size when supplied."
+  [data {:keys [underlying-symbol strike-range]}]
+  (let [strikes (get data "strike" [])
+        rights (get data "right" [])
+        bids (get data "bid" [])
+        asks (get data "ask" [])
+        exps (get data "expiration" [])
+        n (min (count strikes) (count rights) (count bids)
+               (count asks) (count exps))
+        [lo hi] strike-range
+        in-range? (fn [s]
+                    (or (nil? strike-range)
+                        (let [sv (python/float s)]
+                          (and (<= (python/float lo) sv)
+                               (<= sv (python/float hi))))))
+        acc (reduce
+             (fn [acc i]
+               (let [strike (str (nth strikes i))
+                     right (right-kw (nth rights i))]
+                 (cond
+                   (nil? right)
+                   (update acc :unparseable inc)
+
+                   (not (in-range? strike))
+                   acc
+
+                   :else
+                   (update acc :contracts conj
+                           {:instrument/id (ins/instrument-id
+                                            {:instrument/asset-class :asset-class/option
+                                             :instrument/venue "OPRA"
+                                             :instrument/underlying underlying-symbol
+                                             :instrument/expiry (nth exps i)
+                                             :instrument/right right
+                                             :instrument/strike strike})
+                            :quote/bid (str (nth bids i))
+                            :quote/ask (str (nth asks i))}))))
+             {:contracts [] :unparseable 0}
+             (range n))]
+    acc))
+
+(defn- snapshot-observed-at
+  "Max contract timestamp (ET→UTC) = the snapshot's market time; falls
+  back to receive time when the terminal omits timestamps."
+  [data]
+  (let [ts (seq (remove nil? (get data "timestamp" [])))]
+    (if ts
+      (et->utc (reduce (fn [a b] (if (> (compare b a) 0) b a)) ts))
+      (utc-now-str))))
+
+(defn fetch-chain!
+  "One snapshot poll. → {:observed-at ts :contracts [...] :dropped n}
+  | {:error ..}"
+  [{:keys [transport base-url symbol expiration] :as opts}]
+  (let [compact (.replace expiration "-" "")
+        url (str (or base-url default-base-url)
+                 "/v3/option/snapshot/quote?symbol=" symbol
+                 "&expiration=" compact "&format=json")
+        data (get-json transport url)]
+    (cond
+      (:error data) data
+      (not (contains? data "strike")) {:error "no strike column in snapshot"}
+      :else
+      (let [{:keys [contracts unparseable]}
+            (rows->contracts data {:underlying-symbol symbol
+                                   :strike-range (:strike-range opts)})]
+        {:observed-at (snapshot-observed-at data)
+         :contracts contracts
+         :dropped unparseable}))))
+
+(defn chain->fact
+  "Wrap one fetched chain in a canonical fact envelope."
+  [{:keys [underlying-id symbol expiration run-mode]} {:keys [observed-at contracts dropped]}]
+  (let [pref (str "thetadata:chain:" symbol ":" expiration ":" observed-at)
+        payload {:chain/observed-at observed-at
+                 :chain/underlying underlying-id
+                 :chain/expiration expiration
+                 :chain/contracts contracts
+                 :data/provider provider
+                 :data/provider-ref pref
+                 :data/received-at (utc-now-str)
+                 :data/quality {:quality/complete? (zero? (or dropped 0))
+                                :quality/dropped-contracts (or dropped 0)}}]
+    (sch/fact-envelope
+     {:record/type :fact/option-chain-observed
+      :record/mode (or run-mode :mode/paper)
+      :record/source-system provider
+      :record/instrument-id underlying-id
+      :fact/occurred-at observed-at
+      :fact/recorded-at (utc-now-str)
+      :fact/source-ref pref
+      :fact/dedupe-key (str "md/thetadata/" symbol "/" expiration "/"
+                            observed-at)
+      :fact/payload payload})))
+
+(defrecord ThetaDataChainSource [opts state]
+  p/MarketDataSource
+
+  (source-id [this] provider)
+
+  (next-observations [this cursor max-n]
+    (let [{:keys [until poll-seconds]} opts]
+      (loop []
+        (let [held (:snapshot @state)]
+          (cond
+            ;; emit the held snapshot when it is strictly fresher than
+            ;; the (timestamp) cursor
+            (and held
+                 (or (nil? cursor) (= 0 cursor)
+                     (> (compare (:observed-at held) cursor) 0)))
+            {:observations [(chain->fact opts held)]
+             :cursor (:observed-at held)
+             :exhausted? false}
+
+            ;; session over?
+            (and until (>= (compare (utc-now-str) until) 0))
+            {:observations [] :cursor cursor :exhausted? true}
+
+            ;; block-poll for a fresher snapshot
+            :else
+            (do (when (:polled-once? @state)
+                  (time/sleep (or poll-seconds 30)))
+                (let [res (fetch-chain! opts)]
+                  (swap! state assoc :polled-once? true)
+                  (if (:error res)
+                    (swap! state assoc :last-error (:error res)
+                           :last-poll-ok? false)
+                    (swap! state assoc :snapshot res :last-error nil
+                           :last-poll-ok? true
+                           :last-poll-at (utc-now-str))))
+                (recur)))))))
+
+  (source-health [this]
+    (let [{:keys [snapshot last-error last-poll-ok? last-poll-at]} @state]
+      {:source/provider provider
+       :source/healthy? (boolean last-poll-ok?)
+       :source/last-receipt-at (:observed-at snapshot)
+       :source/last-poll-at last-poll-at
+       :source/degradations (filterv some? [last-error])
+       :source/subscription-status :subscription-status/polling
+       :source/contract-count (count (:contracts snapshot))})))
+
+(defn make-thetadata-chain-source
+  "Live ThetaData option-chain source. Opts (explicit map — never kwargs):
+    :symbol         underlying root, e.g. \"SPY\" (required)
+    :underlying-id  canonical underlying id, e.g. \"equity/NASDAQ/SPY\"
+                    (required)
+    :expiration     dashed \"YYYY-MM-DD\" (required — resolve with
+                    nearest-expiration when you want 'front expiry')
+    :base-url       terminal root (default http://127.0.0.1:25503)
+    :strike-range   [\"540\" \"560\"] inclusive decimal-string bounds
+                    (optional payload bound)
+    :until          RFC3339 Z session end (required for live)
+    :poll-seconds   chain poll cadence (default 30)
+    :run-mode       envelope mode (default :mode/paper)
+    :transport      injectable (fn [{:url ..}] {:status :body})"
+  [opts]
+  (let [opts (merge {:poll-seconds 30 :run-mode :mode/paper
+                     :transport default-transport}
+                    opts)]
+    (->ThetaDataChainSource opts (atom {:snapshot nil :polled-once? false}))))

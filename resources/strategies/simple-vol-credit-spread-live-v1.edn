@@ -1,0 +1,20 @@
+;; Live-chain variant of the credit-spread strategy: consumes ThetaData
+;; chain snapshots only (required-bars 0 — no bar feed in this assembly;
+;; chain observed-at drives decision market-time).
+
+{:strategy/id "strategy/simple-vol/credit-spread-live/v1"
+ :strategy/family :strategy-family/simple-vol
+ :strategy/name :strategy-name/credit-spread-live
+ :strategy/version 1
+ :strategy/mode-policy #{:mode/sim :mode/paper}
+ :strategy/schedule {:session :session/us-equities-regular}
+ :strategy/warmup {:required-bars 0}
+ :strategy/instruments ["equity/NASDAQ/SPY"]
+ :strategy/features {:manifest-ref "feature/simple-vol/live-v1"}
+ :strategy/inference {:artifact-ref "model/simple-vol/live-v1"}
+ :strategy/signal {:fn-id :signal/credit-threshold-v1}
+ :strategy/risk {:policy-id :risk/defined-risk-spread
+                 :params {:max-spreads 1
+                          :max-risk "5.00"}}
+ :strategy/execution {:policy-id :execution/vertical-credit-spread-v1
+                      :params {:quantity "1"}}}

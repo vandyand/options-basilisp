@@ -1,0 +1,126 @@
+(ns market-data.test-thetadata
+  "ThetaData chain source — emission contract, timestamp cursors,
+  ET→UTC normalization, quality semantics. All stub-transport."
+  (:import json)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.market-data.protocol :as mdp]
+            [stevetrading.market-data.thetadata :as td]))
+
+(defn- columnar
+  "Build a columnar v3 snapshot body from row maps."
+  [rows]
+  (let [col (fn [k] (python/list (map #(get % k) rows)))]
+    (json/dumps
+     (python/dict {"strike" (col "strike") "right" (col "right")
+                   "bid" (col "bid") "ask" (col "ask")
+                   "bid_size" (col "bid_size") "ask_size" (col "ask_size")
+                   "expiration" (col "expiration")
+                   "timestamp" (col "timestamp")}))))
+
+(def snapshot-1
+  [{"strike" 550.0 "right" "PUT" "bid" 2.15 "ask" 2.2 "bid_size" 5
+    "ask_size" 7 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:30:00.100"}
+   {"strike" 545.0 "right" "PUT" "bid" 0.93 "ask" 0.97 "bid_size" 3
+    "ask_size" 9 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:30:00.200"}
+   {"strike" 555.0 "right" "CALL" "bid" 1.4 "ask" 1.45 "bid_size" 2
+    "ask_size" 2 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:29:59.000"}
+   ;; junk right → unparseable, must be COUNTED not silently lost
+   {"strike" 560.0 "right" "???" "bid" 0.1 "ask" 0.2 "bid_size" 1
+    "ask_size" 1 "expiration" "2026-06-12" "timestamp" nil}])
+
+(def snapshot-2
+  [{"strike" 550.0 "right" "PUT" "bid" 2.4 "ask" 2.45 "bid_size" 5
+    "ask_size" 7 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:31:00.000"}])
+
+(defn- stub-transport
+  "Serves the snapshot held in the `current` atom."
+  [current]
+  (fn [{:keys [url]}]
+    (if (>= (.find url "/v3/option/snapshot/quote") 0)
+      {:status 200 :body (columnar @current)}
+      {:status 404 :body "?"})))
+
+(defn- make-source
+  [current opts]
+  (td/make-thetadata-chain-source
+   (merge {:symbol "SPY"
+           :underlying-id "equity/NASDAQ/SPY"
+           :expiration "2026-06-12"
+           :poll-seconds 0
+           :until "2026-06-10T23:59:00Z"
+           :transport (stub-transport current)}
+          opts)))
+
+(deftest chain-emission-contract
+  (let [current (atom snapshot-1)
+        src (make-source current {})
+        r (mdp/next-observations src 0 1)
+        fact (first (:observations r))
+        contracts (get-in fact [:fact/payload :chain/contracts])]
+    (testing "canonical §4.3 chain fact, validate-fact green"
+      (is (= :fact/option-chain-observed (:record/type fact)))
+      (is (true? (:valid? (v/validate-fact fact))))
+      (is (= "equity/NASDAQ/SPY"
+             (get-in fact [:fact/payload :chain/underlying]))))
+    (testing "contracts carry canonical option ids + decimal-string quotes"
+      (is (= 3 (count contracts)))
+      (is (= #{"option/OPRA/SPY/2026-06-12/P/550.000"
+               "option/OPRA/SPY/2026-06-12/P/545.000"
+               "option/OPRA/SPY/2026-06-12/C/555.000"}
+             (set (map :instrument/id contracts))))
+      (is (= "2.15" (:quote/bid (first (filter #(= "option/OPRA/SPY/2026-06-12/P/550.000"
+                                                   (:instrument/id %))
+                                               contracts))))))
+    (testing "observed-at = max contract ts, ET normalized to UTC Z"
+      (is (= "2026-06-10T19:30:00.200000Z"
+             (get-in fact [:fact/payload :chain/observed-at])))
+      (is (= (get-in fact [:fact/payload :chain/observed-at])
+             (:cursor r))))
+    (testing "unparseable rows are counted as quality loss"
+      (is (= 1 (get-in fact [:fact/payload :data/quality
+                             :quality/dropped-contracts])))
+      (is (false? (get-in fact [:fact/payload :data/quality
+                                :quality/complete?]))))))
+
+(deftest timestamp-cursor-and-freshness
+  (let [current (atom snapshot-1)
+        src (make-source current {})
+        r1 (mdp/next-observations src 0 1)
+        cursor1 (:cursor r1)]
+    (testing "a fresher snapshot emits; cursor advances to its observed-at"
+      (reset! current snapshot-2)
+      (let [r2 (mdp/next-observations src cursor1 1)]
+        (is (= 1 (count (:observations r2))))
+        (is (= "2026-06-10T19:31:00.000000Z" (:cursor r2)))
+        ;; json parse_float=str preserves the wire text exactly: 2.4 → "2.4"
+        (is (= "2.4" (-> (:observations r2) first
+                         (get-in [:fact/payload :chain/contracts])
+                         first :quote/bid)))))
+    (testing "fresh post-restart instance resumes at the timestamp cursor"
+      (let [src-b (make-source current {})
+            rb (mdp/next-observations src-b cursor1 1)]
+        (is (= "2026-06-10T19:31:00.000000Z" (:cursor rb)))))
+    (testing "stale snapshot + expired :until → exhausted, no emission"
+      (let [src-c (make-source current {:until "2026-06-10T00:00:00Z"})
+            rc (mdp/next-observations src-c "2026-06-10T19:31:00.000000Z" 1)]
+        (is (empty? (:observations rc)))
+        (is (true? (:exhausted? rc)))))))
+
+(deftest strike-range-is-config-not-loss
+  (let [current (atom snapshot-1)
+        src (make-source current {:strike-range ["546" "556"]})
+        fact (first (:observations (mdp/next-observations src 0 1)))]
+    (is (= #{"option/OPRA/SPY/2026-06-12/P/550.000"
+             "option/OPRA/SPY/2026-06-12/C/555.000"}
+           (set (map :instrument/id
+                     (get-in fact [:fact/payload :chain/contracts])))))
+    (testing "range exclusions do NOT count as dropped"
+      (is (= 1 (get-in fact [:fact/payload :data/quality
+                             :quality/dropped-contracts]))))))
+
+(deftest et->utc-normalization
+  (is (= "2026-06-10T20:14:56.020000Z" (td/et->utc "2026-06-10T16:14:56.020")))
+  (is (nil? (td/et->utc nil)))
+  (testing "winter (EST) offset"
+    (is (= "2026-01-10T21:14:56.000000Z" (td/et->utc "2026-01-10T16:14:56")))))

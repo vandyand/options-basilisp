@@ -1,0 +1,37 @@
+;; Wiring-proof: live ThetaData chains → credit-spread-live strategy →
+;; sim broker. Short session (~2 polls).
+(import datetime operator)
+(require '[stevetrading.base.engine-live :as live]
+         '[stevetrading.market-data.thetadata :as td])
+
+(def until
+  (let [now (datetime.datetime/now (.-utc datetime/timezone))
+        then (operator/add now (datetime/timedelta ** :seconds 240))]
+    (str (.strftime then "%Y-%m-%dT%H:%M:%S") "Z")))
+
+(def source
+  (td/make-thetadata-chain-source
+   {:symbol "SPY"
+    :underlying-id "equity/NASDAQ/SPY"
+    :expiration "2026-06-11"
+    :strike-range ["700" "740"]
+    :poll-seconds 20
+    :until until
+    :run-mode :mode/sim}))
+
+(def result
+  (live/run-live
+   {:control-plane-root "live_runtime/cp"
+    :process-id "engine-sim-main"
+    :out-dir "live_runtime/td-session"
+    :source source
+    :mode :mode/sim
+    :snapshot-every 20
+    :strategy-paths ["resources/strategies/simple-vol-credit-spread-live-v1.edn"]}))
+
+(println "until was:" until "now:" (td/utc-now-str))
+(println "=== SESSION RESULT ===")
+(prn (select-keys result [:live/started? :live/refusal :facts-appended :orders]))
+(prn (select-keys (:portfolio result)
+                  [:portfolio/positions :portfolio/open-lots
+                   :portfolio/realized-pnl :portfolio/cash]))

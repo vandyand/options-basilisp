@@ -117,15 +117,19 @@
                      :error/manifest-id (:feature-manifest/id manifest)}))))
 
 (defn- required-bars
-  "Minimum bar history needed to derive every feature in the manifest."
+  "Minimum bar history needed to derive every feature in the manifest.
+  Chain-derived features need NO bars — a chain-only manifest (live
+  snapshot-driven strategies) returns 0, so the insufficiency gate
+  cannot starve a strategy whose only market input is the option chain."
   [manifest]
   (reduce (fn [n feature-kw]
             (max n (case feature-kw
                      :feature/sma-fast (feature-window manifest feature-kw :sma-fast)
                      :feature/sma-slow (feature-window manifest feature-kw :sma-slow)
                      (:feature/last-close :feature/bar-count) 1
+                     :feature/chain-mid-width 0
                      1)))
-          1
+          0
           (:feature-manifest/features manifest)))
 
 (defn derive-features

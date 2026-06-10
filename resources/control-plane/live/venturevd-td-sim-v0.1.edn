@@ -1,0 +1,39 @@
+;; ThetaData wiring-proof manifest: live chain feed → credit-spread-live
+;; strategy → SIM broker (market closed; no real orders).
+
+{:control-plane/revision "cp-vv-000002"
+ :control-plane/generated-at "2026-06-10T20:30:00Z"
+ :control-plane/status :control-plane-status/proposed
+ :control-plane/strategies
+ [{:strategy/id "strategy/simple-vol/credit-spread-live/v1"
+   :strategy/enabled? true
+   :strategy/mode :mode/sim
+   :strategy/process "engine-sim-main"
+   :strategy/account-route "route/sim-vol-live"
+   :strategy/artifacts {:model-ref "model/simple-vol/live-v1"
+                        :feature-manifest-ref "feature/simple-vol/live-v1"}
+   :strategy/schedule {:session :session/us-equities-regular}}]
+ :control-plane/accounts
+ [{:account/id "account/sim/main"
+   :account/broker :broker/sim
+   :account/environment :environment/sim
+   :account/allowed-modes #{:mode/sim :mode/replay}
+   :account/live-enabled? false}]
+ :control-plane/processes
+ [{:process/id "engine-sim-main"
+   :process/base :base/engine-live
+   :process/allowed-modes #{:mode/sim}
+   :process/strategies ["strategy/simple-vol/credit-spread-live/v1"]}]
+ :control-plane/routes
+ [{:route/id "route/sim-vol-live"
+   :route/strategy-id "strategy/simple-vol/credit-spread-live/v1"
+   :route/account-id "account/sim/main"
+   :route/broker :broker/sim}]
+ :control-plane/kill-switches
+ [{:kill-switch/scope :kill-switch-scope/global
+   :kill-switch/active? false
+   :kill-switch/reason nil
+   :kill-switch/activated-at nil
+   :kill-switch/actor nil}]
+ :control-plane/policies
+ {:policy/default-degradation :degradation-policy/default-paper}}

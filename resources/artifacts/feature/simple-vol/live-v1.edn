@@ -1,0 +1,20 @@
+;; Live-strike variant of feature/simple-vol/v1 — near-the-money SPY put
+;; spread for the 2026-06-11 expiry (SPY ~725 on 2026-06-10). Same shape;
+;; see feature/simple-vol/v1.edn for the single-source-of-truth notes.
+
+{:feature-manifest/id "feature/simple-vol/live-v1"
+ :feature-manifest/version 1
+ :feature-manifest/features
+ [:feature/chain-mid-width]
+ :feature-manifest/params
+ {:spread {:venue "OPRA"
+           :underlying-symbol "SPY"
+           :expiry "2026-06-11"
+           :right :option-right/put
+           :near-strike "720.000"
+           :far-strike "715.000"}}
+ :feature-manifest/required-inputs
+ [:input/option-chain]
+ :feature-manifest/compatibility
+ {:strategy-family :strategy-family/simple-vol
+  :prediction-schema-version 1}}

@@ -48,6 +48,7 @@ pythonpath = [
   "components/broker.sim/src",
   "components/market-data.polygon/src",
   "components/market-data.alpaca/src",
+  "components/market-data.thetadata/src",
   "components/market-data.replay/src",
   "components/persistence.fact-store/src",
   "components/persistence.snapshot-store/src",

@@ -77,9 +77,9 @@
              :error/missing-key [:strategy/schedule] "must be a map")
       (check (and (map? (:strategy/warmup decl))
                   (int? (get-in decl [:strategy/warmup :required-bars]))
-                  (pos? (get-in decl [:strategy/warmup :required-bars])))
+                  (not (neg? (get-in decl [:strategy/warmup :required-bars]))))
              :error/missing-key [:strategy/warmup :required-bars]
-             "must be a positive integer")
+             "must be a non-negative integer (0 = no bar warmup; valid for chain-snapshot-driven strategies)")
       (check (string? (get-in decl [:strategy/features :manifest-ref]))
              :error/missing-key [:strategy/features :manifest-ref]
              "must be a feature-manifest ref string")

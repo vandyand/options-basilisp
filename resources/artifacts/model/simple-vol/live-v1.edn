@@ -1,0 +1,10 @@
+;; Threshold model for the live-strike spread — low threshold so the
+;; wiring-proof session enters on the first attractive chain snapshot.
+
+{:model/id "model/simple-vol/live-v1"
+ :model/version 1
+ :model/type :model.type/threshold
+ :model/params {:feature :feature/chain-mid-width
+                :threshold "0.05"}
+ :model/feature-manifest-ref "feature/simple-vol/live-v1"
+ :model/prediction-schema-version 1}
