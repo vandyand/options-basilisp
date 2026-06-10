@@ -12,7 +12,16 @@
   - Market observations live in a single global :engine/market map keyed by
     instrument-id: {instrument-id {:bars [...] :chain ... :quote ...
     :last-time ts}}. Bars are capped at `market-bar-cap` (most recent kept).
-    Strategies slice from this map in later phases.")
+    Strategies slice from this map in later phases.
+  - :engine/cursors (Phase 8 addition, §4.5 'latest market data offset
+    consumed'): adapter-side resume cursors, keyed by stream
+    ({:market-data <int>}). Distinct from :engine/watermarks — watermarks
+    are fact-derived (the fold advances them from observed facts), while
+    cursors are loop-side bookkeeping the imperative shell records after
+    each processed observation so a restart resumes the source at the
+    right place. Cursors travel inside snapshots; the fold never touches
+    them, so a recovered state's cursor is exactly the snapshot's cursor
+    (consistent with the snapshot's strategy-local state).")
 
 (def engine-state-version 1)
 
@@ -39,6 +48,8 @@
                        :watermark/market nil
                        :watermark/broker nil
                        :watermark/control-plane nil}
+   ;; adapter resume cursors (loop-side; see ns docstring)
+   :engine/cursors {:market-data nil}
    ;; §4.6 health and degradation state
    :engine/health {:health/level :starting
                    :health/degradations []}})
@@ -126,6 +137,19 @@
 (defn record-watermark
   [state watermark-key value]
   (assoc-in state [:engine/watermarks watermark-key] value))
+
+;; ---------------------------------------------------------------------------
+;; Adapter resume cursors (loop-side bookkeeping; see ns docstring)
+;; ---------------------------------------------------------------------------
+
+(defn record-cursor
+  "Record an adapter resume cursor (e.g. :market-data) on engine state."
+  [state cursor-key value]
+  (assoc-in state [:engine/cursors cursor-key] value))
+
+(defn cursor
+  [state cursor-key]
+  (get-in state [:engine/cursors cursor-key]))
 
 ;; ---------------------------------------------------------------------------
 ;; Market observation map

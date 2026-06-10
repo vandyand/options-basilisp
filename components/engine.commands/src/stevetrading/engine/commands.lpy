@@ -1,0 +1,203 @@
+(ns stevetrading.engine.commands
+  "Command derivation (pure) + dispatch (impure boundary walk).
+
+  Normative: EVENT_COMMAND_TAXONOMY §10.1 (dispatch lineage),
+  BROKER_ADAPTER_CONTRACTS §4.1 (submit payload),
+  ENGINE_STATE_AND_RECOVERY §12.1 (submit duplication rule).
+
+  CORE component — requires domain.*, engine.state, and broker.protocol
+  (protocol components are importable by anyone, POLYLITH §7); never the
+  adapter implementations or persistence stores.
+
+  Design decisions (documented):
+  - `derive-commands` is pure and deterministic apart from each command
+    envelope's fresh :record/id (ULID). Identity lives in the idempotency
+    key (\"submit/intent/\" + order-intent-id), which is a pure function
+    of the intent — so a re-derived command after restart carries the
+    SAME idempotency key and the broker/fact-store dedupe layers treat it
+    as the same logical submission.
+  - `dispatch-commands!` walks the §10.1 lineage: the
+    :fact/command-dispatched envelope is handed to the caller-supplied
+    :append! fn BEFORE the adapter call (durable proof the command left
+    the process — crash between append and adapter call is recoverable),
+    and the adapter-returned outcome facts are handed to :append!
+    immediately after. The dispatched fact's deterministic dedupe key
+    (\"dispatched/\" + idempotency-key) makes the pre-call append
+    idempotent across restarts.
+  - §12.1 submit dedupe: a submit is SKIPPED when engine state PROVES the
+    intent was already accepted or completed — unresolved-order lifecycle
+    in #{:acknowledged :partially-filled :filled} or :order/resolved?
+    true (covers :rejected/:cancelled terminals). :submit-requested does
+    NOT prove acceptance, so re-dispatch is allowed (the broker's
+    idempotency key absorbs the duplicate). :orphaned-needs-reconcile is
+    ambiguous lineage — never resubmit on ambiguity (§16); skipped with
+    its own reason.
+  - The command's :command/issued-at is the intent fact's occurred-at
+    (deterministic market time, never wall clock), and the dispatched
+    fact reuses it — replay-stable timestamps end to end.
+  - Commands themselves are not persisted (commands are instructions, not
+    truth — TAXONOMY §3); the dispatched FACT carries the command id and
+    idempotency key for lineage."
+  (:require [stevetrading.broker.protocol :as bp]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.state :as st]))
+
+(def default-broker-route
+  {:broker/source-system :broker/sim})
+
+(defn submit-idempotency-key
+  "Deterministic idempotency key for submitting one order intent."
+  [order-intent-id]
+  (str "submit/intent/" order-intent-id))
+
+;; ---------------------------------------------------------------------------
+;; derive-commands (pure)
+;; ---------------------------------------------------------------------------
+
+(defn- compact
+  [m]
+  (into {} (filter (comp some? val) m)))
+
+(defn- submit-command
+  "One :command/submit-order-intent envelope for an
+  :fact/order-intent-created fact (BROKER_ADAPTER §4.1 payload)."
+  [intent-fact broker-route]
+  (let [payload (:fact/payload intent-fact)
+        oi-id (:order-intent/id payload)
+        account-id (or (:order-intent/account-id payload)
+                       (:record/account-id intent-fact))
+        idem-key (submit-idempotency-key oi-id)]
+    (sch/command-envelope
+     (compact
+      {:record/type :command/submit-order-intent
+       :record/mode (:record/mode intent-fact)
+       :record/correlation-id (:record/correlation-id intent-fact)
+       :record/causation-ids [(:record/id intent-fact)]
+       :record/strategy-id (:record/strategy-id intent-fact)
+       :record/account-id account-id
+       :record/instrument-id (:record/instrument-id intent-fact)
+       :record/source-system :engine/commands
+       :command/issued-at (:fact/occurred-at intent-fact)
+       :command/target-adapter :adapter/broker
+       :command/idempotency-key idem-key
+       :command/payload {:order-intent/id oi-id
+                         :command/idempotency-key idem-key
+                         :broker/account-id account-id
+                         :broker/route broker-route
+                         :order-intent/payload payload}}))))
+
+(defn derive-commands
+  "Pure: derive :command/submit-order-intent envelopes from
+  :fact/order-intent-created fact envelopes. Non-intent facts are ignored.
+  opts (explicit map — never kwargs):
+    :broker-route  BROKER_ADAPTER §4.1 route map
+                   (default {:broker/source-system :broker/sim})
+
+  Returns a vector of canonical command envelopes, one per intent fact,
+  in input order."
+  ([intent-facts] (derive-commands intent-facts {}))
+  ([intent-facts opts]
+   (let [route (or (:broker-route opts) default-broker-route)]
+     (->> intent-facts
+          (filter #(= :fact/order-intent-created (:record/type %)))
+          (mapv #(submit-command % route))))))
+
+;; ---------------------------------------------------------------------------
+;; dispatch-commands! (impure)
+;; ---------------------------------------------------------------------------
+
+(def ^:private proven-accepted-lifecycles
+  "§12.1 — lifecycles that PROVE broker acceptance/completion."
+  #{:acknowledged :partially-filled :filled})
+
+(defn- skip-reason
+  "nil when the command may dispatch; otherwise the §12.1/§16 skip reason."
+  [state cmd]
+  (let [cmd-type (:record/type cmd)
+        oi-id (get-in cmd [:command/payload :order-intent/id])
+        entry (when (some? oi-id) (st/unresolved-order state oi-id))]
+    (cond
+      (not (contains? #{:command/submit-order-intent
+                        :command/cancel-broker-order}
+                      cmd-type))
+      :skip/unroutable-command-type
+
+      (not= :command/submit-order-intent cmd-type)
+      nil
+
+      (nil? entry)
+      ;; an intent the engine has never folded cannot be submitted —
+      ;; the canonical anchor (:fact/order-intent-created) must exist
+      ;; in state first (TAXONOMY §10: intent before submit)
+      :skip/unknown-order-intent
+
+      (= :orphaned-needs-reconcile (:order/lifecycle entry))
+      :skip/ambiguous-lineage
+
+      (or (:order/resolved? entry)
+          (contains? proven-accepted-lifecycles (:order/lifecycle entry)))
+      :skip/already-accepted-or-completed
+
+      :else nil)))
+
+(defn- dispatched-fact
+  "The :fact/command-dispatched envelope for one command (§10.1 —
+  operational truth that the command left the process). Deterministic
+  dedupe key keeps restart re-appends idempotent."
+  [cmd]
+  (let [at (:command/issued-at cmd)]
+    (sch/fact-envelope
+     (compact
+      {:record/type :fact/command-dispatched
+       :record/mode (:record/mode cmd)
+       :record/correlation-id (:record/correlation-id cmd)
+       :record/causation-ids [(:record/id cmd)]
+       :record/strategy-id (:record/strategy-id cmd)
+       :record/account-id (:record/account-id cmd)
+       :record/instrument-id (:record/instrument-id cmd)
+       :record/source-system :engine/commands
+       :fact/occurred-at at
+       :fact/recorded-at at
+       :fact/dedupe-key (str "dispatched/" (:command/idempotency-key cmd))
+       :fact/payload {:command/type (:record/type cmd)
+                      :command/id (:record/id cmd)
+                      :command/idempotency-key (:command/idempotency-key cmd)
+                      :command/target-adapter (:command/target-adapter cmd)
+                      :order-intent/id (get-in cmd [:command/payload
+                                                    :order-intent/id])}}))))
+
+(defn- call-adapter!
+  [broker cmd]
+  (case (:record/type cmd)
+    :command/submit-order-intent (bp/submit-order-intent! broker cmd)
+    :command/cancel-broker-order (bp/cancel-broker-order! broker cmd)))
+
+(defn dispatch-commands!
+  "Dispatch commands to the broker adapter. Args (explicit opts map):
+    :broker    broker.protocol/Broker instance (required)
+    :state     engine state — the §12.1 submit-dedupe proof source
+               (required)
+    :commands  vector of command envelopes (required)
+    :append!   (fn [facts] ...) durable append hook, called with the
+               dispatched fact BEFORE each adapter call and with the
+               outcome facts immediately after (optional — when absent
+               the caller owns persistence of the returned :facts)
+
+  Per command: §12.1 submit-dedupe first (skip when state proves the
+  intent already accepted/completed; never resubmit on ambiguous
+  lineage), then dispatched-fact append → adapter call → outcome append.
+
+  Returns {:facts   [dispatched + outcome facts, in dispatch order]
+           :skipped [{:command cmd :skip/reason kw}]}."
+  [{:keys [broker state commands append!]}]
+  (reduce
+   (fn [acc cmd]
+     (if-let [reason (skip-reason state cmd)]
+       (update acc :skipped conj {:command cmd :skip/reason reason})
+       (let [dfact (dispatched-fact cmd)
+             _ (when append! (append! [dfact]))
+             outcomes (vec (call-adapter! broker cmd))
+             _ (when (and append! (seq outcomes)) (append! outcomes))]
+         (update acc :facts into (into [dfact] outcomes)))))
+   {:facts [] :skipped []}
+   commands))

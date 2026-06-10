@@ -1,0 +1,252 @@
+(ns e2e.test-replay-golden
+  "Phase 8 golden replay tests (TESTING §8.1-§8.2, EVENT_COMMAND_TAXONOMY
+  §10.2): happy-path end-to-end session, replay determinism, restart
+  convergence.
+
+  State normalization for cross-run comparison (documented):
+  two independent runs write to different out-dirs, so envelope
+  :record/id values (fresh ULIDs) and fact-log offsets necessarily
+  differ even when every logical fact is identical. Normalization strips
+  exactly the fields that carry those run-local identities:
+    - :engine/run                      (run id + wall-clock started-at)
+    - :watermark/fact-log              (offsets shift by recovery
+                                        bookkeeping facts in restarted
+                                        logs)
+    - unresolved-order *-fact-id refs  (ULIDs of the run's own envelopes;
+                                        the logical content they point at
+                                        is asserted via the fact log)
+    - :portfolio/source-watermark      (fact-log offset)
+  Everything else — market state, cursors, strategy lifecycle +
+  signal-local state, order lifecycles/quantities, positions, lots,
+  cash, P&L — must be `=`."
+  (:import tempfile os.path)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.base.engine-replay :as er]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]))
+
+(def fixture-path "resources/fixtures/replay/simple-paper-session-v0.2.edn")
+
+(def ^:private recovery-fact-types
+  #{:fact/recovery-started :fact/recovery-completed})
+
+(defn- run!*
+  [out-dir opts]
+  (er/run-replay (merge {:fixture-path fixture-path
+                         :out-dir out-dir}
+                        opts)))
+
+(defn- log-facts
+  [out-dir]
+  (p/facts-since (fs/make-fact-store (os.path/join out-dir "facts.db")) 0))
+
+(defn- business-fact-pairs
+  "Ordered [fact-type order-intent-id] pairs from the out-dir's log,
+  excluding recovery bookkeeping facts (each recovery run is a real event
+  and appends fresh rows — they are operational, not business truth)."
+  [out-dir]
+  (->> (log-facts out-dir)
+       (remove #(contains? recovery-fact-types (:record/type %)))
+       (mapv (fn [f] [(:record/type f)
+                      (get-in f [:fact/payload :order-intent/id])]))))
+
+(defn- intent-ids
+  [out-dir]
+  (->> (log-facts out-dir)
+       (filter #(= :fact/order-intent-created (:record/type %)))
+       (mapv #(get-in % [:fact/payload :order-intent/id]))))
+
+(defn- norm-state
+  "Strip run-local identity fields (see ns docstring)."
+  [state]
+  (-> state
+      (dissoc :engine/run)
+      (update :engine/watermarks dissoc :watermark/fact-log)
+      (update :engine/unresolved-orders
+              (fn [orders]
+                (into {}
+                      (map (fn [[oi entry]]
+                             [oi (dissoc entry
+                                         :order/creation-fact-id
+                                         :order/dispatch-fact-id
+                                         :order/latest-broker-update-fact-id
+                                         :order/cancel-dispatch-fact-id
+                                         :order/fill-fact-ids)])
+                           orders))))
+      (update :engine/portfolio dissoc :portfolio/source-watermark)))
+
+(defn- norm-portfolio
+  [portfolio]
+  (dissoc portfolio :portfolio/source-watermark))
+
+;; ---------------------------------------------------------------------------
+;; 1. Happy path
+;; ---------------------------------------------------------------------------
+
+(deftest happy-path-end-to-end
+  (let [out-dir (tempfile/mkdtemp)
+        result (run!* out-dir {})]
+    (testing "session completes with every expected output type, in order"
+      (is (true? (:expected-outputs-satisfied? result)))
+      (is (false? (:stopped-early? result)))
+      (is (= 11 (:cursor result)))
+      (is (pos? (:facts-appended result)))
+      (is (empty? (:skipped-ledger-fills result))))
+
+    (testing "the SMA cross produces an entry and an exit, both filled"
+      (let [orders (vals (get-in result [:orders :order/by-intent]))]
+        (is (= 2 (get-in result [:orders :order/count])))
+        (is (every? #(and (= :filled (:order/lifecycle %))
+                          (true? (:order/resolved? %))
+                          (= "1" (:order/filled-quantity %)))
+                    orders))
+        (is (= #{[:order-side/buy :position-effect/open]
+                 [:order-side/sell :position-effect/close]}
+               (set (map (juxt :order/side :order/effect) orders))))))
+
+    (testing "round trip flattens the portfolio with ledger lineage"
+      (let [portfolio (:portfolio result)
+            closed (get-in result [:ledger :ledger/closed-lots])]
+        ;; positions are derived from OPEN lots — a fully closed round
+        ;; trip leaves no open lots and therefore no position entries
+        (is (empty? (:portfolio/open-lots portfolio)))
+        (is (empty? (:portfolio/positions portfolio)))
+        ;; one closed lot records the round trip with full lineage
+        (is (= 1 (count closed)))
+        (is (= "1" (:lot-close/quantity (first closed))))
+        (is (contains? (:portfolio/cash portfolio) "account/sim/main"))))
+
+    (testing "§10.2 lineage chain for the entry intent, one correlation id"
+      (let [store (fs/make-fact-store (os.path/join out-dir "facts.db"))
+            entry-oi (->> (p/facts-by store
+                                      {:fact-type :fact/order-intent-created})
+                          (filter #(= :order-side/buy
+                                      (get-in % [:fact/payload
+                                                 :order-intent/side])))
+                          first
+                          :fact/payload
+                          :order-intent/id)
+            chain (p/facts-by store {:order-intent-id entry-oi})
+            by-type (into {} (map (fn [f] [(:record/type f) f]) chain))]
+        (is (string? entry-oi))
+        (is (= [:fact/order-intent-created
+                :fact/command-dispatched
+                :fact/broker-ack-accepted
+                :fact/fill-observed]
+               (mapv :record/type chain)))
+        ;; one decision thread: every chain fact shares the decision id
+        (let [corr (:record/correlation-id
+                    (by-type :fact/order-intent-created))]
+          (is (.startswith corr "dec_"))
+          (is (every? #(= corr (:record/correlation-id %)) chain)))
+        ;; causation: dispatched records the command id; the broker facts
+        ;; are caused by that same command
+        (let [cmd-id (get-in (by-type :fact/command-dispatched)
+                             [:fact/payload :command/id])]
+          (is (string? cmd-id))
+          (is (= [cmd-id] (:record/causation-ids
+                           (by-type :fact/broker-ack-accepted))))
+          (is (= [cmd-id] (:record/causation-ids
+                           (by-type :fact/fill-observed)))))
+        ;; the ledger derivation is caused by the fill
+        (let [fill-id (:record/id (by-type :fact/fill-observed))
+              lot-opened (first (p/facts-by store
+                                            {:fact-type
+                                             :fact/position-lot-opened}))]
+          (is (= [fill-id] (:record/causation-ids lot-opened))))))
+
+    (testing "the log reads as the §10.2 end-to-end example (subsequence)"
+      (let [types (mapv :record/type (log-facts out-dir))
+            expected [:fact/market-bar-observed
+                      :fact/prediction-produced
+                      :fact/signal-decision-produced
+                      :fact/risk-decision-recorded
+                      :fact/execution-plan-produced
+                      :fact/order-intent-created
+                      :fact/command-dispatched
+                      :fact/broker-ack-accepted
+                      :fact/fill-observed
+                      :fact/position-lot-opened
+                      :fact/cash-movement-recorded]]
+        (is (loop [exp (seq expected) ts (seq types)]
+              (cond (nil? exp) true
+                    (nil? ts) false
+                    (= (first exp) (first ts)) (recur (next exp) (next ts))
+                    :else (recur exp (next ts)))))))))
+
+;; ---------------------------------------------------------------------------
+;; 2. Replay determinism
+;; ---------------------------------------------------------------------------
+
+(deftest replay-determinism
+  (let [dir-a (tempfile/mkdtemp)
+        dir-b (tempfile/mkdtemp)
+        a (run!* dir-a {})
+        b (run!* dir-b {})]
+    (testing "two clean runs append the identical ordered business facts"
+      (is (= (business-fact-pairs dir-a) (business-fact-pairs dir-b))))
+    (testing "one logical decision -> one stable intent id"
+      (is (= (intent-ids dir-a) (intent-ids dir-b)))
+      (is (= 2 (count (intent-ids dir-a))
+             (count (distinct (intent-ids dir-a))))))
+    (testing "final portfolios are equal"
+      (is (= (norm-portfolio (:portfolio a))
+             (norm-portfolio (:portfolio b)))))
+    (testing "full normalized engine states are equal"
+      (is (= (norm-state (:engine/state a))
+             (norm-state (:engine/state b)))))))
+
+;; ---------------------------------------------------------------------------
+;; 3. Restart convergence
+;; ---------------------------------------------------------------------------
+
+(defn- run-with-restarts!
+  "Drive a full session in crash-sized segments: run with :max-facts K
+  (stop WITHOUT a final snapshot — simulated crash at a cycle boundary),
+  then call run-replay again on the same out-dir (it auto-detects the
+  prior work, rebuilds via run-recovery! from snapshot+facts, and resumes
+  from the recovered :engine/cursors market-data cursor) until a segment
+  finishes the fixture. Returns {:summary last :segments n}."
+  [out-dir k]
+  (loop [segment 1]
+    (let [s (run!* out-dir {:max-facts k :snapshot-every 5})]
+      (cond
+        (not (:stopped-early? s)) {:summary s :segments segment}
+        (> segment 40) (throw (ex-info "restart loop did not converge"
+                                       {:error/code :error/no-convergence
+                                        :segments segment}))
+        :else (recur (inc segment))))))
+
+(deftest restart-convergence
+  (let [base-dir (tempfile/mkdtemp)
+        uninterrupted (run!* (os.path/join base-dir "clean")
+                             {:snapshot-every 5})]
+    (doseq [k [3 7]]
+      (testing (str "stop-after-every-" k "-facts converges")
+        (let [out-dir (os.path/join base-dir (str "restart-k" k))
+              {:keys [summary segments]} (run-with-restarts! out-dir k)]
+          ;; genuinely exercised the crash/recover path
+          (is (> segments 1))
+          (is (true? (:resumed? summary)))
+          (is (true? (:expected-outputs-satisfied? summary)))
+
+          (testing "NO duplicate order intents (TESTING §8.1)"
+            (let [ids (intent-ids out-dir)]
+              (is (= 2 (count ids) (count (distinct ids))))
+              (is (= (set (intent-ids (os.path/join base-dir "clean")))
+                     (set ids)))))
+
+          (testing "identical final engine state (normalized)"
+            (is (= (norm-state (:engine/state uninterrupted))
+                   (norm-state (:engine/state summary)))))
+
+          (testing "identical final portfolio"
+            (is (= (norm-portfolio (:portfolio uninterrupted))
+                   (norm-portfolio (:portfolio summary)))))
+
+          (testing "fills/positions never duplicated (TESTING §8.2)"
+            (let [fills (filter #(= :fact/fill-observed (:record/type %))
+                                (log-facts out-dir))]
+              (is (= 2 (count fills)
+                     (count (distinct (map #(get-in % [:fact/payload :fill/id])
+                                           fills))))))))))))
