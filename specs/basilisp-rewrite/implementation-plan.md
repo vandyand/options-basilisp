@@ -40,12 +40,12 @@ Goal: reproducible test/lint gates so every later phase has a green/red signal.
 
 ## Phase 1: Domain Core
 
-Goal: canonical ids, enums, envelopes, validation, and the order-intent identity algorithm. Normative: CANONICAL_SCHEMAS (whole doc), EVENT_COMMAND_TAXONOMY §5–9.
+Goal: canonical ids, enums, envelopes, validation, and the order-intent identity algorithm. **Status: COMPLETE (commit 8fcc9e1)** Normative: CANONICAL_SCHEMAS (whole doc), EVENT_COMMAND_TAXONOMY §5–9.
 
-- [ ] `components/domain.identifiers/src/stevetrading/domain/identifiers.lpy` (new component): `new-record-id` (ULID string via python-ulid), `valid-strategy-id?` (`strategy/<family>/<name>/v<major>` per §5.2.1), `valid-account-id?` (`account/<broker>/<logical-name>`), `parse-strategy-id`/`parse-account-id` returning maps or nil.
-- [ ] `components/domain.instruments/src/stevetrading/domain/instruments.lpy` (new): `instrument-id` from structured ref (equity/option/future formats per §5.2.3, strike rendered with exactly 3 decimal places like `550.000`), `parse-instrument-id` (inverse), `instrument-ref` canonical map shape per §6.1, `canonical-leg-sort` (sort legs by [instrument-id, side, quantity] per §12.3).
-- [ ] `components/domain.enums/src/stevetrading/domain/enums.lpy` (new): named sets for `modes` (`:mode/live :mode/paper :mode/sim :mode/replay :mode/shadow` + `:mode/control-plane :mode/dev :mode/report` used by bases), `order-sides`, `position-effects`, `order-types`, `tifs`, `intent-roles`, `broker-statuses` (BROKER_ADAPTER §5.2 list), `liquidity`, `health-states`, `recovery-states`, `strategy-lifecycle-states`, `order-lifecycle-states` (ENGINE_STATE_MACHINES §4.1/§5.1/§6.1/§7.1), plus `fact-types` and `command-types` (the full canonical v0.1 lists from EVENT_COMMAND_TAXONOMY §8–9, as `:fact/...`/`:command/...` keywords).
-- [ ] `components/domain.schemas/src/stevetrading/domain/schemas.lpy` (extend stub): 
+- [x] `components/domain.identifiers/src/stevetrading/domain/identifiers.lpy` (new component): `new-record-id` (ULID string via python-ulid), `valid-strategy-id?` (`strategy/<family>/<name>/v<major>` per §5.2.1), `valid-account-id?` (`account/<broker>/<logical-name>`), `parse-strategy-id`/`parse-account-id` returning maps or nil.
+- [x] `components/domain.instruments/src/stevetrading/domain/instruments.lpy` (new): `instrument-id` from structured ref (equity/option/future formats per §5.2.3, strike rendered with exactly 3 decimal places like `550.000`), `parse-instrument-id` (inverse), `instrument-ref` canonical map shape per §6.1, `canonical-leg-sort` (sort legs by [instrument-id, side, quantity] per §12.3).
+- [x] `components/domain.enums/src/stevetrading/domain/enums.lpy` (new): named sets for `modes` (`:mode/live :mode/paper :mode/sim :mode/replay :mode/shadow` + `:mode/control-plane :mode/dev :mode/report` used by bases), `order-sides`, `position-effects`, `order-types`, `tifs`, `intent-roles`, `broker-statuses` (BROKER_ADAPTER §5.2 list), `liquidity`, `health-states`, `recovery-states`, `strategy-lifecycle-states`, `order-lifecycle-states` (ENGINE_STATE_MACHINES §4.1/§5.1/§6.1/§7.1), plus `fact-types` and `command-types` (the full canonical v0.1 lists from EVENT_COMMAND_TAXONOMY §8–9, as `:fact/...`/`:command/...` keywords).
+- [x] `components/domain.schemas/src/stevetrading/domain/schemas.lpy` (extend stub): 
   - `canonicalize` — recursively sort map keys (by `pr-str` of key), canonically sort legs via `instruments/canonical-leg-sort` when value is under `:legs`/`:order-intent/legs`; leave vectors otherwise ordered.
   - `canonical-edn-str` — deterministic serialization of a canonicalized value (write maps with sorted keys explicitly; verified NOT to rely on printer internals).
   - `sha256-hex` — via hashlib interop.
@@ -53,12 +53,12 @@ Goal: canonical ids, enums, envelopes, validation, and the order-intent identity
   - `order-intent-id` — `"oi_" + sha256-hex(canonical-edn-str(identity-input))` where identity-input is exactly the §12.1 map (`:identity/version 1`, decision-id, intent-slot, account-id, role, order-shape with side/effect/order-type/tif/quantity/limit-price/stop-price/legs).
   - `fact-envelope` / `command-envelope` constructors taking payload + metadata, filling `:record/id` via `identifiers/new-record-id`, validating required keys per CANONICAL_SCHEMAS §8/§9 (fact: occurred-at, recorded-at, payload; command: issued-at, target-adapter, idempotency-key, payload).
   - `snapshot-envelope` constructor per §10.
-- [ ] `components/domain.validation/src/stevetrading/domain/validation.lpy` (new): `validate-fact`/`validate-command`/`validate-snapshot` returning `{:valid? true}` or `{:valid? false :errors [{:error/code ... :error/path ... :error/message ...}]}`. Checks: required keys present, `:record/type` in known fact/command type sets, enum values in strict fields valid, timestamps match RFC 3339 UTC regex (`Z`-suffixed), quantities/prices are strings parseable as Decimal (reject floats — `(float? v)` → error), business ids well-formed.
-- [ ] Tests `tests/domain/` (ns `domain.test-*`): 
+- [x] `components/domain.validation/src/stevetrading/domain/validation.lpy` (new): `validate-fact`/`validate-command`/`validate-snapshot` returning `{:valid? true}` or `{:valid? false :errors [{:error/code ... :error/path ... :error/message ...}]}`. Checks: required keys present, `:record/type` in known fact/command type sets, enum values in strict fields valid, timestamps match RFC 3339 UTC regex (`Z`-suffixed), quantities/prices are strings parseable as Decimal (reject floats — `(float? v)` → error), business ids well-formed.
+- [x] Tests `tests/domain/` (ns `domain.test-*`): 
   - `test_identity.lpy` — same identity input → same `order-intent-id` across two calls and across canonical-vs-shuffled key order; each §12.4 mutation (account, role, quantity, leg set, order type, limit price, decision slot) → different id; §12.5 invariants (extra envelope metadata does not affect id).
   - `test_schemas.lpy` — envelope constructors produce validation-passing records; missing required key → invalid; float quantity → invalid.
   - `test_instruments.lpy` — equity/option id round-trip; leg sort canonical ordering; strike formatting `550.000`.
-- [ ] Update the old stub API consumers: keep `schema-version`/`canonical-record-kinds` working (tests may reference).
+- [x] Update the old stub API consumers: keep `schema-version`/`canonical-record-kinds` working (tests may reference).
 
 **REPL checkpoints:**
 - `(require '[stevetrading.domain.schemas :as sch])` then build the §12.1 example identity input and call `(sch/order-intent-id ident)` twice → identical `"oi_..."` strings
