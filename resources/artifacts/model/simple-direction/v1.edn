@@ -1,0 +1,12 @@
+;; Model artifact reference (STRATEGY_PIPELINE §7.2) for the
+;; simple-direction SMA-crossover strategy. The "model" is a deterministic
+;; rule (:model.type/sma-crossover) parameterized by the fast/slow SMA
+;; windows; it consumes features produced under the declared feature
+;; manifest.
+
+{:model/id "model/simple-direction/v1"
+ :model/version 1
+ :model/type :model.type/sma-crossover
+ :model/params {:fast 3 :slow 5}
+ :model/feature-manifest-ref "feature/simple-direction/v1"
+ :model/prediction-schema-version 1}

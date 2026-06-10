@@ -1,0 +1,56 @@
+(ns stevetrading.artifact.file-store
+  "Filesystem ArtifactStore adapter (STRATEGY_PIPELINE §7).
+
+  Reads immutable artifact EDN files under a root directory; the artifact
+  ref maps directly onto the path:
+
+    ref \"feature/simple-direction/v1\"
+      -> <root>/feature/simple-direction/v1.edn
+
+  ADAPTER component — may require domain.* and artifact.protocol only
+  (POLYLITH §7). Pure pipeline components must NOT require this namespace;
+  they receive loaded artifact maps from the composing base."
+  (:require [basilisp.edn :as edn]
+            [stevetrading.artifact.protocol :as ap])
+  (:import os.path))
+
+(def ^:private ref-re
+  ;; kind/segment.../vN — lowercase alnum/dash segments only; no dots, so
+  ;; traversal-shaped refs ("..") never reach the filesystem.
+  #"^[a-z0-9-]+(/[a-z0-9-]+)+$")
+
+(defn- artifact-path
+  [root ref]
+  (when-not (and (string? ref) (re-matches ref-re ref))
+    (throw (ex-info (str "malformed artifact ref: " (pr-str ref))
+                    {:error/code :error/malformed-artifact-ref
+                     :error/ref  ref})))
+  (os.path/join root (str ref ".edn")))
+
+(defn- read-artifact
+  [root kind ref]
+  (when-not (= kind (first (.split ref "/")))
+    (throw (ex-info (str "artifact ref " (pr-str ref) " is not a " kind " ref")
+                    {:error/code :error/wrong-artifact-kind
+                     :error/ref  ref
+                     :error/kind kind})))
+  (let [path (artifact-path root ref)]
+    (when-not (os.path/exists path)
+      (throw (ex-info (str "artifact not found: " ref)
+                      {:error/code :error/artifact-not-found
+                       :error/ref  ref
+                       :error/path path})))
+    (edn/read-string (slurp path))))
+
+(defrecord FileArtifactStore [root]
+  ap/ArtifactStore
+  (feature-manifest [_this ref]
+    (read-artifact root "feature" ref))
+  (model-artifact [_this ref]
+    (read-artifact root "model" ref)))
+
+(defn make-file-artifact-store
+  "Create a filesystem ArtifactStore rooted at root (default
+  \"resources/artifacts\")."
+  ([] (make-file-artifact-store "resources/artifacts"))
+  ([root] (->FileArtifactStore root)))

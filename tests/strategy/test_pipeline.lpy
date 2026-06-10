@@ -1,0 +1,251 @@
+(ns strategy.test-pipeline
+  "Strategy pipeline tests (STRATEGY_PIPELINE_AND_ARTIFACT_MODEL, Phase 7):
+  full 7-stage composition over the v0.2 replay fixture bars, deterministic
+  decision/intent identity, hold short-circuit, risk double-entry denial,
+  warmup insufficiency, declaration/artifact compatibility validation, and
+  the file artifact store."
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.artifact.file-store :as afs]
+            [stevetrading.artifact.protocol :as ap]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.feature.core :as feature]
+            [stevetrading.inference.core :as inference]
+            [stevetrading.replay.fixture :as fixture]
+            [stevetrading.strategy.registry :as registry]))
+
+(def account-id "account/sim/test")
+(def instrument-id "equity/NASDAQ/SPY")
+
+(def store (afs/make-file-artifact-store "resources/artifacts"))
+(def manifest (ap/feature-manifest store "feature/simple-direction/v1"))
+(def model (ap/model-artifact store "model/simple-direction/v1"))
+(def decl
+  (edn/read-string (slurp "resources/strategies/simple-direction-sma-cross-v1.edn")))
+
+(def bars
+  "The 10 fixture bars (SMA3 crosses above SMA5 at bar 6, back below at
+  bar 10)."
+  (into []
+        (comp (filter #(= :fact/market-bar-observed (:input/type %)))
+              (map :input/payload))
+        (:fixture/inputs
+         (fixture/load-fixture "resources/fixtures/replay/simple-paper-session-v0.2.edn"))))
+
+(defn bar-slice
+  "engine.state-shaped market slice over the first n fixture bars."
+  [n]
+  {:bars (vec (take n bars))
+   :last-time (:bar/time (nth bars (dec n)))})
+
+(defn run
+  "Run the pipeline over the first n fixture bars.
+  opts: :local-state (default {}), :portfolio (default {})."
+  ([n] (run n {}))
+  ([n {:keys [local-state portfolio]
+       :or {local-state {} portfolio {}}}]
+   (registry/run-pipeline {:strategy decl
+                           :market-slice (bar-slice n)
+                           :strategy-local-state local-state
+                           :portfolio-view portfolio
+                           :artifacts {:feature-manifest manifest :model model}
+                           :account-id account-id
+                           :mode :mode/replay})))
+
+(def position-view
+  {:portfolio/positions {instrument-id {:position/net-quantity "1"}}})
+
+;; ---------------------------------------------------------------------------
+;; Artifact store
+;; ---------------------------------------------------------------------------
+
+(deftest file-store-artifacts
+  (testing "reads artifact EDN by ref"
+    (is (= "feature/simple-direction/v1" (:feature-manifest/id manifest)))
+    (is (= [:feature/sma-fast :feature/sma-slow :feature/last-close]
+           (:feature-manifest/features manifest)))
+    (is (= :model.type/sma-crossover (:model/type model)))
+    (is (= {:fast 3 :slow 5} (:model/params model)))
+    (is (= "feature/simple-direction/v1" (:model/feature-manifest-ref model))))
+  (testing "missing artifact throws"
+    (is (= :error/artifact-not-found
+           (try (ap/feature-manifest store "feature/nope/v1")
+                (catch python/Exception e (:error/code (ex-data e)))))))
+  (testing "kind mismatch throws"
+    (is (= :error/wrong-artifact-kind
+           (try (ap/model-artifact store "feature/simple-direction/v1")
+                (catch python/Exception e (:error/code (ex-data e)))))))
+  (testing "traversal-shaped refs rejected"
+    (is (= :error/malformed-artifact-ref
+           (try (ap/feature-manifest store "feature/../../etc/passwd")
+                (catch python/Exception e (:error/code (ex-data e))))))))
+
+;; ---------------------------------------------------------------------------
+;; Stage units
+;; ---------------------------------------------------------------------------
+
+(deftest feature-derivation
+  (testing "SMA values over the fixture closes (Decimal-exact)"
+    (let [{:feature/keys [values as-of]} (feature/derive-features manifest (bar-slice 6))]
+      (is (= "550.20" (:feature/sma-fast values)))
+      (is (= "550.14" (:feature/sma-slow values)))
+      (is (= "550.40" (:feature/last-close values)))
+      (is (= "2026-06-10T14:35:00Z" as-of))))
+  (testing "insufficient history reports the needed bar count"
+    (is (= {:feature/insufficient? true :feature/needed 5}
+           (feature/derive-features manifest (bar-slice 3))))))
+
+(deftest inference-directions
+  (let [pred (fn [n]
+               (inference/run-inference
+                model (feature/derive-features manifest (bar-slice n))))]
+    (testing "bar 5: fast < slow -> down"
+      (is (= :direction/down (:prediction/direction (pred 5)))))
+    (testing "bar 6: fast > slow -> up"
+      (let [p (pred 6)]
+        (is (= :direction/up (:prediction/direction p)))
+        (is (= "model/simple-direction/v1" (:prediction/model-ref p)))
+        (is (= 1 (:prediction/schema-version p)))
+        (is (= "2026-06-10T14:35:00Z" (:prediction/at p)))))
+    (testing "bar 10: fast < slow -> down"
+      (is (= :direction/down (:prediction/direction (pred 10)))))))
+
+;; ---------------------------------------------------------------------------
+;; Full pipeline
+;; ---------------------------------------------------------------------------
+
+(deftest pipeline-enter-long-at-bar-6
+  (let [{:keys [facts strategy-local-state']} (run 6)]
+    (testing "emits the decision lineage ending in order-intent-created"
+      (is (= [:fact/prediction-produced
+              :fact/signal-decision-produced
+              :fact/risk-decision-recorded
+              :fact/execution-plan-produced
+              :fact/order-intent-created]
+             (mapv :record/type facts))))
+    (testing "every emitted envelope is canonically valid"
+      (is (every? #(:valid? (v/validate-fact %)) facts)))
+    (testing "posture memory updates"
+      (is (= :direction/up (:last-direction strategy-local-state'))))
+    (let [[pred sig risk plan intent] facts
+          decision-id (get-in sig [:fact/payload :decision/id])
+          intent-payload (:fact/payload intent)]
+      (testing "deterministic decision thread"
+        (is (= :posture/enter-long (get-in sig [:fact/payload :decision/posture])))
+        (is (= :risk/allow (get-in risk [:fact/payload :risk/decision])))
+        (is (= "1" (get-in risk [:fact/payload :risk/approved-quantity])))
+        (is (every? #(= decision-id (:record/correlation-id %)) facts))
+        (is (= [(:record/id pred)] (:record/causation-ids sig)))
+        (is (= [(:record/id sig)] (:record/causation-ids risk)))
+        (is (= [(:record/id risk)] (:record/causation-ids plan)))
+        (is (= [(:record/id plan)] (:record/causation-ids intent))))
+      (testing "full §11.3 order-intent payload"
+        (is (= decision-id (:order-intent/decision-id intent-payload)))
+        (is (= 0 (:order-intent/intent-slot intent-payload)))
+        (is (= :intent-role/entry (:order-intent/role intent-payload)))
+        (is (= :order-side/buy (:order-intent/side intent-payload)))
+        (is (= :position-effect/open (:order-intent/effect intent-payload)))
+        (is (= :order-type/market (:order-intent/order-type intent-payload)))
+        (is (= :tif/day (:order-intent/time-in-force intent-payload)))
+        (is (= "1" (:order-intent/quantity intent-payload)))
+        (is (= [{:instrument/id instrument-id
+                 :leg/side :order-side/buy
+                 :leg/quantity "1"}]
+               (:order-intent/legs intent-payload)))))
+    (testing "re-run produces the same order-intent id (replay-stable §12)"
+      (is (= (get-in (last facts) [:fact/payload :order-intent/id])
+             (get-in (last (:facts (run 6))) [:fact/payload :order-intent/id]))))))
+
+(deftest pipeline-hold-emits-nothing
+  (testing "no crossover state change -> NO facts, memory unchanged"
+    (let [{:keys [facts strategy-local-state']}
+          (run 6 {:local-state {:last-direction :direction/up}})]
+      (is (= [] facts))
+      (is (= :direction/up (:last-direction strategy-local-state')))))
+  (testing "down with down memory holds too"
+    (is (= [] (:facts (run 5 {:local-state {:last-direction :direction/down}}))))))
+
+(deftest pipeline-risk-denies-double-entry
+  (let [{:keys [facts]} (run 6 {:portfolio position-view})]
+    (testing "decision facts stop at the risk denial; no plan or intent"
+      (is (= [:fact/prediction-produced
+              :fact/signal-decision-produced
+              :fact/risk-decision-recorded]
+             (mapv :record/type facts)))
+      (is (= :risk/deny (get-in (last facts) [:fact/payload :risk/decision])))
+      (is (= [:reason/position-exists]
+             (get-in (last facts) [:fact/payload :risk/reason-codes]))))))
+
+(deftest pipeline-flattens-at-bar-10
+  (let [{:keys [facts strategy-local-state']}
+        (run 10 {:local-state {:last-direction :direction/up}
+                  :portfolio position-view})
+        intent-payload (:fact/payload (last facts))]
+    (testing "cross back below with an open position -> exit intent"
+      (is (= :fact/order-intent-created (:record/type (last facts))))
+      (is (= :posture/flatten
+             (get-in (second facts) [:fact/payload :decision/posture])))
+      (is (= :intent-role/exit (:order-intent/role intent-payload)))
+      (is (= :order-side/sell (:order-intent/side intent-payload)))
+      (is (= :position-effect/close (:order-intent/effect intent-payload)))
+      (is (= "1" (:order-intent/quantity intent-payload)))
+      (is (= :direction/down (:last-direction strategy-local-state'))))))
+
+(deftest pipeline-flatten-without-position-plans-nothing
+  (testing "flatten allowed but zero approved quantity -> no plan, no intent"
+    (let [{:keys [facts]} (run 10 {:local-state {:last-direction :direction/up}})]
+      (is (= [:fact/prediction-produced
+              :fact/signal-decision-produced
+              :fact/risk-decision-recorded]
+             (mapv :record/type facts)))
+      (is (= :risk/allow (get-in (last facts) [:fact/payload :risk/decision])))
+      (is (= "0" (get-in (last facts) [:fact/payload :risk/approved-quantity]))))))
+
+(deftest pipeline-insufficient-warmup
+  (testing "fewer bars than the slow window -> no decision, no facts"
+    (let [{:keys [facts strategy-local-state']} (run 3)]
+      (is (= [] facts))
+      (is (= {} strategy-local-state')))))
+
+;; ---------------------------------------------------------------------------
+;; Declaration validation + registry
+;; ---------------------------------------------------------------------------
+
+(deftest strategy-decl-validation
+  (testing "the shipped declaration is structurally valid and compatible"
+    (is (= {:valid? true} (registry/validate-strategy-decl decl)))
+    (is (= {:valid? true}
+           (registry/validate-strategy-decl
+            decl {:feature-manifest manifest :model model}))))
+  (testing "artifact incompatibility (mismatched manifest ref) is rejected (§8)"
+    (let [{:keys [valid? errors]}
+          (registry/validate-strategy-decl
+           decl {:feature-manifest manifest
+                 :model (assoc model :model/feature-manifest-ref "feature/other/v9")})]
+      (is (false? valid?))
+      (is (some #(= :error/artifact-incompatible (:error/code %)) errors))))
+  (testing "missing artifacts are rejected"
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          decl {:feature-manifest manifest :model nil})))))
+  (testing "structural violations are rejected"
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (dissoc decl :strategy/warmup)))))
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (assoc decl :strategy/id "not-a-strategy-id")))))
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (assoc decl :strategy/mode-policy #{:mode/bogus})))))
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (assoc decl :strategy/instruments [])))))))
+
+(deftest registry-build
+  (testing "maps declarations by strategy id"
+    (is (= {"strategy/simple-direction/sma-cross/v1" decl}
+           (registry/build-registry [decl]))))
+  (testing "rejects duplicate strategy ids"
+    (is (= :error/duplicate-strategy-id
+           (try (registry/build-registry [decl decl])
+                (catch python/Exception e (:error/code (ex-data e)))))))
+  (testing "rejects invalid declarations"
+    (is (= :error/invalid-strategy-decl
+           (try (registry/build-registry [(dissoc decl :strategy/features)])
+                (catch python/Exception e (:error/code (ex-data e))))))))

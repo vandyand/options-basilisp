@@ -1,0 +1,19 @@
+;; Feature manifest artifact (STRATEGY_PIPELINE §7.1) for the
+;; simple-direction SMA-crossover strategy. :feature-manifest/params carries
+;; the deterministic derivation parameters (SMA window sizes) so feature
+;; derivation is fully specified by manifest + market slice.
+
+{:feature-manifest/id "feature/simple-direction/v1"
+ :feature-manifest/version 1
+ :feature-manifest/features
+ [:feature/sma-fast
+  :feature/sma-slow
+  :feature/last-close]
+ :feature-manifest/params
+ {:sma-fast {:window 3}
+  :sma-slow {:window 5}}
+ :feature-manifest/required-inputs
+ [:input/bar-1m]
+ :feature-manifest/compatibility
+ {:strategy-family :strategy-family/simple-direction
+  :prediction-schema-version 1}}

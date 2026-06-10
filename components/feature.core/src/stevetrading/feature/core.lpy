@@ -1,0 +1,86 @@
+(ns stevetrading.feature.core
+  "Feature derivation stage (STRATEGY_PIPELINE §5.2, ARCHITECTURE §18.1).
+
+  Pure pipeline component: deterministic, no provider I/O. Derives the
+  canonical feature map for one strategy market-state slice under a
+  feature manifest (artifact.protocol §7.1 shape).
+
+  Supported v0.1 features (all over the slice's bar closes, Decimal
+  arithmetic on the canonical decimal strings):
+
+    :feature/sma-fast   simple moving average, window from
+                        [:feature-manifest/params :sma-fast :window]
+    :feature/sma-slow   simple moving average, window from
+                        [:feature-manifest/params :sma-slow :window]
+    :feature/last-close most recent bar close
+    :feature/bar-count  number of bars in the slice
+
+  Market slice shape (engine.state per-instrument slice):
+  {:bars [{:bar/time .. :bar/close .. ...} ...] :last-time ts}."
+  (:import decimal))
+
+(defn- ->dec
+  [s]
+  (decimal/Decimal s))
+
+(defn- sma
+  "SMA over the last n bar closes as a decimal string. Assumes
+  (>= (count bars) n)."
+  [bars n]
+  (let [closes (map #(->dec (:bar/close %)) (take-last n bars))]
+    (str (/ (reduce + closes) (->dec (str n))))))
+
+(defn- feature-window
+  "Window size for an SMA feature kw from manifest params; throws when the
+  manifest does not parameterize it."
+  [manifest feature-kw param-key]
+  (or (get-in manifest [:feature-manifest/params param-key :window])
+      (throw (ex-info (str "feature manifest missing window param for " feature-kw)
+                      {:error/code :error/missing-feature-param
+                       :error/feature feature-kw
+                       :error/manifest-id (:feature-manifest/id manifest)}))))
+
+(defn- derive-feature
+  [manifest bars feature-kw]
+  (case feature-kw
+    :feature/sma-fast   (sma bars (feature-window manifest feature-kw :sma-fast))
+    :feature/sma-slow   (sma bars (feature-window manifest feature-kw :sma-slow))
+    :feature/last-close (:bar/close (peek bars))
+    :feature/bar-count  (str (count bars))
+    (throw (ex-info (str "unknown feature: " feature-kw)
+                    {:error/code :error/unknown-feature
+                     :error/feature feature-kw
+                     :error/manifest-id (:feature-manifest/id manifest)}))))
+
+(defn- required-bars
+  "Minimum bar history needed to derive every feature in the manifest."
+  [manifest]
+  (reduce (fn [n feature-kw]
+            (max n (case feature-kw
+                     :feature/sma-fast (feature-window manifest feature-kw :sma-fast)
+                     :feature/sma-slow (feature-window manifest feature-kw :sma-slow)
+                     (:feature/last-close :feature/bar-count) 1
+                     1)))
+          1
+          (:feature-manifest/features manifest)))
+
+(defn derive-features
+  "Derive the canonical feature map for one market slice under a feature
+  manifest. Deterministic; no I/O.
+
+  Returns {:feature/values {feature-kw decimal-str}
+           :feature/manifest-id ..
+           :feature/as-of last-bar-time}
+  or, when the slice lacks history, {:feature/insufficient? true
+                                     :feature/needed n}."
+  [manifest market-slice]
+  (let [bars (vec (:bars market-slice))
+        needed (required-bars manifest)]
+    (if (< (count bars) needed)
+      {:feature/insufficient? true
+       :feature/needed needed}
+      {:feature/values (into {}
+                             (map (fn [kw] [kw (derive-feature manifest bars kw)])
+                                  (:feature-manifest/features manifest)))
+       :feature/manifest-id (:feature-manifest/id manifest)
+       :feature/as-of (:bar/time (peek bars))})))

@@ -1,0 +1,21 @@
+;; Strategy declaration (STRATEGY_PIPELINE §4) — first direction strategy:
+;; SMA(3)/SMA(5) crossover on SPY 1-minute bars. Pure data; reviewable
+;; without executing code. :strategy/instruments is the v0.1 extension for
+;; market-state selection/decision scoping (ARCHITECTURE §17 "required
+;; instruments"). Execution :params carries the requested entry quantity
+;; consumed by the risk stage.
+
+{:strategy/id "strategy/simple-direction/sma-cross/v1"
+ :strategy/family :strategy-family/simple-direction
+ :strategy/name :strategy-name/sma-cross
+ :strategy/version 1
+ :strategy/mode-policy #{:mode/replay :mode/sim :mode/paper}
+ :strategy/schedule {:session :session/us-equities-regular}
+ :strategy/warmup {:required-bars 5}
+ :strategy/instruments ["equity/NASDAQ/SPY"]
+ :strategy/features {:manifest-ref "feature/simple-direction/v1"}
+ :strategy/inference {:artifact-ref "model/simple-direction/v1"}
+ :strategy/signal {:fn-id :signal/sma-crossover-v1}
+ :strategy/risk {:policy-id :risk/simple-direction-default}
+ :strategy/execution {:policy-id :execution/market-equity-v1
+                      :params {:quantity "1"}}}

@@ -1,0 +1,65 @@
+(ns stevetrading.inference.core
+  "Inference stage (STRATEGY_PIPELINE §5.3, ARCHITECTURE §18.2).
+
+  Pure pipeline component: scores a canonical feature map under a loaded
+  model artifact (artifact.protocol §7.2 shape) into the canonical
+  prediction record. Artifact loading is an adapter concern — this stage
+  sees loaded artifact maps only.
+
+  Supported v0.1 model types:
+
+    :model.type/sma-crossover — direction :direction/up when
+      :feature/sma-fast > :feature/sma-slow, :direction/down when fast <
+      slow, :direction/flat when equal. :prediction/value is the
+      fast-minus-slow spread as a decimal string."
+  (:import decimal))
+
+(defn- ->dec
+  [s]
+  (decimal/Decimal s))
+
+(defn- require-feature
+  [features kw]
+  (or (get-in features [:feature/values kw])
+      (throw (ex-info (str "features missing " kw)
+                      {:error/code :error/missing-feature
+                       :error/feature kw}))))
+
+(defn- sma-crossover-prediction
+  [features]
+  (let [fast (->dec (require-feature features :feature/sma-fast))
+        slow (->dec (require-feature features :feature/sma-slow))]
+    {:prediction/value (str (- fast slow))
+     :prediction/direction (cond
+                             (> fast slow) :direction/up
+                             (< fast slow) :direction/down
+                             :else         :direction/flat)}))
+
+(defn run-inference
+  "Score features under a model artifact. Returns the canonical prediction
+  record:
+
+  {:prediction/value decimal-str
+   :prediction/direction :direction/up|:direction/down|:direction/flat
+   :prediction/model-ref model-id
+   :prediction/schema-version n
+   :prediction/at feature-as-of-ts}
+
+  Deterministic; throws ex-info on unknown model type, insufficient
+  features, or missing feature values."
+  [model-artifact features]
+  (when (:feature/insufficient? features)
+    (throw (ex-info "cannot run inference on insufficient features"
+                    {:error/code :error/insufficient-features
+                     :error/needed (:feature/needed features)})))
+  (let [model-type (:model/type model-artifact)
+        scored (case model-type
+                 :model.type/sma-crossover (sma-crossover-prediction features)
+                 (throw (ex-info (str "unknown model type: " (pr-str model-type))
+                                 {:error/code :error/unknown-model-type
+                                  :error/model-type model-type
+                                  :error/model-id (:model/id model-artifact)})))]
+    (assoc scored
+           :prediction/model-ref (:model/id model-artifact)
+           :prediction/schema-version (:model/prediction-schema-version model-artifact)
+           :prediction/at (:feature/as-of features))))

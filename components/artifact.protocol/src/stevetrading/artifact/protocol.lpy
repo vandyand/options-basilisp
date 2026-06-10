@@ -1,0 +1,22 @@
+(ns stevetrading.artifact.protocol
+  "Artifact store boundary (STRATEGY_PIPELINE_AND_ARTIFACT_MODEL §7).
+
+  Artifacts are immutable versioned EDN references used by strategy stages:
+  feature manifests (§7.1) and model artifacts (§7.2). Artifact loading is
+  an adapter/artifact-service concern (§5.3) — pipeline stages see loaded
+  EDN maps, never filesystem policy.
+
+  PROTOCOL component — importable by anyone (POLYLITH §7).")
+
+(defprotocol ArtifactStore
+  "Resolves immutable artifact references to their EDN payloads."
+  (feature-manifest [this ref]
+    "Resolve a feature-manifest ref (e.g. \"feature/simple-direction/v1\")
+    to its EDN map (§7.1: :feature-manifest/id, :feature-manifest/version,
+    :feature-manifest/features, :feature-manifest/required-inputs, ...).
+    Throws ex-info {:error/code :error/artifact-not-found} when absent.")
+  (model-artifact [this ref]
+    "Resolve a model-artifact ref (e.g. \"model/simple-direction/v1\") to
+    its EDN map (§7.2: :model/id, :model/version,
+    :model/feature-manifest-ref, :model/prediction-schema-version, ...).
+    Throws ex-info {:error/code :error/artifact-not-found} when absent."))

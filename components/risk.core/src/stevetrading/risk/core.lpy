@@ -1,0 +1,73 @@
+(ns stevetrading.risk.core
+  "Risk decision stage (STRATEGY_PIPELINE §5.5, ARCHITECTURE §19).
+
+  Pure pipeline component: decides whether a signal may act and at what
+  size, against the current portfolio view (portfolio.core/derive-portfolio
+  shape) and account constraints.
+
+  v0.1 policy :risk/simple-direction-default:
+  - max 1 open position per instrument: DENY :posture/enter-long when the
+    portfolio already holds a non-zero net position in the instrument
+  - ALLOW :posture/flatten always; approved quantity is the absolute net
+    open position (\"0\" when flat — execution then plans no orders)
+  - approved quantity for entries is the signal's requested quantity"
+  (:import decimal))
+
+(defn- ->dec
+  [s]
+  (decimal/Decimal (or s "0")))
+
+(def ^:private dec-zero (decimal/Decimal "0"))
+
+(defn- net-position
+  "Net open quantity Decimal for instrument-id in a portfolio view."
+  [portfolio-view instrument-id]
+  (->dec (get-in portfolio-view
+                 [:portfolio/positions instrument-id :position/net-quantity])))
+
+(defn- simple-direction-default
+  [signal portfolio-view _account-ctx]
+  (let [instrument-id (:decision/instrument-id signal)
+        net (net-position portfolio-view instrument-id)]
+    (case (:decision/posture signal)
+      :posture/enter-long
+      (if (zero? net)
+        {:risk/decision :risk/allow
+         :risk/reason-codes [:reason/risk-allowed]
+         :risk/approved-quantity (or (:decision/requested-quantity signal) "1")}
+        {:risk/decision :risk/deny
+         :risk/reason-codes [:reason/position-exists]
+         :risk/approved-quantity "0"})
+
+      :posture/flatten
+      {:risk/decision :risk/allow
+       :risk/reason-codes (if (zero? net)
+                            [:reason/risk-allowed :reason/no-open-position]
+                            [:reason/risk-allowed])
+       :risk/approved-quantity (str (abs net))}
+
+      ;; :posture/hold never reaches risk (the pipeline short-circuits),
+      ;; but answer deterministically if asked.
+      {:risk/decision :risk/deny
+       :risk/reason-codes [:reason/no-action-requested]
+       :risk/approved-quantity "0"})))
+
+(defn evaluate-risk
+  "Evaluate a signal decision under a risk policy. signal is the canonical
+  signal decision map enriched with :decision/instrument-id and (for
+  entries) :decision/requested-quantity. Returns
+
+  {:risk/decision :risk/allow|:risk/deny
+   :risk/policy-id policy
+   :risk/reason-codes [...]
+   :risk/approved-quantity decimal-str}
+
+  Throws ex-info on unknown policy ids."
+  [policy signal portfolio-view account-ctx]
+  (let [result (case policy
+                 :risk/simple-direction-default
+                 (simple-direction-default signal portfolio-view account-ctx)
+                 (throw (ex-info (str "unknown risk policy: " (pr-str policy))
+                                 {:error/code :error/unknown-risk-policy
+                                  :error/policy policy})))]
+    (assoc result :risk/policy-id policy)))

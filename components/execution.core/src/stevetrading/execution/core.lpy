@@ -1,0 +1,115 @@
+(ns stevetrading.execution.core
+  "Execution planning stage (STRATEGY_PIPELINE §5.6, ARCHITECTURE §19).
+
+  Pure pipeline component: expresses a risk-approved signal as a canonical
+  execution plan plus order intents. Order intents are FULL
+  :fact/order-intent-created payloads (CANONICAL_SCHEMAS §11.3) whose ids
+  come from the deterministic order-intent identity algorithm
+  (domain.schemas/order-intent-id, §12) — replay-stable, never random.
+
+  v0.1 policy :execution/market-equity-v1: single-leg equity market order,
+  :tif/day, quantity from the risk stage.
+  - :posture/enter-long -> buy/open, role :intent-role/entry
+  - :posture/flatten    -> sell/close, role :intent-role/exit
+  - approved quantity of zero (e.g. flatten with no open position) plans
+    NO intents (empty :execution/order-intents)."
+  (:require [stevetrading.domain.schemas :as schemas])
+  (:import decimal))
+
+(defn- order-intent
+  "Build one full :fact/order-intent-created payload (§11.3) with its
+  deterministic id (§12.1 identity input)."
+  [{:keys [decision-id intent-slot role side effect order-type tif
+           quantity instrument-id account-id]}]
+  (let [legs [{:instrument/id instrument-id
+               :leg/side side
+               :leg/quantity quantity}]
+        intent-id (schemas/order-intent-id
+                   {:identity/version 1
+                    :identity/decision-id decision-id
+                    :identity/intent-slot intent-slot
+                    :identity/account-id account-id
+                    :identity/role role
+                    :identity/order-shape {:side side
+                                           :effect effect
+                                           :order-type order-type
+                                           :time-in-force tif
+                                           :quantity quantity
+                                           :limit-price nil
+                                           :stop-price nil
+                                           :legs legs}})]
+    {:order-intent/id intent-id
+     :order-intent/decision-id decision-id
+     :order-intent/intent-slot intent-slot
+     :order-intent/account-id account-id
+     :order-intent/role role
+     :order-intent/side side
+     :order-intent/effect effect
+     :order-intent/order-type order-type
+     :order-intent/time-in-force tif
+     :order-intent/quantity quantity
+     :order-intent/limit-price nil
+     :order-intent/stop-price nil
+     :order-intent/legs legs}))
+
+(defn- market-equity-v1
+  [risk-approved-signal instrument-ctx account-id]
+  (let [decision-id (:decision/id risk-approved-signal)
+        posture (:decision/posture risk-approved-signal)
+        quantity (:risk/approved-quantity risk-approved-signal)
+        instrument-id (:instrument/id instrument-ctx)]
+    (if (zero? (decimal/Decimal (or quantity "0")))
+      []
+      (case posture
+        :posture/enter-long
+        [(order-intent {:decision-id decision-id
+                        :intent-slot 0
+                        :role :intent-role/entry
+                        :side :order-side/buy
+                        :effect :position-effect/open
+                        :order-type :order-type/market
+                        :tif :tif/day
+                        :quantity quantity
+                        :instrument-id instrument-id
+                        :account-id account-id})]
+
+        :posture/flatten
+        [(order-intent {:decision-id decision-id
+                        :intent-slot 0
+                        :role :intent-role/exit
+                        :side :order-side/sell
+                        :effect :position-effect/close
+                        :order-type :order-type/market
+                        :tif :tif/day
+                        :quantity quantity
+                        :instrument-id instrument-id
+                        :account-id account-id})]
+
+        (throw (ex-info (str "no market-equity-v1 expression for posture "
+                             (pr-str posture))
+                        {:error/code :error/unplannable-posture
+                         :error/posture posture}))))))
+
+(defn plan-execution
+  "Plan order expression for a risk-approved signal under an execution
+  policy. risk-approved-signal is the signal decision map merged with the
+  risk result (needs :decision/id, :decision/posture,
+  :risk/approved-quantity). instrument-ctx is {:instrument/id ..}.
+
+  Returns {:execution/plan {:execution/policy-id ..
+                            :execution/decision-id ..
+                            :execution/order-intent-ids [..]}
+           :execution/order-intents [full §11.3 payloads]}
+
+  Deterministic; throws ex-info on unknown policy ids."
+  [policy risk-approved-signal instrument-ctx account-id]
+  (let [intents (case policy
+                  :execution/market-equity-v1
+                  (market-equity-v1 risk-approved-signal instrument-ctx account-id)
+                  (throw (ex-info (str "unknown execution policy: " (pr-str policy))
+                                  {:error/code :error/unknown-execution-policy
+                                   :error/policy policy})))]
+    {:execution/plan {:execution/policy-id policy
+                      :execution/decision-id (:decision/id risk-approved-signal)
+                      :execution/order-intent-ids (mapv :order-intent/id intents)}
+     :execution/order-intents intents}))

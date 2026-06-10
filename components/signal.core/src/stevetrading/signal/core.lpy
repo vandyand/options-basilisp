@@ -1,0 +1,74 @@
+(ns stevetrading.signal.core
+  "Signal decision stage (STRATEGY_PIPELINE §5.4, ARCHITECTURE §19).
+
+  Pure pipeline component: turns a canonical prediction + market slice +
+  strategy-local state into a posture decision. Strategy-local state is
+  explicit and replay-safe (§6) — the crossover posture memory lives under
+  :last-direction in the strategy-local state map, never in closures.
+
+  v0.1 signal fn :signal/sma-crossover-v1 semantics — posture changes ONLY
+  on crossover state change:
+
+    direction == (:last-direction local-state)  -> :posture/hold
+    changed to :direction/up                    -> :posture/enter-long
+    changed to :direction/down|:direction/flat  -> :posture/flatten
+
+  A nil :last-direction (first decision after warmup) counts as a distinct
+  state, so the first decided direction always produces a posture.
+
+  Determinism: :decision/market-time is the slice's last bar time (never
+  wall clock); :decision/id is the deterministic hash of the canonical
+  decision seed (CANONICAL_SCHEMAS §5.2.6) over strategy-id, decision
+  scope (the slice instrument), the source watermark tuple
+  [instrument-id last-bar-time], the decision timestamp, and the decision
+  slot (0 — one decision per source event set in v0.1)."
+  (:require [stevetrading.domain.schemas :as schemas]))
+
+(defn- posture-for
+  [last-direction direction]
+  (cond
+    (= direction last-direction)    :posture/hold
+    (= :direction/up direction)     :posture/enter-long
+    :else                           :posture/flatten))
+
+(defn- reason-codes
+  [posture last-direction direction]
+  (case posture
+    :posture/hold       [:reason/no-crossover-change]
+    :posture/enter-long [:reason/sma-cross-up]
+    :posture/flatten    (if (= :direction/flat direction)
+                          [:reason/sma-flat]
+                          [:reason/sma-cross-down])))
+
+(defn decide-signal
+  "Decide the strategy posture from a prediction. Returns the canonical
+  signal decision map (CANONICAL_SCHEMAS §11.2 payload shape plus
+  :decision/instrument-id):
+
+  {:decision/id \"dec_...\"
+   :decision/posture :posture/enter-long|:posture/flatten|:posture/hold
+   :decision/reason-codes [...]
+   :decision/market-time ts
+   :decision/instrument-id ..}
+
+  Posture memory (:last-direction) is read from strategy-local-state; the
+  composing pipeline owns writing the updated memory back (registry
+  run-pipeline returns :strategy-local-state')."
+  [strategy-decl prediction market-slice strategy-local-state]
+  (let [instrument-id (first (:strategy/instruments strategy-decl))
+        market-time (or (:bar/time (peek (vec (:bars market-slice))))
+                        (:last-time market-slice))
+        last-direction (:last-direction strategy-local-state)
+        direction (:prediction/direction prediction)
+        posture (posture-for last-direction direction)
+        decision-id (schemas/decision-id
+                     {:decision/strategy-id (:strategy/id strategy-decl)
+                      :decision/scope instrument-id
+                      :decision/source-watermark [instrument-id market-time]
+                      :decision/at market-time
+                      :decision/slot 0})]
+    {:decision/id decision-id
+     :decision/posture posture
+     :decision/reason-codes (reason-codes posture last-direction direction)
+     :decision/market-time market-time
+     :decision/instrument-id instrument-id}))
