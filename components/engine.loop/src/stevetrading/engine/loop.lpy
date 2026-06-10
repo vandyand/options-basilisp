@@ -22,7 +22,7 @@
   cycle (the simplest §6-conformant batch; same-timestamp batching is a
   later optimization).
 
-  Hooks (both optional):
+  Hooks (all optional):
   - :on-observation (fn [obs new?]) — called once per pulled observation
     after the append attempt; new? is true when the store accepted it.
     The replay/live bases use this to advance their replay-position
@@ -30,7 +30,25 @@
   - :on-facts (fn [facts]) — called with every batch of NEWLY APPENDED
     facts (observations, decisions, dispatch/outcomes, ledger facts,
     fold-emitted faults). The live base wires the observability audit
-    derivation here; the loop itself stays adapter-free."
+    derivation here; the loop itself stays adapter-free.
+
+  Crash-injection hooks (Phase 11 — ENGINE_STATE_AND_RECOVERY §17 test
+  infrastructure; both optional, both predicates (fn [fact] bool)):
+  - :crash-after-fact  — checked against every NEWLY APPENDED fact, in
+    every append batch. On the first match, throws the ::crash sentinel
+    *after* the matching fact is durably in the store but before ANY
+    subsequent step (fold, dispatch, ledger derivation, snapshot) runs.
+    Simulates 'process died right after this fact hit disk'.
+  - :crash-before-fact — checked against every fact *about to be
+    appended*. On the first match, throws BEFORE the append, so the
+    matching fact (and its whole batch) never lands. Simulates 'process
+    died after the previous boundary' — e.g. matching the broker ack
+    crashes after :fact/command-dispatched was appended AND the broker
+    received the submit, but before any outcome fact was persisted
+    (§17 scenario 2).
+  The sentinel is an ex-info with ::crash in its data; catch it with
+  crash-ex?. run-replay/run-live catch it and return {:crashed? true}.
+  Production wiring never sets these hooks."
   (:import datetime decimal os.path)
   (:require [basilisp.edn :as edn]
             [stevetrading.artifact.protocol :as ap]
@@ -57,6 +75,23 @@
              "%Y-%m-%dT%H:%M:%SZ"))
 
 ;; ---------------------------------------------------------------------------
+;; Crash injection (test infrastructure — see ns docstring)
+;; ---------------------------------------------------------------------------
+
+(defn- injected-crash
+  [fact when-kw]
+  (ex-info "injected crash (engine.loop test hook)"
+           {::crash true
+            :crash/when when-kw
+            :crash/fact-type (:record/type fact)
+            :crash/fact-id (:record/id fact)}))
+
+(defn crash-ex?
+  "True when e is the ::crash sentinel thrown by an injected crash hook."
+  [e]
+  (boolean (some-> (ex-data e) ::crash)))
+
+;; ---------------------------------------------------------------------------
 ;; Append + fold plumbing
 ;; ---------------------------------------------------------------------------
 
@@ -79,13 +114,31 @@
       {:new-facts new-facts
        :appended-count (count appended)})))
 
+(defn- make-append!
+  "Build the loop's single append fn, wrapping append!* with the optional
+  crash-injection hooks. :crash-before-fact fires on RAW facts before the
+  store sees them (the batch never lands); :crash-after-fact fires on
+  ACCEPTED facts only (duplicates re-appended on resume never re-crash)."
+  [fact-store on-facts crash-before-fact crash-after-fact]
+  (fn [facts]
+    (when crash-before-fact
+      (doseq [f facts]
+        (when (crash-before-fact f)
+          (throw (injected-crash f :crash/before-append)))))
+    (let [res (append!* fact-store on-facts facts)]
+      (when crash-after-fact
+        (doseq [f (:new-facts res)]
+          (when (crash-after-fact f)
+            (throw (injected-crash f :crash/after-append)))))
+      res)))
+
 (defn- fold-new!
   "Fold newly appended facts into engine state; any fold-emitted facts
   (faults) are appended too (canonical truth about this run, matching the
   recovery executor). Returns {:state state' :appended-count n}."
-  [fact-store on-facts state new-facts]
+  [append! state new-facts]
   (let [{:keys [state emitted-facts]} (fold/fold-facts state new-facts)
-        {:keys [appended-count]} (append!* fact-store on-facts emitted-facts)
+        {:keys [appended-count]} (append! emitted-facts)
         state (if (seq new-facts)
                 (st/record-watermark state :watermark/fact-log
                                      (apply max (keep :fact-log/offset
@@ -136,6 +189,24 @@
                                  (:input/payload input)))
           {}
           (take n (:fixture/inputs fixture*))))
+
+(defn observed-position
+  "Resume position for the marks rebuild: the count of fixture inputs
+  at-or-before the recovered :watermark/market, floored at the resume
+  cursor. After a MID-CYCLE crash the fact log (and therefore the
+  recovered market slices/watermark) can be AHEAD of the snapshot's
+  resume cursor; pricing context must reflect everything the engine has
+  already observed, or an intent re-dispatched during catch-up cycles
+  would fill at a stale mark and diverge from the uninterrupted run
+  (ENGINE_STATE_AND_RECOVERY §18.1 convergence). Inputs are sorted by
+  :input/at (fixture invariant), so a take-while suffices."
+  [fixture* state cursor]
+  (let [wm (get-in state [:engine/watermarks :watermark/market])]
+    (if (nil? wm)
+      cursor
+      (max cursor
+           (count (take-while #(<= (compare (:input/at %) wm) 0)
+                              (:fixture/inputs fixture*)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Strategy wiring
@@ -238,7 +309,7 @@
   ONLY the accepted ones into ledger state (duplicates were folded by the
   recovery rebuild). Fills with no resolvable intent context are skipped
   and reported, never guessed."
-  [fact-store on-facts state ledger fill-facts]
+  [append! state ledger fill-facts]
   (reduce
    (fn [acc fill]
      (let [oi-id (get-in fill [:fact/payload :order-intent/id])
@@ -246,8 +317,7 @@
        (if (nil? ctx)
          (update acc :skipped-fills conj (:record/id fill))
          (let [{:keys [new-facts appended-count]}
-               (append!* fact-store on-facts
-                         (ledger/derive-ledger-facts (:ledger acc) fill ctx))]
+               (append! (ledger/derive-ledger-facts (:ledger acc) fill ctx))]
            (-> acc
                (update :ledger ledger/fold-ledger-facts new-facts)
                (update :appended-count + appended-count))))))
@@ -262,8 +332,8 @@
   "Pipeline → append+fold decision facts → derive/dispatch commands →
   append+fold outcomes → ledger derive/append/fold → portfolio refresh.
   Returns {:state .. :ledger .. :appended-count n :skipped-fills [..]}."
-  [{:keys [fact-store broker state ledger strategy account-id run-id
-           run-mode broker-route on-facts]}]
+  [{:keys [append! broker state ledger strategy account-id run-id
+           run-mode broker-route]}]
   (let [{:keys [decl artifacts]} strategy
         sid (:strategy/id decl)
         instrument (first (:strategy/instruments decl))
@@ -279,8 +349,8 @@
                            :run-id run-id})
         ;; §6 step 6: append decision facts, fold the newly accepted ones
         {dec-new :new-facts dec-n :appended-count}
-        (append!* fact-store on-facts facts)
-        fold1 (fold-new! fact-store on-facts state dec-new)
+        (append! facts)
+        fold1 (fold-new! append! state dec-new)
         state (:state fold1)
         ;; strategy-local posture memory is loop-side state (explicit, §6)
         state (st/update-strategy state sid
@@ -293,7 +363,7 @@
         commands (cmds/derive-commands facts {:broker-route broker-route})
         dispatched (atom {:new-facts [] :appended-count 0})
         append-hook (fn [facts*]
-                      (let [res (append!* fact-store on-facts facts*)]
+                      (let [res (append! facts*)]
                         (swap! dispatched
                                (fn [acc]
                                  (-> acc
@@ -307,12 +377,11 @@
                                     :append! append-hook})
         ;; §6 steps 8-10: fold the newly appended dispatch/outcome facts
         outcome-new (:new-facts @dispatched)
-        fold2 (fold-new! fact-store on-facts state outcome-new)
+        fold2 (fold-new! append! state outcome-new)
         state (:state fold2)
         ;; ledger integration point: derive→append→fold per new fill
         fills (filterv #(= :fact/fill-observed (:record/type %)) outcome-new)
-        ledger-res (apply-fills-to-ledger! fact-store on-facts state ledger
-                                           fills)
+        ledger-res (apply-fills-to-ledger! append! state ledger fills)
         ledger' (:ledger ledger-res)
         state (assoc state :engine/portfolio
                      (portfolio/derive-portfolio ledger'))]
@@ -387,16 +456,24 @@
                     commands (default {:broker/source-system :broker/sim})
     :on-observation (fn [obs new?]) hook (optional; see ns docstring)
     :on-facts       (fn [facts]) newly-appended-facts hook (optional)
+    :crash-after-fact  (fn [fact] bool) crash-injection predicate
+                       (optional; see ns docstring — test only)
+    :crash-before-fact (fn [fact] bool) crash-injection predicate
+                       (optional; see ns docstring — test only)
 
   Returns {:state .. :ledger .. :cursor n :appended n :stopped-early? bool
            :skipped-fills [..]} — a final snapshot is written unless the
-  run stopped early."
+  run stopped early. An injected crash escapes as the ::crash sentinel
+  (catch with crash-ex?); like :max-facts, no final snapshot is written."
   [{:keys [fact-store snapshot-store broker source strategies account-id
            run-id run-mode state0 ledger0 cursor0 snapshot-every
-           snapshot-scope max-facts broker-route on-observation on-facts]}]
+           snapshot-scope max-facts broker-route on-observation on-facts
+           crash-after-fact crash-before-fact]}]
   (let [snapshot-every (or snapshot-every default-snapshot-every)
         snapshot-scope (or snapshot-scope default-snapshot-scope)
-        cursor0 (or cursor0 0)]
+        cursor0 (or cursor0 0)
+        append! (make-append! fact-store on-facts
+                              crash-before-fact crash-after-fact)]
     (loop [state state0
            ledger ledger0
            cursor cursor0
@@ -415,8 +492,8 @@
           (let [obs (first observations)
                 ;; §6 steps 1-3
                 {obs-new :new-facts obs-n :appended-count}
-                (append!* fact-store on-facts [obs])
-                obs-fold (fold-new! fact-store on-facts state obs-new)
+                (append! [obs])
+                obs-fold (fold-new! append! state obs-new)
                 state (:state obs-fold)
                 cycle-n (+ obs-n (:appended-count obs-fold))
                 _ (when on-observation
@@ -433,7 +510,7 @@
                      (if (and (= :active lifecycle)
                               (observation-relevant? obs (:decl strategy)))
                        (let [res (run-strategy-cycle!
-                                  {:fact-store fact-store
+                                  {:append! append!
                                    :broker broker
                                    :state (:state acc)
                                    :ledger (:ledger acc)
@@ -441,8 +518,7 @@
                                    :account-id account-id
                                    :run-id run-id
                                    :run-mode run-mode
-                                   :broker-route broker-route
-                                   :on-facts on-facts})]
+                                   :broker-route broker-route})]
                          {:state (:state res)
                           :ledger (:ledger res)
                           :n (+ (:n acc) (:appended-count res))

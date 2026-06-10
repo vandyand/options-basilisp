@@ -1,0 +1,264 @@
+(ns helpers.recovery-helpers
+  "Shared test infrastructure for the Phase 11 recovery validation suite
+  (ENGINE_STATE_AND_RECOVERY §17, TESTING §7-§8) — also requires by the
+  Phase 8 golden replay tests for the normalization helpers.
+
+  Two ways to drive a crash/recover/continue cycle:
+
+  1. run-replay-with-crash via the replay base (engine-replay): crash
+     hook passed straight through run-replay; resume = call run-replay
+     again on the same out-dir (auto-detected replay recovery, FRESH sim
+     broker — a real process restart in replay/sim mode, where the §12.1
+     idempotent re-dispatch path covers any unsent/unacked work).
+
+  2. The env harness (make-env / run-segment! / recover! / continue!):
+     the SAME sim broker instance survives the crash (it stands for the
+     external broker, which does not die with our process), and recovery
+     runs with the broker seam in :crash-recovery mode — the live/paper
+     reconciliation semantics (open-orders/fills-since restore broker
+     truth; the engine must NOT resubmit).
+
+  State normalization for cross-run comparison (documented — shared with
+  e2e.test-replay-golden): two independent runs write to different
+  out-dirs, so envelope :record/id values (fresh ULIDs) and fact-log
+  offsets necessarily differ even when every logical fact is identical.
+  norm-state strips exactly the fields that carry those run-local
+  identities:
+    - :engine/run                      (run id + wall-clock started-at)
+    - :watermark/fact-log              (offsets shift by recovery
+                                        bookkeeping facts)
+    - unresolved-order *-fact-id refs  (ULIDs of the run's own envelopes)
+    - :portfolio/source-watermark      (fact-log offset)
+  Everything else — market state, cursors, strategy lifecycle +
+  signal-local state, order lifecycles/quantities, positions, lots,
+  cash, P&L — must be `=`."
+  (:import os.path tempfile)
+  (:require [stevetrading.artifact.file-store :as afs]
+            [stevetrading.base.engine-replay :as er]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.broker.sim :as sim]
+            [stevetrading.domain.identifiers :as identifiers]
+            [stevetrading.engine.loop :as eloop]
+            [stevetrading.engine.recovery :as rec]
+            [stevetrading.engine.state :as st]
+            [stevetrading.ledger.core :as ledger]
+            [stevetrading.market-data.replay :as replay]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.persistence.snapshot-store :as ss]
+            [stevetrading.replay.fixture :as fixture]))
+
+(def fixture-path "resources/fixtures/replay/simple-paper-session-v0.2.edn")
+
+(def account-id "account/sim/main")
+
+(def snapshot-scope "runtime-main")
+
+(def strategy-paths
+  ["resources/strategies/simple-direction-sma-cross-v1.edn"])
+
+;; ---------------------------------------------------------------------------
+;; Fact-log readers
+;; ---------------------------------------------------------------------------
+
+(defn log-facts
+  [out-dir]
+  (p/facts-since (fs/make-fact-store (os.path/join out-dir "facts.db")) 0))
+
+(defn facts-of-type
+  [facts fact-type]
+  (filterv #(= fact-type (:record/type %)) facts))
+
+(defn intent-ids
+  "Ordered :fact/order-intent-created intent ids in the out-dir's log."
+  [out-dir]
+  (->> (log-facts out-dir)
+       (filter #(= :fact/order-intent-created (:record/type %)))
+       (mapv #(get-in % [:fact/payload :order-intent/id]))))
+
+(def operational-fact-types
+  "Recovery bookkeeping + fault facts: each recovery run is a real
+  operational event and appends fresh rows (recovery start/complete,
+  reconciliation-anomaly orphan marking) — operational truth, excluded
+  from BUSINESS fact comparisons between control and crash runs."
+  #{:fact/recovery-started :fact/recovery-completed :fact/fault-recorded})
+
+(defn business-fact-pairs
+  "Ordered [fact-type order-intent-id] pairs, excluding operational
+  facts (see operational-fact-types)."
+  [out-dir]
+  (->> (log-facts out-dir)
+       (remove #(contains? operational-fact-types (:record/type %)))
+       (mapv (fn [f] [(:record/type f)
+                      (get-in f [:fact/payload :order-intent/id])]))))
+
+;; ---------------------------------------------------------------------------
+;; Cross-run state normalization (see ns docstring)
+;; ---------------------------------------------------------------------------
+
+(defn norm-portfolio
+  [portfolio]
+  (dissoc portfolio :portfolio/source-watermark))
+
+(defn norm-state
+  "Strip run-local identity fields (see ns docstring)."
+  [state]
+  (-> state
+      (dissoc :engine/run)
+      (update :engine/watermarks dissoc :watermark/fact-log)
+      (update :engine/unresolved-orders
+              (fn [orders]
+                (into {}
+                      (map (fn [[oi entry]]
+                             [oi (dissoc entry
+                                         :order/creation-fact-id
+                                         :order/dispatch-fact-id
+                                         :order/latest-broker-update-fact-id
+                                         :order/cancel-dispatch-fact-id
+                                         :order/fill-fact-ids)])
+                           orders))))
+      (update :engine/portfolio norm-portfolio)))
+
+;; ---------------------------------------------------------------------------
+;; Replay-base control run (memoized — shared by every test in a session)
+;; ---------------------------------------------------------------------------
+
+(defonce ^{:doc "Uninterrupted v0.2-fixture control run via run-replay
+  (snapshot-every 5, matching the crash runs). Delay-memoized: the
+  golden comparisons in several test namespaces all reference ONE
+  control."}
+  control
+  (delay
+    (let [out-dir (tempfile/mkdtemp)]
+      {:out-dir out-dir
+       :summary (er/run-replay {:fixture-path fixture-path
+                                :out-dir out-dir
+                                :snapshot-every 5})})))
+
+;; ---------------------------------------------------------------------------
+;; Env harness: persistent broker across crash + seam reconciliation
+;; ---------------------------------------------------------------------------
+
+(defn make-env
+  "Wire one session environment (mirrors the replay base, but the sim
+  broker instance is owned by the test and SURVIVES crashes). opts:
+    :fill-policy  sim broker fill policy (e.g. {:mode :on-poll})"
+  [opts]
+  (let [out-dir (tempfile/mkdtemp)
+        fixture* (fixture/load-fixture fixture-path)
+        market-clock (atom (:input/at (first (:fixture/inputs fixture*))))
+        marks (atom {})]
+    {:out-dir out-dir
+     :fixture* fixture*
+     :fact-store (fs/make-fact-store (os.path/join out-dir "facts.db"))
+     :snapshot-store (ss/make-snapshot-store
+                      (os.path/join out-dir "snapshots"))
+     :market-clock market-clock
+     :marks marks
+     :broker (sim/make-sim-broker
+              {:marks (fn [] @marks)
+               :clock (fn [] @market-clock)
+               :fill-policy (or (:fill-policy opts) {})})
+     :strategies (mapv #(eloop/load-strategy
+                         (afs/make-file-artifact-store "resources/artifacts")
+                         :mode/sim %)
+                       strategy-paths)}))
+
+(defn- run-info
+  []
+  {:run/id (identifiers/new-record-id)
+   :run/engine-version st/engine-state-version
+   :run/mode :mode/sim
+   :run/started-at (eloop/utc-now-str)})
+
+(defn fresh-state0
+  [{:keys [strategies]}]
+  (-> (st/fresh-state)
+      (st/init-run (run-info))
+      (eloop/enable-strategies strategies)))
+
+(defn run-segment!
+  "Run the shared loop over the env until exhaustion or an injected
+  crash. opts: :state0 :ledger0 :cursor0 :crash-after-fact
+  :crash-before-fact. Returns the loop result, or
+  {:crashed? true :crash data} when the crash hook fired."
+  [{:keys [fixture* fact-store snapshot-store broker strategies
+           market-clock marks]}
+   {:keys [state0 ledger0 cursor0 crash-after-fact crash-before-fact]}]
+  (let [seed-wm (get-in state0 [:engine/watermarks :watermark/market])
+        _ (when seed-wm (reset! market-clock seed-wm))
+        ;; marks reflect observed market truth (see the replay base +
+        ;; eloop/observed-position) and stay monotone across catch-up
+        _ (reset! marks (eloop/marks-at
+                         fixture*
+                         (eloop/observed-position fixture* state0
+                                                  (or cursor0 0))))]
+    (try
+      (eloop/run-loop
+       {:fact-store fact-store
+        :snapshot-store snapshot-store
+        :broker broker
+        :source (replay/make-replay-source fixture*)
+        :strategies strategies
+        :account-id account-id
+        :run-id (:run/id (run-info))
+        :run-mode :mode/sim
+        :state0 state0
+        :ledger0 (or ledger0 ledger/empty-ledger)
+        :cursor0 (or cursor0 0)
+        :snapshot-every 5
+        :snapshot-scope snapshot-scope
+        :crash-after-fact crash-after-fact
+        :crash-before-fact crash-before-fact
+        :on-observation
+        (fn [obs new?]
+          (when new? (reset! market-clock (:fact/occurred-at obs)))
+          (when (or (nil? seed-wm)
+                    (>= (compare (:fact/occurred-at obs) seed-wm) 0))
+            (swap! marks eloop/apply-payload-marks (:record/type obs)
+                   (:record/instrument-id obs) (:fact/payload obs))))})
+      (catch python/Exception e
+        (if (eloop/crash-ex? e)
+          {:crashed? true :crash (ex-data e)}
+          (throw e))))))
+
+(defn crash-run!
+  "Fresh-session crash segment over a new env."
+  [env crash-opts]
+  (run-segment! env (merge {:state0 (fresh-state0 env)
+                            :ledger0 ledger/empty-ledger}
+                           crash-opts)))
+
+(defn recover!
+  "run-recovery! from the env's disk state with the env's surviving
+  broker as the reconciliation seam (explicit :crash-recovery — the
+  live/paper semantics, §14.2 blesses reconciliation against simulator
+  state for sim runs). opts may override :broker (e.g. a tampered seam)."
+  ([env] (recover! env {}))
+  ([{:keys [fact-store snapshot-store broker]} opts]
+   (rec/run-recovery! (merge {:fact-store fact-store
+                              :snapshot-store snapshot-store
+                              :run-mode :mode/sim
+                              :mode :crash-recovery
+                              :scope snapshot-scope
+                              :broker (bp/recovery-seam broker)
+                              :run-info (run-info)}
+                             opts))))
+
+(defn continue!
+  "Resume the loop from a :ready recovery result to fixture exhaustion."
+  [env recovery]
+  (run-segment! env
+                {:state0 (-> (st/init-run (:engine/state recovery)
+                                          (run-info))
+                             (eloop/enable-strategies (:strategies env)))
+                 :ledger0 (:recovery/ledger recovery)
+                 :cursor0 (or (st/cursor (:engine/state recovery)
+                                         :market-data)
+                              0)}))
+
+(defn sim-journal-order-count
+  "Orders the env's sim broker has ever journaled (its external truth):
+  the resubmission detector."
+  [env]
+  (count (:order-seq @(:journal (:broker env)))))

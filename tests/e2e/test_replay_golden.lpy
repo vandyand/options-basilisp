@@ -3,81 +3,23 @@
   §10.2): happy-path end-to-end session, replay determinism, restart
   convergence.
 
-  State normalization for cross-run comparison (documented):
-  two independent runs write to different out-dirs, so envelope
-  :record/id values (fresh ULIDs) and fact-log offsets necessarily
-  differ even when every logical fact is identical. Normalization strips
-  exactly the fields that carry those run-local identities:
-    - :engine/run                      (run id + wall-clock started-at)
-    - :watermark/fact-log              (offsets shift by recovery
-                                        bookkeeping facts in restarted
-                                        logs)
-    - unresolved-order *-fact-id refs  (ULIDs of the run's own envelopes;
-                                        the logical content they point at
-                                        is asserted via the fact log)
-    - :portfolio/source-watermark      (fact-log offset)
-  Everything else — market state, cursors, strategy lifecycle +
-  signal-local state, order lifecycles/quantities, positions, lots,
-  cash, P&L — must be `=`."
+  State normalization for cross-run comparison: shared with the Phase 11
+  recovery suite — see helpers.recovery-helpers (norm-state strips
+  exactly the run-local identity fields; everything else must be `=`)."
   (:import tempfile os.path)
   (:require [basilisp.test :refer [deftest is testing]]
+            [helpers.recovery-helpers
+             :refer [business-fact-pairs fixture-path intent-ids log-facts
+                     norm-portfolio norm-state]]
             [stevetrading.base.engine-replay :as er]
             [stevetrading.persistence.fact-store :as fs]
             [stevetrading.persistence.protocol :as p]))
-
-(def fixture-path "resources/fixtures/replay/simple-paper-session-v0.2.edn")
-
-(def ^:private recovery-fact-types
-  #{:fact/recovery-started :fact/recovery-completed})
 
 (defn- run!*
   [out-dir opts]
   (er/run-replay (merge {:fixture-path fixture-path
                          :out-dir out-dir}
                         opts)))
-
-(defn- log-facts
-  [out-dir]
-  (p/facts-since (fs/make-fact-store (os.path/join out-dir "facts.db")) 0))
-
-(defn- business-fact-pairs
-  "Ordered [fact-type order-intent-id] pairs from the out-dir's log,
-  excluding recovery bookkeeping facts (each recovery run is a real event
-  and appends fresh rows — they are operational, not business truth)."
-  [out-dir]
-  (->> (log-facts out-dir)
-       (remove #(contains? recovery-fact-types (:record/type %)))
-       (mapv (fn [f] [(:record/type f)
-                      (get-in f [:fact/payload :order-intent/id])]))))
-
-(defn- intent-ids
-  [out-dir]
-  (->> (log-facts out-dir)
-       (filter #(= :fact/order-intent-created (:record/type %)))
-       (mapv #(get-in % [:fact/payload :order-intent/id]))))
-
-(defn- norm-state
-  "Strip run-local identity fields (see ns docstring)."
-  [state]
-  (-> state
-      (dissoc :engine/run)
-      (update :engine/watermarks dissoc :watermark/fact-log)
-      (update :engine/unresolved-orders
-              (fn [orders]
-                (into {}
-                      (map (fn [[oi entry]]
-                             [oi (dissoc entry
-                                         :order/creation-fact-id
-                                         :order/dispatch-fact-id
-                                         :order/latest-broker-update-fact-id
-                                         :order/cancel-dispatch-fact-id
-                                         :order/fill-fact-ids)])
-                           orders))))
-      (update :engine/portfolio dissoc :portfolio/source-watermark)))
-
-(defn- norm-portfolio
-  [portfolio]
-  (dissoc portfolio :portfolio/source-watermark))
 
 ;; ---------------------------------------------------------------------------
 ;; 1. Happy path

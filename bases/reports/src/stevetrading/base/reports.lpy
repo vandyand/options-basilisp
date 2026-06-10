@@ -1,4 +1,31 @@
-(ns stevetrading.base.reports)
+(ns stevetrading.base.reports
+  "Reporting base (Phase 11): derive a daily/session summary from a fact
+  store — orders, fills, realized P&L per strategy/account, recovery
+  events, faults — and write it as summary.edn + human-readable
+  summary.md.
+
+  Everything is DERIVED from the canonical fact log (ARCHITECTURE §6:
+  facts are truth; reports are projections):
+  - order counts come straight from the lifecycle fact types
+  - P&L comes from replaying the log's fills + derived ledger facts
+    through ledger.core/replay-ledger — the SAME derive/fold code the
+    runtime and recovery use — then portfolio.core/derive-portfolio
+  - intent context for ledger derivation is rebuilt from the log's own
+    :fact/order-intent-created payloads (self-contained lineage; no
+    engine state needed)
+
+  build-summary is pure (facts in, summary out) — the CLI shell only
+  opens the store and writes files.
+
+  CLI:
+    basilisp run -n stevetrading.base.reports -- \\
+      --facts <out-dir>/facts.db --out <report-dir>"
+  (:import os os.path)
+  (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.ledger.core :as ledger]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.portfolio.core :as portfolio]))
 
 (def base-id :base/reports)
 
@@ -7,3 +34,267 @@
   {:base/id base-id
    :base/modes #{:mode/report}})
 
+;; ---------------------------------------------------------------------------
+;; Pure summary derivation
+;; ---------------------------------------------------------------------------
+
+(defn- count-type
+  [facts fact-type]
+  (count (filter #(= fact-type (:record/type %)) facts)))
+
+(defn- intent-ctx-index
+  "order-intent-id → ledger intent-ctx from the log's own intent facts."
+  [facts]
+  (into {}
+        (map (fn [f]
+               (let [pl (:fact/payload f)]
+                 [(:order-intent/id pl)
+                  {:order-intent/id (:order-intent/id pl)
+                   :order-intent/effect (:order-intent/effect pl)
+                   :order-intent/side (:order-intent/side pl)
+                   :order-intent/account-id
+                   (or (:order-intent/account-id pl)
+                       (:record/account-id f))
+                   :order-intent/strategy-id (:record/strategy-id f)
+                   :order-intent/instrument-id (:record/instrument-id f)
+                   :order-intent/legs (:order-intent/legs pl)}]))
+             (filter #(= :fact/order-intent-created (:record/type %))
+                     facts))))
+
+(defn- ledger-stream
+  "Fills + derived ledger facts in log order — the replay-ledger input."
+  [facts]
+  (filterv #(or (= :fact/fill-observed (:record/type %))
+                (contains? enums/ledger-fact-types (:record/type %)))
+           facts))
+
+(defn- pnl-views
+  [views]
+  (into {}
+        (map (fn [[id view]]
+               [id {:realized-pnl (:view/realized-pnl view)
+                    :realized-trade-pnl (:view/realized-trade-pnl view)
+                    :fees (:view/fees view)
+                    :net-positions (:view/net-positions view)}])
+             views)))
+
+(defn build-summary
+  "Pure: full ordered fact log (facts-since 0 output — envelopes with
+  :fact-log/offset) → summary map. Shape:
+    {:summary/fact-count n
+     :summary/orders {:orders/intents-created n
+                      :orders/submits-dispatched n
+                      :orders/acks-accepted n
+                      :orders/acks-rejected n
+                      :orders/cancelled n
+                      :orders/fills n}
+     :summary/fills [{:fill/id .. :fill/price .. :fill/quantity ..
+                      :instrument/id .. :order-intent/id ..
+                      :account/id ..} ...]
+     :summary/pnl {:pnl/realized .. :pnl/realized-trade .. :pnl/fees ..
+                   :pnl/cash {account balance} :pnl/positions {..}
+                   :pnl/by-strategy {strategy-id view}
+                   :pnl/by-account {account-id view}}
+     :summary/recovery [recovery event payloads, in order]
+     :summary/faults [fault payloads, in order]
+     :summary/skipped-ledger-fills [fill record ids without lineage]}"
+  [facts]
+  (let [ctx-index (intent-ctx-index facts)
+        {:keys [ledger skipped-fills]}
+        (ledger/replay-ledger (ledger-stream facts)
+                              (fn [fill]
+                                (get ctx-index
+                                     (get-in fill [:fact/payload
+                                                   :order-intent/id]))))
+        port (portfolio/derive-portfolio ledger)
+        fills (filterv #(= :fact/fill-observed (:record/type %)) facts)
+        dispatched-submits
+        (count (filter #(and (= :fact/command-dispatched (:record/type %))
+                             (= :command/submit-order-intent
+                                (get-in % [:fact/payload :command/type])))
+                       facts))
+        cancelled
+        (count (filter #(or (= :fact/cancel-ack-accepted (:record/type %))
+                            (and (= :fact/broker-order-status-observed
+                                    (:record/type %))
+                                 (= :broker-status/cancelled
+                                    (get-in % [:fact/payload
+                                               :broker/status]))))
+                       facts))
+        recovery-events
+        (->> facts
+             (filter #(contains? #{:fact/recovery-started
+                                   :fact/recovery-completed}
+                                 (:record/type %)))
+             (mapv (fn [f] (assoc (:fact/payload f)
+                                  :record/type (:record/type f)
+                                  :fact/occurred-at (:fact/occurred-at f)))))
+        faults
+        (->> facts
+             (filter #(= :fact/fault-recorded (:record/type %)))
+             (mapv (fn [f] (assoc (:fact/payload f)
+                                  :fact/occurred-at (:fact/occurred-at f)))))]
+    {:summary/fact-count (count facts)
+     :summary/orders
+     {:orders/intents-created (count-type facts :fact/order-intent-created)
+      :orders/submits-dispatched dispatched-submits
+      :orders/acks-accepted (count-type facts :fact/broker-ack-accepted)
+      :orders/acks-rejected (count-type facts :fact/broker-ack-rejected)
+      :orders/cancelled cancelled
+      :orders/fills (count fills)}
+     :summary/fills
+     (mapv (fn [f]
+             (let [pl (:fact/payload f)]
+               {:fill/id (:fill/id pl)
+                :fill/price (:fill/price pl)
+                :fill/quantity (:fill/quantity pl)
+                :fill/occurred-at (:fill/occurred-at pl)
+                :instrument/id (or (:fill/instrument-id pl)
+                                   (:record/instrument-id f))
+                :order-intent/id (:order-intent/id pl)
+                :account/id (or (:broker/account-id pl)
+                                (:record/account-id f))}))
+           fills)
+     :summary/pnl
+     {:pnl/realized (:portfolio/realized-pnl port)
+      :pnl/realized-trade (:portfolio/realized-trade-pnl port)
+      :pnl/fees (:portfolio/fees port)
+      :pnl/cash (:portfolio/cash port)
+      :pnl/positions (:portfolio/positions port)
+      :pnl/by-strategy (pnl-views (:portfolio/by-strategy port))
+      :pnl/by-account (pnl-views (:portfolio/by-account port))}
+     :summary/recovery recovery-events
+     :summary/faults faults
+     :summary/skipped-ledger-fills (vec skipped-fills)}))
+
+;; ---------------------------------------------------------------------------
+;; Markdown rendering
+;; ---------------------------------------------------------------------------
+
+(defn render-markdown
+  "Human-readable summary.md content."
+  [summary]
+  (let [{:summary/keys [orders fills pnl recovery faults fact-count
+                        skipped-ledger-fills]} summary
+        lines
+        (concat
+         ["# Session Summary"
+          ""
+          (str "Facts in log: " fact-count)
+          ""
+          "## Orders"
+          ""
+          (str "| intents | submits | acks | rejects | cancels | fills |")
+          (str "|---|---|---|---|---|---|")
+          (str "| " (:orders/intents-created orders)
+               " | " (:orders/submits-dispatched orders)
+               " | " (:orders/acks-accepted orders)
+               " | " (:orders/acks-rejected orders)
+               " | " (:orders/cancelled orders)
+               " | " (:orders/fills orders) " |")
+          ""
+          "## Fills"
+          ""]
+         (if (empty? fills)
+           ["(none)"]
+           (concat
+            ["| at | instrument | qty | price | account |"
+             "|---|---|---|---|---|"]
+            (map (fn [f]
+                   (str "| " (:fill/occurred-at f)
+                        " | " (:instrument/id f)
+                        " | " (:fill/quantity f)
+                        " | " (:fill/price f)
+                        " | " (:account/id f) " |"))
+                 fills)))
+         [""
+          "## P&L"
+          ""
+          (str "Realized: " (:pnl/realized pnl)
+               " (trade " (:pnl/realized-trade pnl)
+               ", fees " (:pnl/fees pnl) ")")
+          ""
+          "Per strategy:"]
+         (if (empty? (:pnl/by-strategy pnl))
+           ["- (none)"]
+           (map (fn [[sid view]]
+                  (str "- " sid ": " (:realized-pnl view)))
+                (:pnl/by-strategy pnl)))
+         [""
+          "Per account:"]
+         (if (empty? (:pnl/by-account pnl))
+           ["- (none)"]
+           (map (fn [[aid view]]
+                  (str "- " aid ": " (:realized-pnl view)))
+                (:pnl/by-account pnl)))
+         [""
+          (str "## Recovery Events (" (count recovery) ")")
+          ""]
+         (if (empty? recovery)
+           ["(none)"]
+           (map (fn [r]
+                  (str "- " (:fact/occurred-at r) " "
+                       (:record/type r) " "
+                       (or (:recovery/outcome r) (:recovery/mode r))))
+                recovery))
+         [""
+          (str "## Faults (" (count faults) ")")
+          ""]
+         (if (empty? faults)
+           ["(none)"]
+           (map (fn [f]
+                  (str "- " (:fact/occurred-at f) " "
+                       (or (:fault/kind f) (:fault/reason f))))
+                faults))
+         (when (seq skipped-ledger-fills)
+           [""
+            (str "## Skipped ledger fills (no lineage): "
+                 (count skipped-ledger-fills))])
+         [""])]
+    (apply str (interpose "\n" lines))))
+
+;; ---------------------------------------------------------------------------
+;; CLI shell
+;; ---------------------------------------------------------------------------
+
+(defn write-report!
+  "Open the fact db, build the summary, write <out>/summary.edn and
+  <out>/summary.md. Returns the summary."
+  [{:keys [facts-path out-dir]}]
+  (let [store (fs/make-fact-store facts-path)
+        facts (p/facts-since store 0)
+        summary (build-summary facts)]
+    (os/makedirs out-dir ** :exist_ok true)
+    (spit (os.path/join out-dir "summary.edn") (pr-str summary))
+    (spit (os.path/join out-dir "summary.md") (render-markdown summary))
+    summary))
+
+(defn- parse-args
+  [args]
+  (loop [args (seq args) acc {}]
+    (if (nil? args)
+      acc
+      (let [flag (first args)
+            value (second args)]
+        (if (and (string? flag) (.startswith flag "--") (some? value))
+          (recur (nnext args) (assoc acc (keyword (subs flag 2)) value))
+          (recur (next args) acc))))))
+
+(defn -main
+  "CLI entry:
+    basilisp run -n stevetrading.base.reports -- \\
+      --facts <dir>/facts.db --out <report-dir>"
+  [& args]
+  (let [{:keys [facts out]} (parse-args args)]
+    (when (or (nil? facts) (nil? out))
+      (println "usage: basilisp run -n stevetrading.base.reports --"
+               "--facts <facts.db> --out <dir>")
+      (throw (ex-info "missing required --facts/--out"
+                      {:error/code :error/missing-cli-args})))
+    (let [summary (write-report! {:facts-path facts :out-dir out})]
+      (println (str "wrote " (os.path/join out "summary.edn")
+                    " and " (os.path/join out "summary.md")))
+      summary)))
+
+(when (= *main-ns* 'stevetrading.base.reports)
+  (apply -main *command-line-args*))

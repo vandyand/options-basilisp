@@ -1,0 +1,108 @@
+(ns reports.test-reports
+  "Phase 11 reports base tests: the summary over a completed replay
+  session must agree with (a) raw fact-log counts and (b) the portfolio
+  derivation the runtime itself produced."
+  (:import os.path tempfile)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [helpers.recovery-helpers :as h]
+            [stevetrading.base.reports :as rep]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]))
+
+(defn- control-facts
+  []
+  (p/facts-since (fs/make-fact-store
+                  (os.path/join (:out-dir @h/control) "facts.db"))
+                 0))
+
+(deftest summary-counts-match-the-fact-log
+  (let [facts (control-facts)
+        summary (rep/build-summary facts)
+        orders (:summary/orders summary)
+        manual (fn [t] (count (filter #(= t (:record/type %)) facts)))]
+    (is (= (count facts) (:summary/fact-count summary)))
+    (testing "order counts come straight from the lifecycle facts"
+      (is (= (manual :fact/order-intent-created)
+             (:orders/intents-created orders)))
+      (is (= (manual :fact/command-dispatched)
+             (:orders/submits-dispatched orders)))
+      (is (= (manual :fact/broker-ack-accepted)
+             (:orders/acks-accepted orders)))
+      (is (= (manual :fact/broker-ack-rejected)
+             (:orders/acks-rejected orders)))
+      (is (= (manual :fact/fill-observed) (:orders/fills orders)))
+      (is (= 0 (:orders/cancelled orders))))
+    (testing "the SMA-cross session shape: 2 intents → 2 fills"
+      (is (= 2 (:orders/intents-created orders)))
+      (is (= 2 (:orders/fills orders))))
+    (testing "every fill is reported with its price and lineage"
+      (is (= 2 (count (:summary/fills summary))))
+      (is (every? #(and (string? (:fill/price %))
+                        (string? (:fill/quantity %))
+                        (string? (:order-intent/id %)))
+                  (:summary/fills summary))))
+    (testing "a clean session has no recovery events and no faults"
+      (is (empty? (:summary/recovery summary)))
+      (is (empty? (:summary/faults summary)))
+      (is (empty? (:summary/skipped-ledger-fills summary))))))
+
+(deftest summary-pnl-matches-the-portfolio-derivation
+  (let [summary (rep/build-summary (control-facts))
+        ;; the runtime's own final portfolio (same session)
+        port (:portfolio (:summary @h/control))
+        pnl (:summary/pnl summary)]
+    (testing "ledger replay through the same derive/fold code reproduces
+              the runtime's P&L exactly"
+      (is (= (:portfolio/realized-pnl port) (:pnl/realized pnl)))
+      (is (= (:portfolio/realized-trade-pnl port)
+             (:pnl/realized-trade pnl)))
+      (is (= (:portfolio/fees port) (:pnl/fees pnl)))
+      (is (= (:portfolio/cash port) (:pnl/cash pnl)))
+      (is (= (:portfolio/positions port) (:pnl/positions pnl))))
+    (testing "per-strategy and per-account views are present"
+      (is (contains? (:pnl/by-strategy pnl)
+                     "strategy/simple-direction/sma-cross/v1"))
+      (is (contains? (:pnl/by-account pnl) h/account-id))
+      (is (= (:pnl/realized pnl)
+             (get-in pnl [:pnl/by-account h/account-id :realized-pnl]))))))
+
+(deftest summary-reports-recovery-events-and-faults
+  ;; a crashed-and-recovered session surfaces its operational truth
+  (let [env (h/make-env {})
+        _crash (h/crash-run! env {:crash-before-fact
+                                  (fn [f] (= :fact/broker-ack-accepted
+                                             (:record/type f)))})
+        recovery (h/recover! env)
+        summary (rep/build-summary (h/log-facts (:out-dir env)))]
+    (is (= :ready (:recovery/outcome recovery)))
+    (testing "recovery start/complete events are listed in order"
+      (is (= [:fact/recovery-started :fact/recovery-completed]
+             (mapv :record/type (:summary/recovery summary))))
+      (is (= :ready (:recovery/outcome
+                     (second (:summary/recovery summary))))))
+    (testing "the ack-ambiguity orphan marking shows up as a fault"
+      (is (= 1 (count (:summary/faults summary))))
+      (is (= :fault/reconciliation-anomaly
+             (:fault/kind (first (:summary/faults summary))))))))
+
+(deftest write-report-produces-edn-and-md
+  (let [out-dir (tempfile/mkdtemp)
+        summary (rep/write-report!
+                 {:facts-path (os.path/join (:out-dir @h/control)
+                                            "facts.db")
+                  :out-dir out-dir})
+        edn-path (os.path/join out-dir "summary.edn")
+        md-path (os.path/join out-dir "summary.md")
+        round-trip (edn/read-string (slurp edn-path))
+        md (slurp md-path)]
+    (testing "summary.edn round-trips to the pure build-summary value"
+      (is (= summary round-trip)))
+    (testing "summary.md is human-readable and covers the sections"
+      (is (.startswith md "# Session Summary"))
+      (is (>= (.find md "## Orders") 0))
+      (is (>= (.find md "## Fills") 0))
+      (is (>= (.find md "## P&L") 0))
+      (is (>= (.find md "Realized: ") 0))
+      (is (>= (.find md "## Recovery Events") 0))
+      (is (>= (.find md "## Faults") 0)))))

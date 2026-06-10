@@ -1,0 +1,387 @@
+(ns recovery.test-crash-scenarios
+  "ENGINE_STATE_AND_RECOVERY §17 — the 7 recovery acceptance scenarios as
+  deterministic tests (TESTING §7). The architecture is only acceptable
+  if these pass.
+
+  Crash mechanics: the engine.loop crash-injection hooks stop the loop
+  at a PRECISE intra-cycle point (after/before a specific fact append),
+  in-memory state is dropped, recovery rebuilds from disk
+  (run-recovery!), and the session continues — then the result is
+  compared against an uninterrupted control run.
+
+  Two restart flavors (see helpers.recovery-helpers):
+  - run-replay restarts (scenarios 4, 6): a REAL process restart in
+    replay/sim mode — fresh broker, replay recovery, §12.1 idempotent
+    re-dispatch covers unsent/unacked work.
+  - env-harness restarts (scenarios 1, 2, 3, 5, 7): the sim broker
+    SURVIVES the crash (it is the external system) and recovery
+    reconciles through the broker seam (:crash-recovery — the live/paper
+    semantics; §14.2 blesses simulator-state reconciliation in sim).
+
+  Scenario 2 note (documented engine behavior): when the ack was never
+  persisted, recovery orphans the dispatched-but-unacknowledged order
+  (reconciliation-anomaly fault → :orphaned-needs-reconcile) and broker
+  truth restores it via the §5.2 :reconciled/* rows. The broker's stored
+  ack is never re-observed (only open-orders/fills-since are
+  reconciliation inputs), so the restored order's log shows intent →
+  dispatched → fill with NO ack fact — the fill carries the broker
+  correlation (§11.1)."
+  (:import os.path tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [helpers.recovery-helpers :as h]
+            [stevetrading.base.engine-replay :as er]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.engine.recovery :as rec]
+            [stevetrading.ledger.core :as ledger]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.persistence.snapshot-store :as ss]
+            [stevetrading.portfolio.core :as portfolio]))
+
+(defn- crash-after
+  [fact-type]
+  (fn [f] (= fact-type (:record/type f))))
+
+(defn- control-summary [] (:summary @h/control))
+(defn- control-dir [] (:out-dir @h/control))
+
+(defn- converged?
+  "Final normalized engine state + portfolio equal the control run's."
+  [final-state]
+  (and (= (h/norm-state (:engine/state (control-summary)))
+          (h/norm-state final-state))
+       (= (h/norm-portfolio (:portfolio (control-summary)))
+          (h/norm-portfolio (:engine/portfolio final-state)))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 1: crash after order-intent-created, before broker submit
+;; ---------------------------------------------------------------------------
+
+(deftest s1-crash-after-intent-before-dispatch
+  (let [env (h/make-env {})
+        crashed (h/crash-run! env {:crash-after-fact
+                                   (crash-after :fact/order-intent-created)})
+        ;; broker never saw the submit
+        journal-at-crash (h/sim-journal-order-count env)
+        recovery (h/recover! env)
+        continued (h/continue! env recovery)
+        log (h/log-facts (:out-dir env))
+        entry-oi (first (h/intent-ids (:out-dir env)))
+        entry-acks (filterv #(and (= :fact/broker-ack-accepted
+                                     (:record/type %))
+                                  (= entry-oi (get-in % [:fact/payload
+                                                         :order-intent/id])))
+                            log)]
+    (is (true? (:crashed? crashed)))
+    (is (= :fact/order-intent-created
+           (get-in crashed [:crash :crash/fact-type])))
+    (is (= 0 journal-at-crash))
+    (is (= :ready (:recovery/outcome recovery)))
+    (testing "resume submits the recovered intent EXACTLY once"
+      ;; entry + exit = 2 broker orders ever journaled, 1 ack for the
+      ;; recovered entry intent
+      (is (= 2 (h/sim-journal-order-count env)))
+      (is (= 1 (count entry-acks))))
+    (testing "lifecycle completes and the session converges with control"
+      (is (false? (:stopped-early? continued)))
+      (is (= :filled (get-in (:state continued)
+                             [:engine/unresolved-orders entry-oi
+                              :order/lifecycle])))
+      (is (converged? (:state continued))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 2: crash after command-dispatched (broker RECEIVED the
+;; submit), before any outcome fact was appended
+;; ---------------------------------------------------------------------------
+
+(deftest s2-crash-after-dispatch-before-ack-persisted
+  (let [env (h/make-env {})
+        ;; :crash-before-fact on the ack → the dispatched fact is durable
+        ;; AND the broker journaled the order, but no outcome ever landed
+        crashed (h/crash-run! env {:crash-before-fact
+                                   (crash-after :fact/broker-ack-accepted)})
+        journal-at-crash (h/sim-journal-order-count env)
+        log-at-crash (h/log-facts (:out-dir env))
+        recovery (h/recover! env)
+        entry-oi (first (h/intent-ids (:out-dir env)))
+        entry (get-in recovery [:engine/state :engine/unresolved-orders
+                                entry-oi])
+        continued (h/continue! env recovery)
+        log (h/log-facts (:out-dir env))
+        entry-fills (filterv #(and (= :fact/fill-observed (:record/type %))
+                                   (= entry-oi
+                                      (get-in % [:fact/payload
+                                                 :order-intent/id])))
+                             log)
+        lots-opened (h/facts-of-type log :fact/position-lot-opened)
+        lots-closed (h/facts-of-type log :fact/position-lot-closed)]
+    (is (true? (:crashed? crashed)))
+    (testing "the crash point: dispatched durable, broker has the order,
+              no outcome facts persisted"
+      (is (= 1 journal-at-crash))
+      (is (= 1 (count (h/facts-of-type log-at-crash
+                                       :fact/command-dispatched))))
+      (is (= 0 (count (h/facts-of-type log-at-crash
+                                       :fact/broker-ack-accepted))))
+      (is (= 0 (count (h/facts-of-type log-at-crash
+                                       :fact/fill-observed)))))
+    (testing "recovery reconciles broker truth WITHOUT resubmitting"
+      (is (= :ready (:recovery/outcome recovery)))
+      (is (= :filled (:order/lifecycle entry)))
+      (is (true? (:order/resolved? entry)))
+      (is (= "1" (:order/filled-quantity entry)))
+      ;; the fill restored the broker correlation (§11.1)
+      (is (some? (:order/broker-order-id entry))))
+    (testing "single fill, single lot, no second broker order for the entry"
+      ;; entry + exit only — the recovered entry was NEVER resubmitted
+      (is (= 2 (h/sim-journal-order-count env)))
+      (is (= 1 (count entry-fills)))
+      ;; one round trip: the entry fill opened ONE lot, the exit closed it
+      (is (= 1 (count lots-opened)))
+      (is (= 1 (count lots-closed))))
+    (testing "the session converges with control"
+      (is (false? (:stopped-early? continued)))
+      (is (converged? (:state continued))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 3: crash after ack, before fill (:on-poll — ack and fill are
+;; separate broker interactions)
+;; ---------------------------------------------------------------------------
+
+(deftest s3-crash-after-ack-before-fill
+  (let [env (h/make-env {:fill-policy {:mode :on-poll}})
+        crashed (h/crash-run! env {:crash-after-fact
+                                   (crash-after :fact/broker-ack-accepted)})
+        recovery (h/recover! env)
+        entry-oi (first (h/intent-ids (:out-dir env)))
+        entry (get-in recovery [:engine/state :engine/unresolved-orders
+                                entry-oi])
+        port (get-in recovery [:engine/state :engine/portfolio])
+        log (h/log-facts (:out-dir env))]
+    (is (true? (:crashed? crashed)))
+    (is (= :ready (:recovery/outcome recovery)))
+    (testing "the pending fill was recovered via fills-since reconciliation"
+      (is (= :filled (:order/lifecycle entry)))
+      (is (true? (:order/resolved? entry)))
+      (is (= 1 (count (h/facts-of-type log :fact/fill-observed)))))
+    (testing "the recovered portfolio carries the position"
+      (is (= 1 (count (:portfolio/open-lots port))))
+      (is (= "1" (get-in port [:portfolio/positions "equity/NASDAQ/SPY"
+                               :position/net-quantity]))))
+    (testing "no resubmission happened"
+      (is (= 1 (h/sim-journal-order-count env))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 4: crash after fill, before snapshot — the recovered
+;; :engine/portfolio must equal the uninterrupted run's (never stale)
+;; ---------------------------------------------------------------------------
+
+(defn- intent-ctx-index
+  "order-intent-id → ledger intent-ctx, built from the log's own
+  :fact/order-intent-created payloads (self-contained lineage)."
+  [facts]
+  (into {}
+        (map (fn [f]
+               (let [pl (:fact/payload f)]
+                 [(:order-intent/id pl)
+                  {:order-intent/id (:order-intent/id pl)
+                   :order-intent/effect (:order-intent/effect pl)
+                   :order-intent/side (:order-intent/side pl)
+                   :order-intent/account-id
+                   (or (:order-intent/account-id pl) (:record/account-id f))
+                   :order-intent/strategy-id (:record/strategy-id f)
+                   :order-intent/instrument-id (:record/instrument-id f)
+                   :order-intent/legs (:order-intent/legs pl)}]))
+             (filter #(= :fact/order-intent-created (:record/type %))
+                     facts))))
+
+(deftest s4-crash-after-fill-before-snapshot
+  (let [out-dir (tempfile/mkdtemp)
+        crashed (er/run-replay {:fixture-path h/fixture-path
+                                :out-dir out-dir
+                                :snapshot-every 5
+                                :crash-after-fact
+                                (crash-after :fact/fill-observed)})
+        ;; recovery alone (before continuing): the fill is in the log but
+        ;; was never folded/ledger-derived/snapshotted pre-crash
+        recovery (rec/run-recovery!
+                  {:fact-store (fs/make-fact-store
+                                (os.path/join out-dir "facts.db"))
+                   :snapshot-store (ss/make-snapshot-store
+                                    (os.path/join out-dir "snapshots"))
+                   :run-mode :mode/replay
+                   :scope h/snapshot-scope})
+        recovered-port (get-in recovery [:engine/state :engine/portfolio])
+        ;; the uninterrupted run's portfolio AT THE SAME POINT: derive it
+        ;; from the CONTROL log's entry fill through the same ledger path
+        control-log (h/log-facts (control-dir))
+        ctx-index (intent-ctx-index control-log)
+        control-entry-fill (first (h/facts-of-type control-log
+                                                   :fact/fill-observed))
+        control-entry-port
+        (portfolio/derive-portfolio
+         (:ledger (ledger/replay-ledger
+                   [control-entry-fill]
+                   (fn [f] (get ctx-index
+                                (get-in f [:fact/payload
+                                           :order-intent/id]))))))
+        ;; re-poll/duplicate protection: re-appending the logged fills
+        ;; changes nothing
+        store (fs/make-fact-store (os.path/join out-dir "facts.db"))
+        logged-fills (h/facts-of-type (p/facts-since store 0)
+                                      :fact/fill-observed)
+        re-append (p/append-facts! store logged-fills)
+        ;; continue the session to the end
+        resumed (er/run-replay {:fixture-path h/fixture-path
+                                :out-dir out-dir
+                                :snapshot-every 5})
+        final-fills (h/facts-of-type (h/log-facts out-dir)
+                                     :fact/fill-observed)]
+    (is (true? (:crashed? crashed)))
+    (is (= :ready (:recovery/outcome recovery)))
+    (testing "recovered :engine/portfolio = the uninterrupted run's (the
+              adversary assertion: rebuilt from ledger facts, not stale)"
+      (is (= 1 (count (:portfolio/open-lots recovered-port))))
+      (is (= (h/norm-portfolio control-entry-port)
+             (h/norm-portfolio recovered-port))))
+    (testing "no duplicate fill on re-poll: every re-appended fill dedupes"
+      (is (= 0 (count (:appended re-append))))
+      (is (= 1 (count (:duplicates re-append)))))
+    (testing "the continued session converges with control"
+      (is (true? (:resumed? resumed)))
+      (is (true? (:expected-outputs-satisfied? resumed)))
+      (is (= 2 (count final-fills)
+             (count (distinct (map #(get-in % [:fact/payload :fill/id])
+                                   final-fills)))))
+      (is (= (h/norm-state (:engine/state (control-summary)))
+             (h/norm-state (:engine/state resumed))))
+      (is (= (h/norm-portfolio (:portfolio (control-summary)))
+             (h/norm-portfolio (:portfolio resumed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 5: duplicate broker status/fill replay after restart
+;; ---------------------------------------------------------------------------
+
+(deftest s5-duplicate-broker-replay-after-restart
+  (let [env (h/make-env {})
+        finished (h/run-segment! env {:state0 (h/fresh-state0 env)})
+        ;; restart: recover with the broker seam
+        recovery (h/recover! env)
+        ;; the broker replays ALL its fills again (same dedupe keys)
+        seam (bp/recovery-seam (:broker env))
+        dup-fills ((:fills-since seam) h/account-id nil)
+        re-append (p/append-facts! (:fact-store env) dup-fills)
+        refold (fold/fold-facts (:engine/state recovery) dup-fills)]
+    (is (false? (:stopped-early? finished)))
+    (is (= :ready (:recovery/outcome recovery)))
+    (testing "restart converges to the uninterrupted final state"
+      (is (= (h/norm-state (:engine/state (control-summary)))
+             (h/norm-state (:engine/state recovery)))))
+    (testing "replayed fills are absorbed: no new rows, identical state"
+      (is (= 2 (count dup-fills)))
+      (is (= 0 (count (:appended re-append))))
+      (is (= 2 (count (:duplicates re-append))))
+      (is (= (:engine/state recovery) (:state refold)))
+      (is (empty? (:emitted-facts refold))))
+    (testing "exactly one lot per fill — no duplicate exposure"
+      (is (= 1 (count (:ledger/closed-lots (:recovery/ledger recovery)))))
+      (is (empty? (get-in recovery [:engine/state :engine/portfolio
+                                    :portfolio/positions])))
+      (is (= 2 (count (h/facts-of-type (h/log-facts (:out-dir env))
+                                       :fact/fill-observed)))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 6: replayed recovery converges to the uninterrupted-run
+;; state — for EVERY intra-cycle crash point, via real process restarts
+;; ---------------------------------------------------------------------------
+
+(deftest s6-crash-anywhere-resume-converges
+  (doseq [[label crash-opts]
+          [["after intent-created" {:crash-after-fact
+                                    (crash-after :fact/order-intent-created)}]
+           ["after dispatch, before ack" {:crash-before-fact
+                                          (crash-after
+                                           :fact/broker-ack-accepted)}]
+           ["after fill" {:crash-after-fact
+                          (crash-after :fact/fill-observed)}]]]
+    (testing (str "crash " label " → restart → converged")
+      (let [out-dir (tempfile/mkdtemp)
+            crashed (er/run-replay (merge {:fixture-path h/fixture-path
+                                           :out-dir out-dir
+                                           :snapshot-every 5}
+                                          crash-opts))
+            resumed (er/run-replay {:fixture-path h/fixture-path
+                                    :out-dir out-dir
+                                    :snapshot-every 5})]
+        (is (true? (:crashed? crashed)))
+        (is (true? (:resumed? resumed)))
+        (is (true? (:expected-outputs-satisfied? resumed)))
+        (testing "identical business facts, intent ids, state, portfolio"
+          (is (= (h/business-fact-pairs (control-dir))
+                 (h/business-fact-pairs out-dir)))
+          (is (= (h/intent-ids (control-dir)) (h/intent-ids out-dir)))
+          (is (= (h/norm-state (:engine/state (control-summary)))
+                 (h/norm-state (:engine/state resumed))))
+          (is (= (h/norm-portfolio (:portfolio (control-summary)))
+                 (h/norm-portfolio (:portfolio resumed)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Scenario 7: broker returns a fill with unknown intent lineage →
+;; recovery :blocked, no exposure change
+;; ---------------------------------------------------------------------------
+
+(defn- foreign-fill
+  "A well-formed fill fact whose order-intent lineage the engine has
+  never seen (§11.3 Case E)."
+  []
+  (sch/fact-envelope
+   {:record/type :fact/fill-observed
+    :record/source-system :broker/sim
+    :record/account-id h/account-id
+    :fact/occurred-at "2026-06-10T14:35:00Z"
+    :fact/recorded-at "2026-06-10T14:35:00Z"
+    :fact/dedupe-key (str "fill/sim/" h/account-id
+                          "/sim-feedfeedfeedfeed/sim-feedfeedfeedfeed-fill-1")
+    :fact/payload {:order-intent/id (str "oi_" (apply str (repeat 64 "f")))
+                   :broker/source-system :broker/sim
+                   :broker/account-id h/account-id
+                   :broker/order-id "sim-feedfeedfeedfeed"
+                   :fill/id "sim-feedfeedfeedfeed-fill-1"
+                   :fill/occurred-at "2026-06-10T14:35:00Z"
+                   :fill/quantity "1"
+                   :fill/price "550.00"
+                   :fill/liquidity :liquidity/taker}}))
+
+(deftest s7-unknown-lineage-fill-blocks-recovery
+  (let [env (h/make-env {})
+        crashed (h/crash-run! env {:crash-before-fact
+                                   (crash-after :fact/broker-ack-accepted)})
+        ;; tampered seam: the broker can only answer with a fill the
+        ;; engine has no lineage for
+        recovery (h/recover! env
+                             {:broker {:open-orders (fn [_] [])
+                                       :fills-since (fn [_ _]
+                                                      [(foreign-fill)])}})
+        state (:engine/state recovery)
+        log (h/log-facts (:out-dir env))
+        entry-oi (first (h/intent-ids (:out-dir env)))]
+    (is (true? (:crashed? crashed)))
+    (testing "recovery blocks loudly on ambiguous lineage (§9.5/§15)"
+      (is (= :blocked (:recovery/outcome recovery)))
+      (is (= :blocked (:recovery/lifecycle recovery))))
+    (testing "no exposure change: no ledger rebuild, empty portfolio,
+              no ledger facts, the foreign fill attached to NOTHING"
+      (is (not (contains? recovery :recovery/ledger)))
+      (is (empty? (get-in state [:engine/portfolio :portfolio/positions])))
+      (is (empty? (get-in state [:engine/portfolio :portfolio/open-lots])))
+      (is (= 0 (count (h/facts-of-type log :fact/position-lot-opened))))
+      (is (= 0 (count (h/facts-of-type log :fact/cash-movement-recorded))))
+      ;; the known order stays unresolved (never guessed into a fill)
+      (is (false? (get-in state [:engine/unresolved-orders entry-oi
+                                 :order/resolved?])))
+      (is (= "0" (get-in state [:engine/unresolved-orders entry-oi
+                                :order/filled-quantity]))))
+    (testing "the anomaly is durable (§11.2 orphan/anomaly facts)"
+      (is (pos? (count (h/facts-of-type log :fact/fault-recorded)))))))

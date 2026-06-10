@@ -329,6 +329,14 @@
                (-> entry
                    (mark-resolved to)
                    (assoc :order/filled-quantity (str cumulative))
+                   ;; the fill carries the broker correlation too (§11.1):
+                   ;; when broker truth restores an order whose ack never
+                   ;; persisted (§17 scenario 2), the fill is the only
+                   ;; source of :order/broker-order-id; on the normal
+                   ;; ack-first path this re-assocs the same value
+                   (cond-> (some? (:broker/order-id payload))
+                     (assoc :order/broker-order-id
+                            (:broker/order-id payload)))
                    (cond-> multi-leg? (assoc :order/leg-fills leg-fills))
                    (update :order/fill-fact-ids conj (:record/id fact))
                    (update :order/fill-keys conj fill-key)))

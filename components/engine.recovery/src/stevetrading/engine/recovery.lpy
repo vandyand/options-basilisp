@@ -174,6 +174,59 @@
       (p/append-facts! fact-store (:emitted-facts res)))
     res))
 
+(defn- mark-ambiguous-acks!
+  "§10 step 7 + §11.2 orphan detection (Phase 11): an unresolved order
+  sitting in :submit-requested at reconciliation time was dispatched but
+  never acknowledged locally — its external status is AMBIGUOUS (the
+  broker may or may not hold the order; §17 scenario 2). For each such
+  order, append + fold a durable reconciliation-anomaly fault, driving
+  the §5.2 row :submit-requested → :orphaned-needs-reconcile, so the
+  upcoming broker reconciliation can restore true status via the
+  :reconciled/* rows (open-status → :acknowledged, complete-fill →
+  :filled, ...). An order the broker cannot account for stays orphaned
+  and blocks recovery (§11.3 Case D — never silently resubmitted).
+
+  Runs only when reconciliation is about to run: replay/sim restarts
+  without a broker seam keep their :submit-requested orders as-is (the
+  §12.1 idempotent re-dispatch path covers them on resume).
+
+  Like the recovery start/complete facts, the anomaly facts carry no
+  dedupe key — each recovery run is a real operational event.
+
+  Returns the updated state."
+  [fact-store state now-fn]
+  (let [ambiguous (vec (filter (fn [[_ e]]
+                                 (= :submit-requested (:order/lifecycle e)))
+                               (unresolved-entries state)))]
+    (if (empty? ambiguous)
+      state
+      (let [ts (now-fn)
+            facts (mapv (fn [[oi e]]
+                          (sch/fact-envelope
+                           (into {}
+                                 (filter
+                                  (comp some? val)
+                                  {:record/type :fact/fault-recorded
+                                   :record/source-system :engine/recovery
+                                   :record/account-id (:order/account-id e)
+                                   :record/strategy-id (:order/strategy-id e)
+                                   :fact/occurred-at ts
+                                   :fact/recorded-at ts
+                                   :fact/payload
+                                   (into {}
+                                         (filter
+                                          (comp some? val)
+                                          {:fault/kind
+                                           :fault/reconciliation-anomaly
+                                           :fault/reason
+                                           :anomaly/ack-status-ambiguous
+                                           :order-intent/id oi
+                                           :broker/order-id
+                                           (:order/broker-order-id e)}))}))))
+                        ambiguous)]
+        (p/append-facts! fact-store facts)
+        (:state (fold/fold-facts state facts))))))
+
 (defn- reconcile!
   "§10 steps 8-10: query broker truth for every account with unresolved
   work, append the normalized facts (dedupe-safe), fold only the newly
@@ -353,6 +406,12 @@
                         :else
                         (step! lifecycle :event/fact-replay-complete
                                {:reconciliation-required? false}))
+            ;; §10 step 7 / §11.2: dispatched-but-unacknowledged orders
+            ;; have ambiguous external status — orphan them durably so
+            ;; reconciliation can restore broker truth (§17 scenario 2)
+            state (if (and reconcile? (not replay-blocked?))
+                    (mark-ambiguous-acks! fact-store state now-fn)
+                    state)
             rec-res (when (and reconcile? (not replay-blocked?))
                       (reconcile! fact-store broker state))
             state (if rec-res (:state rec-res) state)

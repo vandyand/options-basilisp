@@ -21,10 +21,16 @@
     position (never of broker-instance call history) — required for
     restart convergence, since a restarted run constructs a fresh sim
     broker.
-  - Sim broker marks track replay position (engine.loop/apply-payload-marks
-    per observation; engine.loop/marks-at rebuilds the prefix [0, cursor)
-    on resume) — marks are a pure function of replay position, preserving
-    restart convergence. The sim broker receives (fn [] @marks) and
+  - Sim broker marks track OBSERVED market truth (Phase 11 revision):
+    engine.loop/apply-payload-marks per observation;
+    engine.loop/marks-at rebuilds the prefix [0, observed-position) on
+    resume, where observed-position covers every input at-or-before the
+    recovered :watermark/market — after a MID-CYCLE crash the fact log
+    (hence the recovered slices/watermark) can be ahead of the
+    snapshot's resume cursor, and an intent re-dispatched during
+    catch-up must price at the marks the engine had already seen.
+    Catch-up observations before the seed watermark never roll marks
+    backward (monotone). The sim broker receives (fn [] @marks) and
     resolves it at each pricing moment.
   - The portfolio cache is derived WITHOUT runtime marks (in the shared
     loop) to match the recovery rebuild exactly; mark-based unrealized
@@ -121,6 +127,13 @@
                     appended count reaches this (no final snapshot —
                     simulated crash) (optional)
     :resume?        override resume auto-detection (optional)
+    :crash-after-fact / :crash-before-fact
+                    engine.loop crash-injection predicates (test only;
+                    see that ns) — the loop's ::crash sentinel is caught
+                    here and the run returns
+                    {:crashed? true :crash {..} :run/id ..} instead of a
+                    summary (no final snapshot; resume by calling
+                    run-replay again on the same out-dir)
 
   Returns the session summary:
     {:run/id .. :facts-appended n :orders {..} :portfolio {..}
@@ -128,7 +141,8 @@
      :resumed? bool :engine/state state :ledger ledger-state
      :skipped-ledger-fills [..]}"
   [{:keys [fixture-path out-dir strategy-paths artifact-root account-id
-           snapshot-every max-facts resume?]}]
+           snapshot-every max-facts resume? crash-after-fact
+           crash-before-fact]}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
         account-id (or account-id default-account-id)
@@ -178,37 +192,61 @@
         cursor0 (or (st/cursor state0 :market-data) 0)
         _ (when-let [wm (get-in state0 [:engine/watermarks :watermark/market])]
             (reset! market-clock wm))
-        ;; marks are a pure function of replay position: rebuild the
-        ;; prefix [0, cursor0) on resume, then advance per observation
-        _ (reset! marks (eloop/marks-at fixture* cursor0))
-        ;; 3. the shared loop — one observation per cycle
+        ;; marks are a pure function of OBSERVED market truth: rebuild
+        ;; the prefix [0, observed-position) on resume (the log can be
+        ;; ahead of the snapshot's cursor after a mid-cycle crash — see
+        ;; eloop/observed-position), then advance per observation.
+        ;; Catch-up observations BEFORE the seeded watermark must not
+        ;; roll marks backward (monotone in observed time), or an intent
+        ;; re-dispatched during catch-up would price at a stale mark.
+        seed-wm (get-in state0 [:engine/watermarks :watermark/market])
+        _ (reset! marks (eloop/marks-at fixture*
+                                        (eloop/observed-position
+                                         fixture* state0 cursor0)))
+        ;; 3. the shared loop — one observation per cycle. An injected
+        ;; ::crash sentinel (test hook) is caught here: the run ends
+        ;; exactly where the matching append left the store.
         loop-result
-        (eloop/run-loop
-         {:fact-store fact-store
-          :snapshot-store snapshot-store
-          :broker broker
-          :source source
-          :strategies strategies
-          :account-id account-id
-          :run-id run-id
-          :run-mode run-mode
-          :state0 state0
-          :ledger0 ledger0
-          :cursor0 cursor0
-          :snapshot-every snapshot-every
-          :snapshot-scope snapshot-scope
-          :max-facts max-facts
-          :on-observation
-          (fn [obs new?]
-            (when new?
-              (reset! market-clock (:fact/occurred-at obs)))
-            ;; advance replay-position marks (unconditional — marks
-            ;; depend on position, not on append acceptance)
-            (swap! marks eloop/apply-payload-marks (:record/type obs)
-                   (:record/instrument-id obs) (:fact/payload obs)))})]
-    ;; 4. finish: summary
-    (summary {:run-id run-id :recovery recovery :fact-store fact-store
-              :fixture* fixture* :loop-result loop-result})))
+        (try
+          (eloop/run-loop
+           {:fact-store fact-store
+            :snapshot-store snapshot-store
+            :broker broker
+            :source source
+            :strategies strategies
+            :account-id account-id
+            :run-id run-id
+            :run-mode run-mode
+            :state0 state0
+            :ledger0 ledger0
+            :cursor0 cursor0
+            :snapshot-every snapshot-every
+            :snapshot-scope snapshot-scope
+            :max-facts max-facts
+            :crash-after-fact crash-after-fact
+            :crash-before-fact crash-before-fact
+            :on-observation
+            (fn [obs new?]
+              (when new?
+                (reset! market-clock (:fact/occurred-at obs)))
+              ;; advance marks (independent of append acceptance, but
+              ;; monotone: never roll back behind the recovery seed)
+              (when (or (nil? seed-wm)
+                        (>= (compare (:fact/occurred-at obs) seed-wm) 0))
+                (swap! marks eloop/apply-payload-marks (:record/type obs)
+                       (:record/instrument-id obs) (:fact/payload obs))))})
+          (catch python/Exception e
+            (if (eloop/crash-ex? e)
+              {:crashed? true :crash (ex-data e)}
+              (throw e))))]
+    ;; 4. finish: summary (or the simulated-crash marker)
+    (if (:crashed? loop-result)
+      {:crashed? true
+       :crash (:crash loop-result)
+       :run/id run-id
+       :resumed? (boolean recovery)}
+      (summary {:run-id run-id :recovery recovery :fact-store fact-store
+                :fixture* fixture* :loop-result loop-result}))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI

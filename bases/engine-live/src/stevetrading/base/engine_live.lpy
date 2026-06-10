@@ -244,6 +244,11 @@
     :artifact-root       artifact store root (default resources/artifacts)
     :snapshot-every      snapshot cadence (default 50)
     :max-facts           simulated-crash stop (optional)
+    :crash-after-fact / :crash-before-fact
+                         engine.loop crash-injection predicates (test
+                         only); the loop's ::crash sentinel is caught
+                         here and the session returns
+                         {:live/started? true :crashed? true ..}
     :resume?             override resume auto-detection (optional)
     :alpaca              broker.alpaca/make-alpaca-broker opts when the
                          route is :broker/alpaca-paper — {:base-url
@@ -256,7 +261,7 @@
   :portfolio {..} :health-view {..} ...}."
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
-           max-facts resume? alpaca]}]
+           max-facts resume? alpaca crash-after-fact crash-before-fact]}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
         cp-store (cpfs/make-file-control-plane-store control-plane-root)
@@ -404,7 +409,15 @@
                     _ (when-let [wm (get-in state0 [:engine/watermarks
                                                     :watermark/market])]
                         (reset! market-clock wm))
-                    _ (reset! marks (eloop/marks-at fixture* cursor0))
+                    ;; marks reflect observed market truth, which can be
+                    ;; ahead of the resume cursor after a mid-cycle crash
+                    ;; (see eloop/observed-position); catch-up
+                    ;; observations must not roll them backward
+                    seed-wm (get-in state0 [:engine/watermarks
+                                            :watermark/market])
+                    _ (reset! marks (eloop/marks-at fixture*
+                                                    (eloop/observed-position
+                                                     fixture* state0 cursor0)))
                     ;; 4. record the loaded revision (durable + folded)
                     activated-ts (eloop/utc-now-str)
                     activated-fact
@@ -422,50 +435,72 @@
                                                         [activated-fact])
                     _ (when (seq appended) (on-facts [activated-fact]))
                     state0 (:state (fold/fold-fact state0 activated-fact))
-                    ;; 5. the shared loop
+                    ;; 5. the shared loop (an injected ::crash sentinel —
+                    ;; test hook — is caught here)
                     loop-result
-                    (eloop/run-loop
-                     {:fact-store fact-store
-                      :snapshot-store snapshot-store
-                      :broker broker
-                      :source source
-                      :strategies loaded
-                      :account-id account-id
-                      :run-id run-id
-                      :run-mode run-mode
-                      :state0 state0
-                      :ledger0 ledger0
-                      :cursor0 cursor0
-                      :snapshot-every snapshot-every
-                      :snapshot-scope snapshot-scope
-                      :max-facts max-facts
-                      :broker-route {:broker/source-system broker-kw}
-                      :on-facts on-facts
-                      :on-observation
-                      (fn [obs new?]
-                        (when new?
-                          (reset! market-clock (:fact/occurred-at obs)))
-                        (swap! marks eloop/apply-payload-marks
-                               (:record/type obs)
-                               (:record/instrument-id obs)
-                               (:fact/payload obs)))})]
-                {:live/started? true
-                 :run/id run-id
-                 :process/id process-id
-                 :run/mode run-mode
-                 :control-plane/revision revision
-                 :broker broker-kw
-                 :account/id account-id
-                 :resumed? (boolean recovery)
-                 :facts-appended (:appended loop-result)
-                 :cursor (:cursor loop-result)
-                 :stopped-early? (:stopped-early? loop-result)
-                 :orders (eloop/orders-summary (:state loop-result))
-                 :portfolio (:engine/portfolio (:state loop-result))
-                 :engine/state (:state loop-result)
-                 :ledger (:ledger loop-result)
-                 :skipped-ledger-fills (:skipped-fills loop-result)
-                 :health-view (op/health-view sink)}))))))))
+                    (try
+                      (eloop/run-loop
+                       {:fact-store fact-store
+                        :snapshot-store snapshot-store
+                        :broker broker
+                        :source source
+                        :strategies loaded
+                        :account-id account-id
+                        :run-id run-id
+                        :run-mode run-mode
+                        :state0 state0
+                        :ledger0 ledger0
+                        :cursor0 cursor0
+                        :snapshot-every snapshot-every
+                        :snapshot-scope snapshot-scope
+                        :max-facts max-facts
+                        :crash-after-fact crash-after-fact
+                        :crash-before-fact crash-before-fact
+                        :broker-route {:broker/source-system broker-kw}
+                        :on-facts on-facts
+                        :on-observation
+                        (fn [obs new?]
+                          (when new?
+                            (reset! market-clock (:fact/occurred-at obs)))
+                          (when (or (nil? seed-wm)
+                                    (>= (compare (:fact/occurred-at obs)
+                                                 seed-wm)
+                                        0))
+                            (swap! marks eloop/apply-payload-marks
+                                   (:record/type obs)
+                                   (:record/instrument-id obs)
+                                   (:fact/payload obs))))})
+                      (catch python/Exception e
+                        (if (eloop/crash-ex? e)
+                          {:crashed? true :crash (ex-data e)}
+                          (throw e))))]
+                (if (:crashed? loop-result)
+                  {:live/started? true
+                   :crashed? true
+                   :crash (:crash loop-result)
+                   :run/id run-id
+                   :process/id process-id
+                   :run/mode run-mode
+                   :control-plane/revision revision
+                   :broker broker-kw
+                   :resumed? (boolean recovery)}
+                  {:live/started? true
+                   :run/id run-id
+                   :process/id process-id
+                   :run/mode run-mode
+                   :control-plane/revision revision
+                   :broker broker-kw
+                   :account/id account-id
+                   :resumed? (boolean recovery)
+                   :facts-appended (:appended loop-result)
+                   :cursor (:cursor loop-result)
+                   :stopped-early? (:stopped-early? loop-result)
+                   :orders (eloop/orders-summary (:state loop-result))
+                   :portfolio (:engine/portfolio (:state loop-result))
+                   :engine/state (:state loop-result)
+                   :ledger (:ledger loop-result)
+                   :skipped-ledger-fills (:skipped-fills loop-result)
+                   :health-view (op/health-view sink)})))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI

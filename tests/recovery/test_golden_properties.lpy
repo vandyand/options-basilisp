@@ -1,0 +1,225 @@
+(ns recovery.test-golden-properties
+  "TESTING §8 — the golden properties the system must maintain:
+    8.1 uninterrupted and restarted runs converge (covered in depth by
+        recovery.test-crash-scenarios; the identity slice asserted here)
+    8.2 one logical decision yields ONE stable order-intent-id, across
+        replay AND restart
+    8.3 duplicate broker observations never create duplicate fills or
+        positions
+    8.4 replay and live-normalized inputs share the same fact shapes
+        (ONE domain.validation/validate-fact accepts replay-source
+        observations, sim-broker outputs, and alpaca-stub-normalized
+        broker facts alike)
+    8.5 control-plane violations prevent unsafe startup"
+  (:import json os.path tempfile)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [helpers.recovery-helpers :as h]
+            [stevetrading.base.engine-live :as el]
+            [stevetrading.base.engine-replay :as er]
+            [stevetrading.broker.alpaca :as alp]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.control-plane.file-store :as cpfs]
+            [stevetrading.domain.schemas :as sch]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.market-data.protocol :as mdp]
+            [stevetrading.market-data.replay :as replay]
+            [stevetrading.persistence.fact-store :as fs]
+            [stevetrading.persistence.protocol :as p]
+            [stevetrading.replay.fixture :as fixture]))
+
+;; ---------------------------------------------------------------------------
+;; 8.2 One logical decision → one stable order-intent-id
+;; ---------------------------------------------------------------------------
+
+(deftest one-decision-one-stable-intent-id
+  (let [control-dir (:out-dir @h/control)
+        crash-dir (tempfile/mkdtemp)
+        crashed (er/run-replay {:fixture-path h/fixture-path
+                                :out-dir crash-dir
+                                :snapshot-every 5
+                                :crash-after-fact
+                                (fn [f] (= :fact/order-intent-created
+                                           (:record/type f)))})
+        resumed (er/run-replay {:fixture-path h/fixture-path
+                                :out-dir crash-dir
+                                :snapshot-every 5})
+        control-ids (h/intent-ids control-dir)
+        crash-ids (h/intent-ids crash-dir)]
+    (is (true? (:crashed? crashed)))
+    (is (true? (:expected-outputs-satisfied? resumed)))
+    (testing "the same logical decisions yield the same intent ids,
+              ordered, with no duplicates — across replay AND restart"
+      (is (= 2 (count control-ids) (count (distinct control-ids))))
+      (is (= control-ids crash-ids)))
+    (testing "intent ids are content-addressed (oi_ prefix)"
+      (is (every? #(.startswith % "oi_") control-ids)))))
+
+;; ---------------------------------------------------------------------------
+;; 8.3 Duplicate observations never duplicate fills/positions
+;; ---------------------------------------------------------------------------
+
+(deftest duplicate-observations-never-duplicate-exposure
+  (let [{:keys [out-dir summary]} @h/control
+        store (fs/make-fact-store (os.path/join out-dir "facts.db"))
+        log (p/facts-since store 0)
+        state (:engine/state summary)
+        ;; (a) the append layer: re-appending the ENTIRE log is a no-op
+        re-append (p/append-facts! store log)
+        ;; (b) the fold layer: duplicate broker observations converge
+        fill-dups (filterv #(= :fact/fill-observed (:record/type %)) log)
+        ack-dups (filterv #(= :fact/broker-ack-accepted (:record/type %))
+                          log)
+        refold-fills (fold/fold-facts state fill-dups)
+        refold-acks (fold/fold-facts state ack-dups)]
+    (is (pos? (count log)))
+    (testing "append layer: every re-appended fact is a duplicate"
+      (is (= 0 (count (:appended re-append))))
+      (is (= (count log) (count (:duplicates re-append)))))
+    (testing "fold layer: duplicate fills converge SILENTLY (§12.2 —
+              canonical fill identity dedupe)"
+      (is (pos? (count fill-dups)))
+      (is (= state (:state refold-fills)))
+      (is (empty? (:emitted-facts refold-fills))))
+    (testing "fold layer: a stale ack re-observed after the terminal
+              state never changes state; it only SURFACES loudly as a
+              fault fact (§18.4 explicit anomaly surfacing)"
+      (is (pos? (count ack-dups)))
+      (is (= state (:state refold-acks)))
+      (is (every? #(= :fact/fault-recorded (:record/type %))
+                  (:emitted-facts refold-acks))))
+    (testing "positions/lots unchanged by any duplicate"
+      (is (= (get-in state [:engine/portfolio :portfolio/positions])
+             (get-in (:state refold-fills) [:engine/portfolio
+                                            :portfolio/positions])
+             (get-in (:state refold-acks) [:engine/portfolio
+                                           :portfolio/positions]))))))
+
+;; ---------------------------------------------------------------------------
+;; 8.4 Replay and live-normalized inputs share fact shapes
+;; ---------------------------------------------------------------------------
+
+(def ^:private alpaca-account "account/alpaca/paper-main")
+
+(def ^:private oi-shape (str "oi_" (apply str (repeat 64 "a"))))
+
+(defn- json-str [x] (json/dumps (alp/clj->py x)))
+
+(defn- alpaca-submit-cmd
+  []
+  (sch/command-envelope
+   {:record/type :command/submit-order-intent
+    :record/mode :mode/paper
+    :command/issued-at "2026-06-10T14:30:00Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key (str "submit/intent/" oi-shape)
+    :command/payload
+    {:order-intent/id oi-shape
+     :command/idempotency-key (str "submit/intent/" oi-shape)
+     :broker/account-id alpaca-account
+     :broker/route {:broker/source-system :broker/alpaca-paper}
+     :order-intent/payload
+     {:order-intent/id oi-shape
+      :order-intent/side :order-side/buy
+      :order-intent/effect :position-effect/open
+      :order-intent/order-type :order-type/market
+      :order-intent/time-in-force :tif/day
+      :order-intent/quantity "1"
+      :order-intent/limit-price nil
+      :order-intent/legs [{:instrument/id "equity/ARCA/SPY"
+                           :leg/side :order-side/buy
+                           :leg/quantity "1"}]}}}))
+
+(deftest replay-and-live-inputs-share-fact-shapes
+  (let [;; replay-source observations
+        fixture* (fixture/load-fixture h/fixture-path)
+        source (replay/make-replay-source fixture*)
+        {:keys [observations]} (mdp/next-observations source 0 5)
+        ;; sim-broker normalized facts (from the control run's log)
+        control-log (h/log-facts (:out-dir @h/control))
+        sim-facts (filterv #(contains? #{:fact/broker-ack-accepted
+                                         :fact/fill-observed}
+                                       (:record/type %))
+                           control-log)
+        ;; alpaca-stub normalized facts (stub transport — no network)
+        short-id (alp/alpaca-client-order-id oi-shape)
+        broker (alp/make-alpaca-broker
+                {:key-id "test-key"
+                 :secret "test-secret"
+                 :clock (fn [] "2026-06-10T14:31:02Z")
+                 :transport
+                 (fn [req]
+                   (if (= "POST" (:method req))
+                     {:status 200
+                      :body (json-str {"id" "ord-1"
+                                       "client_order_id" short-id
+                                       "status" "accepted"})}
+                     {:status 200
+                      :body (json-str
+                             [{"id" "ord-1"
+                               "client_order_id" short-id
+                               "status" "filled"
+                               "symbol" "SPY"
+                               "filled_qty" "1"
+                               "filled_avg_price" "550.25"
+                               "filled_at" "2026-06-10T14:31:04Z"}])}))})
+        alpaca-ack (first (bp/submit-order-intent! broker
+                                                   (alpaca-submit-cmd)))
+        alpaca-fill (first (bp/fills-since
+                            broker
+                            {:broker/account-id alpaca-account
+                             :reconcile/known-intent-ids [oi-shape]}
+                            nil))
+        all-facts (concat observations sim-facts [alpaca-ack alpaca-fill])
+        verdicts (mapv (fn [f] [(:record/type f)
+                                (:valid? (v/validate-fact f))])
+                       all-facts)]
+    (is (= 5 (count observations)))
+    (is (pos? (count sim-facts)))
+    (is (= :fact/broker-ack-accepted (:record/type alpaca-ack)))
+    (is (= :fact/fill-observed (:record/type alpaca-fill)))
+    (testing "ONE validate-fact accepts replay observations, sim-broker
+              facts, and alpaca-normalized facts alike"
+      (is (every? #(true? (second %)) verdicts)))
+    (testing "the alpaca fill and the sim fill expose the same §5.3
+              payload keys for the fields the fold consumes"
+      (let [sim-fill (first (filter #(= :fact/fill-observed
+                                        (:record/type %))
+                                    sim-facts))
+            core-keys [:order-intent/id :broker/order-id :fill/id
+                       :fill/quantity :fill/price :fill/occurred-at]]
+        (is (every? #(some? (get-in sim-fill [:fact/payload %])) core-keys))
+        (is (every? #(some? (get-in alpaca-fill [:fact/payload %]))
+                    core-keys))))))
+
+;; ---------------------------------------------------------------------------
+;; 8.5 Control-plane violation prevents startup
+;; ---------------------------------------------------------------------------
+
+(deftest control-plane-violation-prevents-startup
+  (let [manifest (-> (edn/read-string
+                      (slurp "resources/control-plane/examples/sim-main-v0.1.edn"))
+                     (assoc :control-plane/revision "cp-golden-killed-01")
+                     (assoc :control-plane/kill-switches
+                            [{:kill-switch/scope :kill-switch-scope/global
+                              :kill-switch/active? true
+                              :kill-switch/reason "golden-property test"
+                              :kill-switch/activated-at "2026-06-10T14:00:00Z"
+                              :kill-switch/actor "test"}]))
+        root (tempfile/mkdtemp)
+        store (cpfs/make-file-control-plane-store root)
+        activation (cpfs/activate! store manifest {:actor "test"})
+        out-dir (tempfile/mkdtemp)
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-sim-main"
+                             :out-dir out-dir
+                             :fixture-path h/fixture-path})
+        facts (h/log-facts out-dir)]
+    (is (true? (:activated? activation)))
+    (testing "startup refused, durably, before ANY trading work"
+      (is (false? (:live/started? result)))
+      (is (= :violation/kill-switch-active (:live/refusal result)))
+      (is (= 1 (count facts)))
+      (is (= :fact/control-plane-violation-recorded
+             (:record/type (first facts)))))))
