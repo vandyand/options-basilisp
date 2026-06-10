@@ -351,7 +351,46 @@
       (is (= "2" (get-in fill [:fact/payload :fill/quantity])))
       (is (= "550.25" (get-in fill [:fact/payload :fill/price])))
       (is (= "2026-06-10T14:31:04Z"
-             (get-in fill [:fact/payload :fill/occurred-at]))))))
+             (get-in fill [:fact/payload :fill/occurred-at]))))
+    (testing "fresh broker (empty journal): wire symbol parses to the DEFAULT venue"
+      ;; ARCA fidelity is unrecoverable without the journal — documented
+      ;; degraded fidelity of the parse fallback, never a lost identity.
+      (is (= "equity/NASDAQ/SPY"
+             (get-in fill [:fact/payload :fill/instrument-id]))))))
+
+;; ---------------------------------------------------------------------------
+;; Venue fidelity: journal is PRIMARY — a journaled non-default-venue intent
+;; (equity/ARCA/SPY) must keep its exact venue on fill normalization; the
+;; pure OCC parse is only the post-restart fallback (round-3 adversary).
+;; ---------------------------------------------------------------------------
+
+(deftest journaled-intent-keeps-exact-venue-on-fills
+  (let [known-short (alp/alpaca-client-order-id oi-equity)
+        broker (make-broker
+                (fn [req]
+                  (if (= "POST" (:method req))
+                    (accepted-response req "ord-30")
+                    {:status 200
+                     :body (json-str
+                            [{"id" "ord-30"
+                              "client_order_id" known-short
+                              "status" "filled"
+                              "symbol" "SPY"
+                              "filled_qty" "2"
+                              "filled_avg_price" "550.25"
+                              "filled_at" "2026-06-10T14:31:04+00:00"}])})))
+        _ (bp/submit-order-intent! broker (submit-cmd oi-equity equity-intent))
+        facts (bp/fills-since broker
+                              {:broker/account-id account-id
+                               :reconcile/known-intent-ids [oi-equity]}
+                              "2026-06-10T14:00:00Z")
+        fill (first facts)]
+    (testing "journal-primary mapping preserves the intent's ARCA venue"
+      (is (= 1 (count facts)))
+      (is (= :fact/fill-observed (:record/type fill)))
+      (is (= "equity/ARCA/SPY"
+             (get-in fill [:fact/payload :fill/instrument-id])))
+      (is (= "equity/ARCA/SPY" (:record/instrument-id fill))))))
 
 ;; ---------------------------------------------------------------------------
 ;; parse-occ-symbol: pure inverse of occ-symbol (leg identity without journal)

@@ -578,16 +578,18 @@
 
 (defn- leg-instrument-id
   "Map a broker order symbol back to a canonical instrument id. PRIMARY:
-  pure parse-occ-symbol (no process state — survives restarts; a fresh
-  broker has an empty submit journal, so journal-only mapping would lose
-  spread-leg identity after recovery). FALLBACK: this process's submit
-  journal (intent legs keyed by their OCC/wire symbol). nil when neither
-  resolves — the fill still carries :fill/symbol; ledger derivation
-  resolves the leg from intent context."
+  this process's submit journal (intent legs keyed by their OCC/wire
+  symbol) — the journal carries the intent's EXACT instrument id,
+  including non-default venues like equity/ARCA/SPY that the wire symbol
+  alone cannot reconstruct. FALLBACK: pure parse-occ-symbol (no process
+  state — survives restarts; a fresh broker has an empty journal, so
+  parse keeps spread-leg identity after recovery, at default-venue
+  fidelity). nil when neither resolves — the fill still carries
+  :fill/symbol; ledger derivation resolves the leg from intent context."
   [journal client-order-id symbol]
-  (or (parse-occ-symbol symbol)
-      (get-in @journal [:by-client-id client-order-id :symbol->instrument
-                        symbol])))
+  (or (get-in @journal [:by-client-id client-order-id :symbol->instrument
+                        symbol])
+      (parse-occ-symbol symbol)))
 
 (defn- fill-facts-of-order
   "Normalized :fact/fill-observed facts for one CLOSED broker order JSON
