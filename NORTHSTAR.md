@@ -150,3 +150,20 @@ The rewrite should proceed in this order:
 
 Breadth comes after the core is trustworthy.
 
+
+## Status (2026-06-10, end of basilisp-rewrite spec)
+
+Build-order progress (implementation commits on `feature/basilisp-rewrite`):
+
+1. architecture package — COMPLETE (pre-spec, initial scaffold 8af9f35)
+2. canonical domain model — COMPLETE (8fcc9e1)
+3. event ledger and snapshot model — COMPLETE (461dca7, ledger folds e651767)
+4. engine kernel — COMPLETE (8e5b336, shared loop e46d337)
+5. simulated broker — COMPLETE (558fc2e)
+6. replay mode — COMPLETE (fcade1a, base 23c5494)
+7. first end-to-end simple strategy — COMPLETE (3ff6adb + 23c5494)
+8. options execution path — COMPLETE (3883b00)
+9. paper broker adapter — COMPLETE, stub-transport contract tests only (e46d337); live smoke is operator work
+10. parity and recovery validation — recovery validation COMPLETE (25c496f: 7 crash scenarios + golden properties); behavioral parity vs the Python system remains future operator-phase work (needs live market-data adapter + credentials)
+
+Quality bar evidence: replay determinism, restart correctness under unresolved orders, intent→ack→fill lineage, duplicate-observation immunity, and control-plane enforcement are all locked behind tests (203 passing). See `specs/basilisp-rewrite/` and `README.md`.

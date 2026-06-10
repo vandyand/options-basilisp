@@ -15,3 +15,5 @@ ADR rules:
 - ADRs record decisions, not brainstorming
 - decisions here should align with the architecture package
 - later reversals should happen through superseding ADRs, not silent edits
+
+Implementation note (2026-06-10): the basilisp-rewrite spec implemented the system conforming to ADR-0001..0005; no ADR required amendment during implementation.

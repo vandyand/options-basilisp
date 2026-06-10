@@ -34,18 +34,25 @@ See [research.md](research.md) for exploration findings and [implementation-plan
 
 ## Implementation Status
 
-See [implementation-plan.md](implementation-plan.md). Phases:
+All phases complete. 203 tests passing, lint clean. Per-phase implementation commits:
 
-- Phase 0: Toolchain hardening (scripts, lint, deps)
-- Phase 1: Domain core (`domain.*`)
-- Phase 2: Engine kernel (`engine.state`, `engine.fold`, `engine.machines`)
-- Phase 3: Persistence + recovery (`persistence.*`, `engine.recovery`)
-- Phase 4: Sim broker (`broker.protocol`, `broker.sim`)
-- Phase 5: Market data replay (`market-data.*`, `replay.fixture`)
-- Phase 6: Ledger + portfolio (`ledger.core`, `portfolio.core`)
-- Phase 7: Strategy pipeline (`strategy.registry`, `feature/inference/signal/risk/execution.core`, `artifact.*`)
-- Phase 8: Replay base end-to-end + golden tests (`engine.commands`, `base.engine-replay`)
-- Phase 9: Options execution path (multi-leg intents, spread strategy)
-- Phase 10: Control plane, observability, Alpaca adapter, live base (live market-data adapter explicitly deferred — engine-live takes an injected source; replay source in this spec)
-- Phase 11: Recovery validation suite + reports
-- Phase 12: Doc sync (NORTHSTAR status, repo README, spec index)
+- Phase 0: Toolchain hardening — `ca94ee0`
+- Phase 1: Domain core — `8fcc9e1`
+- Phase 2: Engine kernel — `8e5b336`
+- Phase 3: Persistence + recovery — `461dca7`
+- Phase 4: Sim broker — `558fc2e`
+- Phase 5: Market data replay — `fcade1a`
+- Phase 6: Ledger + portfolio — `e651767`
+- Phase 7: Strategy pipeline — `3ff6adb`
+- Phase 8: Replay base E2E + golden tests — `23c5494`
+- Phase 9: Options execution path — `3883b00`
+- Phase 10: Control plane, observability, Alpaca adapter, live base — `e46d337`
+- Phase 11: Recovery validation suite + reports — `25c496f`
+- Phase 12: Doc sync — this commit
+
+### Observations
+
+- **The crash-scenario suite earned its keep:** Phase 11 surfaced two real engine bugs that all prior unit/integration tests missed — lineage loss when a fill arrives for a dispatched-but-unacked order (fixed via recovery-time orphan marking), and stale-mark repricing after mid-cycle crashes (fixed via monotone mark rebuild from observed position). ENGINE_STATE_AND_RECOVERY §17 was right to demand these as acceptance tests.
+- **Deterministic identity paid off everywhere:** dedupe keys + deterministic intent ids made restart re-processing trivially safe — the loop just re-runs and the append layer absorbs duplicates. No special-case resume logic was needed beyond cursor tracking.
+- **Basilisp 0.5.1 gotchas:** `[& {:keys ...}]` kwargs destructuring breaks when the last kwarg value is a map; `tests/__init__.py` breaks the test runner's ns mapping; new component dirs need `importlib.invalidate_caches()` in a running REPL.
+- **Deviation from architecture component list:** `market-data.polygon` was not created (live feed adapters deferred to operator-phase work); `engine.loop` was added (shared cycle mechanics for both bases — the architecture's POLYLITH §10.5 "same engine components across bases" rule made this necessary).

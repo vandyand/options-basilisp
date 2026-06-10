@@ -281,11 +281,11 @@ Goal: prove the golden properties; close the loop. **Status: COMPLETE (commit 25
 
 ## Phase 12: Doc Sync
 
-- [ ] Update `NORTHSTAR.md`: append a `## Status` section marking the build-order items 1–10 with their state after this spec (1–9 complete with commit SHAs; 10 partial: parity vs Python = future operator work) — keep the rest of the doc untouched (it is direction, not status).
-- [ ] Audit `docs/adr/README.md` — note implementation landed; ADRs unchanged (they recorded decisions; the implementation conformed).
-- [ ] Update spec `README.md` Implementation Status with per-phase commit SHAs; add `### Observations` section (what surprised, what deviated).
-- [ ] Regenerate spec index: `python3 ~/.claude/skills/feature-specs/scripts/index.py ./specs`
-- [ ] Commit: `docs(specs): sync docs after basilisp-rewrite`
+- [x] Update `NORTHSTAR.md`: append a `## Status` section marking the build-order items 1–10 with their state after this spec (1–9 complete with commit SHAs; 10 partial: parity vs Python = future operator work) — keep the rest of the doc untouched (it is direction, not status).
+- [x] Audit `docs/adr/README.md` — note implementation landed; ADRs unchanged (they recorded decisions; the implementation conformed).
+- [x] Update spec `README.md` Implementation Status with per-phase commit SHAs; add `### Observations` section (what surprised, what deviated).
+- [x] Regenerate spec index: `python3 ~/.claude/skills/feature-specs/scripts/index.py ./specs`
+- [x] Commit: `docs(specs): sync docs after basilisp-rewrite`
 
 ## Verification (cross-phase)
 
