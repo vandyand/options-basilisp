@@ -15,25 +15,19 @@ NOTE (2026-06-11): the bots now run under the BASILISP engine
 broker-account equity directly, so it is engine-agnostic.
 
 ## Core Pattern
-Six production accounts — MUST use system python3 (the repo venv lacks alpaca-py):
+Run the engine-agnostic stdlib report (six production accounts + venturevd;
+day P&L, trade count, % time in market, avg trade duration, fill count):
 
 ```bash
-cd /home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor
-python3 scripts_5yr/live/current_pnl.py alpaca 2>&1 | grep -vE 'Warning|pandas|bottleneck'
+python3 /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/scripts/current_pnl.py "${ARG:-all}"   # ARG ∈ all | alpaca | venturevd
 ```
 
-venturevd dev account (when asked, or arg venturevd):
-
-```bash
-eval "$(grep '^export ALPACA_VENTUREVD_' ~/.bashrc)"
-curl -s -H "APCA-API-KEY-ID: $ALPACA_VENTUREVD_API_KEY" \
-     -H "APCA-API-SECRET-KEY: $ALPACA_VENTUREVD_API_SECRET" \
-     https://paper-api.alpaca.markets/v2/account | \
-  python3 -c "import json,sys; d=json.load(sys.stdin); print('VENTUREVD today:', float(d['equity'])-float(d['last_equity']), '| equity:', d['equity'])"
-```
-
-`sim` arg: the old Python sim-broker table — DEFUNCT since the Python stack wound
-down (2026-06-10); say so rather than running it.
+- TRADES `N+1o` means N completed round trips plus one episode still open.
+- %MKT = share of the regular session so far with any nonzero position.
+- AVG-TRADE = mean completed-episode duration; `-` when nothing closed yet.
+- Legacy table (equity-only, per-strategy naming) if ever needed:
+  `cd .../Data-Preprocessor && python3 scripts_5yr/live/current_pnl.py alpaca`
+  (system python3 — the repo venv lacks alpaca-py).
 
 ## Quick Reference
 | Group | Day-P&L definition |
