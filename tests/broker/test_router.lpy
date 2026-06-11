@@ -1,0 +1,205 @@
+(ns broker.test-router
+  "Multi-account broker router tests: per-account dispatch on the
+  submit/cancel payload's :broker/account-id, query dispatch on the
+  account-scope argument (bare string or the §8.1 reconciliation map),
+  unknown-account behavior (canonical :fact/fault-recorded for commands,
+  [] for queries), :default fallback semantics, health aggregation, and
+  the engine.recovery seam through the router."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.broker.protocol :as p]
+            [stevetrading.broker.router :as router]
+            [stevetrading.domain.validation :as v]))
+
+(def acct-a "account/alpaca/paper-a")
+(def acct-b "account/alpaca/paper-b")
+(def acct-ghost "account/alpaca/ghost")
+
+(defn- recording-stub
+  "Stub Broker child: records every call into the calls atom tagged with
+  tag and returns recognizable per-tag values."
+  [tag calls]
+  (reify p/Broker
+    (submit-order-intent! [this cmd]
+      (swap! calls conj [tag :submit cmd])
+      [{:record/type :fact/broker-ack-accepted :stub/tag tag}])
+    (cancel-broker-order! [this cmd]
+      (swap! calls conj [tag :cancel cmd])
+      [{:record/type :fact/broker-order-status-observed :stub/tag tag}])
+    (open-orders [this account-id]
+      (swap! calls conj [tag :open-orders account-id])
+      [{:record/type :fact/broker-order-status-observed :stub/tag tag}])
+    (fills-since [this account-id cursor]
+      (swap! calls conj [tag :fills-since account-id cursor])
+      [{:record/type :fact/fill-observed :stub/tag tag}])
+    (account-state [this account-id]
+      (swap! calls conj [tag :account-state account-id])
+      {:record/type :fact/broker-account-observed :stub/tag tag})
+    (health [this]
+      {:record/type :fact/health-heartbeat-recorded :stub/tag tag})))
+
+(defn- two-child-router
+  "Router over two recording stubs. Returns {:router r :calls atom}."
+  ([] (two-child-router nil))
+  ([default]
+   (let [calls (atom [])]
+     {:router (router/make-broker-router
+               {:brokers {acct-a (recording-stub :a calls)
+                          acct-b (recording-stub :b calls)}
+                :default default})
+      :calls calls})))
+
+(defn- submit-cmd
+  [account-id]
+  {:record/id "rec_test-submit"
+   :record/mode :mode/paper
+   :record/strategy-id "strategy/simple-direction/sma-cross/v1"
+   :command/payload {:order-intent/id "oi_test"
+                     :broker/account-id account-id}})
+
+(defn- cancel-cmd
+  [account-id]
+  {:record/id "rec_test-cancel"
+   :command/payload {:order-intent/id "oi_test"
+                     :broker/account-id account-id
+                     :broker/order-id "bo_1"}})
+
+;; ---------------------------------------------------------------------------
+;; Command dispatch (submit/cancel route on the payload account)
+;; ---------------------------------------------------------------------------
+
+(deftest submit-routes-to-the-payload-account-child
+  (let [{:keys [router calls]} (two-child-router)
+        cmd-a (submit-cmd acct-a)
+        cmd-b (submit-cmd acct-b)
+        facts-a (p/submit-order-intent! router cmd-a)
+        facts-b (p/submit-order-intent! router cmd-b)]
+    (is (= [:a] (mapv :stub/tag facts-a)))
+    (is (= [:b] (mapv :stub/tag facts-b)))
+    (testing "each child saw EXACTLY its own command, unmodified"
+      (is (= [[:a :submit cmd-a] [:b :submit cmd-b]] @calls)))))
+
+(deftest cancel-routes-to-the-payload-account-child
+  (let [{:keys [router calls]} (two-child-router)
+        cmd (cancel-cmd acct-b)
+        facts (p/cancel-broker-order! router cmd)]
+    (is (= [:b] (mapv :stub/tag facts)))
+    (is (= [[:b :cancel cmd]] @calls))))
+
+;; ---------------------------------------------------------------------------
+;; Unknown account → canonical fault for commands, [] for queries
+;; ---------------------------------------------------------------------------
+
+(deftest unknown-account-submit-returns-fault-fact
+  (let [{:keys [router calls]} (two-child-router)
+        facts (p/submit-order-intent! router (submit-cmd acct-ghost))
+        fault (first facts)]
+    (is (vector? facts))
+    (is (= 1 (count facts)))
+    (is (= :fact/fault-recorded (:record/type fault)))
+    (is (= :fault/unknown-account
+           (get-in fault [:fact/payload :fault/category])))
+    (is (= acct-ghost (get-in fault [:fact/payload :broker/account-id])))
+    (is (= "oi_test" (get-in fault [:fact/payload :order-intent/id])))
+    (testing "the fault is a valid canonical fact envelope"
+      (is (true? (:valid? (v/validate-fact fault)))))
+    (testing "command lineage is preserved"
+      (is (= "rec_test-submit" (:record/correlation-id fault)))
+      (is (= ["rec_test-submit"] (vec (:record/causation-ids fault)))))
+    (testing "NO child broker was touched"
+      (is (= [] @calls)))))
+
+(deftest unknown-account-cancel-returns-fault-fact
+  (let [{:keys [router calls]} (two-child-router)
+        facts (p/cancel-broker-order! router (cancel-cmd acct-ghost))]
+    (is (= 1 (count facts)))
+    (is (= :fact/fault-recorded (:record/type (first facts))))
+    (is (= :fault/unknown-account
+           (get-in (first facts) [:fact/payload :fault/category])))
+    (is (= [] @calls))))
+
+(deftest unknown-account-queries-return-empty
+  (let [{:keys [router calls]} (two-child-router)]
+    (is (= [] (p/open-orders router acct-ghost)))
+    (is (= [] (p/open-orders router {:broker/account-id acct-ghost
+                                     :reconcile/known-intent-ids ["oi_x"]})))
+    (is (= [] (p/fills-since router acct-ghost nil)))
+    (is (= [] (p/account-state router acct-ghost)))
+    (is (= [] @calls))))
+
+;; ---------------------------------------------------------------------------
+;; Query dispatch (string + §8.1 scope-map account arguments)
+;; ---------------------------------------------------------------------------
+
+(deftest queries-dispatch-on-the-account-argument
+  (let [{:keys [router calls]} (two-child-router)
+        scope {:broker/account-id acct-a
+               :reconcile/known-intent-ids ["oi_1" "oi_2"]}]
+    (testing "open-orders with the §8.1 scope map → the map passes
+              through to the child untouched"
+      (is (= [:a] (mapv :stub/tag (p/open-orders router scope))))
+      (is (= [:a :open-orders scope] (last @calls))))
+    (testing "fills-since with a bare account string + cursor"
+      (is (= [:b] (mapv :stub/tag
+                        (p/fills-since router acct-b
+                                       "2026-06-10T14:30:00Z"))))
+      (is (= [:b :fills-since acct-b "2026-06-10T14:30:00Z"]
+             (last @calls))))
+    (testing "account-state"
+      (is (= :a (:stub/tag (p/account-state router acct-a))))
+      (is (= [:a :account-state acct-a] (last @calls))))))
+
+;; ---------------------------------------------------------------------------
+;; :default fallback (nil account only — explicit ids never fall back)
+;; ---------------------------------------------------------------------------
+
+(deftest default-child-handles-only-nil-account-ids
+  (let [{:keys [router calls]} (two-child-router acct-a)]
+    (testing "a command with NO account identity goes to the default"
+      (let [cmd {:record/id "rec_no-acct" :command/payload {}}
+            facts (p/submit-order-intent! router cmd)]
+        (is (= [:a] (mapv :stub/tag facts)))
+        (is (= [:a :submit cmd] (last @calls)))))
+    (testing "an EXPLICIT unknown account never falls back to the default"
+      (let [facts (p/submit-order-intent! router (submit-cmd acct-ghost))]
+        (is (= :fact/fault-recorded (:record/type (first facts))))))
+    (testing "without a :default, a nil account faults too"
+      (let [{r2 :router} (two-child-router)
+            facts (p/submit-order-intent!
+                   r2 {:record/id "rec_no-acct" :command/payload {}})]
+        (is (= :fact/fault-recorded (:record/type (first facts))))
+        (is (= :fault/unknown-account
+               (get-in (first facts) [:fact/payload :fault/category])))))))
+
+;; ---------------------------------------------------------------------------
+;; Health aggregation
+;; ---------------------------------------------------------------------------
+
+(deftest health-aggregates-every-child
+  (let [{:keys [router]} (two-child-router)
+        h (p/health router)]
+    (is (= #{acct-a acct-b} (set (keys (:router/children h)))))
+    (is (= :a (get-in h [:router/children acct-a :stub/tag])))
+    (is (= :b (get-in h [:router/children acct-b :stub/tag])))
+    (is (every? #(= :fact/health-heartbeat-recorded (:record/type %))
+                (vals (:router/children h))))))
+
+;; ---------------------------------------------------------------------------
+;; Recovery seam through the router (engine.recovery calls the seam fns
+;; once per account with unresolved orders — each call must reach that
+;; account's child)
+;; ---------------------------------------------------------------------------
+
+(deftest recovery-seam-dispatches-per-account-through-the-router
+  (let [{:keys [router calls]} (two-child-router)
+        seam (p/recovery-seam router)]
+    (is (= [:a] (mapv :stub/tag ((:open-orders seam) acct-a))))
+    (is (= [:b] (mapv :stub/tag ((:open-orders seam) acct-b))))
+    (is (= [:b] (mapv :stub/tag
+                      ((:fills-since seam) acct-b "2026-06-10T00:00:00Z"))))
+    (testing "unknown accounts stay observation-silent through the seam"
+      (is (= [] ((:open-orders seam) acct-ghost)))
+      (is (= [] ((:fills-since seam) acct-ghost nil))))
+    (is (= [[:a :open-orders acct-a]
+            [:b :open-orders acct-b]
+            [:b :fills-since acct-b "2026-06-10T00:00:00Z"]]
+           @calls))))

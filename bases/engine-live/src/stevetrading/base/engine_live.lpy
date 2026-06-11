@@ -43,14 +43,21 @@
   plugs in. Live feeds need operator-owned credentials/terminals and
   parity validation against the Python system — post-spec operator work.
 
-  v0.1 single-account processes (documented): all enabled strategies
-  assigned to one process must route to ONE broker and ONE account;
-  mixed routes refuse with :violation/mixed-broker-routes /
-  :violation/mixed-account-routes."
+  Multi-account processes: one process MAY trade several accounts.
+  When the assigned strategies route to more than one distinct account
+  (or the operator passes :alpaca-accounts), build-brokers constructs
+  one broker per :broker/alpaca-paper account (credentials from the
+  :alpaca-accounts opt, merged over the base :alpaca opts) and ONE
+  shared sim broker for every :broker/sim route, wrapped in
+  broker.router/make-broker-router — each strategy's intents carry its
+  own route's account-id (per-strategy :account-id/:broker-route on the
+  loop's strategy entries). Single-route processes keep the original
+  ONE-broker wiring, bit-for-bit."
   (:import os os.path sys)
   (:require [stevetrading.artifact.file-store :as afs]
             [stevetrading.broker.alpaca :as alpaca]
             [stevetrading.broker.protocol :as bp]
+            [stevetrading.broker.router :as router]
             [stevetrading.broker.sim :as sim]
             [stevetrading.control-plane.file-store :as cpfs]
             [stevetrading.control-plane.protocol :as cpp]
@@ -105,11 +112,17 @@
                                    :control-plane/revision revision
                                    :process/id process-id}))})))
 
-(defn- gate-check
+(defn gate-check
   "CONTROL_PLANE §11 startup validation against the active revision.
-  Returns {:ok? true :manifest .. :process .. :strategies [..] :route ..
-           :account .. :broker-kw .. :run-mode ..}
-  or {:ok? false :reason kw :details {..} :manifest manifest-or-nil}."
+  Returns {:ok? true :manifest .. :process .. :strategies [..]
+           :strategy-routes [..]  ;; aligned with :strategies
+           :routes [..]           ;; distinct routes
+           :route .. :account .. :accounts {account-id account}
+           :broker-kw .. :broker-kws #{..} :run-mode ..}
+  (:route/:account/:broker-kw are the FIRST entries — the whole story
+  for single-route processes; multi-account wiring uses the plurals) or
+  {:ok? false :reason kw :details {..} :manifest manifest-or-nil}.
+  Public for cheap wiring tests — run-live is the only runtime caller."
   [{:keys [manifest process-id mode]}]
   (let [fail (fn [reason details]
                {:ok? false :reason reason :details details
@@ -178,27 +191,33 @@
                                                 :kill-switch/target
                                                 :kill-switch/reason])})
 
-                          (> (count brokers) 1)
-                          (fail :violation/mixed-broker-routes
-                                {:brokers brokers})
-
-                          (> (count account-ids) 1)
-                          (fail :violation/mixed-account-routes
-                                {:accounts account-ids})
-
-                          (not (contains? #{:broker/sim :broker/alpaca-paper}
-                                          (first brokers)))
+                          (not (every? #(contains? #{:broker/sim
+                                                     :broker/alpaca-paper}
+                                                   %)
+                                       brokers))
                           (fail :violation/unsupported-broker
-                                {:broker (first brokers)})
+                                {:brokers
+                                 (set (remove #{:broker/sim
+                                                :broker/alpaca-paper}
+                                              brokers))})
 
                           :else
                           {:ok? true
                            :manifest manifest
                            :process process
                            :strategies strategies
+                           :strategy-routes strategy-routes
+                           :routes (vec (distinct strategy-routes))
                            :route (first strategy-routes)
-                           :account (get accounts (first account-ids))
+                           :account (get accounts
+                                         (:route/account-id
+                                          (first strategy-routes)))
+                           :accounts (into {}
+                                           (map (fn [aid]
+                                                  [aid (get accounts aid)])
+                                                account-ids))
                            :broker-kw (first brokers)
+                           :broker-kws brokers
                            :run-mode run-mode})))))))))))))
 
 ;; ---------------------------------------------------------------------------
@@ -220,6 +239,58 @@
      :live/refusal reason
      :live/refusal-details details
      :live/violation-fact fact}))
+
+;; ---------------------------------------------------------------------------
+;; Broker construction (single-route OR multi-account router)
+;; ---------------------------------------------------------------------------
+
+(defn build-brokers
+  "Construct the process broker from manifest routes. opts (explicit
+  map):
+    :routes          [{:route/broker .. :route/account-id ..} ..]
+                     (required; duplicates are de-duped)
+    :alpaca          base broker.alpaca opts shared by every alpaca
+                     child ({:base-url :key-id :secret :transport
+                     :clock}; tests inject :transport here)
+    :alpaca-accounts {account-id {:key-id .. :secret ..}} per-account
+                     credential overrides, merged OVER :alpaca for that
+                     account's child; providing this opt forces router
+                     wiring even for one account
+    :sim-opts        broker.sim opts ({:marks :clock}); ALL :broker/sim
+                     routes share ONE sim broker instance
+
+  ONE distinct account and no :alpaca-accounts → the original
+  single-broker wiring, unchanged. Otherwise → one child per account
+  wrapped in broker.router/make-broker-router.
+
+  Returns {:broker b :router? bool :children {account-id child}}
+  (:children only when :router? is true)."
+  [{:keys [routes alpaca alpaca-accounts sim-opts]}]
+  (let [routes (vec (distinct routes))
+        account-ids (vec (distinct (map :route/account-id routes)))
+        multi? (or (> (count account-ids) 1) (some? alpaca-accounts))]
+    (if-not multi?
+      {:router? false
+       :broker (case (:route/broker (first routes))
+                 :broker/sim (sim/make-sim-broker (or sim-opts {}))
+                 :broker/alpaca-paper
+                 (alpaca/make-alpaca-broker (or alpaca {})))}
+      (let [shared-sim (delay (sim/make-sim-broker (or sim-opts {})))
+            children
+            (into {}
+                  (map (fn [route]
+                         [(:route/account-id route)
+                          (case (:route/broker route)
+                            :broker/sim @shared-sim
+                            :broker/alpaca-paper
+                            (alpaca/make-alpaca-broker
+                             (merge (or alpaca {})
+                                    (get alpaca-accounts
+                                         (:route/account-id route)))))])
+                       routes))]
+        {:router? true
+         :children children
+         :broker (router/make-broker-router {:brokers children})}))))
 
 ;; ---------------------------------------------------------------------------
 ;; run-live
@@ -250,10 +321,16 @@
                          here and the session returns
                          {:live/started? true :crashed? true ..}
     :resume?             override resume auto-detection (optional)
-    :alpaca              broker.alpaca/make-alpaca-broker opts when the
+    :alpaca              broker.alpaca/make-alpaca-broker opts when a
                          route is :broker/alpaca-paper — {:base-url
                          :key-id :secret :transport}; tests ALWAYS inject
-                         a stub :transport
+                         a stub :transport. Multi-account: shared base
+                         opts for every alpaca child
+    :alpaca-accounts     {account-id {:key-id .. :secret ..}} per-account
+                         alpaca credentials (merged over :alpaca for that
+                         account); presence forces broker.router wiring
+                         (see build-brokers) — required whenever several
+                         alpaca-paper accounts are routed
 
   Returns {:live/started? false :live/refusal reason ...} on a gate
   refusal (after durably recording the violation fact), or the session
@@ -261,7 +338,8 @@
   :portfolio {..} :health-view {..} ...}."
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
-           max-facts resume? alpaca crash-after-fact crash-before-fact]
+           max-facts resume? alpaca alpaca-accounts crash-after-fact
+           crash-before-fact]
     injected-source :source}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
@@ -276,22 +354,28 @@
     (if-not (:ok? gate)
       ;; 1. control-plane gate refusal
       (refuse! refusal-ctx manifest (:reason gate) (:details gate))
-      (let [{:keys [manifest strategies route account broker-kw run-mode]}
+      (let [{:keys [manifest strategies strategy-routes routes route
+                    broker-kw broker-kws run-mode]}
             gate
             revision (:control-plane/revision manifest)
             account-id (:route/account-id route)
+            account-ids (vec (distinct (map :route/account-id
+                                            strategy-routes)))
             ;; market-data source: injected live source wins; else the
             ;; replay fixture (the original in-spec wiring)
             fixture* (when fixture-path (fixture/load-fixture fixture-path))
             source (or injected-source (replay/make-replay-source fixture*))
-            replay-feed? (= :market-data/replay (mdp/source-id source))]
-        ;; 2. stale-feed safety gate
-        (if (and (not= :broker/sim broker-kw)
+            replay-feed? (= :market-data/replay (mdp/source-id source))
+            real-brokers (set (remove #{:broker/sim} broker-kws))]
+        ;; 2. stale-feed safety gate (ANY non-sim route counts)
+        (if (and (seq real-brokers)
                  replay-feed?
                  (not allow-replay-feed?))
           (refuse! refusal-ctx manifest
                    :violation/replay-feed-with-real-broker
-                   {:broker broker-kw
+                   {:broker (if (= 1 (count broker-kws))
+                              broker-kw
+                              real-brokers)
                     :market-data/source (mdp/source-id source)
                     :override "--allow-replay-feed"})
           ;; 3. wire adapters + recovery + observability, then the loop
@@ -304,12 +388,16 @@
                                         (first (:fixture/inputs fixture*)))
                                        (eloop/utc-now-str)))
                 marks (atom {})
-                broker (case broker-kw
-                         :broker/sim
-                         (sim/make-sim-broker {:marks (fn [] @marks)
-                                               :clock (fn [] @market-clock)})
-                         :broker/alpaca-paper
-                         (alpaca/make-alpaca-broker (or alpaca {})))
+                ;; single distinct route + no :alpaca-accounts → the
+                ;; original ONE-broker wiring; otherwise per-account
+                ;; children behind broker.router
+                built (build-brokers
+                       {:routes routes
+                        :alpaca alpaca
+                        :alpaca-accounts alpaca-accounts
+                        :sim-opts {:marks (fn [] @marks)
+                                   :clock (fn [] @market-clock)}})
+                broker (:broker built)
                 ;; strategy decls: load, then check the manifest's
                 ;; assignment + artifact refs against the declarations
                 decls (mapv #(eloop/load-strategy artifact-store run-mode %)
@@ -344,7 +432,18 @@
                        {:strategy/ids mismatched})
 
               :else
-              (let [loaded (mapv #(get decl-by-id %) assigned)
+              ;; per-strategy account routing: every loaded strategy
+              ;; carries ITS route's account-id + broker route — the
+              ;; loop prefers these over the global :account-id (for a
+              ;; single-route process they are identical values)
+              (let [loaded (mapv (fn [s route]
+                                   (assoc (get decl-by-id (:strategy/id s))
+                                          :account-id
+                                          (:route/account-id route)
+                                          :broker-route
+                                          {:broker/source-system
+                                           (:route/broker route)}))
+                                 strategies strategy-routes)
                     _ (reg/build-registry (mapv :decl loaded))
                     run-id (identifiers/new-record-id)
                     run-info {:run/id run-id
@@ -494,7 +593,10 @@
                    :run/mode run-mode
                    :control-plane/revision revision
                    :broker broker-kw
+                   :brokers broker-kws
+                   :broker/router? (boolean (:router? built))
                    :account/id account-id
+                   :account/ids account-ids
                    :resumed? (boolean recovery)
                    :facts-appended (:appended loop-result)
                    :cursor (:cursor loop-result)

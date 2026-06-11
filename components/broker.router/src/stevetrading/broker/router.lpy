@@ -1,0 +1,149 @@
+(ns stevetrading.broker.router
+  "Multi-account broker router — one Broker protocol instance that
+  dispatches every call to a per-account child broker on the call's
+  account identity (BROKER_ADAPTER §4: submit/cancel payloads carry
+  :broker/account-id; open-orders/fills-since/account-state take the
+  account scope as an argument, either an account-id string or the §8.1
+  reconciliation map {:broker/account-id .. :reconcile/known-intent-ids
+  [..]}).
+
+  ADAPTER-SHAPED component: children are INJECTED, fully-constructed
+  Broker instances — this namespace requires domain.* and
+  broker.protocol ONLY (never broker.alpaca/broker.sim, never engine.*).
+
+  Dispatch rules:
+  - submit-order-intent! / cancel-broker-order!: route on
+    (get-in cmd [:command/payload :broker/account-id]). Unknown (or
+    absent, with no :default) account → a single canonical
+    :fact/fault-recorded envelope (:fault/category
+    :fault/unknown-account) — never an exception, never a silent
+    misroute to another account's broker.
+  - open-orders / fills-since / account-state: route on the account-id
+    argument (string or scope map). Unknown account → [] (queries are
+    observations; there is no truth to observe for an account this
+    process does not hold a broker for).
+  - health: aggregate map {:router/children {account-id health-fact}} —
+    one child health observation per account.
+  - A nil/absent account-id falls back to the :default child when one
+    is configured; an account-id that IS present but unknown never
+    falls back (explicit identity beats defaults)."
+  (:import datetime)
+  (:require [stevetrading.broker.protocol :as p]
+            [stevetrading.domain.schemas :as sch]))
+
+(def source-system :broker/router)
+
+(defn- default-clock
+  []
+  (fn []
+    (.strftime (datetime.datetime/now datetime.timezone/utc)
+               "%Y-%m-%dT%H:%M:%SZ")))
+
+(defn- compact
+  [m]
+  (into {} (filter (comp some? val) m)))
+
+(defn- scope-account-id
+  "Account identity of an open-orders/fills-since/account-state argument
+  (§8.1 — account-id string or reconciliation scope map)."
+  [account-id-or-scope]
+  (if (map? account-id-or-scope)
+    (:broker/account-id account-id-or-scope)
+    account-id-or-scope))
+
+(defn- child-for
+  "Resolve the child broker for one account-id. nil account-id falls
+  back to the :default child; a present-but-unknown id resolves to nil."
+  [brokers default account-id]
+  (if (nil? account-id)
+    (when (some? default) (get brokers default))
+    (get brokers account-id)))
+
+(defn- unknown-account-fault
+  "Canonical :fact/fault-recorded for a command routed to an account
+  this router holds no broker for (category :fault/unknown-account)."
+  [cmd account-id known-account-ids clock]
+  (let [ts (clock)]
+    (sch/fact-envelope
+     (compact
+      {:record/type :fact/fault-recorded
+       :record/mode (:record/mode cmd)
+       :record/strategy-id (:record/strategy-id cmd)
+       :record/account-id account-id
+       :record/correlation-id (or (:record/correlation-id cmd)
+                                  (:record/id cmd))
+       :record/causation-ids (when (some? (:record/id cmd))
+                               [(:record/id cmd)])
+       :record/source-system source-system
+       :fact/occurred-at ts
+       :fact/recorded-at ts
+       :fact/payload
+       (compact
+        {:fault/category :fault/unknown-account
+         :fault/source-system source-system
+         :fault/message (str "no broker configured for account "
+                             (pr-str account-id) " (known: "
+                             (pr-str (vec (sort known-account-ids))) ")")
+         :broker/account-id account-id
+         :order-intent/id (get-in cmd [:command/payload
+                                       :order-intent/id])})}))))
+
+(defrecord BrokerRouter [brokers default clock]
+  p/Broker
+
+  (submit-order-intent! [this cmd]
+    (let [account-id (get-in cmd [:command/payload :broker/account-id])
+          child (child-for brokers default account-id)]
+      (if (nil? child)
+        [(unknown-account-fault cmd account-id (keys brokers) clock)]
+        (p/submit-order-intent! child cmd))))
+
+  (cancel-broker-order! [this cmd]
+    (let [account-id (get-in cmd [:command/payload :broker/account-id])
+          child (child-for brokers default account-id)]
+      (if (nil? child)
+        [(unknown-account-fault cmd account-id (keys brokers) clock)]
+        (p/cancel-broker-order! child cmd))))
+
+  (open-orders [this account-id]
+    (let [child (child-for brokers default (scope-account-id account-id))]
+      (if (nil? child)
+        []
+        (p/open-orders child account-id))))
+
+  (fills-since [this account-id cursor]
+    (let [child (child-for brokers default (scope-account-id account-id))]
+      (if (nil? child)
+        []
+        (p/fills-since child account-id cursor))))
+
+  (account-state [this account-id]
+    (let [child (child-for brokers default (scope-account-id account-id))]
+      (if (nil? child)
+        []
+        (p/account-state child account-id))))
+
+  (health [this]
+    {:router/children
+     (into {}
+           (map (fn [[account-id child]]
+                  [account-id (p/health child)])
+                brokers))}))
+
+(defn make-broker-router
+  "Build a multi-account broker router. opts (explicit map):
+    :brokers  {account-id BrokerInstance} (required) — fully-constructed
+              broker.protocol/Broker children, one per account; children
+              MAY share an instance (e.g. several sim accounts on one
+              sim broker)
+    :default  account-id whose child receives calls that carry NO
+              account identity (optional; without it such calls fault)
+    :clock    (fn [] iso-ts) for fault-fact timestamps (default UTC wall
+              clock)"
+  [{:keys [brokers default clock]}]
+  (->BrokerRouter (or brokers {}) default (or clock (default-clock))))
+
+(defn children
+  "The injected {account-id child} map (wiring introspection/tests)."
+  [router]
+  (:brokers router))

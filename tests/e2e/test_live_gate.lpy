@@ -10,12 +10,17 @@
   - alpaca-paper route + replay feed WITHOUT --allow-replay-feed →
     refusal with :violation/replay-feed-with-real-broker
   - same with the override flag → gate passes against a stub-transport
-    alpaca broker (no real call anywhere)"
+    alpaca broker (no real call anywhere)
+  - multi-account wiring: a two-strategy/two-account manifest passes the
+    gate (routes + per-strategy accounts surfaced), and build-brokers
+    constructs per-account children behind broker.router (single-route
+    construction stays a bare broker — no router)"
   (:import json os.path tempfile)
   (:require [basilisp.edn :as edn]
             [basilisp.test :refer [deftest is testing]]
             [stevetrading.base.engine-live :as el]
             [stevetrading.broker.alpaca :as alp]
+            [stevetrading.broker.protocol :as bp]
             [stevetrading.control-plane.file-store :as cpfs]
             [stevetrading.persistence.fact-store :as fs]
             [stevetrading.persistence.protocol :as p]))
@@ -49,6 +54,33 @@
                :route/strategy-id "strategy/simple-direction/sma-cross/v1"
                :route/account-id "account/alpaca/paper-main"
                :route/broker :broker/alpaca-paper}])))
+
+(defn- two-account-manifest
+  "Sim example extended to TWO strategies routed to TWO sim accounts on
+  one process — the multi-account gate/wiring subject."
+  []
+  (let [m (sim-manifest)]
+    (-> m
+        (assoc :control-plane/revision "cp-sim-2acct-000001")
+        (update :control-plane/strategies conj
+                (-> (first (:control-plane/strategies m))
+                    (assoc :strategy/id
+                           "strategy/simple-direction/sma-cross-b/v1"
+                           :strategy/account-route "route/sim-direction-b")))
+        (update :control-plane/accounts conj
+                {:account/id "account/sim/alt"
+                 :account/broker :broker/sim
+                 :account/environment :environment/sim
+                 :account/allowed-modes #{:mode/sim :mode/replay}
+                 :account/live-enabled? false})
+        (update :control-plane/routes conj
+                {:route/id "route/sim-direction-b"
+                 :route/strategy-id "strategy/simple-direction/sma-cross-b/v1"
+                 :route/account-id "account/sim/alt"
+                 :route/broker :broker/sim})
+        (assoc-in [:control-plane/processes 0 :process/strategies]
+                  ["strategy/simple-direction/sma-cross/v1"
+                   "strategy/simple-direction/sma-cross-b/v1"]))))
 
 (defn- activate-into!
   "Activate a manifest into a fresh control-plane root; returns the root."
@@ -225,3 +257,93 @@
         (is (every? #(.startswith
                       (get-in % [:fact/payload :broker/order-id]) "stub-ord-")
                     acks))))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-account: gate passage + broker construction (run-live wiring is
+;; gate-check → build-brokers → per-strategy account-ids; unit-tested here
+;; without running a full session)
+;; ---------------------------------------------------------------------------
+
+(deftest two-account-manifest-passes-the-gate
+  (let [gate (el/gate-check {:manifest (two-account-manifest)
+                             :process-id "engine-sim-main"
+                             :mode :mode/sim})]
+    (is (true? (:ok? gate)))
+    (is (= 2 (count (:strategies gate))))
+    (testing "one route per assigned strategy, in strategy order"
+      (is (= ["account/sim/main" "account/sim/alt"]
+             (mapv :route/account-id (:strategy-routes gate))))
+      (is (= 2 (count (:routes gate)))))
+    (is (= #{:broker/sim} (:broker-kws gate)))
+    (is (= #{"account/sim/main" "account/sim/alt"}
+           (set (keys (:accounts gate)))))
+    (testing "single-route compatibility keys still point at the first route"
+      (is (= "account/sim/main" (:route/account-id (:route gate))))
+      (is (= :broker/sim (:broker-kw gate))))))
+
+(deftest single-route-gate-shape-is-backward-compatible
+  (let [gate (el/gate-check {:manifest (sim-manifest)
+                             :process-id "engine-sim-main"
+                             :mode :mode/sim})]
+    (is (true? (:ok? gate)))
+    (is (= 1 (count (:routes gate))))
+    (is (= "account/sim/main" (:route/account-id (:route gate))))
+    (is (= :broker/sim (:broker-kw gate)))))
+
+(deftest build-brokers-single-route-stays-a-bare-broker
+  (let [built (el/build-brokers
+               {:routes [{:route/broker :broker/sim
+                          :route/account-id "account/sim/main"}]
+                :sim-opts {}})]
+    (is (false? (:router? built)))
+    (is (some? (:broker built)))
+    (testing "the bare broker answers the protocol directly (no router)"
+      (is (= :fact/health-heartbeat-recorded
+             (:record/type (bp/health (:broker built))))))))
+
+(deftest build-brokers-multi-account-builds-a-router
+  (let [stub (fn [_] {:status 200 :body "{}"})
+        built (el/build-brokers
+               {:routes [{:route/broker :broker/alpaca-paper
+                          :route/account-id "account/alpaca/paper-a"}
+                         {:route/broker :broker/alpaca-paper
+                          :route/account-id "account/alpaca/paper-b"}
+                         {:route/broker :broker/sim
+                          :route/account-id "account/sim/main"}
+                         {:route/broker :broker/sim
+                          :route/account-id "account/sim/alt"}]
+                :alpaca {:transport stub :base-url "https://stub"}
+                :alpaca-accounts
+                {"account/alpaca/paper-a" {:key-id "key-a" :secret "sec-a"}
+                 "account/alpaca/paper-b" {:key-id "key-b" :secret "sec-b"}}
+                :sim-opts {}})
+        children (:children built)]
+    (is (true? (:router? built)))
+    (is (= #{"account/alpaca/paper-a" "account/alpaca/paper-b"
+             "account/sim/main" "account/sim/alt"}
+           (set (keys children))))
+    (testing "every alpaca account gets ITS OWN broker with ITS creds
+              merged over the shared base opts"
+      (is (not (identical? (get children "account/alpaca/paper-a")
+                           (get children "account/alpaca/paper-b"))))
+      (is (= "key-a" (get-in children ["account/alpaca/paper-a"
+                                       :opts :key-id])))
+      (is (= "key-b" (get-in children ["account/alpaca/paper-b"
+                                       :opts :key-id])))
+      (is (= "https://stub" (get-in children ["account/alpaca/paper-a"
+                                              :opts :base-url]))))
+    (testing "sim routes share ONE sim broker instance"
+      (is (identical? (get children "account/sim/main")
+                      (get children "account/sim/alt"))))
+    (testing "the router dispatches health per account"
+      (let [h (bp/health (:broker built))]
+        (is (= (set (keys children)) (set (keys (:router/children h)))))))
+    (testing "providing :alpaca-accounts forces router wiring even for a
+              single account"
+      (is (true? (:router?
+                  (el/build-brokers
+                   {:routes [{:route/broker :broker/alpaca-paper
+                              :route/account-id "account/alpaca/paper-a"}]
+                    :alpaca {:transport stub}
+                    :alpaca-accounts {"account/alpaca/paper-a"
+                                      {:key-id "k" :secret "s"}}})))))))

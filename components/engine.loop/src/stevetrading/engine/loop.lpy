@@ -336,21 +336,27 @@
   → portfolio path as synchronous fills. Sync brokers (sim) return
   already-known fills which the append layer dedupes to nothing — the
   poll is harmless there and load-bearing for async brokers (alpaca),
-  whose submit returns only the ack. Returns {:state :ledger
-  :appended-count :skipped-fills}."
-  [{:keys [append! broker state ledger account-id since]}]
+  whose submit returns only the ack. Polls once per account in
+  :account-ids (multi-account processes route per-strategy accounts;
+  single-account processes pass exactly one — identical behavior).
+  Returns {:state :ledger :appended-count :skipped-fills}."
+  [{:keys [append! broker state ledger account-ids since]}]
   (let [open (into []
                    (keep (fn [[oi entry]]
                            (when-not (:order/resolved? entry) oi)))
                    (:engine/unresolved-orders state))]
     (if (empty? open)
       {:state state :ledger ledger :appended-count 0 :skipped-fills []}
-      (let [facts (try
-                    (bp/fills-since broker
-                                    {:broker/account-id account-id
-                                     :reconcile/known-intent-ids open}
-                                    since)
-                    (catch python/Exception _ []))
+      (let [facts (vec
+                   (mapcat
+                    (fn [account-id]
+                      (try
+                        (bp/fills-since broker
+                                        {:broker/account-id account-id
+                                         :reconcile/known-intent-ids open}
+                                        since)
+                        (catch python/Exception _ [])))
+                    account-ids))
             {poll-new :new-facts poll-n :appended-count} (append! facts)
             foldp (fold-new! append! state poll-new)
             state (:state foldp)
@@ -371,10 +377,14 @@
 (defn- run-strategy-cycle!
   "Pipeline → append+fold decision facts → derive/dispatch commands →
   append+fold outcomes → ledger derive/append/fold → portfolio refresh.
+  A strategy entry may carry its OWN :account-id / :broker-route (multi-
+  account routing) — these are preferred over the loop-global config.
   Returns {:state .. :ledger .. :appended-count n :skipped-fills [..]}."
   [{:keys [append! broker state ledger strategy account-id run-id
            run-mode broker-route]}]
   (let [{:keys [decl artifacts]} strategy
+        account-id (or (:account-id strategy) account-id)
+        broker-route (or (:broker-route strategy) broker-route)
         sid (:strategy/id decl)
         instrument (first (:strategy/instruments decl))
         local-state (:strategy/signal-state (st/strategy-state state sid))
@@ -479,8 +489,13 @@
     :snapshot-store persistence.protocol/SnapshotStore (required)
     :broker         broker.protocol/Broker (required)
     :source         market-data.protocol/MarketDataSource (required)
-    :strategies     [{:decl .. :artifacts ..}] from load-strategy (required)
-    :account-id     account route for intents (required)
+    :strategies     [{:decl .. :artifacts ..}] from load-strategy
+                    (required); an entry MAY carry :account-id (and
+                    :broker-route) — preferred over the loop-global
+                    values for that strategy's intents (multi-account
+                    processes; see broker.router)
+    :account-id     default account route for intents (required;
+                    per-strategy :account-id wins when present)
     :run-id         this run's id (required)
     :run-mode       engine mode keyword (required)
     :state0         initial engine state (already init-run'd + strategies
@@ -512,6 +527,11 @@
   (let [snapshot-every (or snapshot-every default-snapshot-every)
         snapshot-scope (or snapshot-scope default-snapshot-scope)
         cursor0 (or cursor0 0)
+        ;; every account this process trades (per-strategy overrides +
+        ;; the global default) — the async-fill poll covers all of them;
+        ;; single-account configs yield exactly the old one-call poll
+        poll-account-ids (vec (distinct (map #(or (:account-id %) account-id)
+                                             strategies)))
         append! (make-append! fact-store on-facts
                               crash-before-fact crash-after-fact)]
     (loop [state state0
@@ -573,7 +593,7 @@
                 ;; async-fill reconciliation poll (no-op when nothing open)
                 poll-res (poll-broker-fills!
                           {:append! append! :broker broker :state state
-                           :ledger ledger :account-id account-id
+                           :ledger ledger :account-ids poll-account-ids
                            :since (get-in state [:engine/run :run/started-at])})
                 state (:state poll-res)
                 ledger (:ledger poll-res)

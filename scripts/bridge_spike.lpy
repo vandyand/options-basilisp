@@ -1,0 +1,284 @@
+(ns bridge-spike
+  "CRITICAL-PATH SPIKE: prove the six Python production strategy brains run
+  from Basilisp via interop, on REAL data, TODAY.
+
+  Run from the engine repo root with the REF venv's basilisp:
+
+    eval \"$(grep '^export ALPACA_VENTUREVD_' ~/.bashrc)\"
+    PYTHONPATH=$(sed \"s|^|$PWD/|; s|:|:$PWD/|g\" .nrepl-pythonpath) \\
+      $REF/.venv/bin/basilisp run scripts/bridge_spike.lpy
+
+  Steps:
+    1. Equivalence: Basilisp consensus-vote vs Python _consensus_vote (81
+       cases) and direction-step vs DirectionEnsembleSignal.evaluate
+       (343 z-combos x 3 priors, per-bot calibrations).
+    2. Real bars: Alpaca IEX 1-min bars for SPY/HYG/TLT/VXX (200 each);
+       SPX/VIX/TNX derived proxies (as production does).
+    3. Real chains: 3 ThetaData terminal v3 SPY chain snapshots -> BS
+       greeks (their implied_vol/bs_greeks) -> (6,21,8) grids.
+    4. Features + preds + signals for all six bots."
+  (:import datetime
+           importlib
+           json
+           os
+           sys
+           time
+           urllib.request
+           zoneinfo)
+  (:require [stevetrading.bridge.steve-v2 :as bridge]))
+
+(def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+(def terminal "http://127.0.0.1:25503")
+
+(defn- http-json [url headers]
+  (let [req (urllib.request/Request url ** :headers (python/dict headers))
+        resp (urllib.request/urlopen req ** :timeout 30)]
+    (json/loads (.decode (.read resp) "utf-8"))))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; Step 1 — equivalence checks (pure Basilisp logic vs Python reference)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(defn- kind->py [sk-cls k] (sk-cls (name k)))
+(defn- py->kind [pk] (keyword (.-value pk)))
+
+(defn check-consensus-equivalence []
+  (let [_ (do (.insert (.-path sys) 0 ref-root)
+              (.insert (.-path sys) 0 (str ref-root "/src")))
+        pc (importlib/import-module "stevetrading_v2.signals.parrot_consensus")
+        sig (importlib/import-module "stevetrading_v2.primitives.signal")
+        sk (.-SignalKind sig)
+        vote-py (.-_consensus_vote pc)
+        kinds [:long :short :flat]
+        mismatches
+        (for [a kinds b kinds c kinds prior kinds
+              :let [py (py->kind (vote-py (python/tuple [(kind->py sk a)
+                                                         (kind->py sk b)
+                                                         (kind->py sk c)])
+                                          (kind->py sk prior)))
+                    bs (bridge/consensus-vote [a b c] prior)]
+              :when (not= py bs)]
+          [[a b c] prior py bs])]
+    (println "  consensus-vote: 81/81 cases checked,"
+             (count mismatches) "mismatches" (vec mismatches))
+    (zero? (count mismatches))))
+
+(defn check-direction-equivalence [cal-paths]
+  (let [de (importlib/import-module "stevetrading_v2.signals.direction_ensemble")
+        sig (importlib/import-module "stevetrading_v2.primitives.signal")
+        np (importlib/import-module "numpy")
+        sk (.-SignalKind sig)
+        signal ((.-DirectionEnsembleSignal de))
+        dss (.-DirectionSignalState de)
+        zs [-1.0 -0.55 -0.35 0.0 0.35 0.55 1.0]
+        total (atom 0)
+        bad (atom [])]
+    (doseq [[bot path] cal-paths]
+      (let [cal-json (slurp path)
+            cal (bridge/parse-calibration cal-json)
+            cal-state-py (.get (json/loads cal-json) "state")
+            bundles #py {"dir_cal_v1" cal-state-py}
+            std (:std cal)]
+        (doseq [zl zs zg zs zsh zs prior [:flat :long :short]]
+          (let [pred [(* zl (:long std)) (* zg (:gen std)) (* zsh (:short std))]
+                state-py (dss ** :last_kind (kind->py sk prior)
+                              :last_z_long 0.0 :last_z_gen 0.0
+                              :last_z_short 0.0)
+                out-py (first (.evaluate signal
+                                         ** :prediction (.array np (python/list pred))
+                                         :calibration_bundles bundles
+                                         :features #py {}
+                                         :state state-py))
+                kind-py (py->kind (.-kind out-py))
+                res-bs (bridge/direction-step
+                        pred cal (assoc bridge/default-direction-state
+                                        :last-kind prior))
+                kind-bs (:kind res-bs)]
+            (swap! total inc)
+            (when (not= kind-py kind-bs)
+              (swap! bad conj [bot [zl zg zsh] prior kind-py kind-bs]))))
+        ;; NaN fault path
+        (let [out-py (first (.evaluate signal
+                                       ** :prediction (.array np #py ((.-nan np) 0.0 0.0))
+                                       :calibration_bundles #py {"dir_cal_v1" cal-state-py}
+                                       :features #py {}
+                                       :state nil))
+              res-bs (bridge/direction-step [##NaN 0.0 0.0] cal nil)]
+          (swap! total inc)
+          (when (not= (py->kind (.-kind out-py)) (:kind res-bs))
+            (swap! bad conj [bot :nan-case])))))
+    (println "  direction-step:" @total "cases checked,"
+             (count @bad) "mismatches" (vec (take 5 @bad)))
+    (zero? (count @bad))))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; Step 2 — real bars from Alpaca IEX
+;; ────────────────────────────────────────────────────────────────────────────
+
+(defn fetch-bars [sym n]
+  (let [k (.get (.-environ os) "ALPACA_VENTUREVD_API_KEY")
+        s (.get (.-environ os) "ALPACA_VENTUREVD_API_SECRET")
+        _ (when-not (and k s)
+            (throw (ex-info "ALPACA_VENTUREVD_* env vars not set" {})))
+        url (str "https://data.alpaca.markets/v2/stocks/" sym
+                 "/bars?timeframe=1Min&feed=iex&limit=" n "&sort=desc")
+        doc (http-json url {"APCA-API-KEY-ID" k "APCA-API-SECRET-KEY" s})
+        dt-cls (.-datetime datetime)
+        bars (.get doc "bars")]
+    (vec (reverse
+          (map (fn [b]
+                 {:time (.fromisoformat dt-cls (.get b "t"))
+                  :open (.get b "o") :high (.get b "h") :low (.get b "l")
+                  :close (.get b "c") :volume (.get b "v")
+                  :vwap (.get b "vw" (.get b "c"))
+                  :trade-count (.get b "n" 0)})
+               bars)))))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; Step 3 — real SPY chain from the local ThetaData terminal (v3)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(defn fetch-chain-snapshot
+  "All SPY contracts for expirations within max-days, as bridge contract maps."
+  [max-days]
+  (let [date-cls (.-date datetime)
+        today (.today date-cls)
+        horizon (.fromordinal date-cls (+ (.toordinal today) max-days))
+        exps-doc (http-json (str terminal "/v3/option/list/expirations?symbol=SPY&format=json") {})
+        exps (->> (.get exps-doc "expiration")
+                  (map str)
+                  (filter (fn [e]
+                            (let [d (.fromisoformat date-cls e)]
+                              (and (>= (.toordinal d) (.toordinal today))
+                                   (<= (.toordinal d) (.toordinal horizon))))))
+                  distinct
+                  sort
+                  vec)
+        contracts
+        (vec (mapcat
+              (fn [exp]
+                (let [compact (.replace exp "-" "")
+                      doc (http-json (str terminal "/v3/option/snapshot/quote?symbol=SPY&expiration=" compact "&format=json") {})
+                      strikes (.get doc "strike")
+                      rights (.get doc "right")
+                      bids (.get doc "bid")
+                      asks (.get doc "ask")
+                      n (python/len strikes)]
+                  (map (fn [i]
+                         {:strike (.__getitem__ strikes i)
+                          :right (str (.__getitem__ rights i))
+                          :bid (let [b (.__getitem__ bids i)] (if (nil? b) 0.0 (double b)))
+                          :ask (let [a (.__getitem__ asks i)] (if (nil? a) 0.0 (double a)))
+                          :expiration exp})
+                       (range n))))
+              exps))]
+    {:n-expirations (count exps) :contracts contracts}))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; Main
+;; ────────────────────────────────────────────────────────────────────────────
+
+(defn -main []
+  (let [bundle-dirs {:chestnut (str ref-root "/pipeline_data/live_model_chestnut_multihead")
+                     :lynx (str ref-root "/pipeline_data/live_model_lynx_multihead")
+                     :moose (str ref-root "/pipeline_data/live_model_moose_multihead")}
+        cal-paths {:chestnut (str ref-root "/pipeline_data/calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
+                   :lynx (str ref-root "/pipeline_data/calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
+                   :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}]
+
+    (println "── Step 1: Basilisp-vs-Python signal-logic equivalence ──")
+    (let [ok-c (check-consensus-equivalence)
+          ok-d (check-direction-equivalence cal-paths)]
+      (when-not (and ok-c ok-d)
+        (println "EQUIVALENCE FAILED — aborting")
+        (sys/exit 1)))
+
+    (println "── Step 2: building bridge (torch/xgboost bundle load) ──")
+    (let [t0 (time/time)
+          b (bridge/make-bridge {:ref-root ref-root
+                                 :bundle-dirs bundle-dirs
+                                 :calibrations cal-paths})
+          _ (println "  bridge up in" (format "%.1fs" (- (time/time) t0)))
+
+          _ (println "── Step 3: real bars (Alpaca IEX, 200×1min) ──")
+          bars-seed (into {} (map (fn [sym] [sym (fetch-bars sym 200)])
+                                  bridge/stock-symbols))
+          _ (doseq [[sym bars] bars-seed]
+              (println " " sym (count bars) "bars, last close"
+                       (:close (last bars)) "at" (str (:time (last bars)))))
+
+          _ (println "── Step 4: real SPY chains (ThetaData v3, 3 snapshots) ──")
+          snaps (vec (for [i (range 3)]
+                       (let [t1 (time/time)
+                             snap (fetch-chain-snapshot 90)]
+                         (println "  snapshot" (inc i) ":"
+                                  (:n-expirations snap) "expirations,"
+                                  (count (:contracts snap)) "contracts,"
+                                  (format "%.1fs" (- (time/time) t1)))
+                         (when (< i 2) (time/sleep 15))
+                         {:contracts (:contracts snap)})))
+
+          _ (println "── Step 5: prime! ──")
+          t2 (time/time)
+          _ (bridge/prime! b bars-seed [])
+          _ (doseq [snap snaps]
+              (let [r (bridge/on-chain! b snap)]
+                (println "  grid:" (:n-gridded r) "of" (:n-input r)
+                         "contracts gridded, SPY" (:spy-price r))))
+          _ (println "  primed in" (format "%.1fs" (- (time/time) t2)))
+
+          _ (println "── Step 6: features + preds + signals ──")
+          t3 (time/time)
+          result (bridge/signals b)
+          _ (println "  inference in" (format "%.1fs" (- (time/time) t3)))]
+
+      (println)
+      (println "FEATURE VECTORS (zeros = unavailable-live features, by design):")
+      (doseq [[bot st] (:feature-stats result)]
+        (println " " bot ": n=" (:n st) " zero=" (:n-zero st)
+                 (format "(%.1f%%)" (* 100.0 (/ (:n-zero st) (:n st))))))
+
+      (println)
+      (println "RAW PREDS [p-long p-gen p-short]:")
+      (doseq [[bot p] (:preds result)]
+        (println " " bot (vec (map #(format "%+.3e" %) p))))
+
+      (println)
+      (println "Z-SCORES (vs v0_legacy_freeze final_target_std):")
+      (doseq [[bot z] (:zs result)]
+        (println " " bot (format "long %+.2f gen %+.2f short %+.2f"
+                                 (:long z) (:gen z) (:short z))))
+
+      (println)
+      (println "VOTES mult1 (oak/parrot):" (get-in result [:votes :mult1])
+               "| mult2 (dolphin):" (get-in result [:votes :mult2]))
+      (println)
+      (println "═══ SIX BOT SIGNALS NOW ═══")
+      (doseq [bot [:chestnut :lynx :moose :oak :dolphin :parrot]]
+        (println (format "  %-9s → %s" (name bot) (name (get result bot)))))
+
+      ;; cross-check OAK/PARROT against their ParrotConsensusSignal end-to-end
+      (println)
+      (println "── Step 7: cross-check vs Python ParrotConsensusSignal ──")
+      (let [pc (importlib/import-module "stevetrading_v2.signals.parrot_consensus")
+            np (importlib/import-module "numpy")
+            psig ((.-ParrotConsensusSignal pc))
+            stacked (.array np (python/list
+                                (map (fn [bot]
+                                       (python/list (get-in result [:preds bot])))
+                                     [:chestnut :lynx :moose])))
+            bundles (python/dict)
+            _ (doseq [[bot path] cal-paths]
+                (.__setitem__ bundles
+                              (str "dir_cal_" (name bot) "_h3_v1")
+                              (.get (json/loads (slurp path)) "state")))
+            out (first (.evaluate psig ** :prediction stacked
+                                  :calibration_bundles bundles
+                                  :features #py {} :state nil))]
+        (println "  Python ParrotConsensusSignal kind:" (.-value (.-kind out))
+                 "votes:" (.get (.-metadata out) "votes")
+                 "| bridge oak/parrot:" (name (:oak result)))
+        (println (if (= (keyword (.-value (.-kind out))) (:oak result))
+                   "  ✓ MATCH" "  ✗ MISMATCH"))))))
+
+(-main)

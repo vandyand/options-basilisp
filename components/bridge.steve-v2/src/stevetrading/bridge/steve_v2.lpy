@@ -1,0 +1,508 @@
+(ns stevetrading.bridge.steve-v2
+  "Bridge to the six PROVEN Python production strategy brains
+  (CHESTNUT/LYNX/MOOSE H3 direction bots + OAK/DOLPHIN/PARROT 2-of-3
+  consensus) living in the Python reference repo (Data-Preprocessor).
+
+  ⚠ NOT REPLAY-SAFE (v0): this component holds mutable Python-side state
+  (bar deques, greeks-grid history, torch/xgboost model objects). It is a
+  stateful adapter, not a fold. Restart = re-prime from history via
+  `prime!`. Do NOT wire this into the deterministic replay path until the
+  feature/inference layers are ported natively.
+
+  Runtime requirements (NOT needed to load this namespace — everything
+  heavy is imported lazily inside `make-bridge` via importlib):
+    - torch, xgboost, numpy, scipy, pandas (the REF .venv has them)
+    - the REF repo on disk (`:ref-root`), providing:
+        scripts_5yr.live.feature_engine   FeatureEngine (918-feature vector)
+        scripts_5yr.live.model_inference  MultiHeadLiveInference (3 XGB heads)
+        scripts_5yr.live.greeks_grid      GreeksGridBuilder ((6,21,8) grids)
+        scripts_5yr.live.options_fetcher  implied_vol / bs_greeks / time_to_expiry
+          (imported with `alpaca` stub modules injected when the alpaca SDK
+           is absent — we only use its pure Black-Scholes functions)
+
+  Verified Python reference behavior this bridge mirrors:
+    - bar_buffers: dict sym→deque of bar dicts for SPY/HYG/TLT/VXX plus
+      DERIVED index proxies (data_fetcher.py): SPX = SPY×10, VIX = VXX copy,
+      TNX = TLT copy. Production never fetches real SPX/TNX/VIX bars.
+    - greeks grids: option chain (strike/right/bid/ask/expiration) →
+      BS implied vol + greeks at r=0.043 → (6,21,8) grid (greeks_grid.py).
+    - preds: FeatureEngine (918,) + grid history → per-bot bundle →
+      (p_long, p_gen, p_short).
+    - signal: z = pred / final_target_std (mean anchored at 0), AND-gated
+      entry, OR-gated exit hysteresis, per multihead_signal_generator.py /
+      stevetrading_v2.signals.direction_ensemble (v0_legacy_freeze cal).
+    - consensus: 2-of-3 vote (parrot_consensus._consensus_vote); OAK and
+      PARROT at threshold-mult 1.0 (identical signal, different execution),
+      DOLPHIN at threshold-mult 2.0 applied to all 8 hysteresis params.
+
+  The hysteresis state machine and consensus vote are REIMPLEMENTED here
+  as pure Basilisp fns (`direction-step`, `consensus-vote`) so they are
+  testable without torch; scripts/bridge_spike.lpy verifies them
+  exhaustively against the Python implementations (81 consensus cases,
+  direction-step sweep) before trusting this port.
+
+  Call protocol (once per 1-min bar):
+    (on-bar! bridge {:symbol \"SPY\" :time dt :open o :high h :low l
+                     :close c :volume v})          ; per stock symbol
+    (on-chain! bridge {:observed-at dt :contracts [{:strike 600.0
+                       :right \"CALL\" :bid 1.2 :ask 1.3
+                       :expiration \"2026-06-12\"} ...]})
+    (signals bridge) → {:chestnut :long|:short|:flat ... :oak ... :dolphin
+                        ... :parrot ... :preds {...} :zs {...}}
+  `signals` ADVANCES hysteresis/consensus state — call exactly once per bar."
+  (:import collections
+           datetime
+           importlib
+           json
+           math
+           sys
+           types
+           zoneinfo))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; Pure logic — verified equivalent to the Python reference (see spike report)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(def hysteresis-keys
+  "The 8 hysteresis params scaled by per-account threshold-mult
+  (ensemble_runner_v2 _HYSTERESIS_KEYS)."
+  [:enter-long-sigma :enter-gen-long-sigma :enter-short-sigma
+   :enter-gen-short-sigma :exit-long-delta :exit-gen-long-delta
+   :exit-short-delta :exit-gen-short-delta])
+
+(defn scale-hysteresis
+  "Scale all 8 hysteresis params by mult (OAK/PARROT 1.0, DOLPHIN 2.0)."
+  [params mult]
+  (reduce (fn [m k] (assoc m k (* (get m k) mult))) params hysteresis-keys))
+
+(def default-direction-state
+  {:last-kind :flat :last-z-long 0.0 :last-z-gen 0.0 :last-z-short 0.0})
+
+(defn- finite? [x]
+  (and (number? x) (math/isfinite x)))
+
+(defn direction-step
+  "One bar of the 3-head direction signal. Pure port of
+  stevetrading_v2.signals.direction_ensemble.DirectionEnsembleSignal.evaluate
+  (itself a verified port of multihead_signal_generator.py lines 144-212).
+
+  pred  — [p-long p-gen p-short] raw head outputs
+  cal   — {:std {:long s :gen s :short s}
+           :hysteresis {:enter-long-sigma .. 8 keys ..}
+           :regime-active bool (default true)}
+  state — {:last-kind :flat|:long|:short :last-z-long .. :last-z-gen ..
+           :last-z-short ..} (default-direction-state when nil)
+
+  Returns {:kind k :state next-state :z {:long :gen :short} :fault reason?}."
+  [pred cal state]
+  (let [state (or state default-direction-state)
+        last-kind (:last-kind state)
+        [p-long p-gen p-short] pred
+        std (:std cal)
+        nan-state {:last-kind last-kind :last-z-long ##NaN
+                   :last-z-gen ##NaN :last-z-short ##NaN}]
+    (cond
+      (not (and (finite? p-long) (finite? p-gen) (finite? p-short)))
+      {:kind :flat :fault :nan-prediction :state nan-state}
+
+      (or (<= (:long std 0.0) 0.0) (<= (:gen std 0.0) 0.0)
+          (<= (:short std 0.0) 0.0))
+      {:kind :flat :fault :degenerate-std :state nan-state}
+
+      (false? (:regime-active cal true))
+      {:kind :flat :fault nil :reason :regime-gated
+       :state default-direction-state}
+
+      :else
+      (let [h (:hysteresis cal)
+            enter-long  (:enter-long-sigma h)
+            exit-long   (:exit-long-delta h)
+            enter-gl    (:enter-gen-long-sigma h)
+            exit-gl     (:exit-gen-long-delta h)
+            enter-gs    (:enter-gen-short-sigma h)
+            exit-gs     (:exit-gen-short-delta h)
+            enter-short (:enter-short-sigma h)
+            exit-short  (:exit-short-delta h)
+            z-long  (/ p-long (:long std))
+            z-gen   (/ p-gen (:gen std))
+            z-short (/ p-short (:short std))
+            long-entry  (and (> z-long enter-long) (> z-gen enter-gl))
+            short-entry (and (< z-short (- enter-short)) (< z-gen (- enter-gs)))
+            long-exit   (or (<= z-long (- enter-long exit-long))
+                            (<= z-gen (- enter-gl exit-gl)))
+            short-exit  (or (>= z-short (- (- enter-short exit-short)))
+                            (>= z-gen (- (- enter-gs exit-gs))))
+            new-kind
+            (case last-kind
+              :flat (cond
+                      (and long-entry short-entry)
+                      (if (>= (abs z-long) (abs z-short)) :long :short)
+                      long-entry :long
+                      short-entry :short
+                      :else :flat)
+              :long (cond
+                      long-exit (if short-entry :short :flat)
+                      short-entry :short
+                      :else :long)
+              :short (cond
+                       short-exit (if long-entry :long :flat)
+                       long-entry :long
+                       :else :short)
+              :flat)]
+        {:kind new-kind
+         :z {:long z-long :gen z-gen :short z-short}
+         :state {:last-kind new-kind :last-z-long z-long
+                 :last-z-gen z-gen :last-z-short z-short}}))))
+
+(defn consensus-vote
+  "2-of-3 consensus state machine. Pure port of
+  stevetrading_v2.signals.parrot_consensus._consensus_vote.
+
+  votes — seq of 3 kinds (:long/:short/:flat), prior — prior consensus kind."
+  [votes prior]
+  (let [n-long  (count (filter #(= % :long) votes))
+        n-short (count (filter #(= % :short) votes))]
+    (case prior
+      :flat (cond
+              (and (>= n-long 2) (>= n-short 2))
+              (cond (> n-long n-short) :long
+                    (> n-short n-long) :short
+                    :else :flat)
+              (>= n-long 2) :long
+              (>= n-short 2) :short
+              :else :flat)
+      :long (cond
+              (>= n-short 2) :short
+              (< n-long 2) :flat
+              :else :long)
+      :short (cond
+               (>= n-long 2) :long
+               (< n-short 2) :flat
+               :else :short)
+      :flat)))
+
+(defn parse-calibration
+  "Parse a v0_legacy_freeze calibration JSON string → bridge cal map.
+  Pure (string in, map out) so it's testable without the REF tree."
+  [json-str]
+  (let [doc (json/loads json-str)
+        st (.get doc "state")
+        std (.get st "final_target_std")
+        h (.get st "hysteresis_params")]
+    {:bundle-version (.get doc "bundle_version")
+     :std {:long (.get std "long") :gen (.get std "gen")
+           :short (.get std "short")}
+     :hysteresis {:enter-long-sigma      (.get h "enter_long_sigma")
+                  :exit-long-delta       (.get h "exit_long_delta")
+                  :enter-gen-long-sigma  (.get h "enter_gen_long_sigma")
+                  :exit-gen-long-delta   (.get h "exit_gen_long_delta")
+                  :enter-gen-short-sigma (.get h "enter_gen_short_sigma")
+                  :exit-gen-short-delta  (.get h "exit_gen_short_delta")
+                  :enter-short-sigma     (.get h "enter_short_sigma")
+                  :exit-short-delta      (.get h "exit_short_delta")}
+     ;; v0_legacy_freeze bundles carry no regime_active key → the live code
+     ;; path defaults it to true (direction_ensemble.py line 360).
+     :regime-active (if (.__contains__ st "regime_active")
+                      (.get st "regime_active")
+                      true)}))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; Python-side plumbing (everything below holds live Python objects)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(def stock-symbols ["SPY" "HYG" "TLT" "VXX"])
+(def bots [:chestnut :lynx :moose])
+
+(defn- ensure-alpaca-stub!
+  "options_fetcher.py imports the alpaca SDK at module top but we only use
+  its pure Black-Scholes functions. When alpaca isn't installed (the REF
+  .venv lacks it), inject empty stub modules so the import succeeds."
+  []
+  (try
+    (importlib/import-module "alpaca")
+    (catch python/ImportError _
+      (let [mods (.-modules sys)
+            mk! (fn [name attrs]
+                  (let [m (types/ModuleType name)]
+                    (doseq [a attrs]
+                      (python/setattr m a (python/type a #py () #py {})))
+                    (.__setitem__ mods name m)
+                    m))]
+        (mk! "alpaca" [])
+        (mk! "alpaca.trading" [])
+        (mk! "alpaca.trading.client" ["TradingClient"])
+        (mk! "alpaca.trading.enums" ["AssetStatus"])
+        (mk! "alpaca.trading.requests" ["GetOptionContractsRequest"])
+        (mk! "alpaca.data" [])
+        (mk! "alpaca.data.historical" [])
+        (mk! "alpaca.data.historical.option" ["OptionHistoricalDataClient"])
+        (mk! "alpaca.data.requests" ["OptionSnapshotRequest"
+                                     "StockBarsRequest"
+                                     "StockLatestQuoteRequest"])
+        nil))))
+
+(defn- ensure-ref-paths! [ref-root]
+  (let [spath (.-path sys)]
+    (doseq [p [ref-root (str ref-root "/src")]]
+      (when-not (.__contains__ spath p)
+        (.insert spath 0 p)))))
+
+(defn- load-npz-dict
+  "np.load an .npz and project the given keys into a python dict
+  (FeatureEngine wants plain dicts for hmm_model / dictionary_atoms)."
+  [np path keys*]
+  (let [npz (.load np path)
+        d (python/dict)]
+    (doseq [k keys*]
+      (.__setitem__ d k (.__getitem__ npz k)))
+    d))
+
+(defn- bar->py [bar]
+  (let [d #py {"time" (:time bar)
+               "open" (double (:open bar))
+               "high" (double (:high bar))
+               "low" (double (:low bar))
+               "close" (double (:close bar))
+               "volume" (double (:volume bar 0.0))
+               "vwap" (double (:vwap bar (:close bar)))
+               "trade_count" (python/int (:trade-count bar 0))}]
+    (when (:bid bar) (.__setitem__ d "bid" (double (:bid bar))))
+    (when (:ask bar) (.__setitem__ d "ask" (double (:ask bar))))
+    d))
+
+(defn- rebuild-proxies!
+  "Mirror data_fetcher._update_proxies: SPX = SPY×10 (o/h/l/c/vwap),
+  VIX = VXX copy, TNX = TLT copy. Full rebuild of the proxy deque."
+  [buffers sym]
+  (let [rebuild (fn [target f]
+                  (let [tgt (.__getitem__ buffers target)
+                        src (.__getitem__ buffers sym)]
+                    (.clear tgt)
+                    (doseq [b (python/list src)]
+                      (.append tgt (f b)))))]
+    (case sym
+      "SPY" (rebuild "SPX"
+                     (fn [b]
+                       #py {"time" (.__getitem__ b "time")
+                            "open" (* (.__getitem__ b "open") 10)
+                            "high" (* (.__getitem__ b "high") 10)
+                            "low" (* (.__getitem__ b "low") 10)
+                            "close" (* (.__getitem__ b "close") 10)
+                            "volume" (.__getitem__ b "volume")
+                            "vwap" (* (.get b "vwap" (.__getitem__ b "close")) 10)
+                            "trade_count" (.get b "trade_count" 0)}))
+      "VXX" (rebuild "VIX" (fn [b] (.copy b)))
+      "TLT" (rebuild "TNX" (fn [b] (.copy b)))
+      nil)))
+
+(defn make-bridge
+  "Construct the bridge. config:
+    :ref-root        — path to the Data-Preprocessor checkout (REQUIRED)
+    :bundle-dirs     — {:chestnut path :lynx path :moose path} model bundles
+    :calibrations    — {:chestnut path :lynx path :moose path}
+                       v0_legacy_freeze.json paths
+    :risk-free-rate  — BS r (default 0.043, OptionsChainFetcher.RISK_FREE_RATE)
+    :max-bars        — bar deque maxlen (default 200, data_fetcher.MAX_HISTORY)
+    :grid-history    — grid deque maxlen (default 10, main.py GRID_HISTORY_LEN)
+
+  Loads torch/xgboost models eagerly — requires the REF venv."
+  [{:keys [ref-root bundle-dirs calibrations risk-free-rate max-bars
+           grid-history]
+    :or {risk-free-rate 0.043 max-bars 200 grid-history 10}}]
+  (ensure-ref-paths! ref-root)
+  (ensure-alpaca-stub!)
+  (let [np (importlib/import-module "numpy")
+        fe-mod (importlib/import-module "scripts_5yr.live.feature_engine")
+        mi-mod (importlib/import-module "scripts_5yr.live.model_inference")
+        gg-mod (importlib/import-module "scripts_5yr.live.greeks_grid")
+        of-mod (importlib/import-module "scripts_5yr.live.options_fetcher")
+        deque (.-deque collections)
+        buffers (python/dict)
+        _ (doseq [sym ["SPY" "HYG" "TLT" "VXX" "SPX" "TNX" "VIX"]]
+            (.__setitem__ buffers sym (deque ** :maxlen max-bars)))
+        load-bot (fn [bot]
+                   (let [bdir (str (get bundle-dirs bot))
+                         engine ((.-FeatureEngine fe-mod)
+                                 (str bdir "/feature_stats.npz")
+                                 (str bdir "/feature_names.json"))
+                         inference ((.-MultiHeadLiveInference mi-mod) bdir)
+                         hmm (load-npz-dict np (str bdir "/hmm_model.npz")
+                                            ["means" "covars" "transmat"
+                                             "startprob"])
+                         atoms (load-npz-dict np
+                                              (str bdir "/dictionary_atoms.npz")
+                                              ["components" "train_mean"
+                                               "train_std"])
+                         cal (parse-calibration (slurp (str (get calibrations bot))))]
+                     {:engine engine :inference inference :hmm hmm
+                      :atoms atoms :cal cal}))]
+    {:np np
+     :greeks-fns {:implied-vol (.-implied_vol of-mod)
+                  :bs-greeks (.-bs_greeks of-mod)
+                  :time-to-expiry (.-time_to_expiry of-mod)}
+     :grid-builder ((.-GreeksGridBuilder gg-mod))
+     :risk-free-rate risk-free-rate
+     :buffers buffers
+     :grid-history (deque ** :maxlen grid-history)
+     :bots (into {} (map (fn [b] [b (load-bot b)]) bots))
+     :state (atom {:mult1 (zipmap bots (repeat default-direction-state))
+                   :mult2 (zipmap bots (repeat default-direction-state))
+                   :oak :flat
+                   :dolphin :flat
+                   :parrot :flat})}))
+
+(defn on-bar!
+  "Append one 1-min bar for a stock symbol (SPY/HYG/TLT/VXX); index proxies
+  (SPX/VIX/TNX) are derived automatically, mirroring production."
+  [bridge {:keys [symbol] :as bar}]
+  (let [buffers (:buffers bridge)]
+    (.append (.__getitem__ buffers symbol) (bar->py bar))
+    (rebuild-proxies! buffers symbol)
+    nil))
+
+(defn spy-price [bridge]
+  (let [spy (.__getitem__ (:buffers bridge) "SPY")]
+    (when (pos? (python/len spy))
+      (.get (.__getitem__ spy -1) "close"))))
+
+(defn on-chain!
+  "Convert one option-chain snapshot into a (6,21,8) greeks grid and append
+  it to the grid history. Mirrors options_fetcher._fetch_snapshots'
+  Black-Scholes fallback path (the path production actually uses —
+  USE_ALPACA_NATIVE_GREEKS=False) + greeks_grid.build_grid.
+
+  snapshot: {:observed-at tz-aware-datetime (default now ET)
+             :contracts [{:strike 600.0 :right \"CALL\"|\"PUT\" :bid f :ask f
+                          :expiration \"YYYY-MM-DD\"} ...]}
+  Returns {:n-input n :n-gridded n :spy-price p}."
+  [bridge {:keys [observed-at contracts]}]
+  (let [s (spy-price bridge)
+        _ (when-not s
+            (throw (ex-info "on-chain! requires a primed SPY bar buffer" {})))
+        et (zoneinfo/ZoneInfo "America/New_York")
+        now (or observed-at (.now (.-datetime datetime) ** :tz et))
+        r (:risk-free-rate bridge)
+        {:keys [implied-vol bs-greeks time-to-expiry]} (:greeks-fns bridge)
+        date-cls (.-date datetime)
+        converted
+        (reduce
+         (fn [acc c]
+           (let [k (double (:strike c))
+                 bid (double (:bid c 0.0))
+                 ask (double (:ask c 0.0))
+                 mid (when (and (pos? bid) (pos? ask)) (/ (+ bid ask) 2.0))
+                 ;; production strike filter: ±12% of underlying
+                 in-range (< (/ (abs (- k s)) s) 0.12)
+                 opt-type (if (= (str (:right c)) "PUT") "put" "call")
+                 exp (.fromisoformat date-cls (str (:expiration c)))
+                 t (when (and mid in-range) (time-to-expiry exp now))]
+             (if (and t (pos? t))
+               (let [iv (implied-vol mid s k t r opt-type)]
+                 (if (pos? iv)
+                   (let [g (bs-greeks s k t r iv opt-type)]
+                     (conj acc
+                           #py {"strike" k
+                                "expiration" exp
+                                "option_type" opt-type
+                                "iv" iv
+                                "delta" (.get g "delta")
+                                "vega" (.get g "vega")
+                                "theta" (.get g "theta")
+                                "rho" (.get g "rho")}))
+                   acc))
+               acc)))
+         []
+         contracts)
+        grid (.build_grid (:grid-builder bridge)
+                          (python/list converted) s now)]
+    (.append (:grid-history bridge) grid)
+    {:n-input (count contracts) :n-gridded (count converted) :spy-price s}))
+
+(defn prime!
+  "Seed the bridge from history. bars-seed: {sym [bar-maps...]} for the four
+  stock symbols (oldest→newest). chain-seed: [snapshot ...] as per on-chain!."
+  [bridge bars-seed chain-seed]
+  (doseq [sym stock-symbols
+          bar (get bars-seed sym)]
+    (on-bar! bridge (assoc bar :symbol sym)))
+  (doseq [snap chain-seed]
+    (on-chain! bridge snap))
+  nil)
+
+(defn predictions
+  "Run feature engine + the three model bundles on current buffers.
+  Returns {:chestnut [p-long p-gen p-short] :lynx ... :moose ...
+           :features {:chestnut {:n-zero n :n n}}} — does NOT touch signal
+  state."
+  [bridge]
+  (let [np (:np bridge)
+        buffers (:buffers bridge)
+        grids (python/list (:grid-history bridge))
+        grids-seq (if (pos? (count grids))
+                    (.stack np grids)
+                    (.zeros np #py (1 6 21 8) ** :dtype (.-float32 np)))]
+    (into
+     {}
+     (map (fn [[bot {:keys [engine inference hmm atoms]}]]
+            (let [feats (.compute_all_features
+                         engine
+                         ** :bar_buffers buffers
+                         :greeks_grids_history grids
+                         :hmm_model hmm
+                         :dictionary_atoms atoms)
+                  pred (.predict inference feats grids-seq)]
+              [bot {:pred (vec (map double pred))
+                    :n-features (python/len feats)
+                    :n-zero (python/int
+                             (.sum np (.equal np feats 0.0)))}]))
+          (:bots bridge)))))
+
+(defn signals
+  "Compute the six bots' signals for the CURRENT bar and ADVANCE
+  hysteresis/consensus state (call exactly once per bar).
+
+  Returns {:chestnut k :lynx k :moose k :oak k :dolphin k :parrot k
+           :votes {:mult1 [...] :mult2 [...]}
+           :preds {bot [p-long p-gen p-short]}
+           :zs {bot {:long z :gen z :short z}}}"
+  [bridge]
+  (let [preds (predictions bridge)
+        bots* (:bots bridge)
+        st @(:state bridge)
+        step (fn [states mult]
+               (into {}
+                     (map (fn [bot]
+                            (let [cal (get-in bots* [bot :cal])
+                                  cal (if (== mult 1.0)
+                                        cal
+                                        (update cal :hysteresis
+                                                scale-hysteresis mult))]
+                              [bot (direction-step
+                                    (get-in preds [bot :pred])
+                                    cal
+                                    (get states bot))]))
+                          bots)))
+        r1 (step (:mult1 st) 1.0)
+        r2 (step (:mult2 st) 2.0)
+        votes1 (mapv #(:kind (get r1 %)) bots)
+        votes2 (mapv #(:kind (get r2 %)) bots)
+        oak (consensus-vote votes1 (:oak st))
+        parrot (consensus-vote votes1 (:parrot st))
+        dolphin (consensus-vote votes2 (:dolphin st))]
+    (reset! (:state bridge)
+            {:mult1 (into {} (map (fn [[b r]] [b (:state r)]) r1))
+             :mult2 (into {} (map (fn [[b r]] [b (:state r)]) r2))
+             :oak oak :dolphin dolphin :parrot parrot})
+    {:chestnut (:kind (:chestnut r1))
+     :lynx (:kind (:lynx r1))
+     :moose (:kind (:moose r1))
+     :oak oak
+     :dolphin dolphin
+     :parrot parrot
+     :votes {:mult1 votes1 :mult2 votes2}
+     :preds (into {} (map (fn [[b m]] [b (:pred m)]) preds))
+     :feature-stats (into {} (map (fn [[b m]]
+                                    [b {:n (:n-features m)
+                                        :n-zero (:n-zero m)}])
+                                  preds))
+     :zs (into {} (map (fn [[b r]] [b (:z r)]) r1))}))

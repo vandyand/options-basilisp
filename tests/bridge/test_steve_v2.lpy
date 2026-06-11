@@ -1,0 +1,226 @@
+(ns bridge.test-steve-v2
+  "bridge.steve-v2 — pure signal logic (consensus vote, hysteresis state
+  machine, calibration parsing) + torch-dependent bundle smoke tests.
+
+  The pure parts were verified equivalent to the Python reference by
+  scripts/bridge_spike.lpy (81/81 consensus cases vs
+  parrot_consensus._consensus_vote; 3090/3090 direction cases vs
+  DirectionEnsembleSignal.evaluate, run 2026-06-11) — these tests pin the
+  ported behavior so it can't drift.
+
+  Torch-dependent tests SKIP (assert true + println) when torch/the REF
+  tree are unavailable — the engine .venv has neither; run the full suite
+  with the REF .venv's basilisp to exercise them."
+  (:import datetime importlib json math zoneinfo)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.bridge.steve-v2 :as b]))
+
+(def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; consensus-vote — 2-of-3 state machine (parrot_consensus._consensus_vote)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(deftest consensus-vote-table
+  (testing "FLAT entries"
+    (is (= :long (b/consensus-vote [:long :long :flat] :flat)))
+    (is (= :long (b/consensus-vote [:long :long :long] :flat)))
+    (is (= :long (b/consensus-vote [:long :long :short] :flat)))
+    (is (= :short (b/consensus-vote [:short :short :flat] :flat)))
+    (is (= :short (b/consensus-vote [:short :short :long] :flat)))
+    (is (= :flat (b/consensus-vote [:long :short :flat] :flat)))
+    (is (= :flat (b/consensus-vote [:flat :flat :flat] :flat)))
+    (is (= :flat (b/consensus-vote [:long :flat :flat] :flat))))
+  (testing "LONG holds, drops, flips"
+    (is (= :long (b/consensus-vote [:long :long :flat] :long)))
+    (is (= :flat (b/consensus-vote [:long :flat :flat] :long)))
+    (is (= :flat (b/consensus-vote [:long :short :flat] :long)))
+    (is (= :short (b/consensus-vote [:short :short :flat] :long)))
+    (is (= :short (b/consensus-vote [:short :short :long] :long))))
+  (testing "SHORT holds, drops, flips"
+    (is (= :short (b/consensus-vote [:short :short :flat] :short)))
+    (is (= :flat (b/consensus-vote [:short :flat :flat] :short)))
+    (is (= :long (b/consensus-vote [:long :long :short] :short)))
+    (is (= :long (b/consensus-vote [:long :long :flat] :short)))))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; direction-step — hysteresis state machine
+;; (z thresholds chosen vs a unit calibration: std=1 ⇒ pred IS the z-score)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(def unit-cal
+  "std=1.0 calibration with the DirectionEnsembleSignal default hysteresis
+  (enter 0.75σ / exit-delta 0.50 → exit band at 0.25σ)."
+  {:std {:long 1.0 :gen 1.0 :short 1.0}
+   :hysteresis {:enter-long-sigma 0.75 :exit-long-delta 0.50
+                :enter-gen-long-sigma 0.50 :exit-gen-long-delta 0.50
+                :enter-gen-short-sigma 0.50 :exit-gen-short-delta 0.50
+                :enter-short-sigma 0.75 :exit-short-delta 0.50}
+   :regime-active true})
+
+(defn- step [pred state] (b/direction-step pred unit-cal state))
+(defn- in-kind [k] (assoc b/default-direction-state :last-kind k))
+
+(deftest direction-entry
+  (testing "AND-gated long entry: specialist AND generalist must agree"
+    (is (= :long (:kind (step [0.8 0.6 0.0] nil))))
+    (is (= :flat (:kind (step [0.8 0.4 0.0] nil))) "gen below gate")
+    (is (= :flat (:kind (step [0.7 0.6 0.0] nil))) "long head below gate"))
+  (testing "AND-gated short entry (sign-flipped)"
+    (is (= :short (:kind (step [0.0 -0.6 -0.8] nil))))
+    (is (= :flat (:kind (step [0.0 -0.4 -0.8] nil))))
+    (is (= :flat (:kind (step [0.0 -0.6 -0.7] nil)))))
+  (testing "gen head sign decides side when gates are zero"
+    ;; NOTE: simultaneous long+short entry (the |z| tiebreak branch) is
+    ;; structurally unreachable — it needs z-gen > enter-gen-long AND
+    ;; z-gen < -enter-gen-short at once, impossible for gates >= 0. The
+    ;; branch is kept verbatim for parity with the Python reference.
+    (let [cal (assoc unit-cal :hysteresis
+                     (zipmap b/hysteresis-keys (repeat 0.0)))]
+      (is (= :long (:kind (b/direction-step [0.9 0.1 -0.5] cal nil))))
+      (is (= :short (:kind (b/direction-step [0.5 -0.1 -0.9] cal nil)))))))
+
+(deftest direction-exit-and-hold
+  (testing "hold inside hysteresis band"
+    ;; entered at >0.75; holds while z-long > 0.25 AND z-gen > 0.0
+    (is (= :long (:kind (step [0.3 0.1 0.0] (in-kind :long))))))
+  (testing "OR-gated exit: either head crossing band exits"
+    (is (= :flat (:kind (step [0.2 0.1 0.0] (in-kind :long)))) "specialist exit")
+    (is (= :flat (:kind (step [0.3 -0.1 0.0] (in-kind :long)))) "generalist exit"))
+  (testing "exit straight into opposite entry"
+    (is (= :short (:kind (step [0.0 -0.6 -0.8] (in-kind :long)))))
+    (is (= :long (:kind (step [0.8 0.6 0.0] (in-kind :short))))))
+  (testing "short side hold/exit mirror"
+    (is (= :short (:kind (step [0.0 -0.1 -0.3] (in-kind :short)))))
+    (is (= :flat (:kind (step [0.0 -0.1 -0.2] (in-kind :short)))))
+    (is (= :flat (:kind (step [0.0 0.1 -0.3] (in-kind :short)))))))
+
+(deftest direction-faults
+  (testing "NaN prediction → REFUSE → flat + nan state"
+    (let [r (step [##NaN 0.0 0.0] (in-kind :long))]
+      (is (= :flat (:kind r)))
+      (is (= :nan-prediction (:fault r)))
+      (is (= :long (get-in r [:state :last-kind])) "prior kind carried")))
+  (testing "degenerate std → flat"
+    (is (= :degenerate-std
+           (:fault (b/direction-step [1.0 1.0 1.0]
+                                     (assoc-in unit-cal [:std :gen] 0.0)
+                                     nil)))))
+  (testing "regime gate forces flat"
+    (let [r (b/direction-step [5.0 5.0 0.0]
+                              (assoc unit-cal :regime-active false)
+                              (in-kind :long))]
+      (is (= :flat (:kind r)))
+      (is (= :regime-gated (:reason r))))))
+
+(deftest direction-state-roundtrip
+  (testing "emitted state feeds the next bar (hysteresis persistence)"
+    (let [r1 (step [0.8 0.6 0.0] nil)
+          r2 (step [0.3 0.1 0.0] (:state r1))
+          r3 (step [0.2 0.1 0.0] (:state r2))]
+      (is (= [:long :long :flat] [(:kind r1) (:kind r2) (:kind r3)])))))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; calibration parsing + DOLPHIN scaling
+;; ────────────────────────────────────────────────────────────────────────────
+
+(def cal-fixture
+  "Mini v0_legacy_freeze-shaped doc (values from the real chestnut bundle)."
+  "{\"bundle_version\": \"v0_legacy_freeze\",
+    \"state\": {\"final_target_std\": {\"gen\": 0.00033154842094518244,
+                                       \"long\": 0.00022409101075027138,
+                                       \"short\": 0.00022416624415200204},
+                \"hysteresis_params\": {\"enter_gen_long_sigma\": 0.4427,
+                                        \"enter_gen_short_sigma\": 0.6499,
+                                        \"enter_long_sigma\": 0.4175,
+                                        \"enter_short_sigma\": 0.3618,
+                                        \"exit_gen_long_delta\": 0.3081,
+                                        \"exit_gen_short_delta\": 0.568,
+                                        \"exit_long_delta\": 0.3321,
+                                        \"exit_short_delta\": 0.1655}}}")
+
+(deftest calibration-parsing
+  (let [cal (b/parse-calibration cal-fixture)]
+    (is (= "v0_legacy_freeze" (:bundle-version cal)))
+    (is (= 0.00022409101075027138 (get-in cal [:std :long])))
+    (is (= 0.4175 (get-in cal [:hysteresis :enter-long-sigma])))
+    (is (= 0.568 (get-in cal [:hysteresis :exit-gen-short-delta])))
+    (is (true? (:regime-active cal))
+        "freeze bundles lack regime_active → defaults true (live behavior)")))
+
+(deftest dolphin-scaling
+  (let [h (:hysteresis (b/parse-calibration cal-fixture))
+        h2 (b/scale-hysteresis h 2.0)]
+    (is (= 8 (count b/hysteresis-keys)))
+    (doseq [k b/hysteresis-keys]
+      (is (= (* 2.0 (get h k)) (get h2 k)) (str k " doubled")))))
+
+(deftest entry-threshold-from-real-calibration
+  (testing "entry expectations derived from chestnut v0_legacy_freeze numbers"
+    (let [cal (b/parse-calibration cal-fixture)
+          std (:std cal)
+          ;; preds sitting exactly 1σ above each enter gate → LONG
+          p [(* 0.4176 (:long std)) (* 0.4428 (:gen std)) 0.0]]
+      (is (= :long (:kind (b/direction-step p cal nil))))
+      ;; just under the long gate → flat
+      (is (= :flat (:kind (b/direction-step
+                           [(* 0.4174 (:long std)) (* 0.4428 (:gen std)) 0.0]
+                           cal nil)))))))
+
+;; ────────────────────────────────────────────────────────────────────────────
+;; torch/xgboost-dependent: bundle load + deterministic synthetic predict
+;; (skips unless torch + the REF tree are available — e.g. under REF/.venv)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(defn- ref-env-available? []
+  (try
+    (importlib/import-module "torch")
+    (importlib/import-module "xgboost")
+    true
+    (catch python/ImportError _ false)))
+
+(defn- synthetic-bars
+  "70 deterministic bars (gentle ramp so TA indicators are non-degenerate)."
+  [base]
+  (let [dt-cls (.-datetime datetime)
+        et (zoneinfo/ZoneInfo "America/New_York")]
+    (vec (for [i (range 70)]
+           (let [px (+ base (* 0.01 i))]
+             {:time (dt-cls 2026 6 11 ** :hour 10 :minute (mod i 60)
+                            :second (quot i 60) :tzinfo et)
+              :open px :high (+ px 0.05) :low (- px 0.05) :close px
+              :volume 1000.0})))))
+
+(deftest bundle-load-and-synthetic-predict
+  (if-not (ref-env-available?)
+    (do (println "SKIP bundle-load-and-synthetic-predict: torch/xgboost not"
+                 "importable (run under the REF .venv for full coverage)")
+        (is true))
+    (let [mk #(str ref-root "/pipeline_data/" %)
+          bridge (b/make-bridge
+                  {:ref-root ref-root
+                   :bundle-dirs {:chestnut (mk "live_model_chestnut_multihead")
+                                 :lynx (mk "live_model_lynx_multihead")
+                                 :moose (mk "live_model_moose_multihead")}
+                   :calibrations
+                   {:chestnut (mk "calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
+                    :lynx (mk "calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
+                    :moose (mk "calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}})]
+      ;; deterministic inputs: fixed synthetic bars, NO chain → zero grids
+      (b/prime! bridge
+                {"SPY" (synthetic-bars 600.0) "HYG" (synthetic-bars 80.0)
+                 "TLT" (synthetic-bars 85.0) "VXX" (synthetic-bars 26.0)}
+                [])
+      (let [preds (b/predictions bridge)]
+        (doseq [bot [:chestnut :lynx :moose]]
+          (let [{:keys [pred n-features]} (get preds bot)]
+            (is (= 918 n-features) (str bot " feature count"))
+            (is (= 3 (count pred)) (str bot " 3-head pred"))
+            (is (every? #(and (number? %) (math/isfinite %)) pred)
+                (str bot " finite preds: " pred)))))
+      ;; signals end-to-end: six kinds emitted, consensus consistent
+      (let [s (b/signals bridge)]
+        (doseq [bot [:chestnut :lynx :moose :oak :dolphin :parrot]]
+          (is (contains? #{:long :short :flat} (get s bot)) (str bot)))
+        (is (= (:oak s) (:parrot s))
+            "OAK and PARROT share the mult-1.0 consensus vote")))))

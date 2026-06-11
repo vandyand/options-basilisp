@@ -38,6 +38,7 @@ PURE_PREFIXES = (
 # forms, not underscored file paths) plus all base namespaces.
 FORBIDDEN_PREFIXES = (
     "stevetrading.broker.alpaca",
+    "stevetrading.broker.router",
     "stevetrading.broker.sim",
     "stevetrading.market-data.replay",
     "stevetrading.market-data.polygon",

@@ -48,7 +48,7 @@
            :underlying-id "equity/NASDAQ/SPY"
            :expiration "2026-06-12"
            :poll-seconds 0
-           :until "2026-06-10T23:59:00Z"
+           :until "2099-01-01T00:00:00Z"
            :transport (stub-transport current)}
           opts)))
 
@@ -102,7 +102,7 @@
             rb (mdp/next-observations src-b cursor1 1)]
         (is (= "2026-06-10T19:31:00.000000Z" (:cursor rb)))))
     (testing "stale snapshot + expired :until → exhausted, no emission"
-      (let [src-c (make-source current {:until "2026-06-10T00:00:00Z"})
+      (let [src-c (make-source current {:until "2000-01-01T00:00:00Z"})
             rc (mdp/next-observations src-c "2026-06-10T19:31:00.000000Z" 1)]
         (is (empty? (:observations rc)))
         (is (true? (:exhausted? rc)))))))
