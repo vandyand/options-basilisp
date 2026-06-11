@@ -173,13 +173,23 @@
                     (:facts (run-bridge chestnut-decl {:chestnut :long})))))))))
 
 (deftest bridge-same-kind-holds
-  (testing "unchanged kind -> :posture/hold -> NO facts; memory kept"
+  (testing "unchanged kind WITH a position -> :posture/hold -> NO facts"
     (let [{:keys [facts strategy-local-state']}
           (run-bridge chestnut-decl {:chestnut :long}
-                      {:local-state {:last-kind :long}})]
+                      {:local-state {:last-kind :long}
+                       :portfolio long-50-view})]
       (is (= [] facts))
       (is (= :long (:last-kind strategy-local-state')))))
-  (testing "unchanged :flat holds too"
+  (testing "unchanged directional kind with a FLAT book RE-EMITS the entry
+            (2026-06-11 stuck-hold fix: an entry skipped or never filled
+            must not deadlock the bot)"
+    (let [{:keys [facts]}
+          (run-bridge chestnut-decl {:chestnut :long}
+                      {:local-state {:last-kind :long}})]
+      (is (= :posture/enter-long
+             (get-in (first facts) [:fact/payload :decision/posture])))
+      (is (seq (intent-payloads facts)))))
+  (testing "unchanged :flat holds (flat kind + flat book is the fixpoint)"
     (is (= [] (:facts (run-bridge chestnut-decl {:chestnut :flat}
                                   {:local-state {:last-kind :flat}}))))))
 

@@ -146,12 +146,17 @@
                                 :vwap (python/float (:bar/close payload))
                                 :trade-count 0})
             ;; production cadence: one greeks grid per minute, keyed to
-            ;; the SPY bar; multi-expiration fetch matches their grid input
+            ;; the SPY bar. IN-LOOP fetches use a 14-day expiration
+            ;; horizon (~5 expirations) instead of prime's 90d — the 90d
+            ;; fetch (~18 serial REST calls + BS solve) stalled the cycle
+            ;; ~30-60s/bar on 2026-06-11 and the loop fell minutes behind
+            ;; real time. Near-dated expirations dominate the DTE-minute
+            ;; grid bins; documented parity deviation.
             (when (= sym "SPY")
               (try
                 (bridge/on-chain! br {:observed-at (datetime.datetime/now
                                                     (zoneinfo/ZoneInfo "America/New_York"))
-                                      :contracts (fetch-chain-contracts 90)})
+                                      :contracts (fetch-chain-contracts 14)})
                 (catch python/Exception e
                   (println "WARN chain fetch failed:" (str e)))))))
         :else nil))))
