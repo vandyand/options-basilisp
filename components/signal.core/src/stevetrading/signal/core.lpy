@@ -112,6 +112,72 @@
      :decision/net-credit (:prediction/value prediction)}))
 
 ;; ---------------------------------------------------------------------------
+;; :signal/steve-v2-bridge
+;; ---------------------------------------------------------------------------
+
+(def bridge-kind->posture
+  "Bridge signal kind (bridge.steve-v2 vocabulary) → canonical posture."
+  {:long  :posture/enter-long
+   :short :posture/enter-short
+   :flat  :posture/flatten})
+
+(defn- bridge-reason-codes
+  [posture]
+  (case posture
+    :posture/hold        [:reason/no-bridge-kind-change]
+    :posture/enter-long  [:reason/bridge-long]
+    :posture/enter-short [:reason/bridge-short]
+    :posture/flatten     [:reason/bridge-flat]))
+
+(defn decide-bridge-signal
+  "Posture decision for a bridge strategy (:signal/steve-v2-bridge). The
+  prediction stage is replaced by the bridge's per-bot kind
+  (:long/:short/:flat — bridge.steve-v2 `signals`); this fn applies the
+  same KIND-CHANGE-ONLY semantics as the v0.1 signal fns, with the memory
+  key :last-kind in strategy-local-state:
+
+    kind == (:last-kind local-state) -> :posture/hold (no facts)
+    changed to :long                 -> :posture/enter-long
+    changed to :short                -> :posture/enter-short
+    changed to :flat                 -> :posture/flatten
+
+  A nil :last-kind (first decision after warmup/restart) counts as a
+  distinct state, so the first kind always produces a posture — including
+  :flat -> :posture/flatten (risk allows; execution plans nothing when
+  already flat).
+
+  :decision/market-time is the slice's :last-time first (chain snapshots
+  between bars yield distinct decision ids, mirroring
+  :signal/credit-threshold-v1), bar-time fallback. The decision-id seed is
+  the same deterministic CANONICAL_SCHEMAS §5.2.6 hash used by the other
+  signal fns. The decision carries :decision/bridge-kind and
+  :decision/bot for the signal fact payload (observability + audit).
+
+  Throws ex-info on an unknown bridge kind (nil = the bridge returned no
+  entry for this bot)."
+  [strategy-decl bot kind market-slice strategy-local-state]
+  (when-not (contains? bridge-kind->posture kind)
+    (throw (ex-info (str "unknown bridge signal kind: " (pr-str kind))
+                    {:error/code :error/unknown-bridge-kind
+                     :error/kind kind
+                     :error/bot bot
+                     :error/strategy-id (:strategy/id strategy-decl)})))
+  (let [instrument-id (first (:strategy/instruments strategy-decl))
+        market-time (or (:last-time market-slice)
+                        (:bar/time (peek (vec (:bars market-slice)))))
+        last-kind (:last-kind strategy-local-state)
+        posture (if (= kind last-kind)
+                  :posture/hold
+                  (get bridge-kind->posture kind))]
+    {:decision/id (decision-id-for strategy-decl instrument-id market-time)
+     :decision/posture posture
+     :decision/reason-codes (bridge-reason-codes posture)
+     :decision/market-time market-time
+     :decision/instrument-id instrument-id
+     :decision/bridge-kind kind
+     :decision/bot bot}))
+
+;; ---------------------------------------------------------------------------
 ;; Dispatch
 ;; ---------------------------------------------------------------------------
 

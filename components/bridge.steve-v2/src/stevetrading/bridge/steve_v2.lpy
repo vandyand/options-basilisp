@@ -49,7 +49,31 @@
                        :expiration \"2026-06-12\"} ...]})
     (signals bridge) → {:chestnut :long|:short|:flat ... :oak ... :dolphin
                         ... :parrot ... :preds {...} :zs {...}}
-  `signals` ADVANCES hysteresis/consensus state — call exactly once per bar."
+  `signals` ADVANCES hysteresis/consensus state ONCE PER NEW BAR and is
+  IDEMPOTENT within a bar: the result is memoized by the last ingested
+  SPY bar time, so repeated calls before the next on-bar! return the
+  cached map without advancing state. This is load-bearing for the
+  engine, where run-pipeline runs per strategy per observation — six
+  bridge strategies call `signals` up to 6+ times per bar via the shared
+  handle.
+
+  ENGINE WIRING (launcher-side; the engine loop itself never touches the
+  bridge): construct the bridge + prime! it, then
+  - INGESTION via the loop's :on-observation hook, which fires once per
+    pulled observation: on :fact/market-bar-observed facts call
+    (on-bar! bridge {:symbol <mapped> ...}) — map the fact's
+    :record/instrument-id to the bridge symbol (the bridge needs
+    SPY/HYG/TLT/VXX bars, so the market-data source must supply all
+    four); on :fact/option-chain-observed facts call (on-chain! bridge
+    {:observed-at .. :contracts ..}) with the chain payload's contracts
+    (strike/right/bid/ask/expiration parsed from the contract
+    instrument ids).
+  - SIGNALS via the strategy entries: each of the six strategy entries
+    carries :bridge {:signals-fn (fn [] (signals bridge))} (the SAME
+    bridge — memoization makes the shared calls per-bar idempotent);
+    strategy.registry's bridge pipeline path reads its bot's kind from
+    the returned map. Tests inject a plain stub
+    {:signals-fn (fn [] {:chestnut :long ...})} — no torch needed."
   (:import collections
            datetime
            importlib
@@ -457,15 +481,19 @@
                              (.sum np (.equal np feats 0.0)))}]))
           (:bots bridge)))))
 
-(defn signals
-  "Compute the six bots' signals for the CURRENT bar and ADVANCE
-  hysteresis/consensus state (call exactly once per bar).
-
-  Returns {:chestnut k :lynx k :moose k :oak k :dolphin k :parrot k
-           :votes {:mult1 [...] :mult2 [...]}
-           :preds {bot [p-long p-gen p-short]}
-           :zs {bot {:long z :gen z :short z}}}"
+(defn- last-spy-bar-time
+  "The last ingested SPY bar's time object (the `signals` memoization
+  key), or nil when the buffer is empty."
   [bridge]
+  (let [spy (.__getitem__ (:buffers bridge) "SPY")]
+    (when (pos? (python/len spy))
+      (.get (.__getitem__ spy -1) "time"))))
+
+(defn- signals!*
+  "Compute the six bots' signals for the CURRENT bar and ADVANCE
+  hysteresis/consensus state. Internal — `signals` wraps this with the
+  per-bar memoization."
+  [bridge bar-time]
   (let [preds (predictions bridge)
         bots* (:bots bridge)
         st @(:state bridge)
@@ -488,21 +516,45 @@
         votes2 (mapv #(:kind (get r2 %)) bots)
         oak (consensus-vote votes1 (:oak st))
         parrot (consensus-vote votes1 (:parrot st))
-        dolphin (consensus-vote votes2 (:dolphin st))]
+        dolphin (consensus-vote votes2 (:dolphin st))
+        result {:chestnut (:kind (:chestnut r1))
+                :lynx (:kind (:lynx r1))
+                :moose (:kind (:moose r1))
+                :oak oak
+                :dolphin dolphin
+                :parrot parrot
+                :votes {:mult1 votes1 :mult2 votes2}
+                :preds (into {} (map (fn [[b m]] [b (:pred m)]) preds))
+                :feature-stats (into {} (map (fn [[b m]]
+                                               [b {:n (:n-features m)
+                                                   :n-zero (:n-zero m)}])
+                                             preds))
+                :zs (into {} (map (fn [[b r]] [b (:z r)]) r1))}]
     (reset! (:state bridge)
             {:mult1 (into {} (map (fn [[b r]] [b (:state r)]) r1))
              :mult2 (into {} (map (fn [[b r]] [b (:state r)]) r2))
-             :oak oak :dolphin dolphin :parrot parrot})
-    {:chestnut (:kind (:chestnut r1))
-     :lynx (:kind (:lynx r1))
-     :moose (:kind (:moose r1))
-     :oak oak
-     :dolphin dolphin
-     :parrot parrot
-     :votes {:mult1 votes1 :mult2 votes2}
-     :preds (into {} (map (fn [[b m]] [b (:pred m)]) preds))
-     :feature-stats (into {} (map (fn [[b m]]
-                                    [b {:n (:n-features m)
-                                        :n-zero (:n-zero m)}])
-                                  preds))
-     :zs (into {} (map (fn [[b r]] [b (:z r)]) r1))}))
+             :oak oak :dolphin dolphin :parrot parrot
+             :last-bar-time bar-time
+             :last-result result})
+    result))
+
+(defn signals
+  "The six bots' signals for the CURRENT bar, memoized by the last
+  ingested SPY bar time (ns docstring): the FIRST call after a new SPY
+  bar computes + advances hysteresis/consensus state; subsequent calls
+  before the next bar return the cached result without advancing
+  anything. With an empty SPY buffer every call computes (no caching
+  key) — production always primes bars first.
+
+  Returns {:chestnut k :lynx k :moose k :oak k :dolphin k :parrot k
+           :votes {:mult1 [...] :mult2 [...]}
+           :preds {bot [p-long p-gen p-short]}
+           :zs {bot {:long z :gen z :short z}}}"
+  [bridge]
+  (let [bar-time (last-spy-bar-time bridge)
+        st @(:state bridge)]
+    (if (and (some? bar-time)
+             (some? (:last-result st))
+             (= bar-time (:last-bar-time st)))
+      (:last-result st)
+      (signals!* bridge bar-time))))

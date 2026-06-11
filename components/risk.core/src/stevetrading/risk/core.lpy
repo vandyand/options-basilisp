@@ -27,8 +27,31 @@
     throughout the ledger)
   - ALLOW :posture/flatten always; approved quantity is the largest
     absolute net leg position (\"0\" when flat — execution then plans no
-    orders)"
-  (:import decimal))
+    orders)
+
+  Bridge policy :risk/steve-v2-default (the six steve-v2 bridge bots):
+  - account-ctx carries :risk/params ({:max-positions 1}) and
+    :risk/strategy-view (the strategy's :portfolio/by-strategy sub-view —
+    bridge strategies are judged on THEIR OWN positions, not the whole
+    account)
+  - the strategy's open direction is derived from the view's net
+    positions: the primary instrument's net sign (equity bots), and open
+    option positions (long call/short put -> :long, long put/short call
+    -> :short; the option bots only ever BUY options in v0)
+  - DENY entry when a SAME-direction position is already open
+    (:reason/position-exists); ALLOW entry when flat or when only an
+    OPPOSITE position exists (the direction executors emit close+open in
+    one plan — flip handled at execution, not risk)
+  - :max-positions is recorded but only 1 is supported in v0: the
+    same-direction deny plus the executors' close-first flip structurally
+    cap net entries at one position
+  - ALLOW :posture/flatten always; approved quantity is the view's total
+    absolute net quantity over the primary instrument + option positions
+    (\"0\" when flat). NOTE: the direction executors size closes from the
+    view themselves (per-lot for options); the flatten approved quantity
+    is recorded for observability, entries use it as the entry size."
+  (:import decimal)
+  (:require [stevetrading.domain.instruments :as instruments]))
 
 (defn- ->dec
   [s]
@@ -114,6 +137,75 @@
          :risk/reason-codes [:reason/no-action-requested]
          :risk/approved-quantity "0"}))))
 
+;; ---------------------------------------------------------------------------
+;; :risk/steve-v2-default helpers
+;; ---------------------------------------------------------------------------
+
+(defn- view-net-positions
+  "Seq of [instrument-id net-Decimal] for the non-zero net positions in a
+  :portfolio/by-strategy sub-view (nil view -> empty)."
+  [strategy-view]
+  (keep (fn [[iid qty-str]]
+          (let [net (->dec qty-str)]
+            (when-not (zero? net) [iid net])))
+        (:view/net-positions strategy-view)))
+
+(defn- position-direction
+  "Direction (:long/:short/nil) implied by one net position entry:
+  - the primary instrument (equity bots): sign of the net quantity
+  - an option instrument: long call/short put -> :long, long put/short
+    call -> :short
+  - anything else -> nil (not a directional exposure this policy reads)."
+  [primary-instrument-id iid net]
+  (if (= iid primary-instrument-id)
+    (if (pos? net) :long :short)
+    (let [ref (instruments/parse-instrument-id iid)]
+      (when (= :asset-class/option (:instrument/asset-class ref))
+        (let [long-lot? (pos? net)
+              call? (= :option-right/call (:instrument/right ref))]
+          (if (= long-lot? call?) :long :short))))))
+
+(defn- open-directions
+  "Set of open directions (#{} | #{:long} | #{:short} | both) in the
+  strategy view."
+  [strategy-view primary-instrument-id]
+  (into #{}
+        (keep (fn [[iid net]]
+                (position-direction primary-instrument-id iid net)))
+        (view-net-positions strategy-view)))
+
+(defn- steve-v2-default
+  [signal _portfolio-view account-ctx]
+  (let [view (:risk/strategy-view account-ctx)
+        primary (:decision/instrument-id signal)
+        dirs (open-directions view primary)
+        entry (fn [direction]
+                (if (contains? dirs direction)
+                  {:risk/decision :risk/deny
+                   :risk/reason-codes [:reason/position-exists]
+                   :risk/approved-quantity "0"}
+                  {:risk/decision :risk/allow
+                   :risk/reason-codes [:reason/risk-allowed]
+                   :risk/approved-quantity
+                   (or (:decision/requested-quantity signal) "1")}))]
+    (case (:decision/posture signal)
+      :posture/enter-long  (entry :long)
+      :posture/enter-short (entry :short)
+
+      :posture/flatten
+      (let [total (reduce (fn [acc [_ net]] (+ acc (abs net)))
+                          dec-zero
+                          (view-net-positions view))]
+        {:risk/decision :risk/allow
+         :risk/reason-codes (if (zero? total)
+                              [:reason/risk-allowed :reason/no-open-position]
+                              [:reason/risk-allowed])
+         :risk/approved-quantity (str total)})
+
+      {:risk/decision :risk/deny
+       :risk/reason-codes [:reason/no-action-requested]
+       :risk/approved-quantity "0"})))
+
 (defn evaluate-risk
   "Evaluate a signal decision under a risk policy. signal is the canonical
   signal decision map enriched with :decision/instrument-id and (for
@@ -133,6 +225,8 @@
                  (simple-direction-default signal portfolio-view account-ctx)
                  :risk/defined-risk-spread
                  (defined-risk-spread signal portfolio-view account-ctx)
+                 :risk/steve-v2-default
+                 (steve-v2-default signal portfolio-view account-ctx)
                  (throw (ex-info (str "unknown risk policy: " (pr-str policy))
                                  {:error/code :error/unknown-risk-policy
                                   :error/policy policy})))]

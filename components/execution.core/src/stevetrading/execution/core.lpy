@@ -47,7 +47,43 @@
   lots. The EXIT intent uses :position-effect/close with mirrored per-leg
   sides, closing both lot kinds. The per-leg side travels on the legs
   themselves; ledger.core resolves each fill's side from the intent leg
-  matching the fill's instrument."
+  matching the fill's instrument.
+
+  Steve-v2 bridge direction policies (instrument-ctx additionally carries
+  :execution/strategy-view — the strategy's :portfolio/by-strategy
+  sub-view; the option policy also reads :execution/chain — the market
+  slice's latest :fact/option-chain-observed payload — and
+  :execution/spot — the last bar close decimal string):
+
+  :execution/equity-direction-v1 — single-leg SPY market orders,
+  :tif/day. The executor receives ONE posture; a FLIP (entering while an
+  OPPOSITE net position exists in the strategy view) emits TWO intents in
+  one plan: slot 0 closes the existing net position, slot 1 opens the new
+  one. Entry quantity = :risk/approved-quantity; close quantity = |net|
+  from the view (never the risk quantity).
+  - :posture/enter-long  -> buy/open (after sell-close of any short)
+  - :posture/enter-short -> sell/open, opens a SHORT lot (after
+    sell-close of any long)
+  - :posture/flatten     -> close the net position (side opposite the net
+    sign, qty |net|); no position -> NO intents
+
+  :execution/single-leg-option-atm-v1 — long single options as direction
+  proxy (OAK/DOLPHIN). ATM = the chain contract of the wanted right with
+  BOTH quotes whose strike is closest to spot (ties -> lower strike);
+  entries are LIMIT at the (bid+ask)/2 mid rounded to 2dp.
+  - :posture/enter-long  -> BUY the ATM CALL (limit at mid)
+  - :posture/enter-short -> BUY the ATM PUT (limit at mid)
+  - :posture/flatten     -> one close intent per open option lot in the
+    strategy view (FIFO slot order): side opposite the lot side, limit at
+    the contract's current mid, or a MARKET order when the contract is no
+    longer quoted two-sided in the chain
+  - flip -> close every open option lot (slots 0..n-1) + open the new
+    contract (slot n) in one plan
+  - NO chain in the slice -> NO intents; plan-execution returns
+    :execution/skip-reason :skip/no-chain (the pipeline then emits no
+    plan/intent facts). Likewise :skip/no-spot (no bars yet) and
+    :skip/no-eligible-contract (chain present but no two-sided contract
+    of the wanted right)."
   (:require [stevetrading.domain.instruments :as instruments]
             [stevetrading.domain.schemas :as schemas])
   (:import decimal))
@@ -233,6 +269,199 @@
                          :policy :execution/iron-condor-v1}))))
 
 ;; ---------------------------------------------------------------------------
+;; :execution/equity-direction-v1
+;; ---------------------------------------------------------------------------
+
+(defn- view-net
+  "Net position Decimal for instrument-id in a :portfolio/by-strategy
+  sub-view (nil view -> 0)."
+  [strategy-view instrument-id]
+  (decimal/Decimal
+   (or (get-in strategy-view [:view/net-positions instrument-id]) "0")))
+
+(defn- equity-direction-v1
+  [risk-approved-signal instrument-ctx account-id]
+  (let [decision-id (:decision/id risk-approved-signal)
+        posture (:decision/posture risk-approved-signal)
+        quantity (:risk/approved-quantity risk-approved-signal)
+        instrument-id (:instrument/id instrument-ctx)
+        net (view-net (:execution/strategy-view instrument-ctx) instrument-id)
+        base {:decision-id decision-id
+              :order-type :order-type/market
+              :tif :tif/day
+              :limit-price nil
+              :instrument-id instrument-id
+              :account-id account-id}
+        close-intent (fn [slot]
+                       (order-intent
+                        (assoc base
+                               :intent-slot slot
+                               :role :intent-role/exit
+                               :side (if (pos? net)
+                                       :order-side/sell
+                                       :order-side/buy)
+                               :effect :position-effect/close
+                               :quantity (str (abs net)))))
+        open-intent (fn [slot side]
+                      (order-intent
+                       (assoc base
+                              :intent-slot slot
+                              :role :intent-role/entry
+                              :side side
+                              :effect :position-effect/open
+                              :quantity quantity)))
+        ;; flip = close the opposite net position (slot 0) then open
+        ;; (slot 1); same-direction entry is risk-denied upstream — plan
+        ;; nothing rather than double up if it ever reaches here.
+        enter (fn [side opposite?]
+                (cond
+                  (zero-qty? quantity) []
+                  (zero? net) [(open-intent 0 side)]
+                  opposite? [(close-intent 0) (open-intent 1 side)]
+                  :else []))]
+    (case posture
+      :posture/enter-long  (enter :order-side/buy (neg? net))
+      :posture/enter-short (enter :order-side/sell (pos? net))
+      :posture/flatten     (if (zero? net) [] [(close-intent 0)])
+      (unplannable-posture! :execution/equity-direction-v1 posture))))
+
+;; ---------------------------------------------------------------------------
+;; :execution/single-leg-option-atm-v1
+;; ---------------------------------------------------------------------------
+
+(def ^:private dec-two (decimal/Decimal "2"))
+(def ^:private dec-cent (decimal/Decimal "0.01"))
+
+(defn- contract-mid
+  "Two-sided (bid+ask)/2 mid Decimal for one chain contract, or nil."
+  [contract]
+  (let [bid (:quote/bid contract)
+        ask (:quote/ask contract)]
+    (when (and (some? bid) (some? ask))
+      (/ (+ (decimal/Decimal bid) (decimal/Decimal ask)) dec-two))))
+
+(defn- mid-2dp
+  "Limit-price decimal string: mid rounded to 2dp (Decimal quantize,
+  default half-even)."
+  [mid]
+  (str (.quantize mid dec-cent)))
+
+(defn- atm-contract
+  "The chain contract of the wanted right (:option-right/call|put) with
+  both quotes whose strike is closest to spot. Deterministic ties: lower
+  strike. Returns {:instrument/id .. :mid Decimal} or nil."
+  [chain spot right]
+  (->> (:chain/contracts chain)
+       (keep (fn [c]
+               (let [ref (instruments/parse-instrument-id (:instrument/id c))
+                     mid (contract-mid c)]
+                 (when (and (some? mid)
+                            (= :asset-class/option
+                               (:instrument/asset-class ref))
+                            (= right (:instrument/right ref)))
+                   {:instrument/id (:instrument/id c)
+                    :mid mid
+                    :strike (decimal/Decimal (:instrument/strike ref))}))))
+       (sort-by (fn [{:keys [strike]}]
+                  (python/tuple [(abs (- strike spot)) strike])))
+       (first)))
+
+(defn- chain-mids
+  "{instrument-id mid-Decimal} for every two-sided contract in the chain."
+  [chain]
+  (into {}
+        (keep (fn [c]
+                (when-let [mid (contract-mid c)]
+                  [(:instrument/id c) mid])))
+        (:chain/contracts chain)))
+
+(defn- open-option-lots
+  [strategy-view]
+  (filterv #(.startswith (str (:lot/instrument-id %)) "option/")
+           (:view/open-lots strategy-view)))
+
+(defn- close-option-lot-intents
+  "One close intent per open option lot, FIFO slot order. Side opposite
+  the lot side; limit at the contract's current chain mid, market when the
+  contract is no longer quoted two-sided."
+  [{:keys [decision-id account-id lots mids]}]
+  (vec
+   (map-indexed
+    (fn [slot lot]
+      (let [iid (:lot/instrument-id lot)
+            mid (get mids iid)]
+        (order-intent {:decision-id decision-id
+                       :intent-slot slot
+                       :role :intent-role/exit
+                       :side (if (= :order-side/sell (:lot/side lot))
+                               :order-side/buy
+                               :order-side/sell)
+                       :effect :position-effect/close
+                       :order-type (if mid
+                                     :order-type/limit
+                                     :order-type/market)
+                       :tif :tif/day
+                       :quantity (:lot/remaining-quantity lot)
+                       :limit-price (when mid (mid-2dp mid))
+                       :instrument-id iid
+                       :account-id account-id})))
+    lots)))
+
+(defn- skip
+  [reason]
+  {:execution/order-intents []
+   :execution/skip-reason reason})
+
+(defn- single-leg-option-atm-v1
+  [risk-approved-signal instrument-ctx account-id]
+  (let [decision-id (:decision/id risk-approved-signal)
+        posture (:decision/posture risk-approved-signal)
+        quantity (:risk/approved-quantity risk-approved-signal)
+        chain (:execution/chain instrument-ctx)
+        spot-str (:execution/spot instrument-ctx)
+        lots (open-option-lots (:execution/strategy-view instrument-ctx))
+        closes (fn [] (close-option-lot-intents
+                       {:decision-id decision-id
+                        :account-id account-id
+                        :lots lots
+                        :mids (chain-mids chain)}))
+        enter (fn [right]
+                (cond
+                  (zero-qty? quantity) []
+                  (nil? spot-str) (skip :skip/no-spot)
+                  :else
+                  (let [pick (atm-contract chain
+                                           (decimal/Decimal spot-str)
+                                           right)]
+                    (if (nil? pick)
+                      (skip :skip/no-eligible-contract)
+                      ;; flip: close every open option lot first (only
+                      ;; opposite-direction lots can exist — same-direction
+                      ;; entries are risk-denied), then open.
+                      (let [close-intents (closes)]
+                        (conj close-intents
+                              (order-intent
+                               {:decision-id decision-id
+                                :intent-slot (count close-intents)
+                                :role :intent-role/entry
+                                :side :order-side/buy
+                                :effect :position-effect/open
+                                :order-type :order-type/limit
+                                :tif :tif/day
+                                :quantity quantity
+                                :limit-price (mid-2dp (:mid pick))
+                                :instrument-id (:instrument/id pick)
+                                :account-id account-id})))))))]
+    (if (nil? chain)
+      (skip :skip/no-chain)
+      (case posture
+        :posture/enter-long  (enter :option-right/call)
+        :posture/enter-short (enter :option-right/put)
+        :posture/flatten     (closes)
+        (unplannable-posture! :execution/single-leg-option-atm-v1
+                              posture)))))
+
+;; ---------------------------------------------------------------------------
 ;; plan-execution
 ;; ---------------------------------------------------------------------------
 
@@ -248,20 +477,31 @@
                             :execution/decision-id ..
                             :execution/order-intent-ids [..]}
            :execution/order-intents [full §11.3 payloads]}
+  plus :execution/skip-reason when a policy planned nothing for a stated
+  reason (e.g. :skip/no-chain — see ns docstring).
 
   Deterministic; throws ex-info on unknown policy ids."
   [policy risk-approved-signal instrument-ctx account-id]
-  (let [intents (case policy
-                  :execution/market-equity-v1
-                  (market-equity-v1 risk-approved-signal instrument-ctx account-id)
-                  :execution/vertical-credit-spread-v1
-                  (vertical-credit-spread-v1 risk-approved-signal instrument-ctx account-id)
-                  :execution/iron-condor-v1
-                  (iron-condor-v1 risk-approved-signal instrument-ctx account-id)
-                  (throw (ex-info (str "unknown execution policy: " (pr-str policy))
-                                  {:error/code :error/unknown-execution-policy
-                                   :error/policy policy})))]
-    {:execution/plan {:execution/policy-id policy
-                      :execution/decision-id (:decision/id risk-approved-signal)
-                      :execution/order-intent-ids (mapv :order-intent/id intents)}
-     :execution/order-intents intents}))
+  (let [result (case policy
+                 :execution/market-equity-v1
+                 (market-equity-v1 risk-approved-signal instrument-ctx account-id)
+                 :execution/vertical-credit-spread-v1
+                 (vertical-credit-spread-v1 risk-approved-signal instrument-ctx account-id)
+                 :execution/iron-condor-v1
+                 (iron-condor-v1 risk-approved-signal instrument-ctx account-id)
+                 :execution/equity-direction-v1
+                 (equity-direction-v1 risk-approved-signal instrument-ctx account-id)
+                 :execution/single-leg-option-atm-v1
+                 (single-leg-option-atm-v1 risk-approved-signal instrument-ctx account-id)
+                 (throw (ex-info (str "unknown execution policy: " (pr-str policy))
+                                 {:error/code :error/unknown-execution-policy
+                                  :error/policy policy})))
+        ;; policies return a vector of intents, or a {:execution/order-intents
+        ;; [] :execution/skip-reason ..} map when skipping for a reason
+        intents (if (map? result) (:execution/order-intents result) result)
+        skip-reason (when (map? result) (:execution/skip-reason result))]
+    (cond-> {:execution/plan {:execution/policy-id policy
+                              :execution/decision-id (:decision/id risk-approved-signal)
+                              :execution/order-intent-ids (mapv :order-intent/id intents)}
+             :execution/order-intents intents}
+      (some? skip-reason) (assoc :execution/skip-reason skip-reason))))

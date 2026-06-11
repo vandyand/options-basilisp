@@ -52,6 +52,16 @@
     :intent-role/exit
     :intent-role/adjust})
 
+;; Signal postures (STRATEGY_PIPELINE §5.4 decision payloads).
+;; :posture/enter-short added for the steve-v2 bridge strategies (the
+;; Python direction bots emit :short kinds); existing v0.1 signal fns
+;; never produce it.
+(def postures
+  #{:posture/enter-long
+    :posture/enter-short
+    :posture/flatten
+    :posture/hold})
+
 ;; BROKER_ADAPTER_CONTRACTS §5.2 — allowed canonical broker statuses.
 (def broker-statuses
   #{:broker-status/new

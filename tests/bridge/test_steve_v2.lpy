@@ -168,6 +168,30 @@
                            cal nil)))))))
 
 ;; ────────────────────────────────────────────────────────────────────────────
+;; signals memoization — idempotent per ingested SPY bar (no torch needed:
+;; the cache-hit path never reaches predictions, and the cache-bypass path
+;; is detected by the fake bridge blowing up when it DOES reach them)
+;; ────────────────────────────────────────────────────────────────────────────
+
+(deftest signals-memoized-per-bar
+  (let [spy-buf (python/list [#py {"time" "2026-06-11T10:00" "close" 600.0}])
+        cached {:chestnut :long :lynx :flat :moose :flat
+                :oak :flat :dolphin :flat :parrot :flat}
+        bridge {:buffers #py {"SPY" spy-buf}
+                :state (atom {:last-bar-time "2026-06-11T10:00"
+                              :last-result cached})}]
+    (testing "repeated calls within the same bar return the cached result"
+      (is (= cached (b/signals bridge)))
+      (is (= cached (b/signals bridge))))
+    (testing "a NEW bar time bypasses the cache (recompute is attempted)"
+      (.append spy-buf #py {"time" "2026-06-11T10:01" "close" 600.5})
+      (is (= :recomputed
+             (try
+               (b/signals bridge)
+               :served-stale-cache
+               (catch python/Exception _ :recomputed)))))))
+
+;; ────────────────────────────────────────────────────────────────────────────
 ;; torch/xgboost-dependent: bundle load + deterministic synthetic predict
 ;; (skips unless torch + the REF tree are available — e.g. under REF/.venv)
 ;; ────────────────────────────────────────────────────────────────────────────

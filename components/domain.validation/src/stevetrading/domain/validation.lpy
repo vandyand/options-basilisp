@@ -56,7 +56,8 @@
    :order-intent/role          enums/intent-roles
    :leg/side                   enums/order-sides
    :broker/status              enums/broker-statuses
-   :fill/liquidity             enums/liquidity})
+   :fill/liquidity             enums/liquidity
+   :decision/posture           enums/postures})
 
 (def ^:private decimal-fields
   #{:order-intent/quantity

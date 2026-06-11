@@ -1,0 +1,312 @@
+(ns strategy.test-bridge-pipeline
+  "Bridge strategy pipeline tests (the six steve-v2 bots): declaration
+  validation without features/inference, the run-pipeline :bridge path
+  (signal from a stub {:signals-fn ..} handle — NO torch), kind-change
+  posture semantics (:last-kind memory), the :posture/enter-short enum
+  extension, flip close+open planning, and deterministic intent ids."
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.strategy.registry :as registry]))
+
+(def account-id "account/sim/test")
+(def spy "equity/NASDAQ/SPY")
+
+(defn- load-decl [name*]
+  (edn/read-string (slurp (str "resources/strategies/steve/" name* ".edn"))))
+
+(def chestnut-decl (load-decl "chestnut-h3-v2"))
+(def oak-decl (load-decl "oak-v2"))
+(def all-decls
+  (mapv load-decl ["chestnut-h3-v2" "lynx-h3-v2" "moose-h3-v2"
+                   "parrot-v2" "oak-v2" "dolphin-v2"]))
+
+(def sma-decl
+  (edn/read-string
+   (slurp "resources/strategies/simple-direction-sma-cross-v1.edn")))
+
+(def chestnut-sid "strategy/steve-v2/chestnut/v1")
+(def oak-sid "strategy/steve-v2/oak/v1")
+
+(def slice
+  {:bars [{:bar/time "2026-06-10T14:30:00Z"
+           :bar/open "550.00" :bar/high "550.40"
+           :bar/low "549.90" :bar/close "550.20"
+           :bar/volume "1000"}]
+   :last-time "2026-06-10T14:30:00Z"})
+
+(def chain
+  {:chain/observed-at "2026-06-10T14:30:00Z"
+   :chain/underlying spy
+   :chain/contracts
+   [{:instrument/id "option/OPRA/SPY/2026-06-12/C/545.000"
+     :quote/bid "5.50" :quote/ask "5.70"}
+    {:instrument/id "option/OPRA/SPY/2026-06-12/C/550.000"
+     :quote/bid "2.10" :quote/ask "2.20"}
+    {:instrument/id "option/OPRA/SPY/2026-06-12/C/555.000"
+     :quote/bid "0.70" :quote/ask "0.80"}
+    {:instrument/id "option/OPRA/SPY/2026-06-12/P/550.000"
+     :quote/bid "1.90" :quote/ask "2.00"}
+    {:instrument/id "option/OPRA/SPY/2026-06-12/P/545.000"
+     :quote/bid "0.60" :quote/ask "0.70"}]})
+
+(defn- stub-bridge
+  "Test bridge handle: a plain map with :signals-fn (no torch)."
+  [kinds]
+  {:signals-fn (fn [] kinds)})
+
+(defn- run-bridge
+  "Run the pipeline for decl with a stub bridge returning kinds.
+  opts: :local-state, :portfolio, :slice."
+  ([decl kinds] (run-bridge decl kinds {}))
+  ([decl kinds {:keys [local-state portfolio slice*]
+                :or {local-state {} portfolio {} slice* slice}}]
+   (registry/run-pipeline {:strategy decl
+                           :market-slice slice*
+                           :strategy-local-state local-state
+                           :portfolio-view portfolio
+                           :artifacts {}
+                           :account-id account-id
+                           :mode :mode/sim
+                           :bridge (stub-bridge kinds)})))
+
+(defn- strategy-view
+  "Portfolio view holding ONE strategy's by-strategy sub-view."
+  [sid view]
+  {:portfolio/by-strategy {sid view}})
+
+(def long-50-view
+  (strategy-view chestnut-sid {:view/net-positions {spy "50"}}))
+
+(defn- intent-payloads [facts]
+  (mapv :fact/payload
+        (filter #(= :fact/order-intent-created (:record/type %)) facts)))
+
+;; ---------------------------------------------------------------------------
+;; Declaration validation
+;; ---------------------------------------------------------------------------
+
+(deftest bridge-decl-validation
+  (testing "all six shipped bridge declarations are valid WITHOUT features/inference"
+    (doseq [decl all-decls]
+      (is (= {:valid? true} (registry/validate-strategy-decl decl))
+          (:strategy/id decl))
+      (is (nil? (:strategy/features decl)))
+      (is (nil? (:strategy/inference decl)))))
+  (testing "2-arity validation with no artifacts also passes (no compatibility surface)"
+    (is (= {:valid? true} (registry/validate-strategy-decl chestnut-decl {}))))
+  (testing "the registry maps all six by id"
+    (is (= 6 (count (registry/build-registry all-decls)))))
+  (testing "bridge decl must use the :signal/steve-v2-bridge signal fn"
+    (let [{:keys [valid? errors]}
+          (registry/validate-strategy-decl
+           (assoc chestnut-decl :strategy/signal {:fn-id :signal/sma-crossover-v1}))]
+      (is (false? valid?))
+      (is (some #(= [:strategy/signal :fn-id] (:error/path %)) errors))))
+  (testing "bridge decl bot must be one of the six"
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (assoc chestnut-decl :strategy/bridge {:bot :badger}))))))
+  (testing "non-bridge declarations keep their behavior (features/inference required)"
+    (is (= {:valid? true} (registry/validate-strategy-decl sma-decl)))
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (dissoc sma-decl :strategy/features)))))
+    (is (false? (:valid? (registry/validate-strategy-decl
+                          (dissoc sma-decl :strategy/inference)))))))
+
+(deftest enter-short-posture-enum
+  (testing ":posture/enter-short is a known posture"
+    (is (contains? enums/postures :posture/enter-short)))
+  (testing "validation accepts enter-short and rejects unknown postures"
+    (let [fact-with (fn [posture]
+                      (-> (run-bridge chestnut-decl {:chestnut :short}
+                                      {:local-state {:last-kind :long}
+                                       :portfolio long-50-view})
+                          :facts
+                          first
+                          (assoc-in [:fact/payload :decision/posture] posture)))]
+      (is (true? (:valid? (v/validate-fact (fact-with :posture/enter-short)))))
+      (let [{:keys [valid? errors]} (v/validate-fact (fact-with :posture/sideways))]
+        (is (false? valid?))
+        (is (some #(= :error/invalid-enum (:error/code %)) errors))))))
+
+;; ---------------------------------------------------------------------------
+;; Equity bridge pipeline (chestnut)
+;; ---------------------------------------------------------------------------
+
+(deftest bridge-long-enters-equity
+  (let [{:keys [facts strategy-local-state']}
+        (run-bridge chestnut-decl {:chestnut :long :lynx :flat :moose :flat
+                                   :oak :flat :dolphin :flat :parrot :flat})]
+    (testing "signal -> risk -> plan -> intent; NO prediction fact (v0 bridge)"
+      (is (= [:fact/signal-decision-produced
+              :fact/risk-decision-recorded
+              :fact/execution-plan-produced
+              :fact/order-intent-created]
+             (mapv :record/type facts))))
+    (testing "every emitted envelope is canonically valid"
+      (is (every? #(:valid? (v/validate-fact %)) facts)))
+    (testing "signal fact carries the bridge kind + bot"
+      (let [payload (:fact/payload (first facts))]
+        (is (= :posture/enter-long (:decision/posture payload)))
+        (is (= :long (:decision/bridge-kind payload)))
+        (is (= :chestnut (:decision/bot payload)))
+        (is (= [:reason/bridge-long] (:decision/reason-codes payload)))))
+    (testing "intent: BUY 50 SPY market/open/entry"
+      (let [[intent] (intent-payloads facts)]
+        (is (= :order-side/buy (:order-intent/side intent)))
+        (is (= :position-effect/open (:order-intent/effect intent)))
+        (is (= :order-type/market (:order-intent/order-type intent)))
+        (is (= :tif/day (:order-intent/time-in-force intent)))
+        (is (= "50" (:order-intent/quantity intent)))
+        (is (= :intent-role/entry (:order-intent/role intent)))
+        (is (= [{:instrument/id spy
+                 :leg/side :order-side/buy
+                 :leg/quantity "50"}]
+               (:order-intent/legs intent)))))
+    (testing "posture memory records the kind"
+      (is (= :long (:last-kind strategy-local-state'))))
+    (testing "re-run produces the same deterministic intent id (§12 replay-stable)"
+      (is (= (mapv :order-intent/id (intent-payloads facts))
+             (mapv :order-intent/id
+                   (intent-payloads
+                    (:facts (run-bridge chestnut-decl {:chestnut :long})))))))))
+
+(deftest bridge-same-kind-holds
+  (testing "unchanged kind -> :posture/hold -> NO facts; memory kept"
+    (let [{:keys [facts strategy-local-state']}
+          (run-bridge chestnut-decl {:chestnut :long}
+                      {:local-state {:last-kind :long}})]
+      (is (= [] facts))
+      (is (= :long (:last-kind strategy-local-state')))))
+  (testing "unchanged :flat holds too"
+    (is (= [] (:facts (run-bridge chestnut-decl {:chestnut :flat}
+                                  {:local-state {:last-kind :flat}}))))))
+
+(deftest bridge-flat-flattens-position
+  (let [{:keys [facts strategy-local-state']}
+        (run-bridge chestnut-decl {:chestnut :flat}
+                    {:local-state {:last-kind :long}
+                     :portfolio long-50-view})]
+    (testing "long -> flat with an open position closes it"
+      (is (= :posture/flatten
+             (get-in (first facts) [:fact/payload :decision/posture])))
+      (let [[intent] (intent-payloads facts)]
+        (is (= :order-side/sell (:order-intent/side intent)))
+        (is (= :position-effect/close (:order-intent/effect intent)))
+        (is (= "50" (:order-intent/quantity intent)))
+        (is (= :intent-role/exit (:order-intent/role intent))))
+      (is (= :flat (:last-kind strategy-local-state'))))))
+
+(deftest bridge-flat-without-position-plans-nothing
+  (testing "first decision :flat (nil memory) -> flatten allowed, qty 0, no plan/intent"
+    (let [{:keys [facts]} (run-bridge chestnut-decl {:chestnut :flat})]
+      (is (= [:fact/signal-decision-produced
+              :fact/risk-decision-recorded]
+             (mapv :record/type facts)))
+      (is (= :risk/allow (get-in (second facts) [:fact/payload :risk/decision])))
+      (is (= "0" (get-in (second facts) [:fact/payload :risk/approved-quantity]))))))
+
+(deftest bridge-flip-long-to-short
+  (let [{:keys [facts]}
+        (run-bridge chestnut-decl {:chestnut :short}
+                    {:local-state {:last-kind :long}
+                     :portfolio long-50-view})
+        intents (intent-payloads facts)]
+    (testing "enter-short with an open long -> TWO intents: close then open"
+      (is (= :posture/enter-short
+             (get-in (first facts) [:fact/payload :decision/posture])))
+      (is (= 2 (count intents)))
+      (let [[close open] intents]
+        (is (= 0 (:order-intent/intent-slot close)))
+        (is (= :intent-role/exit (:order-intent/role close)))
+        (is (= :order-side/sell (:order-intent/side close)))
+        (is (= :position-effect/close (:order-intent/effect close)))
+        (is (= "50" (:order-intent/quantity close)))
+        (is (= 1 (:order-intent/intent-slot open)))
+        (is (= :intent-role/entry (:order-intent/role open)))
+        (is (= :order-side/sell (:order-intent/side open)))
+        (is (= :position-effect/open (:order-intent/effect open)))
+        (is (= "50" (:order-intent/quantity open)))
+        (is (not= (:order-intent/id close) (:order-intent/id open)))))
+    (testing "all flip facts validate (enter-short accepted end to end)"
+      (is (every? #(:valid? (v/validate-fact %)) facts)))
+    (testing "flip intent ids are deterministic on re-run"
+      (is (= (mapv :order-intent/id intents)
+             (mapv :order-intent/id
+                   (intent-payloads
+                    (:facts (run-bridge chestnut-decl {:chestnut :short}
+                                        {:local-state {:last-kind :long}
+                                         :portfolio long-50-view})))))))))
+
+(deftest bridge-same-direction-entry-denied
+  (testing "entering long with an open long is risk-denied (max-positions 1)"
+    (let [{:keys [facts]}
+          (run-bridge chestnut-decl {:chestnut :long}
+                      {:local-state {:last-kind :flat}
+                       :portfolio long-50-view})]
+      (is (= [:fact/signal-decision-produced
+              :fact/risk-decision-recorded]
+             (mapv :record/type facts)))
+      (is (= :risk/deny (get-in (second facts) [:fact/payload :risk/decision])))
+      (is (= [:reason/position-exists]
+             (get-in (second facts) [:fact/payload :risk/reason-codes]))))))
+
+;; ---------------------------------------------------------------------------
+;; Option bridge pipeline (oak)
+;; ---------------------------------------------------------------------------
+
+(deftest bridge-oak-buys-atm-call
+  (let [{:keys [facts]}
+        (run-bridge oak-decl {:oak :long}
+                    {:slice* (assoc slice :chain chain)})]
+    (testing "ATM CALL (strike closest to spot 550.20) at the 2dp mid limit"
+      (is (= [:fact/signal-decision-produced
+              :fact/risk-decision-recorded
+              :fact/execution-plan-produced
+              :fact/order-intent-created]
+             (mapv :record/type facts)))
+      (let [[intent] (intent-payloads facts)]
+        (is (= :order-side/buy (:order-intent/side intent)))
+        (is (= :position-effect/open (:order-intent/effect intent)))
+        (is (= :order-type/limit (:order-intent/order-type intent)))
+        (is (= "2.15" (:order-intent/limit-price intent)))
+        (is (= "1" (:order-intent/quantity intent)))
+        (is (= [{:instrument/id "option/OPRA/SPY/2026-06-12/C/550.000"
+                 :leg/side :order-side/buy
+                 :leg/quantity "1"}]
+               (:order-intent/legs intent)))))
+    (testing "envelopes valid"
+      (is (every? #(:valid? (v/validate-fact %)) facts)))))
+
+(deftest bridge-oak-no-chain-plans-nothing
+  (testing "no chain in the slice -> signal + risk facts only (skip, no intents)"
+    (let [{:keys [facts]} (run-bridge oak-decl {:oak :long})]
+      (is (= [:fact/signal-decision-produced
+              :fact/risk-decision-recorded]
+             (mapv :record/type facts)))
+      (is (= :risk/allow (get-in (second facts) [:fact/payload :risk/decision]))))))
+
+(deftest bridge-oak-flatten-sells-open-lot
+  (let [lot {:lot/instrument-id "option/OPRA/SPY/2026-06-12/C/550.000"
+             :lot/side :order-side/buy
+             :lot/remaining-quantity "1"}
+        portfolio (strategy-view
+                   oak-sid
+                   {:view/net-positions {"option/OPRA/SPY/2026-06-12/C/550.000" "1"}
+                    :view/open-lots [lot]})
+        {:keys [facts]}
+        (run-bridge oak-decl {:oak :flat}
+                    {:local-state {:last-kind :long}
+                     :portfolio portfolio
+                     :slice* (assoc slice :chain chain)})]
+    (testing "flatten sells the open option lot at the current mid"
+      (let [[intent] (intent-payloads facts)]
+        (is (= :order-side/sell (:order-intent/side intent)))
+        (is (= :position-effect/close (:order-intent/effect intent)))
+        (is (= :order-type/limit (:order-intent/order-type intent)))
+        (is (= "2.15" (:order-intent/limit-price intent)))
+        (is (= [{:instrument/id "option/OPRA/SPY/2026-06-12/C/550.000"
+                 :leg/side :order-side/sell
+                 :leg/quantity "1"}]
+               (:order-intent/legs intent)))))))

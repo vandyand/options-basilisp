@@ -1,0 +1,26 @@
+;; Bridge strategy declaration (STRATEGY_PIPELINE §4 + the :strategy/bridge
+;; extension) — DOLPHIN v2: the 2-of-3 consensus vote over
+;; CHESTNUT/LYNX/MOOSE at hysteresis mult 2.0 (higher conviction
+;; thresholds than OAK/PARROT), expressed as LONG SINGLE ATM SPY OPTIONS
+;; (call when long, put when short —
+;; :execution/single-leg-option-atm-v1), signalling through
+;; components/bridge.steve-v2. No :strategy/features/:strategy/inference —
+;; the feature/inference stages live Python-side; risk + execution run
+;; through the canonical pipeline. Entries need an option-chain snapshot
+;; in the market slice (no chain -> the executor skips with
+;; :skip/no-chain and no intents are planned).
+
+{:strategy/id "strategy/steve-v2/dolphin/v1"
+ :strategy/family :strategy-family/steve-v2
+ :strategy/name :strategy-name/dolphin
+ :strategy/version 1
+ :strategy/mode-policy #{:mode/paper :mode/sim}
+ :strategy/schedule {:session :session/us-equities-regular}
+ :strategy/warmup {:required-bars 1}
+ :strategy/instruments ["equity/NASDAQ/SPY"]
+ :strategy/bridge {:bot :dolphin}
+ :strategy/signal {:fn-id :signal/steve-v2-bridge}
+ :strategy/risk {:policy-id :risk/steve-v2-default
+                 :params {:max-positions 1}}
+ :strategy/execution {:policy-id :execution/single-leg-option-atm-v1
+                      :params {:quantity "1"}}}

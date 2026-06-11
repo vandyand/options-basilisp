@@ -28,7 +28,21 @@
     \"watermark/<instrument-id>/<last-bar-time>\"
   - each later fact is caused by the record id of the previous stage's
     fact: signal <- prediction, risk <- signal, plan <- risk,
-    order-intent <- plan"
+    order-intent <- plan
+
+  BRIDGE strategies (:strategy/bridge {:bot :chestnut|..} in the decl —
+  the six steve-v2 bots whose SIGNAL comes from the Python brains via
+  components/bridge.steve-v2): the feature + inference stages are
+  SKIPPED (declarations carry no :strategy/features/:strategy/inference;
+  signal fn-id must be :signal/steve-v2-bridge; risk + execution are
+  still required and run canonically). run-pipeline receives the bridge
+  HANDLE under the :bridge input key (an opaque map with at least
+  :signals-fn — a 0-arity fn returning the bridge.steve-v2 `signals`
+  map {:chestnut :long|:short|:flat ..}); the loop threads it from the
+  strategy entry. No :fact/prediction-produced is emitted in v0 (the
+  bridge's raw preds are observability, later) — the signal fact is
+  caused directly by the market watermark token and its payload carries
+  :decision/bridge-kind + :decision/bot."
   (:require [stevetrading.domain.enums :as enums]
             [stevetrading.domain.identifiers :as identifiers]
             [stevetrading.domain.instruments :as instruments]
@@ -53,56 +67,76 @@
   [errors pred code path message]
   (if pred errors (conj errors (err code path message))))
 
+(def bridge-bots
+  "The six bridged steve-v2 bot keys (bridge.steve-v2 `signals` map keys)."
+  #{:chestnut :lynx :moose :oak :dolphin :parrot})
+
+(defn bridge-strategy?
+  "True when decl is a bridge strategy (carries :strategy/bridge)."
+  [decl]
+  (some? (:strategy/bridge decl)))
+
 (defn- structural-errors
   "STRATEGY_PIPELINE §4 minimum declaration shape, plus
   :strategy/instruments (ARCHITECTURE §17 'required instruments' — needed
-  by market-state selection and decision scoping)."
-  [decl]
-  (-> []
-      (check (identifiers/valid-strategy-id? (:strategy/id decl))
-             :error/invalid-strategy-id [:strategy/id]
-             "must be a strategy/<family>/<name>/v<major> id string")
-      (check (keyword? (:strategy/family decl))
-             :error/missing-key [:strategy/family] "must be a keyword")
-      (check (keyword? (:strategy/name decl))
-             :error/missing-key [:strategy/name] "must be a keyword")
-      (check (int? (:strategy/version decl))
-             :error/missing-key [:strategy/version] "must be an integer")
-      (check (and (set? (:strategy/mode-policy decl))
-                  (seq (:strategy/mode-policy decl))
-                  (every? #(contains? enums/modes %) (:strategy/mode-policy decl)))
-             :error/invalid-enum [:strategy/mode-policy]
-             "must be a non-empty set of known modes")
-      (check (map? (:strategy/schedule decl))
-             :error/missing-key [:strategy/schedule] "must be a map")
-      (check (and (map? (:strategy/warmup decl))
-                  (int? (get-in decl [:strategy/warmup :required-bars]))
-                  (not (neg? (get-in decl [:strategy/warmup :required-bars]))))
-             :error/missing-key [:strategy/warmup :required-bars]
-             "must be a non-negative integer (0 = no bar warmup; valid for chain-snapshot-driven strategies)")
-      (check (string? (get-in decl [:strategy/features :manifest-ref]))
-             :error/missing-key [:strategy/features :manifest-ref]
-             "must be a feature-manifest ref string")
-      (check (string? (get-in decl [:strategy/inference :artifact-ref]))
-             :error/missing-key [:strategy/inference :artifact-ref]
-             "must be a model-artifact ref string")
-      (check (keyword? (get-in decl [:strategy/signal :fn-id]))
-             :error/missing-key [:strategy/signal :fn-id] "must be a keyword")
-      (check (keyword? (get-in decl [:strategy/risk :policy-id]))
-             :error/missing-key [:strategy/risk :policy-id] "must be a keyword")
-      (check (keyword? (get-in decl [:strategy/execution :policy-id]))
-             :error/missing-key [:strategy/execution :policy-id] "must be a keyword")
-      (check (and (vector? (:strategy/instruments decl))
-                  (seq (:strategy/instruments decl))
-                  (every? string? (:strategy/instruments decl)))
-             :error/missing-key [:strategy/instruments]
-             "must be a non-empty vector of instrument-id strings")))
+  by market-state selection and decision scoping).
 
-(defn- compatibility-errors
-  "STRATEGY_PIPELINE §8 artifact compatibility: declared refs must resolve
-  to artifacts whose ids match, and the model must expect exactly the
-  declared feature manifest."
-  [decl {:keys [feature-manifest model]}]
+  Bridge declarations (:strategy/bridge present) skip the feature +
+  inference checks (those stages are replaced by the bridge) and instead
+  require a known :bot plus the :signal/steve-v2-bridge signal fn."
+  [decl]
+  (let [errors
+        (-> []
+            (check (identifiers/valid-strategy-id? (:strategy/id decl))
+                   :error/invalid-strategy-id [:strategy/id]
+                   "must be a strategy/<family>/<name>/v<major> id string")
+            (check (keyword? (:strategy/family decl))
+                   :error/missing-key [:strategy/family] "must be a keyword")
+            (check (keyword? (:strategy/name decl))
+                   :error/missing-key [:strategy/name] "must be a keyword")
+            (check (int? (:strategy/version decl))
+                   :error/missing-key [:strategy/version] "must be an integer")
+            (check (and (set? (:strategy/mode-policy decl))
+                        (seq (:strategy/mode-policy decl))
+                        (every? #(contains? enums/modes %) (:strategy/mode-policy decl)))
+                   :error/invalid-enum [:strategy/mode-policy]
+                   "must be a non-empty set of known modes")
+            (check (map? (:strategy/schedule decl))
+                   :error/missing-key [:strategy/schedule] "must be a map")
+            (check (and (map? (:strategy/warmup decl))
+                        (int? (get-in decl [:strategy/warmup :required-bars]))
+                        (not (neg? (get-in decl [:strategy/warmup :required-bars]))))
+                   :error/missing-key [:strategy/warmup :required-bars]
+                   "must be a non-negative integer (0 = no bar warmup; valid for chain-snapshot-driven strategies)")
+            (check (keyword? (get-in decl [:strategy/signal :fn-id]))
+                   :error/missing-key [:strategy/signal :fn-id] "must be a keyword")
+            (check (keyword? (get-in decl [:strategy/risk :policy-id]))
+                   :error/missing-key [:strategy/risk :policy-id] "must be a keyword")
+            (check (keyword? (get-in decl [:strategy/execution :policy-id]))
+                   :error/missing-key [:strategy/execution :policy-id] "must be a keyword")
+            (check (and (vector? (:strategy/instruments decl))
+                        (seq (:strategy/instruments decl))
+                        (every? string? (:strategy/instruments decl)))
+                   :error/missing-key [:strategy/instruments]
+                   "must be a non-empty vector of instrument-id strings"))]
+    (if (bridge-strategy? decl)
+      (-> errors
+          (check (contains? bridge-bots (get-in decl [:strategy/bridge :bot]))
+                 :error/invalid-enum [:strategy/bridge :bot]
+                 "must be one of :chestnut :lynx :moose :oak :dolphin :parrot")
+          (check (= :signal/steve-v2-bridge (get-in decl [:strategy/signal :fn-id]))
+                 :error/invalid-enum [:strategy/signal :fn-id]
+                 "bridge strategies must use the :signal/steve-v2-bridge signal fn"))
+      (-> errors
+          (check (string? (get-in decl [:strategy/features :manifest-ref]))
+                 :error/missing-key [:strategy/features :manifest-ref]
+                 "must be a feature-manifest ref string")
+          (check (string? (get-in decl [:strategy/inference :artifact-ref]))
+                 :error/missing-key [:strategy/inference :artifact-ref]
+                 "must be a model-artifact ref string")))))
+
+(defn- compatibility-errors*
+  [decl feature-manifest model]
   (let [manifest-ref (get-in decl [:strategy/features :manifest-ref])
         model-ref (get-in decl [:strategy/inference :artifact-ref])]
     (-> []
@@ -128,6 +162,16 @@
                (str "model expects feature manifest "
                     (:model/feature-manifest-ref model)
                     " but strategy declares " manifest-ref)))))
+
+(defn- compatibility-errors
+  "STRATEGY_PIPELINE §8 artifact compatibility: declared refs must resolve
+  to artifacts whose ids match, and the model must expect exactly the
+  declared feature manifest. Bridge strategies declare no artifacts —
+  no compatibility surface (always [])."
+  [decl {:keys [feature-manifest model]}]
+  (if (bridge-strategy? decl)
+    []
+    (compatibility-errors* decl feature-manifest model)))
 
 (defn validate-strategy-decl
   "Validate a strategy declaration. 1-arity checks the §4 minimum
@@ -189,6 +233,103 @@
             :fact/payload payload}
      (some? run-id) (assoc :record/run-id run-id))))
 
+(defn- run-bridge-pipeline
+  "Bridge-strategy pipeline path (see ns docstring): signal from the
+  injected bridge handle, then the canonical risk -> execution stages.
+  No prediction fact; posture memory key is :last-kind."
+  [{:keys [strategy market-slice strategy-local-state portfolio-view
+           bridge account-id mode run-id]}]
+  (when (nil? (:signals-fn bridge))
+    (throw (ex-info "bridge strategy requires a :bridge handle with :signals-fn"
+                    {:error/code :error/missing-bridge
+                     :error/strategy-id (:strategy/id strategy)})))
+  (let [bot (get-in strategy [:strategy/bridge :bot])
+        kinds ((:signals-fn bridge))
+        kind (get kinds bot)
+        decision (signal/decide-bridge-signal strategy bot kind market-slice
+                                              strategy-local-state)
+        state' (assoc strategy-local-state :last-kind kind)]
+    (if (= :posture/hold (:decision/posture decision))
+      {:facts []
+       :strategy-local-state' state'}
+      (let [sid (:strategy/id strategy)
+            instrument-id (:decision/instrument-id decision)
+            decision-id (:decision/id decision)
+            market-time (:decision/market-time decision)
+            ctx {:mode mode
+                 :run-id run-id
+                 :strategy-id sid
+                 :account-id account-id
+                 :instrument-id instrument-id
+                 :decision-id decision-id
+                 :market-time market-time}
+            watermark-token (str "watermark/" instrument-id "/" market-time)
+            signal-fact
+            (pipeline-fact ctx :fact/signal-decision-produced
+                           [watermark-token]
+                           (str "signal/" decision-id)
+                           (select-keys decision
+                                        [:decision/id :decision/posture
+                                         :decision/reason-codes
+                                         :decision/market-time
+                                         :decision/instrument-id
+                                         :decision/bridge-kind
+                                         :decision/bot]))
+            ;; the strategy's OWN sub-view — bridge risk/execution are
+            ;; judged per strategy, not on the whole account portfolio
+            strategy-view (get-in portfolio-view [:portfolio/by-strategy sid])
+            requested-qty (get-in strategy
+                                  [:strategy/execution :params :quantity]
+                                  "1")
+            risk-result (risk/evaluate-risk
+                         (get-in strategy [:strategy/risk :policy-id])
+                         (assoc decision :decision/requested-quantity requested-qty)
+                         portfolio-view
+                         {:account/id account-id
+                          :risk/params (get-in strategy [:strategy/risk :params])
+                          :risk/strategy-view strategy-view})
+            risk-fact
+            (pipeline-fact ctx :fact/risk-decision-recorded
+                           [(:record/id signal-fact)]
+                           (str "risk/" decision-id)
+                           (assoc (select-keys risk-result
+                                               [:risk/policy-id :risk/decision
+                                                :risk/reason-codes
+                                                :risk/approved-quantity])
+                                  :decision/id decision-id))
+            base-facts [signal-fact risk-fact]]
+        (if (not= :risk/allow (:risk/decision risk-result))
+          {:facts base-facts
+           :strategy-local-state' state'}
+          (let [{:execution/keys [plan order-intents]}
+                (execution/plan-execution
+                 (get-in strategy [:strategy/execution :policy-id])
+                 (merge decision risk-result)
+                 {:instrument/id instrument-id
+                  :execution/strategy-view strategy-view
+                  :execution/chain (:chain market-slice)
+                  :execution/spot (:bar/close (peek (vec (:bars market-slice))))}
+                 account-id)]
+            (if (empty? order-intents)
+              {:facts base-facts
+               :strategy-local-state' state'}
+              (let [plan-fact
+                    (pipeline-fact ctx :fact/execution-plan-produced
+                                   [(:record/id risk-fact)]
+                                   (str "plan/" decision-id)
+                                   (assoc plan :decision/id decision-id))
+                    intent-facts
+                    (mapv (fn [intent]
+                            (pipeline-fact ctx :fact/order-intent-created
+                                           [(:record/id plan-fact)]
+                                           (str "intent/" (:order-intent/id intent))
+                                           intent))
+                          order-intents)]
+                {:facts (into (conj base-facts plan-fact) intent-facts)
+                 :strategy-local-state' state'}))))))))
+
+(declare ^:private run-standard-pipeline)
+
 (defn run-pipeline
   "Run the full pure strategy pipeline for one strategy over one market
   slice. Input:
@@ -200,7 +341,8 @@
    :artifacts {:feature-manifest m :model m}
    :account-id \"account/..\"
    :mode :mode/replay                      ; stamped as :record/mode
-   :run-id ..}                             ; optional
+   :run-id ..                              ; optional
+   :bridge {:signals-fn (fn [] ..)}}       ; bridge strategies only
 
   Returns {:facts [fact-envelopes] :strategy-local-state' {..}}.
 
@@ -210,7 +352,20 @@
   - otherwise: prediction-produced, signal-decision-produced,
     risk-decision-recorded; then, only when risk allows AND an order is
     planned: execution-plan-produced + one order-intent-created per
-    intent (full §11.3 payloads, deterministic ids)."
+    intent (full §11.3 payloads, deterministic ids).
+
+  BRIDGE strategies (:strategy/bridge in the decl — see ns docstring)
+  skip the feature + inference stages: the bot's kind comes from
+  ((:signals-fn bridge)), posture memory is :last-kind, NO prediction
+  fact is emitted, and the execution stage receives the strategy's own
+  :portfolio/by-strategy sub-view plus the slice's :chain and last bar
+  close (spot) for the option policy."
+  [{:keys [strategy] :as input}]
+  (if (bridge-strategy? strategy)
+    (run-bridge-pipeline input)
+    (run-standard-pipeline input)))
+
+(defn- run-standard-pipeline
   [{:keys [strategy market-slice strategy-local-state portfolio-view
            artifacts account-id mode run-id]}]
   (let [features (feature/derive-features (:feature-manifest artifacts) market-slice)]

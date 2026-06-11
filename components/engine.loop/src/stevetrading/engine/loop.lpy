@@ -216,16 +216,20 @@
 (defn load-strategy
   "Load + validate one strategy declaration with its artifacts. Throws on
   structural/compatibility errors or a mode policy that excludes
-  run-mode."
+  run-mode. Bridge declarations (:strategy/bridge) declare no artifacts —
+  none are loaded (the launcher injects the bridge HANDLE onto the
+  strategy entry itself, under :bridge)."
   [artifact-store run-mode path]
   (let [decl (edn/read-string (slurp path))
-        artifacts {:feature-manifest (ap/feature-manifest
-                                      artifact-store
-                                      (get-in decl [:strategy/features
-                                                    :manifest-ref]))
-                   :model (ap/model-artifact
-                           artifact-store
-                           (get-in decl [:strategy/inference :artifact-ref]))}
+        artifacts (if (reg/bridge-strategy? decl)
+                    {}
+                    {:feature-manifest (ap/feature-manifest
+                                        artifact-store
+                                        (get-in decl [:strategy/features
+                                                      :manifest-ref]))
+                     :model (ap/model-artifact
+                             artifact-store
+                             (get-in decl [:strategy/inference :artifact-ref]))})
         {:keys [valid? errors]} (reg/validate-strategy-decl decl artifacts)]
     (when-not valid?
       (throw (ex-info (str "invalid strategy declaration: " path)
@@ -396,7 +400,11 @@
                            :artifacts artifacts
                            :account-id account-id
                            :mode run-mode
-                           :run-id run-id})
+                           :run-id run-id
+                           ;; bridge strategies: the entry's injected
+                           ;; bridge handle ({:signals-fn ..}); nil for
+                           ;; standard strategies
+                           :bridge (:bridge strategy)})
         ;; §6 step 6: append decision facts, fold the newly accepted ones
         {dec-new :new-facts dec-n :appended-count}
         (append! facts)
@@ -493,7 +501,12 @@
                     (required); an entry MAY carry :account-id (and
                     :broker-route) — preferred over the loop-global
                     values for that strategy's intents (multi-account
-                    processes; see broker.router)
+                    processes; see broker.router). A BRIDGE strategy
+                    entry additionally carries :bridge (opaque map with
+                    at least :signals-fn — bridge.steve-v2), threaded
+                    into run-pipeline as :bridge; bridge INGESTION
+                    (on-bar!/on-chain!) is launcher-side via the
+                    :on-observation hook, never in the loop
     :account-id     default account route for intents (required;
                     per-strategy :account-id wins when present)
     :run-id         this run's id (required)

@@ -1,0 +1,276 @@
+(ns strategy.test-direction-executors
+  "Unit tests for the steve-v2 direction stages: the
+  :execution/equity-direction-v1 and :execution/single-leg-option-atm-v1
+  execution policies (flip close+open, view-sized closes, ATM contract
+  selection, chain-skip reasons) and the :risk/steve-v2-default policy
+  (same-direction deny, opposite-direction allow, flatten always)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.execution.core :as exe]
+            [stevetrading.risk.core :as risk]))
+
+(def acct "account/sim/test")
+(def spy "equity/NASDAQ/SPY")
+(def call-545 "option/OPRA/SPY/2026-06-12/C/545.000")
+(def call-550 "option/OPRA/SPY/2026-06-12/C/550.000")
+(def call-555 "option/OPRA/SPY/2026-06-12/C/555.000")
+(def put-550 "option/OPRA/SPY/2026-06-12/P/550.000")
+(def put-545 "option/OPRA/SPY/2026-06-12/P/545.000")
+
+(def chain
+  {:chain/observed-at "2026-06-10T14:30:00Z"
+   :chain/underlying spy
+   :chain/contracts
+   [{:instrument/id call-545 :quote/bid "5.50" :quote/ask "5.70"}
+    {:instrument/id call-550 :quote/bid "2.10" :quote/ask "2.20"}
+    {:instrument/id call-555 :quote/bid "0.70" :quote/ask "0.80"}
+    {:instrument/id put-550 :quote/bid "1.90" :quote/ask "2.00"}
+    {:instrument/id put-545 :quote/bid "0.60" :quote/ask "0.70"}]})
+
+(defn- ras
+  "Risk-approved signal for direct plan-execution calls."
+  [posture qty]
+  {:decision/id "dec_direction_test"
+   :decision/posture posture
+   :risk/approved-quantity qty})
+
+(defn- equity-ctx [net]
+  {:instrument/id spy
+   :execution/strategy-view (when net {:view/net-positions {spy net}})})
+
+(defn- plan-equity [posture qty net]
+  (:execution/order-intents
+   (exe/plan-execution :execution/equity-direction-v1
+                       (ras posture qty) (equity-ctx net) acct)))
+
+(defn- option-ctx [{:keys [chain* spot view]}]
+  {:instrument/id spy
+   :execution/strategy-view view
+   :execution/chain chain*
+   :execution/spot spot})
+
+(defn- plan-option [posture qty ctx-opts]
+  (exe/plan-execution :execution/single-leg-option-atm-v1
+                      (ras posture qty) (option-ctx ctx-opts) acct))
+
+;; ---------------------------------------------------------------------------
+;; :execution/equity-direction-v1
+;; ---------------------------------------------------------------------------
+
+(deftest equity-entries-when-flat
+  (testing "enter-long with no position -> one BUY/open market intent"
+    (let [[intent :as intents] (plan-equity :posture/enter-long "50" nil)]
+      (is (= 1 (count intents)))
+      (is (= :order-side/buy (:order-intent/side intent)))
+      (is (= :position-effect/open (:order-intent/effect intent)))
+      (is (= :order-type/market (:order-intent/order-type intent)))
+      (is (= :tif/day (:order-intent/time-in-force intent)))
+      (is (= "50" (:order-intent/quantity intent)))
+      (is (= 0 (:order-intent/intent-slot intent)))
+      (is (= :intent-role/entry (:order-intent/role intent)))
+      (is (nil? (:order-intent/limit-price intent)))))
+  (testing "enter-short with no position -> one SELL/open market intent (short)"
+    (let [[intent] (plan-equity :posture/enter-short "50" "0")]
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= :position-effect/open (:order-intent/effect intent)))
+      (is (= :intent-role/entry (:order-intent/role intent)))))
+  (testing "zero approved quantity plans nothing"
+    (is (= [] (plan-equity :posture/enter-long "0" nil)))))
+
+(deftest equity-flatten-closes-the-net
+  (testing "flatten a long -> SELL/close |net|"
+    (let [[intent :as intents] (plan-equity :posture/flatten "50" "50")]
+      (is (= 1 (count intents)))
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= :position-effect/close (:order-intent/effect intent)))
+      (is (= "50" (:order-intent/quantity intent)))
+      (is (= :intent-role/exit (:order-intent/role intent)))))
+  (testing "flatten a short -> BUY/close |net|"
+    (let [[intent] (plan-equity :posture/flatten "50" "-50")]
+      (is (= :order-side/buy (:order-intent/side intent)))
+      (is (= :position-effect/close (:order-intent/effect intent)))
+      (is (= "50" (:order-intent/quantity intent)))))
+  (testing "flatten with no position plans nothing"
+    (is (= [] (plan-equity :posture/flatten "0" nil)))
+    (is (= [] (plan-equity :posture/flatten "0" "0")))))
+
+(deftest equity-flip-emits-close-then-open
+  (testing "enter-short over an open long -> [SELL/close 50, SELL/open qty]"
+    (let [[close open :as intents] (plan-equity :posture/enter-short "50" "50")]
+      (is (= 2 (count intents)))
+      (is (= [0 1] (mapv :order-intent/intent-slot intents)))
+      (is (= :position-effect/close (:order-intent/effect close)))
+      (is (= :order-side/sell (:order-intent/side close)))
+      (is (= :intent-role/exit (:order-intent/role close)))
+      (is (= :position-effect/open (:order-intent/effect open)))
+      (is (= :order-side/sell (:order-intent/side open)))
+      (is (= :intent-role/entry (:order-intent/role open)))))
+  (testing "enter-long over an open short -> [BUY/close 30, BUY/open qty]"
+    (let [[close open] (plan-equity :posture/enter-long "50" "-30")]
+      (is (= :order-side/buy (:order-intent/side close)))
+      (is (= "30" (:order-intent/quantity close)))
+      (is (= :order-side/buy (:order-intent/side open)))
+      (is (= "50" (:order-intent/quantity open)))))
+  (testing "same-direction entry (risk-denied upstream) defensively plans nothing"
+    (is (= [] (plan-equity :posture/enter-long "50" "50")))))
+
+;; ---------------------------------------------------------------------------
+;; :execution/single-leg-option-atm-v1
+;; ---------------------------------------------------------------------------
+
+(deftest option-atm-entry-selection
+  (testing "enter-long buys the CALL with strike closest to spot, limit at 2dp mid"
+    (let [{:execution/keys [order-intents skip-reason]}
+          (plan-option :posture/enter-long "1" {:chain* chain :spot "550.20"})
+          [intent] order-intents]
+      (is (nil? skip-reason))
+      (is (= 1 (count order-intents)))
+      (is (= :order-side/buy (:order-intent/side intent)))
+      (is (= :position-effect/open (:order-intent/effect intent)))
+      (is (= :order-type/limit (:order-intent/order-type intent)))
+      (is (= "2.15" (:order-intent/limit-price intent)))
+      (is (= [{:instrument/id call-550
+               :leg/side :order-side/buy
+               :leg/quantity "1"}]
+             (:order-intent/legs intent)))))
+  (testing "spot near another strike picks that strike"
+    (let [{:execution/keys [order-intents]}
+          (plan-option :posture/enter-long "1" {:chain* chain :spot "554.10"})]
+      (is (= call-555
+             (get-in (first order-intents)
+                     [:order-intent/legs 0 :instrument/id])))))
+  (testing "enter-short buys the ATM PUT"
+    (let [{:execution/keys [order-intents]}
+          (plan-option :posture/enter-short "1" {:chain* chain :spot "550.20"})
+          [intent] order-intents]
+      (is (= :order-side/buy (:order-intent/side intent)))
+      (is (= "1.95" (:order-intent/limit-price intent)))
+      (is (= put-550
+             (get-in intent [:order-intent/legs 0 :instrument/id]))))))
+
+(deftest option-skip-reasons
+  (testing "no chain -> no intents + :skip/no-chain"
+    (let [{:execution/keys [order-intents skip-reason]}
+          (plan-option :posture/enter-long "1" {:spot "550.20"})]
+      (is (= [] order-intents))
+      (is (= :skip/no-chain skip-reason))))
+  (testing "no chain skips flatten too"
+    (is (= :skip/no-chain
+           (:execution/skip-reason
+            (plan-option :posture/flatten "1" {:spot "550.20"})))))
+  (testing "chain without a two-sided contract of the wanted right -> :skip/no-eligible-contract"
+    (let [calls-only (update chain :chain/contracts
+                             (fn [cs]
+                               (filterv #(.startswith (str (:instrument/id %))
+                                                      "option/OPRA/SPY/2026-06-12/C")
+                                        cs)))]
+      (is (= :skip/no-eligible-contract
+             (:execution/skip-reason
+              (plan-option :posture/enter-short "1"
+                           {:chain* calls-only :spot "550.20"}))))))
+  (testing "no spot (no bars yet) -> :skip/no-spot"
+    (is (= :skip/no-spot
+           (:execution/skip-reason
+            (plan-option :posture/enter-long "1" {:chain* chain}))))))
+
+(def long-call-lot
+  {:lot/instrument-id call-550
+   :lot/side :order-side/buy
+   :lot/remaining-quantity "1"})
+
+(def long-call-view
+  {:view/net-positions {call-550 "1"}
+   :view/open-lots [long-call-lot]})
+
+(deftest option-flatten-closes-lots
+  (testing "flatten sells the open lot at the contract's current mid"
+    (let [{:execution/keys [order-intents]}
+          (plan-option :posture/flatten "1"
+                       {:chain* chain :spot "550.20" :view long-call-view})
+          [intent] order-intents]
+      (is (= 1 (count order-intents)))
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= :position-effect/close (:order-intent/effect intent)))
+      (is (= :order-type/limit (:order-intent/order-type intent)))
+      (is (= "2.15" (:order-intent/limit-price intent)))
+      (is (= "1" (:order-intent/quantity intent)))))
+  (testing "contract no longer two-sided in the chain -> MARKET close"
+    (let [chain-sans (update chain :chain/contracts
+                             (fn [cs]
+                               (filterv #(not= call-550 (:instrument/id %)) cs)))
+          {:execution/keys [order-intents]}
+          (plan-option :posture/flatten "1"
+                       {:chain* chain-sans :spot "550.20" :view long-call-view})
+          [intent] order-intents]
+      (is (= :order-type/market (:order-intent/order-type intent)))
+      (is (nil? (:order-intent/limit-price intent)))
+      (is (= :order-side/sell (:order-intent/side intent)))))
+  (testing "flatten with no open option lots plans nothing"
+    (is (= [] (:execution/order-intents
+               (plan-option :posture/flatten "0"
+                            {:chain* chain :spot "550.20"}))))))
+
+(deftest option-flip-closes-then-opens
+  (testing "enter-short over an open long call -> [SELL/close call, BUY/open put]"
+    (let [{:execution/keys [order-intents]}
+          (plan-option :posture/enter-short "1"
+                       {:chain* chain :spot "550.20" :view long-call-view})
+          [close open] order-intents]
+      (is (= 2 (count order-intents)))
+      (is (= [0 1] (mapv :order-intent/intent-slot order-intents)))
+      (is (= :position-effect/close (:order-intent/effect close)))
+      (is (= call-550 (get-in close [:order-intent/legs 0 :instrument/id])))
+      (is (= :position-effect/open (:order-intent/effect open)))
+      (is (= put-550 (get-in open [:order-intent/legs 0 :instrument/id])))
+      (is (= :order-side/buy (:order-intent/side open))))))
+
+;; ---------------------------------------------------------------------------
+;; :risk/steve-v2-default
+;; ---------------------------------------------------------------------------
+
+(defn- eval-risk [posture view]
+  (risk/evaluate-risk :risk/steve-v2-default
+                      {:decision/posture posture
+                       :decision/instrument-id spy
+                       :decision/requested-quantity "50"}
+                      {}
+                      {:account/id acct
+                       :risk/params {:max-positions 1}
+                       :risk/strategy-view view}))
+
+(deftest steve-v2-risk-entries
+  (testing "flat view: entries allowed at the requested quantity"
+    (let [r (eval-risk :posture/enter-long nil)]
+      (is (= :risk/allow (:risk/decision r)))
+      (is (= "50" (:risk/approved-quantity r))))
+    (is (= :risk/allow (:risk/decision (eval-risk :posture/enter-short nil)))))
+  (testing "same-direction equity position -> deny"
+    (let [long-view {:view/net-positions {spy "50"}}
+          short-view {:view/net-positions {spy "-50"}}]
+      (is (= :risk/deny (:risk/decision (eval-risk :posture/enter-long long-view))))
+      (is (= [:reason/position-exists]
+             (:risk/reason-codes (eval-risk :posture/enter-long long-view))))
+      (is (= :risk/deny (:risk/decision (eval-risk :posture/enter-short short-view))))
+      (testing "OPPOSITE direction allowed (executor flips close+open)"
+        (is (= :risk/allow (:risk/decision (eval-risk :posture/enter-short long-view))))
+        (is (= :risk/allow (:risk/decision (eval-risk :posture/enter-long short-view)))))))
+  (testing "option positions carry direction: long call -> :long, long put -> :short"
+    (let [call-view {:view/net-positions {call-550 "1"}}
+          put-view {:view/net-positions {put-550 "1"}}]
+      (is (= :risk/deny (:risk/decision (eval-risk :posture/enter-long call-view))))
+      (is (= :risk/allow (:risk/decision (eval-risk :posture/enter-short call-view))))
+      (is (= :risk/deny (:risk/decision (eval-risk :posture/enter-short put-view))))
+      (is (= :risk/allow (:risk/decision (eval-risk :posture/enter-long put-view)))))))
+
+(deftest steve-v2-risk-flatten
+  (testing "flatten always allowed; approved quantity from the view"
+    (let [r (eval-risk :posture/flatten {:view/net-positions {spy "50"}})]
+      (is (= :risk/allow (:risk/decision r)))
+      (is (= "50" (:risk/approved-quantity r))))
+    (let [r (eval-risk :posture/flatten {:view/net-positions {spy "-50"
+                                                              call-550 "1"}})]
+      (is (= "51" (:risk/approved-quantity r))))
+    (let [r (eval-risk :posture/flatten nil)]
+      (is (= :risk/allow (:risk/decision r)))
+      (is (= "0" (:risk/approved-quantity r)))
+      (is (= [:reason/risk-allowed :reason/no-open-position]
+             (:risk/reason-codes r))))))
