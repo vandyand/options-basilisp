@@ -217,9 +217,31 @@
       (is (= :risk/allow (get-in (second facts) [:fact/payload :risk/decision])))
       (is (= "0" (get-in (second facts) [:fact/payload :risk/approved-quantity]))))))
 
+(def shortable-decl
+  "Chestnut decl with shorting permitted — the shipped declarations set
+  :allow-short? false (the six Alpaca paper accounts 403 short opens,
+  observed live 2026-06-11), so the two-intent flip path needs its own
+  fixture."
+  (assoc-in chestnut-decl [:strategy/execution :params :allow-short?] true))
+
+(deftest bridge-short-degrades-to-flatten-when-shorts-forbidden
+  (testing ":allow-short? false (the SHIPPED equity decls): :short with an
+            open long closes it and opens NOTHING"
+    (let [{:keys [facts]}
+          (run-bridge chestnut-decl {:chestnut :short}
+                      {:local-state {:last-kind :long}
+                       :portfolio long-50-view})
+          intents (intent-payloads facts)]
+      (is (= 1 (count intents)))
+      (is (= :position-effect/close (:order-intent/effect (first intents))))
+      (is (= :order-side/sell (:order-intent/side (first intents))))))
+  (testing ":short while flat under :allow-short? false plans nothing"
+    (is (= [] (intent-payloads
+               (:facts (run-bridge chestnut-decl {:chestnut :short})))))))
+
 (deftest bridge-flip-long-to-short
   (let [{:keys [facts]}
-        (run-bridge chestnut-decl {:chestnut :short}
+        (run-bridge shortable-decl {:chestnut :short}
                     {:local-state {:last-kind :long}
                      :portfolio long-50-view})
         intents (intent-payloads facts)]
@@ -245,7 +267,7 @@
       (is (= (mapv :order-intent/id intents)
              (mapv :order-intent/id
                    (intent-payloads
-                    (:facts (run-bridge chestnut-decl {:chestnut :short}
+                    (:facts (run-bridge shortable-decl {:chestnut :short}
                                         {:local-state {:last-kind :long}
                                          :portfolio long-50-view})))))))))
 

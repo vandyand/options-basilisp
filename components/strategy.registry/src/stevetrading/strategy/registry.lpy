@@ -329,7 +329,9 @@
                  {:instrument/id instrument-id
                   :execution/strategy-view strategy-view
                   :execution/chain (:chain market-slice)
-                  :execution/spot (:bar/close (peek (vec (:bars market-slice))))}
+                  :execution/spot (:bar/close (peek (vec (:bars market-slice))))
+                  :execution/params (get-in strategy
+                                            [:strategy/execution :params])}
                  account-id)]
             (if (empty? order-intents)
               {:facts base-facts

@@ -23,4 +23,4 @@
  :strategy/risk {:policy-id :risk/steve-v2-default
                  :params {:max-positions 1}}
  :strategy/execution {:policy-id :execution/equity-direction-v1
-                      :params {:quantity "50"}}}
+                      :params {:quantity "50" :allow-short? false}}}

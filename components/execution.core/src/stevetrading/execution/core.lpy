@@ -321,7 +321,14 @@
                   :else []))]
     (case posture
       :posture/enter-long  (enter :order-side/buy (neg? net))
-      :posture/enter-short (enter :order-side/sell (pos? net))
+      ;; :allow-short? false (declaration execution :params — the six-bot
+      ;; Alpaca paper accounts reject short opens with 403 forbidden,
+      ;; observed live 2026-06-11): a :short posture degrades to
+      ;; flatten-only — close any long, never open a short lot.
+      :posture/enter-short
+      (if (false? (get-in instrument-ctx [:execution/params :allow-short?]))
+        (if (pos? net) [(close-intent 0)] [])
+        (enter :order-side/sell (pos? net)))
       :posture/flatten     (if (zero? net) [] [(close-intent 0)])
       (unplannable-posture! :execution/equity-direction-v1 posture))))
 
