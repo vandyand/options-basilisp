@@ -258,8 +258,11 @@
         sid (:strategy/id strategy)
         sview (get-in portfolio-view [:portfolio/by-strategy sid])
         ;; view net-positions values are plain decimal strings
-        ;; (portfolio.core/net-positions)
-        flat? (and (empty? (:view/open-lots sview))
+        ;; (portfolio.core/net-positions). An in-flight (unresolved)
+        ;; order also counts as NOT flat — re-emitting while an entry is
+        ;; still resolving is exactly the double-entry leak.
+        flat? (and (zero? (or (:view/in-flight-orders sview) 0))
+                   (empty? (:view/open-lots sview))
                    (every? (fn [[_ q]] (zero? (python/float (str q))))
                            (:view/net-positions sview)))
         reemit-due? (and (contains? #{:long :short} kind)

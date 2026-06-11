@@ -205,6 +205,23 @@
                :else :short)
       :flat)))
 
+(defn seed-stats->std
+  "Pure: running-sum seed stats {:pred-sum s :pred-sum-sq ss :pred-count n}
+  → prediction-distribution std. Used by the :seed-pred-std calibration
+  correction (the 4a unit fix, 2026-06-11): v0_legacy_freeze froze
+  final_target_std in RAW-RETURN units (~2e-4) while live predictions are
+  in STANDARDIZED-target units (~unit scale, seed mean +0.42/std 0.74),
+  so z = pred/std blew up to ~1e3-1e4 σ and the Optuna-tuned hysteresis
+  bands (0.3-0.65σ) degenerated to sign(pred). Dividing by the PREDICTION
+  std restores the σ scale those parameters were tuned for. The zero
+  mean-anchor convention of the live signal path is preserved (std-only
+  correction)."
+  [{:keys [pred-sum pred-sum-sq pred-count]}]
+  (let [n (double pred-count)
+        mean (/ (double pred-sum) n)
+        var (- (/ (double pred-sum-sq) n) (* mean mean))]
+    (python/max 1e-9 (math/sqrt (python/max 0.0 var)))))
+
 (defn parse-calibration
   "Parse a v0_legacy_freeze calibration JSON string → bridge cal map.
   Pure (string in, map out) so it's testable without the REF tree."
@@ -331,8 +348,9 @@
 
   Loads torch/xgboost models eagerly — requires the REF venv."
   [{:keys [ref-root bundle-dirs calibrations risk-free-rate max-bars
-           grid-history]
-    :or {risk-free-rate 0.043 max-bars 200 grid-history 10}}]
+           grid-history calibration-correction]
+    :or {risk-free-rate 0.043 max-bars 200 grid-history 10
+         calibration-correction :seed-pred-std}}]
   (ensure-ref-paths! ref-root)
   (ensure-alpaca-stub!)
   (let [np (importlib/import-module "numpy")
@@ -357,7 +375,27 @@
                                               (str bdir "/dictionary_atoms.npz")
                                               ["components" "train_mean"
                                                "train_std"])
-                         cal (parse-calibration (slurp (str (get calibrations bot))))]
+                         cal (parse-calibration (slurp (str (get calibrations bot))))
+                         ;; 4a unit fix (see seed-stats->std): replace the
+                         ;; frozen raw-return stds with the PREDICTION
+                         ;; distribution stds from the bundle's seed files.
+                         ;; :calibration-correction :none = bug-faithful
+                         ;; parity mode for comparison runs.
+                         cal (if (= :seed-pred-std calibration-correction)
+                               (let [seed-std
+                                     (fn [head]
+                                       (let [d (.load np (str bdir "/calibration_seed_" head ".npz"))]
+                                         (seed-stats->std
+                                          {:pred-sum (python/float (.__getitem__ d "pred_sum"))
+                                           :pred-sum-sq (python/float (.__getitem__ d "pred_sum_sq"))
+                                           :pred-count (python/float (.__getitem__ d "pred_count"))})))]
+                                 (assoc cal
+                                        :std-frozen (:std cal)
+                                        :correction :seed-pred-std
+                                        :std {:long (seed-std "long")
+                                              :gen (seed-std "gen")
+                                              :short (seed-std "short")}))
+                               (assoc cal :correction :none))]
                      {:engine engine :inference inference :hmm hmm
                       :atoms atoms :cal cal}))]
     {:np np

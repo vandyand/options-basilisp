@@ -179,11 +179,24 @@
   (let [view (:risk/strategy-view account-ctx)
         primary (:decision/instrument-id signal)
         dirs (open-directions view primary)
+        in-flight (or (:view/in-flight-orders view) 0)
         entry (fn [direction]
-                (if (contains? dirs direction)
+                (cond
+                  ;; IN-FLIGHT GUARD (2026-06-11 double-entry leak): an
+                  ;; unresolved order means the settled view is about to
+                  ;; change — deny entries until it resolves. Flatten
+                  ;; stays allowed below.
+                  (pos? in-flight)
+                  {:risk/decision :risk/deny
+                   :risk/reason-codes [:reason/orders-in-flight]
+                   :risk/approved-quantity "0"}
+
+                  (contains? dirs direction)
                   {:risk/decision :risk/deny
                    :risk/reason-codes [:reason/position-exists]
                    :risk/approved-quantity "0"}
+
+                  :else
                   {:risk/decision :risk/allow
                    :risk/reason-codes [:reason/risk-allowed]
                    :risk/approved-quantity

@@ -392,11 +392,25 @@
         sid (:strategy/id decl)
         instrument (first (:strategy/instruments decl))
         local-state (:strategy/signal-state (st/strategy-state state sid))
+        ;; IN-FLIGHT GUARD (2026-06-11 double-entry leak): fills land in
+        ;; the portfolio one poll cycle after their orders, so a pipeline
+        ;; deciding on settled lots alone can double-enter while an order
+        ;; is still resolving. Surface the strategy's unresolved-order
+        ;; count in its sub-view; risk denies entries while any exist.
+        in-flight (count
+                   (filterv (fn [[_ entry]]
+                              (and (= sid (:order/strategy-id entry))
+                                   (not (:order/resolved? entry))))
+                            (:engine/unresolved-orders state)))
+        portfolio-view (assoc-in (:engine/portfolio state)
+                                 [:portfolio/by-strategy sid
+                                  :view/in-flight-orders]
+                                 in-flight)
         {:keys [facts strategy-local-state']}
         (reg/run-pipeline {:strategy decl
                            :market-slice (st/market-slice state instrument)
                            :strategy-local-state local-state
-                           :portfolio-view (:engine/portfolio state)
+                           :portfolio-view portfolio-view
                            :artifacts artifacts
                            :account-id account-id
                            :mode run-mode
