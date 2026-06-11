@@ -14,8 +14,14 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 LIFECYCLE="$HOME/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor/thetadata_lifecycle.sh"
 cd "$REPO"
 
-# shellcheck disable=SC1090
-source "$HOME/.bashrc" 2>/dev/null || true
+# ~/.bashrc's interactivity guard (line 6: `case $- in *i*) ;; *) return`)
+# returns before the export lines under cron — caused the 2026-06-11
+# 09:28 startup failure. Read the creds directly instead of sourcing.
+eval "$(grep '^export ALPACA_VENTUREVD_' "$HOME/.bashrc")"
+if [ -z "${ALPACA_VENTUREVD_API_KEY:-}" ] || [ -z "${ALPACA_VENTUREVD_API_SECRET:-}" ]; then
+  echo "$(date -u '+%FT%TZ') [open-session] FATAL: could not load ALPACA_VENTUREVD creds from ~/.bashrc" >&2
+  exit 1
+fi
 
 log() { echo "$(date -u '+%FT%TZ') [open-session] $*"; }
 

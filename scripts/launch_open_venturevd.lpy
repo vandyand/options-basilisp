@@ -130,7 +130,12 @@
              :strategy/execution {:policy-id :execution/vertical-credit-spread-v1
                                   :params {:quantity "1"}}})
 
-(def revision (str "cp-vv-open-" compact-date))
+;; time-suffixed: a dry run earlier the same day activates its own
+;; immutable revision; the real launch must mint a fresh one (revision
+;; immutability refused the 2026-06-11 relaunch when the id was date-only)
+(def revision (str "cp-vv-open-" compact-date "-"
+                   (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+                              "%H%M%S")))
 (def manifest
   {:control-plane/revision revision
    :control-plane/generated-at (td/utc-now-str)
