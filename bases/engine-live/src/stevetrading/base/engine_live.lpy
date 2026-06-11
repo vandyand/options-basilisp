@@ -331,6 +331,10 @@
                          account); presence forces broker.router wiring
                          (see build-brokers) — required whenever several
                          alpaca-paper accounts are routed
+    :session-clock       {:entry-cutoff iso-utc :flatten-at iso-utc}
+                         engine.loop wall-clock session gating (no new
+                         entries at/after :entry-cutoff; forced flatten
+                         at/after :flatten-at) — see engine.loop/run-loop
 
   Returns {:live/started? false :live/refusal reason ...} on a gate
   refusal (after durably recording the violation fact), or the session
@@ -339,7 +343,8 @@
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
            max-facts resume? alpaca alpaca-accounts bridge-ctx
-           on-observation crash-after-fact crash-before-fact]
+           session-clock on-observation crash-after-fact
+           crash-before-fact]
     injected-source :source}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
@@ -573,6 +578,7 @@
                         :crash-after-fact crash-after-fact
                         :crash-before-fact crash-before-fact
                         :broker-route {:broker/source-system broker-kw}
+                        :session-clock session-clock
                         :on-facts on-facts
                         :on-observation
                         (fn [obs new?]

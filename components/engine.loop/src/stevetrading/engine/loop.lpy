@@ -385,7 +385,7 @@
   account routing) — these are preferred over the loop-global config.
   Returns {:state .. :ledger .. :appended-count n :skipped-fills [..]}."
   [{:keys [append! broker state ledger strategy account-id run-id
-           run-mode broker-route]}]
+           run-mode broker-route session]}]
   (let [{:keys [decl artifacts]} strategy
         account-id (or (:account-id strategy) account-id)
         broker-route (or (:broker-route strategy) broker-route)
@@ -418,7 +418,10 @@
                            ;; bridge strategies: the entry's injected
                            ;; bridge handle ({:signals-fn ..}); nil for
                            ;; standard strategies
-                           :bridge (:bridge strategy)})
+                           :bridge (:bridge strategy)
+                           ;; session clock flags (nil when no
+                           ;; :session-clock — replay determinism)
+                           :session session})
         ;; §6 step 6: append decision facts, fold the newly accepted ones
         {dec-new :new-facts dec-n :appended-count}
         (append! facts)
@@ -536,6 +539,17 @@
                     snapshot (simulated crash) (optional)
     :broker-route   BROKER_ADAPTER §4.1 route map for derived submit
                     commands (default {:broker/source-system :broker/sim})
+    :session-clock  {:entry-cutoff iso-utc-str :flatten-at iso-utc-str}
+                    (optional, LIVE wiring only — wall-clock gating
+                    breaks replay determinism, so replay never sets it).
+                    Each cycle the loop compares wall-clock UTC against
+                    the cutoffs and passes {:entries-allowed? bool
+                    :force-flatten? bool} to the strategy pipeline:
+                    entries are blocked at/after :entry-cutoff, ALL
+                    postures become flatten at/after :flatten-at (the
+                    end-of-session close-out — keep the SOURCE alive
+                    past :flatten-at so the flatten decisions and their
+                    fills can actually run)
     :on-observation (fn [obs new?]) hook (optional; see ns docstring)
     :on-facts       (fn [facts]) newly-appended-facts hook (optional)
     :crash-after-fact  (fn [fact] bool) crash-injection predicate
@@ -549,8 +563,8 @@
   (catch with crash-ex?); like :max-facts, no final snapshot is written."
   [{:keys [fact-store snapshot-store broker source strategies account-id
            run-id run-mode state0 ledger0 cursor0 snapshot-every
-           snapshot-scope max-facts broker-route on-observation on-facts
-           crash-after-fact crash-before-fact]}]
+           snapshot-scope max-facts broker-route session-clock
+           on-observation on-facts crash-after-fact crash-before-fact]}]
   (let [snapshot-every (or snapshot-every default-snapshot-every)
         snapshot-scope (or snapshot-scope default-snapshot-scope)
         cursor0 (or cursor0 0)
@@ -587,6 +601,18 @@
                     (on-observation obs (boolean (seq obs-new))))
                 ;; lifecycle: warmup advancement from accumulated history
                 state (advance-warmups state strategies)
+                ;; session clock: wall-clock UTC vs the configured
+                ;; cutoffs, once per cycle (ISO-8601 Z strings compare
+                ;; lexicographically). nil when no clock is configured.
+                session (when session-clock
+                          (let [now (utc-now-str)
+                                {:keys [entry-cutoff flatten-at]} session-clock]
+                            {:entries-allowed?
+                             (or (nil? entry-cutoff)
+                                 (neg? (compare now entry-cutoff)))
+                             :force-flatten?
+                             (and (some? flatten-at)
+                                  (>= (compare now flatten-at) 0))}))
                 ;; §6 steps 4-10 per active + relevant strategy
                 cycle-res
                 (reduce
@@ -605,7 +631,8 @@
                                    :account-id account-id
                                    :run-id run-id
                                    :run-mode run-mode
-                                   :broker-route broker-route})]
+                                   :broker-route broker-route
+                                   :session session})]
                          {:state (:state res)
                           :ledger (:ledger res)
                           :n (+ (:n acc) (:appended-count res))

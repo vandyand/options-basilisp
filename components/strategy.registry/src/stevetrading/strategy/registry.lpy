@@ -238,14 +238,48 @@
   injected bridge handle, then the canonical risk -> execution stages.
   No prediction fact; posture memory key is :last-kind."
   [{:keys [strategy market-slice strategy-local-state portfolio-view
-           bridge account-id mode run-id]}]
+           bridge account-id mode run-id session]}]
   (when (nil? (:signals-fn bridge))
     (throw (ex-info "bridge strategy requires a :bridge handle with :signals-fn"
                     {:error/code :error/missing-bridge
                      :error/strategy-id (:strategy/id strategy)})))
   (let [bot (get-in strategy [:strategy/bridge :bot])
         kinds ((:signals-fn bridge))
-        kind (get kinds bot)
+        raw-kind (get kinds bot)
+        sid (:strategy/id strategy)
+        sview (get-in portfolio-view [:portfolio/by-strategy sid])
+        ;; view net-positions values are plain decimal strings
+        ;; (portfolio.core/net-positions). An in-flight (unresolved)
+        ;; order also counts as NOT flat — re-emitting while an entry is
+        ;; still resolving is exactly the double-entry leak.
+        in-flight (or (:view/in-flight-orders sview) 0)
+        positions-open? (boolean
+                         (or (seq (:view/open-lots sview))
+                             (some (fn [[_ q]]
+                                     (not (zero? (python/float (str q)))))
+                                   (:view/net-positions sview))))
+        flat? (and (zero? in-flight) (not positions-open?))
+        ;; SESSION CLOCK (2026-06-11 0DTE pin-risk close-out): the loop
+        ;; passes {:entries-allowed? bool :force-flatten? bool} (nil =
+        ;; no clock = both unrestricted, e.g. replay).
+        ;; - force-flatten (15:45 ET): every kind becomes :flat — close
+        ;;   everything, open nothing.
+        ;; - entry cutoff (15:30 ET): a directional kind that would OPEN
+        ;;   exposure (book flat, or kind opposite the open direction —
+        ;;   the flip executor would close+REopen) is coerced to :flat,
+        ;;   so flips still CLOSE but never re-open; a kind matching the
+        ;;   open direction passes through (plain hold — the cutoff must
+        ;;   not force early exits).
+        entries-allowed? (not (false? (:entries-allowed? session)))
+        force-flatten? (boolean (:force-flatten? session))
+        open-dirs (risk/open-directions
+                   sview (first (:strategy/instruments strategy)))
+        kind (cond
+               force-flatten? :flat
+               (and (not entries-allowed?)
+                    (contains? #{:long :short} raw-kind)
+                    (not (contains? open-dirs raw-kind))) :flat
+               :else raw-kind)
         ;; RE-EMIT WHILE FLAT (2026-06-11 stuck-hold fix): a directional
         ;; kind equal to :last-kind normally holds — but when the
         ;; strategy's own book is FLAT (entry skipped earlier, e.g.
@@ -255,16 +289,6 @@
         ;; intent ids stay deterministic per decision (new bar = new
         ;; decision id — a still-resting prior order can briefly overlap;
         ;; acceptable v0 for liquid SPY 0DTE mids, documented).
-        sid (:strategy/id strategy)
-        sview (get-in portfolio-view [:portfolio/by-strategy sid])
-        ;; view net-positions values are plain decimal strings
-        ;; (portfolio.core/net-positions). An in-flight (unresolved)
-        ;; order also counts as NOT flat — re-emitting while an entry is
-        ;; still resolving is exactly the double-entry leak.
-        flat? (and (zero? (or (:view/in-flight-orders sview) 0))
-                   (empty? (:view/open-lots sview))
-                   (every? (fn [[_ q]] (zero? (python/float (str q))))
-                           (:view/net-positions sview)))
         reemit-due? (and (contains? #{:long :short} kind)
                          (= kind (:last-kind strategy-local-state))
                          flat?)
@@ -275,7 +299,14 @@
         ;; entry was still invisible to the view.
         cooldown (get strategy-local-state :reemit-cooldown 0)
         reemit-now? (and reemit-due? (zero? cooldown))
-        effective-state (if reemit-now?
+        ;; FORCE-FLATTEN RETRY: while positions remain open with nothing
+        ;; in flight, erase posture memory so the flatten posture
+        ;; re-emits every bar until the book is actually flat (a single
+        ;; emission could strand a position if its close order failed).
+        ;; The in-flight check prevents duplicate closes while one is
+        ;; resolving.
+        flatten-retry? (and force-flatten? positions-open? (zero? in-flight))
+        effective-state (if (or reemit-now? flatten-retry?)
                           (dissoc strategy-local-state :last-kind)
                           strategy-local-state)
         decision (signal/decide-bridge-signal strategy bot kind market-slice
@@ -382,7 +413,9 @@
    :account-id \"account/..\"
    :mode :mode/replay                      ; stamped as :record/mode
    :run-id ..                              ; optional
-   :bridge {:signals-fn (fn [] ..)}}       ; bridge strategies only
+   :bridge {:signals-fn (fn [] ..)}        ; bridge strategies only
+   :session {:entries-allowed? bool        ; optional session clock
+             :force-flatten? bool}}        ; (engine.loop :session-clock)
 
   Returns {:facts [fact-envelopes] :strategy-local-state' {..}}.
 

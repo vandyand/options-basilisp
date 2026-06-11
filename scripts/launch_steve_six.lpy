@@ -7,10 +7,15 @@
 ;;
 ;; Env: STEVE_DRY_RUN=1 → wire + prime + one signals call, skip run-live.
 ;;
+;; Session clock (2026-06-11, operator-specified):
+;; - 15:30 ET entry cutoff — no NEW entries (flips still close, never
+;;   re-open); positions opened before the cutoff ride normally
+;; - 15:45 ET forced flatten — every bot closes everything (0DTE
+;;   pin-risk close-out); re-emits each bar until the book is flat
+;; - sources run until 15:55 ET so the flatten decisions + fills resolve
+;;
 ;; v0 limitations (documented):
 ;; - bridge is NOT replay-safe (Python-side state; restart = re-prime)
-;; - no 15:50 pin-risk auto-flatten for OAK/DOLPHIN 0DTE — session ends
-;;   19:45Z; operator checks/flattens resting option positions at close
 ;; - equity bots trade fixed qty 50 (production sized by $50k notional)
 (import datetime json os re time urllib.request zoneinfo)
 (require '[stevetrading.base.engine-live :as live]
@@ -26,7 +31,16 @@
 (def dry-run? (= "1" (os/getenv "STEVE_DRY_RUN")))
 (def session-date
   (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
-(def until (str session-date "T19:45:00Z"))
+
+;; session clock: ET wall times -> UTC iso strings (DST-correct)
+(defn- et->utc-str [hh mm]
+  (let [et-now (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York"))
+        at (.replace et-now ** :hour hh :minute mm :second 0 :microsecond 0)]
+    (.strftime (.astimezone at (.-utc datetime/timezone))
+               "%Y-%m-%dT%H:%M:%SZ")))
+(def entry-cutoff (et->utc-str 15 30))
+(def flatten-at (et->utc-str 15 45))
+(def until (et->utc-str 15 55))
 
 (def bots [:chestnut :lynx :moose :parrot :oak :dolphin])
 (def stock-syms ["SPY" "HYG" "TLT" "VXX"])
@@ -257,6 +271,7 @@
 (if dry-run?
   (do (println "=== DRY RUN OK ===")
       (println {:revision revision :spot spot :until until
+                :entry-cutoff entry-cutoff :flatten-at flatten-at
                 :signals (select-keys sig0 bots)}))
   (let [result (live/run-live
                 {:control-plane-root "live_runtime/cp-steve"
@@ -271,6 +286,8 @@
                                                "-h3-v2.edn" "-v2.edn"))
                                        bots)
                  :alpaca-accounts (into {} (map (fn [bot] [(account-id bot) (get creds bot)]) bots))
+                 :session-clock {:entry-cutoff entry-cutoff
+                                 :flatten-at flatten-at}
                  :bridge-ctx bridge-ctx
                  :on-observation obs->bridge!})]
     (println "=== SESSION RESULT ===")

@@ -165,9 +165,12 @@
               call? (= :option-right/call (:instrument/right ref))]
           (if (= long-lot? call?) :long :short))))))
 
-(defn- open-directions
+(defn open-directions
   "Set of open directions (#{} | #{:long} | #{:short} | both) in the
-  strategy view."
+  strategy view. Public: the strategy registry's session-clock entry
+  cutoff reuses this to distinguish 'directional kind that matches the
+  open book' (hold) from 'directional kind that would OPEN exposure'
+  (coerced to :flat after the cutoff)."
   [strategy-view primary-instrument-id]
   (into #{}
         (keep (fn [[iid net]]
