@@ -127,7 +127,8 @@
       (is (= :order-side/buy (:order-intent/side intent)))
       (is (= :position-effect/open (:order-intent/effect intent)))
       (is (= :order-type/limit (:order-intent/order-type intent)))
-      (is (= "2.15" (:order-intent/limit-price intent)))
+      ;; marketable limit (2026-06-11 fix): entry buys price at the ASK
+      (is (= "2.20" (:order-intent/limit-price intent)))
       (is (= [{:instrument/id call-550
                :leg/side :order-side/buy
                :leg/quantity "1"}]
@@ -143,7 +144,8 @@
           (plan-option :posture/enter-short "1" {:chain* chain :spot "550.20"})
           [intent] order-intents]
       (is (= :order-side/buy (:order-intent/side intent)))
-      (is (= "1.95" (:order-intent/limit-price intent)))
+      ;; ask of 1.90/2.00
+      (is (= "2.00" (:order-intent/limit-price intent)))
       (is (= put-550
              (get-in intent [:order-intent/legs 0 :instrument/id]))))))
 
@@ -182,7 +184,7 @@
    :view/open-lots [long-call-lot]})
 
 (deftest option-flatten-closes-lots
-  (testing "flatten sells the open lot at the contract's current mid"
+  (testing "flatten sells the open lot at the contract bid (marketable)"
     (let [{:execution/keys [order-intents]}
           (plan-option :posture/flatten "1"
                        {:chain* chain :spot "550.20" :view long-call-view})
@@ -191,7 +193,8 @@
       (is (= :order-side/sell (:order-intent/side intent)))
       (is (= :position-effect/close (:order-intent/effect intent)))
       (is (= :order-type/limit (:order-intent/order-type intent)))
-      (is (= "2.15" (:order-intent/limit-price intent)))
+      ;; marketable limit (2026-06-11 fix): selling a long lot prices at the BID
+      (is (= "2.10" (:order-intent/limit-price intent)))
       (is (= "1" (:order-intent/quantity intent)))))
   (testing "contract no longer two-sided in the chain -> MARKET close"
     (let [chain-sans (update chain :chain/contracts

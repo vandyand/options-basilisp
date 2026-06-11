@@ -262,14 +262,28 @@
         flat? (and (empty? (:view/open-lots sview))
                    (every? (fn [[_ q]] (zero? (python/float (str q))))
                            (:view/net-positions sview)))
-        effective-state (if (and (contains? #{:long :short} kind)
-                                 (= kind (:last-kind strategy-local-state))
-                                 flat?)
+        reemit-due? (and (contains? #{:long :short} kind)
+                         (= kind (:last-kind strategy-local-state))
+                         flat?)
+        ;; COOLDOWN (2026-06-11 churn damper): a flat book with an
+        ;; unchanged directional kind re-attempts the entry at most
+        ;; every 3rd bar — fill observation lags one poll cycle, and
+        ;; re-emitting every bar produced order spam while a just-filled
+        ;; entry was still invisible to the view.
+        cooldown (get strategy-local-state :reemit-cooldown 0)
+        reemit-now? (and reemit-due? (zero? cooldown))
+        effective-state (if reemit-now?
                           (dissoc strategy-local-state :last-kind)
                           strategy-local-state)
         decision (signal/decide-bridge-signal strategy bot kind market-slice
                                               effective-state)
-        state' (assoc strategy-local-state :last-kind kind)]
+        state' (assoc strategy-local-state
+                      :last-kind kind
+                      :reemit-cooldown
+                      (cond
+                        reemit-now? 2
+                        (and reemit-due? (pos? cooldown)) (dec cooldown)
+                        :else 0))]
     (if (= :posture/hold (:decision/posture decision))
       {:facts []
        :strategy-local-state' state'}

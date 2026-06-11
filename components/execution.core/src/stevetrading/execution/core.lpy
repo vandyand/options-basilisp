@@ -382,6 +382,20 @@
                   [(:instrument/id c) mid])))
         (:chain/contracts chain)))
 
+(defn- chain-pxs
+  "{instrument-id {:bid Decimal :ask Decimal}} for every two-sided
+  contract in the chain (marketable-limit pricing inputs)."
+  [chain]
+  (into {}
+        (keep (fn [c]
+                (let [bid (:quote/bid c)
+                      ask (:quote/ask c)]
+                  (when (and (some? bid) (some? ask))
+                    [(:instrument/id c)
+                     {:bid (decimal/Decimal bid)
+                      :ask (decimal/Decimal ask)}]))))
+        (:chain/contracts chain)))
+
 (defn- open-option-lots
   [strategy-view]
   (filterv #(.startswith (str (:lot/instrument-id %)) "option/")
@@ -389,27 +403,35 @@
 
 (defn- close-option-lot-intents
   "One close intent per open option lot, FIFO slot order. Side opposite
-  the lot side; limit at the contract's current chain mid, market when the
-  contract is no longer quoted two-sided."
-  [{:keys [decision-id account-id lots mids]}]
+  the lot side. MARKETABLE limit (2026-06-11 fix — mid-priced limits
+  rested unfilled across signal flips and the book accumulated outside
+  the engine's model): selling a long lot prices at the BID, buying back
+  a short lot prices at the ASK; market order when the contract is no
+  longer quoted two-sided."
+  [{:keys [decision-id account-id lots pxs]}]
   (vec
    (map-indexed
     (fn [slot lot]
       (let [iid (:lot/instrument-id lot)
-            mid (get mids iid)]
+            px (get pxs iid)
+            closing-side (if (= :order-side/sell (:lot/side lot))
+                           :order-side/buy
+                           :order-side/sell)
+            limit (when px
+                    (if (= :order-side/buy closing-side)
+                      (:ask px)
+                      (:bid px)))]
         (order-intent {:decision-id decision-id
                        :intent-slot slot
                        :role :intent-role/exit
-                       :side (if (= :order-side/sell (:lot/side lot))
-                               :order-side/buy
-                               :order-side/sell)
+                       :side closing-side
                        :effect :position-effect/close
-                       :order-type (if mid
+                       :order-type (if limit
                                      :order-type/limit
                                      :order-type/market)
                        :tif :tif/day
                        :quantity (:lot/remaining-quantity lot)
-                       :limit-price (when mid (mid-2dp mid))
+                       :limit-price (when limit (mid-2dp limit))
                        :instrument-id iid
                        :account-id account-id})))
     lots)))
@@ -427,11 +449,12 @@
         chain (:execution/chain instrument-ctx)
         spot-str (:execution/spot instrument-ctx)
         lots (open-option-lots (:execution/strategy-view instrument-ctx))
+        pxs (chain-pxs chain)
         closes (fn [] (close-option-lot-intents
                        {:decision-id decision-id
                         :account-id account-id
                         :lots lots
-                        :mids (chain-mids chain)}))
+                        :pxs pxs}))
         enter (fn [right]
                 (cond
                   (zero-qty? quantity) []
@@ -444,8 +467,11 @@
                       (skip :skip/no-eligible-contract)
                       ;; flip: close every open option lot first (only
                       ;; opposite-direction lots can exist — same-direction
-                      ;; entries are risk-denied), then open.
-                      (let [close-intents (closes)]
+                      ;; entries are risk-denied), then open. Entry buys
+                      ;; price at the ASK (marketable limit — see
+                      ;; close-option-lot-intents docstring).
+                      (let [close-intents (closes)
+                            ask (get-in pxs [(:instrument/id pick) :ask])]
                         (conj close-intents
                               (order-intent
                                {:decision-id decision-id
@@ -456,7 +482,7 @@
                                 :order-type :order-type/limit
                                 :tif :tif/day
                                 :quantity quantity
-                                :limit-price (mid-2dp (:mid pick))
+                                :limit-price (mid-2dp (or ask (:mid pick)))
                                 :instrument-id (:instrument/id pick)
                                 :account-id account-id})))))))]
     (if (nil? chain)
