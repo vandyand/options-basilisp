@@ -12,7 +12,7 @@
 ;; - no 15:50 pin-risk auto-flatten for OAK/DOLPHIN 0DTE — session ends
 ;;   19:45Z; operator checks/flattens resting option positions at close
 ;; - equity bots trade fixed qty 50 (production sized by $50k notional)
-(import datetime json os re urllib.request zoneinfo)
+(import datetime json os re time urllib.request zoneinfo)
 (require '[stevetrading.base.engine-live :as live]
          '[stevetrading.bridge.steve-v2 :as bridge]
          '[stevetrading.control-plane.file-store :as cpfs]
@@ -114,11 +114,18 @@
                    :lynx (str ref-root "/pipeline_data/calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
                    :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}}))
 
-(println "priming bridge: bars x4 symbols + 2 chain snapshots...")
+(println "priming bridge: bars x4 symbols + steady-state grid history...")
 (def bars-seed (into {} (map (fn [s] [s (fetch-bars s 200)]) stock-syms)))
 (def now-et (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York")))
+;; GRID HOMOGENEITY (2026-06-11 churn root cause): the Mamba encoder
+;; (lynx) sawtooths when the grid-history sequence mixes compositions —
+;; different expiration horizons OR a filling deque (zero-pad ratio
+;; changes every bar). Prime the history to FULL depth with the same
+;; 90d snapshot (production's steady state), and keep the in-loop
+;; horizon at the SAME 90d.
+(def seed-contracts (fetch-chain-contracts 90))
 (def chain-seed
-  [{:observed-at now-et :contracts (fetch-chain-contracts 90)}])
+  (vec (repeat 10 {:observed-at now-et :contracts seed-contracts})))
 (bridge/prime! br bars-seed chain-seed)
 (def sig0 (bridge/signals br))
 (println "primed. signals now:"
@@ -126,6 +133,7 @@
 
 ;; --- on-observation hook: feed the bridge ------------------------------------
 (def dt-cls (.-datetime datetime))
+(def chain-fetch-mono (atom 0))
 (defn- obs->bridge! [obs new?]
   (when new?
     (let [t (:record/type obs)
@@ -145,20 +153,23 @@
                                 :volume (python/float (:bar/volume payload))
                                 :vwap (python/float (:bar/close payload))
                                 :trade-count 0})
-            ;; production cadence: one greeks grid per minute, keyed to
-            ;; the SPY bar. IN-LOOP fetches use a 14-day expiration
-            ;; horizon (~5 expirations) instead of prime's 90d — the 90d
-            ;; fetch (~18 serial REST calls + BS solve) stalled the cycle
-            ;; ~30-60s/bar on 2026-06-11 and the loop fell minutes behind
-            ;; real time. Near-dated expirations dominate the DTE-minute
-            ;; grid bins; documented parity deviation.
+            ;; production cadence: one greeks grid per WALL minute at the
+            ;; SAME 90d horizon as prime (homogeneous grid composition —
+            ;; the lynx churn root cause was horizon mixing). Throttled by
+            ;; wall clock, NOT per bar: when the loop catches up a bar
+            ;; backlog, old bars reuse the last grid instead of each
+            ;; triggering an 18-expiration fetch (the run-1 death spiral).
             (when (= sym "SPY")
-              (try
-                (bridge/on-chain! br {:observed-at (datetime.datetime/now
-                                                    (zoneinfo/ZoneInfo "America/New_York"))
-                                      :contracts (fetch-chain-contracts 14)})
-                (catch python/Exception e
-                  (println "WARN chain fetch failed:" (str e)))))))
+              (let [now (time/monotonic)
+                    last-fetch @chain-fetch-mono]
+                (when (>= (- now last-fetch) 55)
+                  (reset! chain-fetch-mono now)
+                  (try
+                    (bridge/on-chain! br {:observed-at (datetime.datetime/now
+                                                        (zoneinfo/ZoneInfo "America/New_York"))
+                                          :contracts (fetch-chain-contracts 90)})
+                    (catch python/Exception e
+                      (println "WARN chain fetch failed:" (str e)))))))))
         :else nil))))
 
 ;; --- manifest ----------------------------------------------------------------
