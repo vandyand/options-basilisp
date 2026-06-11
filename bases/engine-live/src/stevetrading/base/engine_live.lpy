@@ -338,8 +338,8 @@
   :portfolio {..} :health-view {..} ...}."
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
-           max-facts resume? alpaca alpaca-accounts crash-after-fact
-           crash-before-fact]
+           max-facts resume? alpaca alpaca-accounts bridge-ctx
+           on-observation crash-after-fact crash-before-fact]
     injected-source :source}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
@@ -412,6 +412,11 @@
                                                     (:strategy/id s)))
                                    want (:strategy/artifacts s)]
                                (when (and (some? decl)
+                                          ;; bridge strategies carry no
+                                          ;; feature/inference artifacts —
+                                          ;; their manifest refs are
+                                          ;; placeholders, not checkable
+                                          (not (reg/bridge-strategy? decl))
                                           (or (not= (:model-ref want)
                                                     (get-in decl
                                                             [:strategy/inference
@@ -437,12 +442,20 @@
               ;; loop prefers these over the global :account-id (for a
               ;; single-route process they are identical values)
               (let [loaded (mapv (fn [s route]
-                                   (assoc (get decl-by-id (:strategy/id s))
-                                          :account-id
-                                          (:route/account-id route)
-                                          :broker-route
-                                          {:broker/source-system
-                                           (:route/broker route)}))
+                                   (let [sid (:strategy/id s)
+                                         entry (assoc (get decl-by-id sid)
+                                                      :account-id
+                                                      (:route/account-id route)
+                                                      :broker-route
+                                                      {:broker/source-system
+                                                       (:route/broker route)})]
+                                     ;; bridge strategies get their handle
+                                     ;; ({:signals-fn ..}) from the
+                                     ;; :bridge-ctx run-live opt, keyed by
+                                     ;; strategy id
+                                     (if-let [bctx (get bridge-ctx sid)]
+                                       (assoc entry :bridge bctx)
+                                       entry)))
                                  strategies strategy-routes)
                     _ (reg/build-registry (mapv :decl loaded))
                     run-id (identifiers/new-record-id)
@@ -572,7 +585,11 @@
                             (swap! marks eloop/apply-payload-marks
                                    (:record/type obs)
                                    (:record/instrument-id obs)
-                                   (:fact/payload obs))))})
+                                   (:fact/payload obs)))
+                          ;; caller hook (e.g. bridge ingestion) composes
+                          ;; AFTER the internal marks/clock bookkeeping
+                          (when on-observation
+                            (on-observation obs new?)))})
                       (catch python/Exception e
                         (if (eloop/crash-ex? e)
                           {:crashed? true :crash (ex-data e)}

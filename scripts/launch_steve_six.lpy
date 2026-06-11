@@ -1,0 +1,263 @@
+;; Six-bot bridged session: CHESTNUT/LYNX/MOOSE/PARROT (SPY equity) +
+;; OAK/DOLPHIN (SPY 0DTE ATM options), Python brains via bridge.steve-v2,
+;; one engine process, six Alpaca paper accounts.
+;;
+;; MUST run under the Data-Preprocessor venv (torch/xgboost):
+;;   PYTHONPATH=$(cat .nrepl-pythonpath) REF/.venv/bin/basilisp run scripts/launch_steve_six.lpy
+;;
+;; Env: STEVE_DRY_RUN=1 → wire + prime + one signals call, skip run-live.
+;;
+;; v0 limitations (documented):
+;; - bridge is NOT replay-safe (Python-side state; restart = re-prime)
+;; - no 15:50 pin-risk auto-flatten for OAK/DOLPHIN 0DTE — session ends
+;;   19:45Z; operator checks/flattens resting option positions at close
+;; - equity bots trade fixed qty 50 (production sized by $50k notional)
+(import datetime json os re urllib.request zoneinfo)
+(require '[stevetrading.base.engine-live :as live]
+         '[stevetrading.bridge.steve-v2 :as bridge]
+         '[stevetrading.control-plane.file-store :as cpfs]
+         '[stevetrading.domain.instruments :as ins]
+         '[stevetrading.market-data.alpaca :as mda]
+         '[stevetrading.market-data.composite :as mdc]
+         '[stevetrading.market-data.thetadata :as td])
+
+(def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+(def terminal "http://127.0.0.1:25503")
+(def dry-run? (= "1" (os/getenv "STEVE_DRY_RUN")))
+(def session-date
+  (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
+(def until (str session-date "T19:45:00Z"))
+
+(def bots [:chestnut :lynx :moose :parrot :oak :dolphin])
+(def stock-syms ["SPY" "HYG" "TLT" "VXX"])
+
+;; --- creds from REF/.env -----------------------------------------------------
+(def env-text (slurp (str ref-root "/.env")))
+(defn- env-val [k]
+  (second (re-find (re-pattern (str "(?m)^" k "=(.+)$")) env-text)))
+(def creds
+  (into {}
+        (map (fn [bot]
+               (let [up (.upper (name bot))
+                     k (env-val (str "ALPACA_" up "_API_KEY"))
+                     s (env-val (str "ALPACA_" up "_API_SECRET"))]
+                 (when-not (and k s)
+                   (println "FATAL: missing creds for" up) (python/exit 1))
+                 [bot {:key-id (.strip k) :secret (.strip s)}]))
+             bots)))
+(def data-creds (get creds :chestnut))
+
+;; --- REST helpers ------------------------------------------------------------
+(defn- http-json [url headers]
+  (let [req (urllib.request/Request url)]
+    (doseq [[k v] headers] (.add-header req k v))
+    (.add-header req "Accept" "application/json")
+    (json/loads (.decode (.read (urllib.request/urlopen req ** :timeout 30))
+                         "utf-8"))))
+
+(defn fetch-bars [sym n]
+  (let [url (str "https://data.alpaca.markets/v2/stocks/" sym
+                 "/bars?timeframe=1Min&feed=iex&limit=" n "&sort=desc")
+        doc (http-json url {"APCA-API-KEY-ID" (:key-id data-creds)
+                            "APCA-API-SECRET-KEY" (:secret data-creds)})
+        dt-cls (.-datetime datetime)]
+    (vec (reverse
+          (map (fn [b]
+                 {:time (.fromisoformat dt-cls (get b "t"))
+                  :open (get b "o") :high (get b "h") :low (get b "l")
+                  :close (get b "c") :volume (get b "v")
+                  :vwap (get b "vw" (get b "c"))
+                  :trade-count (get b "n" 0)})
+               (get doc "bars"))))))
+
+(defn fetch-chain-contracts
+  "All SPY contracts for expirations within max-days — bridge contract maps."
+  [max-days]
+  (let [date-cls (.-date datetime)
+        today (.today date-cls)
+        horizon (.fromordinal date-cls (+ (.toordinal today) max-days))
+        exps-doc (http-json (str terminal "/v3/option/list/expirations?symbol=SPY&format=json") {})
+        exps (->> (get exps-doc "expiration")
+                  (map str)
+                  (filter (fn [e]
+                            (let [d (.fromisoformat date-cls e)]
+                              (and (>= (.toordinal d) (.toordinal today))
+                                   (<= (.toordinal d) (.toordinal horizon))))))
+                  distinct sort vec)]
+    (vec (mapcat
+          (fn [exp]
+            (let [compact (.replace exp "-" "")
+                  doc (http-json (str terminal "/v3/option/snapshot/quote?symbol=SPY&expiration=" compact "&format=json") {})
+                  strikes (get doc "strike")
+                  rights (get doc "right")
+                  bids (get doc "bid")
+                  asks (get doc "ask")
+                  n (python/len strikes)]
+              (map (fn [i]
+                     {:strike (.__getitem__ strikes i)
+                      :right (str (.__getitem__ rights i))
+                      :bid (let [b (.__getitem__ bids i)] (if (nil? b) 0.0 (double b)))
+                      :ask (let [a (.__getitem__ asks i)] (if (nil? a) 0.0 (double a)))
+                      :expiration exp})
+                   (range n))))
+          exps))))
+
+;; --- bridge ------------------------------------------------------------------
+(println "loading bridge (torch/xgboost bundles)...")
+(def br
+  (bridge/make-bridge
+   {:ref-root ref-root
+    :bundle-dirs {:chestnut (str ref-root "/pipeline_data/live_model_chestnut_multihead")
+                  :lynx (str ref-root "/pipeline_data/live_model_lynx_multihead")
+                  :moose (str ref-root "/pipeline_data/live_model_moose_multihead")}
+    :calibrations {:chestnut (str ref-root "/pipeline_data/calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
+                   :lynx (str ref-root "/pipeline_data/calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
+                   :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}}))
+
+(println "priming bridge: bars x4 symbols + 2 chain snapshots...")
+(def bars-seed (into {} (map (fn [s] [s (fetch-bars s 200)]) stock-syms)))
+(def now-et (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York")))
+(def chain-seed
+  [{:observed-at now-et :contracts (fetch-chain-contracts 90)}])
+(bridge/prime! br bars-seed chain-seed)
+(def sig0 (bridge/signals br))
+(println "primed. signals now:"
+         (select-keys sig0 [:chestnut :lynx :moose :oak :dolphin :parrot]))
+
+;; --- on-observation hook: feed the bridge ------------------------------------
+(def dt-cls (.-datetime datetime))
+(defn- obs->bridge! [obs new?]
+  (when new?
+    (let [t (:record/type obs)
+          payload (:fact/payload obs)]
+      (cond
+        (= :fact/market-bar-observed t)
+        (let [iid (:record/instrument-id obs)
+              sym (last (.split iid "/"))]
+          (when (contains? (set stock-syms) sym)
+            (bridge/on-bar! br {:symbol sym
+                                :time (.fromisoformat dt-cls
+                                                      (.replace (:bar/time payload) "Z" "+00:00"))
+                                :open (python/float (:bar/open payload))
+                                :high (python/float (:bar/high payload))
+                                :low (python/float (:bar/low payload))
+                                :close (python/float (:bar/close payload))
+                                :volume (python/float (:bar/volume payload))
+                                :vwap (python/float (:bar/close payload))
+                                :trade-count 0})
+            ;; production cadence: one greeks grid per minute, keyed to
+            ;; the SPY bar; multi-expiration fetch matches their grid input
+            (when (= sym "SPY")
+              (try
+                (bridge/on-chain! br {:observed-at (datetime.datetime/now
+                                                    (zoneinfo/ZoneInfo "America/New_York"))
+                                      :contracts (fetch-chain-contracts 90)})
+                (catch python/Exception e
+                  (println "WARN chain fetch failed:" (str e)))))))
+        :else nil))))
+
+;; --- manifest ----------------------------------------------------------------
+(def account-id (fn [bot] (str "account/alpaca/" (name bot) "-paper")))
+(def strategy-id (fn [bot] (str "strategy/steve-v2/" (name bot) "/v1")))
+(def revision (str "cp-steve-" (.replace session-date "-" "") "-"
+                   (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+                              "%H%M%S")))
+(def manifest
+  {:control-plane/revision revision
+   :control-plane/generated-at (td/utc-now-str)
+   :control-plane/status :control-plane-status/proposed
+   :control-plane/strategies
+   (vec (for [bot bots]
+          {:strategy/id (strategy-id bot)
+           :strategy/enabled? true
+           :strategy/mode :mode/paper
+           :strategy/process "engine-paper-steve"
+           :strategy/account-route (str "route/" (name bot))
+           :strategy/artifacts {:model-ref "model/steve-v2/bridge/v1"
+                                :feature-manifest-ref "feature/steve-v2/bridge/v1"}
+           :strategy/schedule {:session :session/us-equities-regular}}))
+   :control-plane/accounts
+   (vec (for [bot bots]
+          {:account/id (account-id bot)
+           :account/broker :broker/alpaca-paper
+           :account/environment :environment/paper
+           :account/allowed-modes #{:mode/paper :mode/shadow}
+           :account/live-enabled? false}))
+   :control-plane/processes
+   [{:process/id "engine-paper-steve"
+     :process/base :base/engine-live
+     :process/allowed-modes #{:mode/paper}
+     :process/strategies (mapv strategy-id bots)}]
+   :control-plane/routes
+   (vec (for [bot bots]
+          {:route/id (str "route/" (name bot))
+           :route/strategy-id (strategy-id bot)
+           :route/account-id (account-id bot)
+           :route/broker :broker/alpaca-paper}))
+   :control-plane/kill-switches
+   [{:kill-switch/scope :kill-switch-scope/global
+     :kill-switch/active? false :kill-switch/reason nil
+     :kill-switch/activated-at nil :kill-switch/actor nil}]
+   :control-plane/policies
+   {:policy/default-degradation :degradation-policy/default-paper}})
+
+(def cp-store (cpfs/make-file-control-plane-store "live_runtime/cp-steve"))
+(def activation (cpfs/activate! cp-store manifest {:activation/actor "steve-six-launcher"}))
+(when-not (:activated? activation)
+  (println "FATAL: activation failed:" activation) (python/exit 1))
+(println "manifest" revision "activated")
+
+;; --- sources -----------------------------------------------------------------
+(def spot (python/float (bridge/spy-price br)))
+(def bar-srcs
+  (vec (for [sym stock-syms]
+         (mda/make-alpaca-bars-source
+          {:symbol sym
+           :instrument-id (str "equity/NASDAQ/" sym)
+           :key-id (:key-id data-creds) :secret (:secret data-creds)
+           :warmup-bars 3 :block? false :poll-seconds 10
+           :until until}))))
+(def chain-src
+  (td/make-thetadata-chain-source
+   {:symbol "SPY" :underlying-id "equity/NASDAQ/SPY"
+    :expiration session-date
+    :strike-range [(str (- (python/int spot) 25)) (str (+ (python/int spot) 25))]
+    :block? false :poll-seconds 55
+    :until until}))
+(def source (mdc/make-composite-source
+             {:sources (conj bar-srcs chain-src)
+              :poll-seconds 2 :until until}))
+
+;; --- run ---------------------------------------------------------------------
+(def bridge-ctx
+  (into {} (map (fn [bot]
+                  [(strategy-id bot)
+                   {:signals-fn (fn []
+                                  (let [s (bridge/signals br)]
+                                    (select-keys s [:chestnut :lynx :moose
+                                                    :oak :dolphin :parrot])))}])
+                bots)))
+
+(if dry-run?
+  (do (println "=== DRY RUN OK ===")
+      (println {:revision revision :spot spot :until until
+                :signals (select-keys sig0 bots)}))
+  (let [result (live/run-live
+                {:control-plane-root "live_runtime/cp-steve"
+                 :process-id "engine-paper-steve"
+                 :out-dir (str "live_runtime/steve-session-" session-date)
+                 :source source
+                 :mode :mode/paper
+                 :snapshot-every 50
+                 :strategy-paths (mapv #(str "resources/strategies/steve/"
+                                             (name %)
+                                             (if (#{:chestnut :lynx :moose} %)
+                                               "-h3-v2.edn" "-v2.edn"))
+                                       bots)
+                 :alpaca-accounts (into {} (map (fn [bot] [(account-id bot) (get creds bot)]) bots))
+                 :bridge-ctx bridge-ctx
+                 :on-observation obs->bridge!})]
+    (println "=== SESSION RESULT ===")
+    (prn (select-keys result [:live/started? :live/refusal :run/id
+                              :facts-appended :orders]))
+    (prn (:portfolio result))))
