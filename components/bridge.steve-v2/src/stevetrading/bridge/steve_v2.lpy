@@ -79,6 +79,7 @@
            importlib
            json
            math
+           os
            sys
            types
            zoneinfo))
@@ -345,10 +346,16 @@
     :risk-free-rate  — BS r (default 0.043, OptionsChainFetcher.RISK_FREE_RATE)
     :max-bars        — bar deque maxlen (default 200, data_fetcher.MAX_HISTORY)
     :grid-history    — grid deque maxlen (default 10, main.py GRID_HISTORY_LEN)
+    :capture-dir     — when set, every NEW bar's 918-feature vectors (all
+                       three engine instances), latest greeks grid, and
+                       SPY price are appended to
+                       <capture-dir>/live_features_<utc-date>.npz
+                       (full rewrite per bar, ~MBs) — the live side of
+                       the train/serve feature-parity check
 
   Loads torch/xgboost models eagerly — requires the REF venv."
   [{:keys [ref-root bundle-dirs calibrations risk-free-rate max-bars
-           grid-history calibration-correction]
+           grid-history calibration-correction capture-dir]
     :or {risk-free-rate 0.043 max-bars 200 grid-history 10
          calibration-correction :seed-pred-std}}]
   (ensure-ref-paths! ref-root)
@@ -407,6 +414,8 @@
      :buffers buffers
      :grid-history (deque ** :maxlen grid-history)
      :bots (into {} (map (fn [b] [b (load-bot b)]) bots))
+     :capture-dir (when capture-dir (str capture-dir))
+     :capture (atom [])
      :state (atom {:mult1 (zipmap bots (repeat default-direction-state))
                    :mult2 (zipmap bots (repeat default-direction-state))
                    :oak :flat
@@ -514,10 +523,46 @@
                          :dictionary_atoms atoms)
                   pred (.predict inference feats grids-seq)]
               [bot {:pred (vec (map double pred))
+                    :feats feats
                     :n-features (python/len feats)
                     :n-zero (python/int
                              (.sum np (.equal np feats 0.0)))}]))
           (:bots bridge)))))
+
+(defn- capture-features!
+  "Feature-parity capture (live side): append this bar's per-bot
+  918-feature vectors + latest greeks grid + SPY price to the capture
+  log and rewrite <capture-dir>/live_features_<utc-date>.npz. Full
+  rewrite per bar (390 bars x 3 bots x 918 f32 + grids — a few MB) is
+  crash-safe enough for a diagnostic capture. Never throws (a capture
+  failure must not take down the trading session)."
+  [bridge bar-time preds]
+  (when-let [cdir (:capture-dir bridge)]
+    (try
+      (let [np (:np bridge)
+            grids (python/list (:grid-history bridge))
+            grid (if (pos? (count grids))
+                   (.__getitem__ grids -1)
+                   (.zeros np #py (6 21 8) ** :dtype (.-float32 np)))
+            entry {:time (str bar-time)
+                   :spy (python/float (or (spy-price bridge) 0.0))
+                   :grid grid
+                   :feats (into {} (map (fn [[b m]] [b (:feats m)]) preds))}
+            entries (swap! (:capture bridge) conj entry)
+            stamp (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+                             "%Y%m%d")
+            path (str cdir "/live_features_" stamp ".npz")]
+        (os/makedirs cdir ** :exist_ok true)
+        (.savez_compressed
+         np path
+         ** :times (.array np (python/list (map :time entries)))
+         :spy (.array np (python/list (map :spy entries)))
+         :grids (.stack np (python/list (map :grid entries)))
+         :chestnut (.stack np (python/list (map #(get-in % [:feats :chestnut]) entries)))
+         :lynx (.stack np (python/list (map #(get-in % [:feats :lynx]) entries)))
+         :moose (.stack np (python/list (map #(get-in % [:feats :moose]) entries)))))
+      (catch python/Exception e
+        (println "WARN feature capture failed:" (str e))))))
 
 (defn- last-spy-bar-time
   "The last ingested SPY bar's time object (the `signals` memoization
@@ -533,6 +578,7 @@
   per-bar memoization."
   [bridge bar-time]
   (let [preds (predictions bridge)
+        _ (capture-features! bridge bar-time preds)
         bots* (:bots bridge)
         st @(:state bridge)
         step (fn [states mult]
