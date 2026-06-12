@@ -29,6 +29,11 @@
 
 (def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
 (def dry-run? (= "1" (os/getenv "SIM_DRY_RUN")))
+;; wiring-run overrides (verification only — defaults are the strategy)
+(def condor-threshold (or (os/getenv "SIM_CONDOR_THRESHOLD") "0.50"))
+(def enter-sigma (python/float (or (os/getenv "SIM_ENTER_SIGMA") "2.0")))
+(def min-samples (python/int (or (os/getenv "SIM_MIN_SAMPLES") "20")))
+(def out-suffix (or (os/getenv "SIM_OUT_SUFFIX") ""))
 
 ;; data creds (bars only — the broker is SIM): chestnut from REF/.env
 (def env-text (slurp (str ref-root "/.env")))
@@ -116,7 +121,7 @@
              :model/version 1
              :model/type :model.type/threshold
              :model/params {:feature :feature/condor-mid-credit
-                            :threshold "0.50"}
+                            :threshold condor-threshold}
              :model/feature-manifest-ref condor-feature-ref
              :model/prediction-schema-version 1})
 
@@ -173,8 +178,8 @@
              :strategy/inference {:artifact-ref calendar-model-ref}
              :strategy/signal {:fn-id :signal/zscore-hysteresis-v1
                                :params {:delta-horizon 10 :stats-window 60
-                                        :enter-sigma 2.0 :exit-sigma 0.5
-                                        :min-samples 20}}
+                                        :enter-sigma enter-sigma :exit-sigma 0.5
+                                        :min-samples min-samples}}
              :strategy/risk {:policy-id :risk/single-structure :params {}}
              :strategy/execution {:policy-id :execution/calendar-spread-v1
                                   :params {:quantity "1"
@@ -233,7 +238,7 @@
 (prn {:spot spy-price :front front-exp :back back-exp
       :condor {:puts [(k (- atm 6)) (k (- atm 10))]
                :calls [(k (+ atm 6)) (k (+ atm 10))]
-               :threshold "0.50"}
+               :threshold condor-threshold}
       :calendar {:strikes [(k (- atm 3)) "..." (k (+ atm 3))]}
       :revision revision :until until})
 
@@ -257,7 +262,7 @@
         result (live/run-live
                 {:control-plane-root "live_runtime/cp-sim-vt"
                  :process-id "engine-sim-vol-term"
-                 :out-dir (str "live_runtime/sim-vt-session-" session-date)
+                 :out-dir (str "live_runtime/sim-vt-session-" session-date out-suffix)
                  :source source
                  :mode :mode/sim
                  :snapshot-every 50
