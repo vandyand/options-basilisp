@@ -137,7 +137,10 @@
                    :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}
     ;; feature-parity capture (live side): per-bar 918-feature vectors
     ;; land in live_runtime/feature-capture/live_features_<date>.npz
-    :capture-dir "live_runtime/feature-capture"}))
+    :capture-dir "live_runtime/feature-capture"
+    ;; DOLPHIN hysteresis lane: 1.5x (operator, 2026-06-12) — the legacy
+    ;; 2.0x never reached conviction under honest z-scores
+    :mult2-scale 1.5}))
 
 (println "priming bridge: bars x4 symbols + steady-state grid history...")
 (def bars-seed (into {} (map (fn [s] [s (fetch-bars s 200)]) stock-syms)))

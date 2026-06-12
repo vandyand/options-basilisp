@@ -347,6 +347,10 @@
     :risk-free-rate  — BS r (default 0.043, OptionsChainFetcher.RISK_FREE_RATE)
     :max-bars        — bar deque maxlen (default 200, data_fetcher.MAX_HISTORY)
     :grid-history    — grid deque maxlen (default 10, main.py GRID_HISTORY_LEN)
+    :mult2-scale     — hysteresis multiplier for the second lane
+                       (DOLPHIN's consensus input; default 2.0 =
+                       production legacy, operator-tuned to 1.5
+                       2026-06-12 for the honest-z regime)
     :capture-dir     — when set, every NEW bar's 918-feature vectors (all
                        three engine instances), latest greeks grid, and
                        SPY price are appended to
@@ -356,9 +360,9 @@
 
   Loads torch/xgboost models eagerly — requires the REF venv."
   [{:keys [ref-root bundle-dirs calibrations risk-free-rate max-bars
-           grid-history calibration-correction capture-dir]
+           grid-history calibration-correction capture-dir mult2-scale]
     :or {risk-free-rate 0.043 max-bars 200 grid-history 10
-         calibration-correction :seed-pred-std}}]
+         calibration-correction :seed-pred-std mult2-scale 2.0}}]
   (ensure-ref-paths! ref-root)
   (ensure-alpaca-stub!)
   (let [np (importlib/import-module "numpy")
@@ -441,6 +445,7 @@
      :bots (into {} (map (fn [b] [b (load-bot b)]) bots))
      :capture-dir (when capture-dir (str capture-dir))
      :capture (atom [])
+     :mult2-scale (double mult2-scale)
      :state (atom {:mult1 (zipmap bots (repeat default-direction-state))
                    :mult2 (zipmap bots (repeat default-direction-state))
                    :oak :flat
@@ -625,7 +630,12 @@
                                     (get states bot))]))
                           bots)))
         r1 (step (:mult1 st) 1.0)
-        r2 (step (:mult2 st) 2.0)
+        ;; the second hysteresis lane (DOLPHIN's consensus input).
+        ;; Production hardcoded 2.0; tuned against the identity-stats
+        ;; bug's saturated signals — under honest z-scores 2.0 never
+        ;; reached conviction (Jun 12: dolphin flat all morning), so
+        ;; it's configurable now (operator set 1.5, 2026-06-12).
+        r2 (step (:mult2 st) (double (:mult2-scale bridge 2.0)))
         votes1 (mapv #(:kind (get r1 %)) bots)
         votes2 (mapv #(:kind (get r2 %)) bots)
         oak (consensus-vote votes1 (:oak st))
