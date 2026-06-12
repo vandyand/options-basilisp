@@ -1,0 +1,26 @@
+(ns bridge.test-v2-term
+  "bridge.v2-term pure logic — the TermSlopeSignal hysteresis machine
+  (verified sign convention hawk_term_main.py: z>+enter -> LONG_CALENDAR,
+  z<-enter -> SHORT_CALENDAR, |z|<exit while held -> flat). The
+  prediction_fn wrap itself is interop (smoke-tested live, not unit-
+  tested — no torch/network in the suite)."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.bridge.v2-term :as v2t]))
+
+(deftest hysteresis-machine
+  (testing "flat + small z stays flat"
+    (is (= :flat (v2t/hysteresis-step :flat 0.4 2.5 0.5)))
+    (is (= :flat (v2t/hysteresis-step :flat -2.4 2.5 0.5))))
+  (testing "entries at the band edges"
+    (is (= :long (v2t/hysteresis-step :flat 2.51 2.5 0.5)))
+    (is (= :short (v2t/hysteresis-step :flat -2.51 2.5 0.5))))
+  (testing "held position rides until the exit band"
+    (is (= :long (v2t/hysteresis-step :long 1.0 2.5 0.5)))
+    (is (= :long (v2t/hysteresis-step :long 0.51 2.5 0.5)))
+    (is (= :flat (v2t/hysteresis-step :long 0.49 2.5 0.5)))
+    (is (= :flat (v2t/hysteresis-step :short -0.3 2.5 0.5))))
+  (testing "flip through zero: short while long requires full opposite entry"
+    (is (= :short (v2t/hysteresis-step :long -2.6 2.5 0.5))))
+  (testing "nil z (predictor cold / fetch error) holds the prior kind"
+    (is (= :long (v2t/hysteresis-step :long nil 2.5 0.5)))
+    (is (= :flat (v2t/hysteresis-step :flat nil 2.5 0.5)))))

@@ -1,0 +1,121 @@
+(ns stevetrading.bridge.v2-term
+  "Python interop bridge to the V2 TERM-family brains (HAWK_TERM_*) —
+  the model-driven Phase 2 replacing the rule-based straddle-slope v1.
+
+  Wraps stevetrading_v2.strategies._term_predictor_builder
+  /build_term_prediction_fn: the returned prediction_fn(now) is
+  SELF-CONTAINED (fetches its own equity price via Alpaca + chain via
+  ThetaDataProvider, loads the legacy term predictor + 61-feature XGB,
+  manages its own predictor state under :state-dir) and returns an
+  already-z-scored slope-change prediction (V2 calibration is pinned to
+  pred_mean=0 / pred_std=1 — verified _term_predictor_builder.py:404).
+
+  This bridge adds ONLY the TermSlopeSignal hysteresis machine
+  (verified sign convention, hawk_term_main.py):
+      z > +enter-sigma             -> :long  (LONG_CALENDAR)
+      z < -enter-sigma             -> :short (SHORT_CALENDAR)
+      |z| < exit-sigma while held  -> :flat
+  and per-wall-minute memoization (prediction_fn does network I/O —
+  at most one evaluation per strategy per minute; errors/NaN hold the
+  prior kind and degrade health, never throw into the engine).
+
+  Handle shape matches bridge.steve-v2: {:signals-fn (fn [] {bot kind})}
+  — the registry's bridge pipeline consumes it unchanged. NOT
+  replay-safe (Python predictor state; restart = re-hydrate)."
+  (:import datetime importlib math sys))
+
+(defn- ensure-ref-paths! [ref-root]
+  (let [spath (.-path sys)]
+    (doseq [p [ref-root (str ref-root "/src")]]
+      (when-not (.__contains__ spath p)
+        (.insert spath 0 p)))))
+
+(def spec-vars
+  "Bot keyword -> _term_predictor_builder spec var name."
+  {:hawk-term-spy "HAWK_TERM_SPY_V2_SPEC"
+   :hawk-term-spxw "HAWK_TERM_SPXW_V2_SPEC"
+   :hawk-term-qqq "HAWK_TERM_QQQ_V2_SPEC"
+   :hawk-term-qqq-aug "HAWK_TERM_QQQ_AUG_V2_SPEC"})
+
+(defn hysteresis-step
+  "Pure TermSlopeSignal step: held kind + z -> kind."
+  [held z enter-sigma exit-sigma]
+  (cond
+    (nil? z) held
+    (> z enter-sigma) :long
+    (< z (- enter-sigma)) :short
+    (and (not= :flat held) (< (abs z) exit-sigma)) :flat
+    :else held))
+
+(defn make-v2-term-bridge
+  "Construct the bridge. config:
+    :ref-root      Data-Preprocessor checkout (REQUIRED)
+    :state-dir     predictor state dir (REQUIRED — sim sessions use a
+                   live_runtime path, NEVER production's state dir)
+    :alpaca-key/:alpaca-secret  paper creds for price hydration (REQUIRED)
+    :strategies    {bot {:enter-sigma 2.5 :exit-sigma 0.5}} — bots from
+                   spec-vars (default: hawk-term-spy only)
+    :theta-port    terminal v3 data port (default 25503)
+
+  Loads the legacy term predictors + XGB eagerly (REF venv)."
+  [{:keys [ref-root state-dir alpaca-key alpaca-secret strategies theta-port]
+    :or {strategies {:hawk-term-spy {:enter-sigma 2.5 :exit-sigma 0.5}}
+         theta-port 25503}}]
+  (ensure-ref-paths! ref-root)
+  (let [builder (importlib/import-module
+                 "stevetrading_v2.strategies._term_predictor_builder")
+        tdp-mod (importlib/import-module
+                 "stevetrading_v2.data_providers.thetadata")
+        theta ((.-ThetaDataProvider tdp-mod) ** :data_port theta-port)
+        load-bot (fn [bot params]
+                   (let [spec-var (or (get spec-vars bot)
+                                      (throw (ex-info (str "unknown v2 term bot " bot)
+                                                      {:error/bot bot})))
+                         spec (python/getattr builder spec-var)
+                         [pred-fn _cal] ((.-build_term_prediction_fn builder)
+                                         spec
+                                         ** :state_dir state-dir
+                                         :alpaca_paper_api_key alpaca-key
+                                         :alpaca_paper_secret_key alpaca-secret
+                                         :theta_provider theta)]
+                     {:pred-fn pred-fn
+                      :enter-sigma (double (:enter-sigma params 2.5))
+                      :exit-sigma (double (:exit-sigma params 0.5))}))
+        bots (into {} (map (fn [[bot params] ] [bot (load-bot bot params)])
+                           strategies))
+        state (atom {:kinds (zipmap (keys bots) (repeat :flat))
+                     :last-minute nil
+                     :last-z {}
+                     :last-error nil})]
+    {:bots bots
+     :state state
+     :signals-fn
+     (fn []
+       (let [now (datetime.datetime/now (.-utc datetime/timezone))
+             minute (.strftime now "%Y-%m-%dT%H:%M")
+             st @state]
+         (if (= minute (:last-minute st))
+           (:kinds st)
+           (let [results
+                 (into {}
+                       (map (fn [[bot {:keys [pred-fn enter-sigma exit-sigma]}]]
+                              (let [held (get-in st [:kinds bot] :flat)
+                                    z (try
+                                        (let [v (pred-fn now)
+                                              f (python/float v)]
+                                          (when-not (math/isnan f) f))
+                                        (catch python/Exception e
+                                          (swap! state assoc :last-error
+                                                 (str bot ": " e))
+                                          nil))]
+                                [bot {:kind (hysteresis-step held z
+                                                             enter-sigma
+                                                             exit-sigma)
+                                      :z z}]))
+                            bots))
+                 kinds (into {} (map (fn [[b r]] [b (:kind r)]) results))]
+             (swap! state assoc
+                    :kinds kinds
+                    :last-minute minute
+                    :last-z (into {} (map (fn [[b r]] [b (:z r)]) results)))
+             kinds))))}))

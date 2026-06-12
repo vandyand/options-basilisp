@@ -113,9 +113,12 @@
            (assoc chestnut-decl :strategy/signal {:fn-id :signal/sma-crossover-v1}))]
       (is (false? valid?))
       (is (some #(= [:strategy/signal :fn-id] (:error/path %)) errors))))
-  (testing "bridge decl bot must be one of the six"
+  (testing "bridge decl bot must be a keyword (any bridge's key — the
+            v2-term bots opened the enum 2026-06-12); non-keywords rejected"
+    (is (true? (:valid? (registry/validate-strategy-decl
+                         (assoc chestnut-decl :strategy/bridge {:bot :hawk-term-spy})))))
     (is (false? (:valid? (registry/validate-strategy-decl
-                          (assoc chestnut-decl :strategy/bridge {:bot :badger}))))))
+                          (assoc chestnut-decl :strategy/bridge {:bot "badger"}))))))
   (testing "non-bridge declarations keep their behavior (features/inference required)"
     (is (= {:valid? true} (registry/validate-strategy-decl sma-decl)))
     (is (false? (:valid? (registry/validate-strategy-decl

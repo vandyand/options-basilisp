@@ -29,3 +29,4 @@ htmlcov/
 
 # Runtime session state (facts, snapshots, control-plane runtime root)
 live_runtime/
+pipeline_data

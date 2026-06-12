@@ -68,7 +68,12 @@
   (if pred errors (conj errors (err code path message))))
 
 (def bridge-bots
-  "The six bridged steve-v2 bot keys (bridge.steve-v2 `signals` map keys)."
+  "The six bridged steve-v2 bot keys (bridge.steve-v2 `signals` map
+  keys). Other bridges (bridge.v2-term's :hawk-term-* and the coming
+  vol family) declare their own bot keys — validation requires only a
+  KEYWORD bot; the launcher's :bridge-ctx wiring is the authority on
+  which keys a signals-fn actually serves (a missing key throws at the
+  first decide-bridge-signal call: unknown bridge kind nil)."
   #{:chestnut :lynx :moose :oak :dolphin :parrot})
 
 (defn bridge-strategy?
@@ -121,9 +126,9 @@
                    "must be a non-empty vector of instrument-id strings"))]
     (if (bridge-strategy? decl)
       (-> errors
-          (check (contains? bridge-bots (get-in decl [:strategy/bridge :bot]))
+          (check (keyword? (get-in decl [:strategy/bridge :bot]))
                  :error/invalid-enum [:strategy/bridge :bot]
-                 "must be one of :chestnut :lynx :moose :oak :dolphin :parrot")
+                 "must be a keyword (a key the injected :bridge signals-fn serves)")
           (check (= :signal/steve-v2-bridge (get-in decl [:strategy/signal :fn-id]))
                  :error/invalid-enum [:strategy/signal :fn-id]
                  "bridge strategies must use the :signal/steve-v2-bridge signal fn"))

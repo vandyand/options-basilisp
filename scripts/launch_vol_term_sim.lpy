@@ -16,12 +16,14 @@
 ;; expirations) resolves at LAUNCH; dated artifacts + manifest land
 ;; under live_runtime/generated-sim/.
 ;;
-;; Run (engine venv, no torch needed):
-;;   PYTHONPATH=$(cat .nrepl-pythonpath) .venv/bin/basilisp run scripts/launch_vol_term_sim.lpy
+;; Run under the REF venv (the HAWK_TERM bridge loads xgboost + the V2
+;; legacy term predictor):
+;;   PYTHONPATH=$(cat .nrepl-pythonpath) REF/.venv/bin/basilisp run scripts/launch_vol_term_sim.lpy
 ;; Env: SIM_DRY_RUN=1 -> resolve + activate + print, skip run-live.
 (import datetime json os os.path re urllib.request zoneinfo)
 (require '[basilisp.edn :as edn]
          '[stevetrading.base.engine-live :as live]
+         '[stevetrading.bridge.v2-term :as v2t]
          '[stevetrading.control-plane.file-store :as cpfs]
          '[stevetrading.market-data.alpaca :as mda]
          '[stevetrading.market-data.composite :as mdc]
@@ -186,6 +188,39 @@
                                            :right :option-right/call
                                            :allow-short? true}}})
 
+;; --- HAWK_TERM_SPY_V2 (model-driven Phase 2) ---------------------------------
+;; V2 brains via bridge.v2-term: 61-feature XGB slope-change prediction
+;; (already z-scored), TermSlopeSignal 2.5/0.5 sigma hysteresis; trades
+;; the SAME calendar executor as the rule-based v1 (a live A/B).
+(def hawk-sid "strategy/v2-term/hawk-term-spy/v2")
+(def hawk-decl-path (str gen-root "/strategies/hawk-term-spy.edn"))
+(write-edn! hawk-decl-path
+            {:strategy/id hawk-sid
+             :strategy/family :strategy-family/v2-term
+             :strategy/name :strategy-name/hawk-term-spy
+             :strategy/version 2
+             :strategy/mode-policy #{:mode/sim}
+             :strategy/schedule {:session :session/us-equities-regular}
+             :strategy/warmup {:required-bars 1}
+             :strategy/instruments ["equity/NASDAQ/SPY"]
+             :strategy/bridge {:bot :hawk-term-spy}
+             :strategy/signal {:fn-id :signal/steve-v2-bridge}
+             :strategy/risk {:policy-id :risk/single-structure :params {}}
+             :strategy/execution {:policy-id :execution/calendar-spread-v1
+                                  :params {:quantity "1"
+                                           :right :option-right/call
+                                           :allow-short? true}}})
+
+(def v2-bridge
+  (when-not dry-run?
+    (println "loading HAWK_TERM_SPY_V2 bridge (xgboost + legacy term predictor)...")
+    (v2t/make-v2-term-bridge
+     {:ref-root ref-root
+      :state-dir "live_runtime/v2-term-state"
+      :alpaca-key key-id
+      :alpaca-secret secret
+      :strategies {:hawk-term-spy {:enter-sigma 2.5 :exit-sigma 0.5}}})))
+
 ;; --- manifest -----------------------------------------------------------------
 (def revision (str "cp-sim-vt-" compact-date "-"
                    (.strftime (datetime.datetime/now (.-utc datetime/timezone))
@@ -196,7 +231,8 @@
    :control-plane/status :control-plane-status/proposed
    :control-plane/strategies
    (vec (for [[sid feature-ref model-ref] [[condor-sid condor-feature-ref condor-model-ref]
-                                           [calendar-sid calendar-feature-ref calendar-model-ref]]]
+                                           [calendar-sid calendar-feature-ref calendar-model-ref]
+                                           [hawk-sid "feature/v2-term/bridge/v2" "model/v2-term/bridge/v2"]]]
           {:strategy/id sid
            :strategy/enabled? true
            :strategy/mode :mode/sim
@@ -215,9 +251,9 @@
    [{:process/id "engine-sim-vol-term"
      :process/base :base/engine-live
      :process/allowed-modes #{:mode/sim}
-     :process/strategies [condor-sid calendar-sid]}]
+     :process/strategies [condor-sid calendar-sid hawk-sid]}]
    :control-plane/routes
-   (vec (for [sid [condor-sid calendar-sid]]
+   (vec (for [sid [condor-sid calendar-sid hawk-sid]]
           {:route/id (str "route/" sid)
            :route/strategy-id sid
            :route/account-id "account/sim/vol-term"
@@ -266,8 +302,10 @@
                  :source source
                  :mode :mode/sim
                  :snapshot-every 50
-                 :strategy-paths [condor-decl-path calendar-decl-path]
-                 :artifact-root artifact-root})]
+                 :strategy-paths [condor-decl-path calendar-decl-path
+                                  hawk-decl-path]
+                 :artifact-root artifact-root
+                 :bridge-ctx {hawk-sid {:signals-fn (:signals-fn v2-bridge)}}})]
     (println "=== SESSION RESULT ===")
     (prn (select-keys result [:live/started? :live/refusal :run/id
                               :facts-appended :orders]))
