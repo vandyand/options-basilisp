@@ -118,12 +118,20 @@
 
 ;; --- bridge ------------------------------------------------------------------
 (println "loading bridge (torch/xgboost bundles)...")
+;; CLEAN-FEATURE-PARITY BUNDLES (2026-06-12, operator-approved): default
+;; to the *_corrected copies (recovered raw feature stats + neutralized
+;; broken live sources — see deploy_corrected_bundles.py). Rollback:
+;; STEVE_BUNDLES=identity relaunches on the original bug-faithful
+;; bundles.
+(def bundle-suffix
+  (if (= "identity" (os/getenv "STEVE_BUNDLES")) "" "_corrected"))
+(println "bundle variant:" (if (= "" bundle-suffix) "identity (legacy)" "corrected"))
 (def br
   (bridge/make-bridge
    {:ref-root ref-root
-    :bundle-dirs {:chestnut (str ref-root "/pipeline_data/live_model_chestnut_multihead")
-                  :lynx (str ref-root "/pipeline_data/live_model_lynx_multihead")
-                  :moose (str ref-root "/pipeline_data/live_model_moose_multihead")}
+    :bundle-dirs {:chestnut (str ref-root "/pipeline_data/live_model_chestnut_multihead" bundle-suffix)
+                  :lynx (str ref-root "/pipeline_data/live_model_lynx_multihead" bundle-suffix)
+                  :moose (str ref-root "/pipeline_data/live_model_moose_multihead" bundle-suffix)}
     :calibrations {:chestnut (str ref-root "/pipeline_data/calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
                    :lynx (str ref-root "/pipeline_data/calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
                    :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}

@@ -80,6 +80,7 @@
            json
            math
            os
+           os.path
            sys
            types
            zoneinfo))
@@ -402,9 +403,33 @@
                                         :std {:long (seed-std "long")
                                               :gen (seed-std "gen")
                                               :short (seed-std "short")}))
-                               (assoc cal :correction :none))]
+                               (assoc cal :correction :none))
+                         ;; FEATURE NEUTRALIZATION (2026-06-12 corrected-
+                         ;; stats deployment): a corrected bundle may
+                         ;; carry neutralize_features.json — feature
+                         ;; names whose LIVE source is missing (the
+                         ;; engine zero-fills GCS-only chain features) or
+                         ;; broken (IEX volume ~3% of SIP, bid/ask close-
+                         ;; price fallback). Their values are pinned to
+                         ;; the bundle's train MEAN pre-inference (z=0,
+                         ;; the same neutral effect they had under the
+                         ;; identity-stats bug) so the correctly-computed
+                         ;; features can be fixed without injecting
+                         ;; wrong-but-now-scaled values from the rest.
+                         neutralize
+                         (let [path (str bdir "/neutralize_features.json")]
+                           (when (os.path/exists path)
+                             (let [names* (json/loads (slurp path))
+                                   feat-names (json/loads (slurp (str bdir "/feature_names.json")))
+                                   name->idx (into {} (map-indexed (fn [i n] [n i]) feat-names))
+                                   idxs (vec (keep #(get name->idx %) names*))]
+                               {:indices (.array np (python/list idxs)
+                                                 ** :dtype (.-int64 np))
+                                :means (.take (.__getitem__ (.load np (str bdir "/feature_stats.npz")) "mean")
+                                              (.array np (python/list idxs) ** :dtype (.-int64 np)))
+                                :n (count idxs)})))]
                      {:engine engine :inference inference :hmm hmm
-                      :atoms atoms :cal cal}))]
+                      :atoms atoms :cal cal :neutralize neutralize}))]
     {:np np
      :greeks-fns {:implied-vol (.-implied_vol of-mod)
                   :bs-greeks (.-bs_greeks of-mod)
@@ -514,13 +539,18 @@
                     (.zeros np #py (1 6 21 8) ** :dtype (.-float32 np)))]
     (into
      {}
-     (map (fn [[bot {:keys [engine inference hmm atoms]}]]
+     (map (fn [[bot {:keys [engine inference hmm atoms neutralize]}]]
             (let [feats (.compute_all_features
                          engine
                          ** :bar_buffers buffers
                          :greeks_grids_history grids
                          :hmm_model hmm
                          :dictionary_atoms atoms)
+                  ;; pin known-bad live sources to their train mean
+                  ;; (z=0) — see load-bot neutralize docstring
+                  _ (when neutralize
+                      (.__setitem__ feats (:indices neutralize)
+                                    (:means neutralize)))
                   pred (.predict inference feats grids-seq)]
               [bot {:pred (vec (map double pred))
                     :feats feats
