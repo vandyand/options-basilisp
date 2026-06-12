@@ -49,7 +49,7 @@
   The sentinel is an ex-info with ::crash in its data; catch it with
   crash-ex?. run-replay/run-live catch it and return {:crashed? true}.
   Production wiring never sets these hooks."
-  (:import datetime decimal os.path)
+  (:import datetime decimal os.path time)
   (:require [basilisp.edn :as edn]
             [stevetrading.artifact.protocol :as ap]
             [stevetrading.domain.enums :as enums]
@@ -378,6 +378,77 @@
                             (:appended-count ledger-res))
          :skipped-fills (:skipped-fills ledger-res)}))))
 
+(defn- cancel-stale-orders!
+  "Stale resting-order cancel policy (2026-06-12: marketable limits
+  USUALLY fill instantly, but one miss rests for the rest of the day —
+  poisoning in-flight accounting (entries denied, flatten-retry
+  suppressed) and consuming qty_available at the broker (closes rejected
+  as 'uncovered'). DOLPHIN lost a whole session to one resting entry;
+  CHESTNUT's 15:45 close-out stalled on one resting close.)
+
+  Each cycle: every unresolved, broker-acknowledged, not-yet-cancel-
+  requested order is cancelled when it has rested longer than
+  stale-seconds (wall clock — LIVE wiring only, like the session clock)
+  OR immediately when the session clock says force-flatten. pending is
+  the {order-intent-id monotonic-first-seen} age-tracking map threaded
+  through the loop. Returns {:state .. :appended-count n :pending ..}."
+  [{:keys [append! broker state strategies account-id run-mode session
+           stale-seconds pending]}]
+  (let [entries (into {}
+                      (filter (fn [[_ e]]
+                                (and (not (:order/resolved? e))
+                                     (not (:order/cancel-requested? e))
+                                     (some? (:order/broker-order-id e))))
+                              (:engine/unresolved-orders state)))
+        now (time/monotonic)
+        pending' (into {}
+                       (map (fn [[oi _]] [oi (get pending oi now)]))
+                       entries)
+        sid->account (into {}
+                           (map (fn [s] [(get-in s [:decl :strategy/id])
+                                         (or (:account-id s) account-id)]))
+                           strategies)
+        to-cancel (filterv (fn [[oi _]]
+                             (or (:force-flatten? session)
+                                 (>= (- now (get pending' oi now))
+                                     stale-seconds)))
+                           entries)]
+    (if (empty? to-cancel)
+      {:state state :appended-count 0 :pending pending'}
+      (let [commands (mapv (fn [[oi e]]
+                             (cmds/cancel-command
+                              {:order-intent-id oi
+                               :broker-order-id (:order/broker-order-id e)
+                               :account-id (get sid->account
+                                                (:order/strategy-id e)
+                                                account-id)
+                               :strategy-id (:order/strategy-id e)
+                               :mode run-mode
+                               :issued-at (utc-now-str)
+                               :reason (if (:force-flatten? session)
+                                         :cancel/session-flatten
+                                         :cancel/stale-order)}))
+                           to-cancel)
+            dispatched (atom {:new-facts [] :appended-count 0})
+            append-hook (fn [facts*]
+                          (let [res (append! facts*)]
+                            (swap! dispatched
+                                   (fn [acc]
+                                     (-> acc
+                                         (update :new-facts into (:new-facts res))
+                                         (update :appended-count +
+                                                 (:appended-count res)))))
+                            res))
+            _ (cmds/dispatch-commands! {:broker broker
+                                        :state state
+                                        :commands commands
+                                        :append! append-hook})
+            foldr (fold-new! append! state (:new-facts @dispatched))]
+        {:state (:state foldr)
+         :appended-count (+ (:appended-count @dispatched)
+                            (:appended-count foldr))
+         :pending pending'}))))
+
 (defn- run-strategy-cycle!
   "Pipeline → append+fold decision facts → derive/dispatch commands →
   append+fold outcomes → ledger derive/append/fold → portfolio refresh.
@@ -550,6 +621,12 @@
                     end-of-session close-out — keep the SOURCE alive
                     past :flatten-at so the flatten decisions and their
                     fills can actually run)
+    :stale-order-seconds  (optional, LIVE wiring only) cancel any
+                    unresolved broker-acknowledged order resting longer
+                    than this many wall-clock seconds; under
+                    force-flatten ALL resting orders cancel immediately
+                    (see cancel-stale-orders! — the 2026-06-12 resting-
+                    limit incident)
     :on-observation (fn [obs new?]) hook (optional; see ns docstring)
     :on-facts       (fn [facts]) newly-appended-facts hook (optional)
     :crash-after-fact  (fn [fact] bool) crash-injection predicate
@@ -564,7 +641,8 @@
   [{:keys [fact-store snapshot-store broker source strategies account-id
            run-id run-mode state0 ledger0 cursor0 snapshot-every
            snapshot-scope max-facts broker-route session-clock
-           on-observation on-facts crash-after-fact crash-before-fact]}]
+           stale-order-seconds on-observation on-facts crash-after-fact
+           crash-before-fact]}]
   (let [snapshot-every (or snapshot-every default-snapshot-every)
         snapshot-scope (or snapshot-scope default-snapshot-scope)
         cursor0 (or cursor0 0)
@@ -580,7 +658,10 @@
            cursor cursor0
            appended 0
            since-snap 0
-           skipped-fills []]
+           skipped-fills []
+           ;; {order-intent-id monotonic-first-seen} age tracking for the
+           ;; stale-order cancel policy (live wiring only)
+           cancel-pending {}]
       (let [{:keys [observations] next-cursor :cursor}
             (mdp/next-observations source cursor 1)]
         (if (empty? observations)
@@ -653,6 +734,22 @@
                 ledger (:ledger poll-res)
                 cycle-n (+ cycle-n (:appended-count poll-res))
                 skipped-fills (into skipped-fills (:skipped-fills poll-res))
+                ;; stale resting-order cancel (live wiring only —
+                ;; see cancel-stale-orders!)
+                cancel-res (if (some? stale-order-seconds)
+                             (cancel-stale-orders!
+                              {:append! append! :broker broker :state state
+                               :strategies strategies
+                               :account-id account-id
+                               :run-mode run-mode
+                               :session session
+                               :stale-seconds stale-order-seconds
+                               :pending cancel-pending})
+                             {:state state :appended-count 0
+                              :pending cancel-pending})
+                state (:state cancel-res)
+                cycle-n (+ cycle-n (:appended-count cancel-res))
+                cancel-pending (:pending cancel-res)
                 ;; cursor advance — the snapshot-carried resume point
                 state (st/record-cursor state :market-data next-cursor)
                 appended (+ appended cycle-n)
@@ -669,4 +766,4 @@
                :appended appended :stopped-early? true
                :skipped-fills skipped-fills}
               (recur state ledger next-cursor appended since-snap
-                     skipped-fills))))))))
+                     skipped-fills cancel-pending))))))))

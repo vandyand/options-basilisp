@@ -343,8 +343,8 @@
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
            max-facts resume? alpaca alpaca-accounts bridge-ctx
-           session-clock on-observation crash-after-fact
-           crash-before-fact]
+           session-clock stale-order-seconds on-observation
+           crash-after-fact crash-before-fact]
     injected-source :source}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
@@ -579,6 +579,7 @@
                         :crash-before-fact crash-before-fact
                         :broker-route {:broker/source-system broker-kw}
                         :session-clock session-clock
+                        :stale-order-seconds stale-order-seconds
                         :on-facts on-facts
                         :on-observation
                         (fn [obs new?]

@@ -102,6 +102,36 @@
           (filter #(= :fact/order-intent-created (:record/type %)))
           (mapv #(submit-command % route))))))
 
+(defn cancel-command
+  "One :command/cancel-broker-order envelope for a resting unresolved
+  order entry (2026-06-12 stale-order policy — resting unfilled limits
+  poisoned in-flight accounting all day: DOLPHIN suppressed from 9:52,
+  CHESTNUT's 15:45 flatten close 403'd because the resting sell consumed
+  qty_available). args:
+    :order-intent-id / :broker-order-id  from the entry (required)
+    :account-id    the strategy's broker account (required)
+    :strategy-id   for the envelope (optional)
+    :mode :issued-at :reason  envelope metadata"
+  [{:keys [order-intent-id broker-order-id account-id strategy-id mode
+           issued-at reason]}]
+  (let [idem-key (str "cancel/intent/" order-intent-id)]
+    (sch/command-envelope
+     (compact
+      {:record/type :command/cancel-broker-order
+       :record/mode mode
+       :record/strategy-id strategy-id
+       :record/account-id account-id
+       :record/source-system :engine/commands
+       :command/issued-at issued-at
+       :command/target-adapter :adapter/broker
+       :command/idempotency-key idem-key
+       :command/payload (compact
+                         {:order-intent/id order-intent-id
+                          :command/idempotency-key idem-key
+                          :broker/account-id account-id
+                          :broker/order-id broker-order-id
+                          :cancel/reason reason})}))))
+
 ;; ---------------------------------------------------------------------------
 ;; dispatch-commands! (impure)
 ;; ---------------------------------------------------------------------------

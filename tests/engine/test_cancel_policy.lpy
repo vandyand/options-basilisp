@@ -1,0 +1,123 @@
+(ns engine.test-cancel-policy
+  "Stale resting-order cancel policy (engine.loop/cancel-stale-orders! —
+  the 2026-06-12 incident: one broker-acknowledged limit that never
+  filled rested all day, holding in-flight at 1, which suppressed every
+  DOLPHIN entry and CHESTNUT's 15:45 flatten retry, and consumed
+  qty_available at Alpaca so the flatten close 403'd as 'uncovered')."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [engine.test-fold :as ff]
+            [stevetrading.broker.protocol :as bp]
+            [stevetrading.domain.identifiers :as identifiers]
+            [stevetrading.engine.fold :as fold]
+            [stevetrading.engine.loop :as eloop]
+            [stevetrading.engine.state :as st]))
+
+(def cancel-stale! @#'eloop/cancel-stale-orders!)
+
+(defn- resting-order-state
+  "Engine state holding ONE unresolved broker-acknowledged order
+  (intent -> submit-dispatched -> ack-accepted; no fill ever)."
+  []
+  (reduce (fn [state fact]
+            (:state (fold/fold-fact state fact)))
+          (st/init-run (st/fresh-state)
+                       {:run/id (identifiers/new-record-id)
+                        :run/engine-version st/engine-state-version
+                        :run/mode :mode/sim
+                        :run/started-at "2026-06-10T14:30:00Z"})
+          [(ff/intent-fact) (ff/submit-dispatched-fact) (ff/ack-fact)]))
+
+(defn- cancelled-status-fact []
+  (ff/ffact :fact/broker-order-status-observed
+            {:order-intent/id ff/oi
+             :broker/source-system :broker/sim
+             :broker/order-id "sim-1"
+             :broker/status :broker-status/cancelled
+             :broker/observed-at "2026-06-10T14:31:00Z"}
+            "2026-06-10T14:31:00Z"))
+
+(defn- stub-broker
+  "Cancels acknowledge with a cancelled status fact; records calls."
+  [calls]
+  (reify bp/Broker
+    (submit-order-intent! [_ _] [])
+    (cancel-broker-order! [_ cmd]
+      (swap! calls conj (get-in cmd [:command/payload :broker/order-id]))
+      [(cancelled-status-fact)])
+    (open-orders [_ _] [])
+    (fills-since [_ _ _] [])
+    (account-state [_ _] {})
+    (health [_] {})))
+
+(defn- collecting-append!
+  "Mimics the loop's append! contract: enrich with offsets, collect."
+  [sink]
+  (let [n (atom 0)]
+    (fn [facts]
+      (let [enriched (mapv #(assoc % :fact-log/offset (swap! n inc)) facts)]
+        (swap! sink into enriched)
+        {:new-facts enriched :appended-count (count enriched)}))))
+
+(defn- run-policy [state opts]
+  (let [sink (atom [])
+        calls (atom [])
+        res (cancel-stale! (merge {:append! (collecting-append! sink)
+                                   :broker (stub-broker calls)
+                                   :state state
+                                   :strategies []
+                                   :account-id "account/sim/test"
+                                   :run-mode :mode/sim
+                                   :session nil
+                                   :stale-seconds 0
+                                   :pending {}}
+                                  opts))]
+    (assoc res :sink @sink :calls @calls)))
+
+(deftest stale-order-cancelled-and-resolved
+  (let [state (resting-order-state)
+        entry (st/unresolved-order state ff/oi)]
+    (testing "precondition: acked, unresolved, in-flight"
+      (is (= :acknowledged (:order/lifecycle entry)))
+      (is (false? (:order/resolved? entry))))
+    (let [{:keys [state sink calls pending]} (run-policy state {})]
+      (testing "cancel dispatched to the broker with the broker order id"
+        (is (= ["sim-1"] calls)))
+      (testing "dispatch + cancelled-status facts appended and folded"
+        (is (some #(= :fact/command-dispatched (:record/type %)) sink))
+        (is (some #(= :fact/broker-order-status-observed (:record/type %))
+                  sink)))
+      (testing "the entry resolves — in-flight poison cleared"
+        (let [entry' (st/unresolved-order state ff/oi)]
+          (is (true? (:order/cancel-requested? entry')))
+          (is (true? (:order/resolved? entry')))
+          (is (= :cancelled (:order/lifecycle entry')))))
+      (testing "age tracking carries the order"
+        (is (contains? pending ff/oi))))))
+
+(deftest fresh-order-not-cancelled-until-stale
+  (let [state (resting-order-state)
+        {:keys [calls pending]} (run-policy state {:stale-seconds 3600})]
+    (testing "young order left alone; age tracked for later cycles"
+      (is (= [] calls))
+      (is (contains? pending ff/oi)))))
+
+(deftest force-flatten-cancels-immediately
+  (let [state (resting-order-state)
+        {:keys [calls state]} (run-policy
+                               state {:stale-seconds 3600
+                                      :session {:force-flatten? true}})]
+    (testing "session close-out cancels even young resting orders"
+      (is (= ["sim-1"] calls))
+      (is (true? (:order/resolved? (st/unresolved-order state ff/oi)))))))
+
+(deftest unacked-orders-not-cancelled
+  (testing "no broker-order-id (submit in flight) -> nothing to cancel"
+    (let [state (reduce (fn [s f] (:state (fold/fold-fact s f)))
+                        (st/init-run (st/fresh-state)
+                                     {:run/id (identifiers/new-record-id)
+                                      :run/engine-version st/engine-state-version
+                                      :run/mode :mode/sim
+                                      :run/started-at "2026-06-10T14:30:00Z"})
+                        [(ff/intent-fact) (ff/submit-dispatched-fact)])
+          {:keys [calls]} (run-policy state {})]
+      (is (= [] calls)))))

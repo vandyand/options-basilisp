@@ -302,6 +302,10 @@
                  :alpaca-accounts (into {} (map (fn [bot] [(account-id bot) (get creds bot)]) bots))
                  :session-clock {:entry-cutoff entry-cutoff
                                  :flatten-at flatten-at}
+                 ;; cancel any broker-acked order resting unfilled >90s
+                 ;; (2026-06-12: one resting limit suppressed DOLPHIN all
+                 ;; day and stalled CHESTNUT's 15:45 close-out)
+                 :stale-order-seconds 90
                  :bridge-ctx bridge-ctx
                  :on-observation obs->bridge!})]
     (println "=== SESSION RESULT ===")

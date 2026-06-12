@@ -490,11 +490,20 @@
                       (str (:order-intent/limit-price intent)))
                base)]
     (if (= 1 (count legs))
-      (let [leg (first legs)]
+      (let [leg (first legs)
+            symbol (occ-symbol (:instrument/id leg))]
         (merge base
-               {"symbol" (occ-symbol (:instrument/id leg))
+               {"symbol" symbol
                 "qty" (str (:order-intent/quantity intent))
-                "side" (get side->wire (:order-intent/side intent))}))
+                "side" (get side->wire (:order-intent/side intent))}
+               ;; single-leg OPTION orders carry position_intent too
+               ;; (2026-06-12: without it Alpaca classified a close sell
+               ;; as an uncovered open — a resting earlier sell had
+               ;; consumed qty_available — and 403'd the 15:45 flatten)
+               (when (.startswith (str (:instrument/id leg)) "option/")
+                 {"position_intent" (position-intent
+                                     (:order-intent/effect intent)
+                                     (:order-intent/side intent))})))
       (merge base
              {"order_class" "mleg"
               "qty" (str (:order-intent/quantity intent))
