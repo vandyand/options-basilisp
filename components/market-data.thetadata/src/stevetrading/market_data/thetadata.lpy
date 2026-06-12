@@ -35,7 +35,8 @@
            urllib.request
            zoneinfo
            datetime)
-  (:require [stevetrading.domain.instruments :as ins]
+  (:require [clojure.string]
+            [stevetrading.domain.instruments :as ins]
             [stevetrading.domain.schemas :as sch]
             [stevetrading.market-data.protocol :as p]))
 
@@ -161,8 +162,8 @@
       (utc-now-str))))
 
 (defn fetch-chain!
-  "One snapshot poll. → {:observed-at ts :contracts [...] :dropped n}
-  | {:error ..}"
+  "One snapshot poll for ONE expiration.
+  → {:observed-at ts :contracts [...] :dropped n} | {:error ..}"
   [{:keys [transport base-url symbol expiration] :as opts}]
   (let [compact (.replace expiration "-" "")
         url (str (or base-url default-base-url)
@@ -180,13 +181,44 @@
          :contracts contracts
          :dropped unparseable}))))
 
+(defn fetch-chains!
+  "One snapshot poll across ALL the source's expirations, merged into ONE
+  snapshot (term/calendar strategies need every leg's expiration in the
+  same observation). Contracts carry fully-qualified option instrument
+  ids, so consumers filter by expiry naturally. ALL-OR-NOTHING: any
+  failing expiration fails the whole poll — a term-slope computed from a
+  partial snapshot is silent garbage, not degraded data.
+  → {:observed-at max-ts :contracts [...] :dropped n} | {:error ..}"
+  [{:keys [expirations expiration] :as opts}]
+  (let [exps (or (seq expirations) [expiration])]
+    (reduce
+     (fn [acc exp]
+       (let [res (fetch-chain! (assoc opts :expiration exp))]
+         (if (:error res)
+           (reduced {:error (str exp ": " (:error res))})
+           {:observed-at (let [a (:observed-at acc)]
+                           (if (and a (> (compare a (:observed-at res)) 0))
+                             a
+                             (:observed-at res)))
+            :contracts (into (:contracts acc) (:contracts res))
+            :dropped (+ (:dropped acc) (:dropped res))})))
+     {:observed-at nil :contracts [] :dropped 0}
+     exps)))
+
 (defn chain->fact
-  "Wrap one fetched chain in a canonical fact envelope."
-  [{:keys [underlying-id symbol expiration run-mode]} {:keys [observed-at contracts dropped]}]
-  (let [pref (str "thetadata:chain:" symbol ":" expiration ":" observed-at)
+  "Wrap one fetched (possibly multi-expiration merged) chain in a
+  canonical fact envelope. :chain/expiration stays the FRONT expiration
+  (existing consumers); :chain/expirations carries the full list when
+  the source polls several."
+  [{:keys [underlying-id symbol expiration expirations run-mode]}
+   {:keys [observed-at contracts dropped]}]
+  (let [exps (or (seq expirations) [expiration])
+        exp-key (clojure.string/join "+" exps)
+        pref (str "thetadata:chain:" symbol ":" exp-key ":" observed-at)
         payload {:chain/observed-at observed-at
                  :chain/underlying underlying-id
-                 :chain/expiration expiration
+                 :chain/expiration (first exps)
+                 :chain/expirations (vec exps)
                  :chain/contracts contracts
                  :data/provider provider
                  :data/provider-ref pref
@@ -201,7 +233,7 @@
       :fact/occurred-at observed-at
       :fact/recorded-at (utc-now-str)
       :fact/source-ref pref
-      :fact/dedupe-key (str "md/thetadata/" symbol "/" expiration "/"
+      :fact/dedupe-key (str "md/thetadata/" symbol "/" exp-key "/"
                             observed-at)
       :fact/payload payload})))
 
@@ -218,10 +250,11 @@
        :exhausted? false})))
 
 (defn- poll-chain!
-  "One snapshot poll; records the result (or degradation) in the state
-  atom. Errors degrade health — they never throw across the boundary."
+  "One snapshot poll (all configured expirations); records the result
+  (or degradation) in the state atom. Errors degrade health — they
+  never throw across the boundary."
   [opts state]
-  (let [res (fetch-chain! opts)]
+  (let [res (fetch-chains! opts)]
     (swap! state assoc :polled-once? true)
     (if (:error res)
       (swap! state assoc :last-error (:error res)
@@ -289,8 +322,12 @@
     :symbol         underlying root, e.g. \"SPY\" (required)
     :underlying-id  canonical underlying id, e.g. \"equity/NASDAQ/SPY\"
                     (required)
-    :expiration     dashed \"YYYY-MM-DD\" (required — resolve with
-                    nearest-expiration when you want 'front expiry')
+    :expiration     dashed \"YYYY-MM-DD\" (required unless :expirations —
+                    resolve with nearest-expiration for 'front expiry')
+    :expirations    [\"YYYY-MM-DD\" ...] poll SEVERAL expirations into ONE
+                    merged snapshot per cycle (term/calendar strategies —
+                    every leg's expiry lands in the same observation;
+                    all-or-nothing on per-expiration failures)
     :base-url       terminal root (default http://127.0.0.1:25503)
     :strike-range   [\"540\" \"560\"] inclusive decimal-string bounds
                     (optional payload bound)

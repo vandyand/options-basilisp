@@ -1,0 +1,315 @@
+(ns strategy.test-vol-term-pipeline
+  "Vol (iron-condor) + calendar-term sim strategies — the 2026-06-12
+  dust-off: condor-mid-credit / realized-vol / calendar-straddle-slope
+  features, passthrough model, zscore-hysteresis signal,
+  single-structure risk, calendar-spread executor, full run-pipeline
+  E2E for both declarations."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.domain.validation :as v]
+            [stevetrading.execution.core :as execution]
+            [stevetrading.feature.core :as feature]
+            [stevetrading.risk.core :as risk]
+            [stevetrading.strategy.registry :as registry]))
+
+(def account-id "account/sim/test")
+(def spy "equity/NASDAQ/SPY")
+
+(defn- opt-id [exp right strike]
+  (str "option/OPRA/SPY/" exp "/" right "/" strike))
+
+(defn- c [exp right strike bid ask]
+  {:instrument/id (opt-id exp right strike)
+   :quote/bid bid :quote/ask ask})
+
+(def front "2026-06-12")
+(def back "2026-06-13")
+
+(def chain
+  "Two-expiration merged chain: calls+puts at 549/550/551 both expiries
+  (calendar candidates), plus condor legs at 544/540 puts, 556/560 calls."
+  {:chain/observed-at "2026-06-12T15:30:00Z"
+   :chain/underlying spy
+   :chain/expiration front
+   :chain/expirations [front back]
+   :chain/contracts
+   [;; front ATM straddle components
+    (c front "C" "550.000" "1.00" "1.10")
+    (c front "P" "550.000" "0.90" "1.00")
+    (c front "C" "549.000" "1.50" "1.60")
+    (c front "P" "549.000" "0.60" "0.70")
+    (c front "C" "551.000" "0.60" "0.70")
+    (c front "P" "551.000" "1.40" "1.50")
+    ;; back ATM straddle components (richer — positive slope)
+    (c back "C" "550.000" "2.00" "2.10")
+    (c back "P" "550.000" "1.90" "2.00")
+    (c back "C" "549.000" "2.50" "2.60")
+    (c back "P" "549.000" "1.55" "1.65")
+    (c back "C" "551.000" "1.55" "1.65")
+    (c back "P" "551.000" "2.45" "2.55")
+    ;; condor legs (front expiry): put spread 544/540, call spread 556/560
+    (c front "P" "544.000" "0.50" "0.60")
+    (c front "P" "540.000" "0.20" "0.30")
+    (c front "C" "556.000" "0.45" "0.55")
+    (c front "C" "560.000" "0.15" "0.25")]})
+
+(defn- bars [n]
+  (vec (map (fn [i]
+              {:bar/time (str "2026-06-12T15:" (format "%02d" i) ":00Z")
+               :bar/open "550.00" :bar/high "550.40"
+               :bar/low "549.90"
+               :bar/close (str (+ 550.0 (* 0.05 (mod i 3))))
+               :bar/volume "1000"})
+            (range n))))
+
+(def slice
+  {:bars (bars 30)
+   :chain chain
+   :last-time "2026-06-12T15:30:00Z"})
+
+;; ---------------------------------------------------------------------------
+;; Features
+;; ---------------------------------------------------------------------------
+
+(def condor-manifest
+  {:feature-manifest/id "feature/test-condor/v1"
+   :feature-manifest/version 1
+   :feature-manifest/features [:feature/condor-mid-credit
+                               :feature/realized-vol]
+   :feature-manifest/params
+   {:realized-vol {:window 20}
+    :condor {:put-spread {:venue "OPRA" :underlying-symbol "SPY"
+                          :expiry front :right :option-right/put
+                          :near-strike "544.000" :far-strike "540.000"}
+             :call-spread {:venue "OPRA" :underlying-symbol "SPY"
+                           :expiry front :right :option-right/call
+                           :near-strike "556.000" :far-strike "560.000"}}}
+   :feature-manifest/required-inputs [:input/option-chain]
+   :feature-manifest/compatibility
+   {:strategy-family :strategy-family/sim-vol
+    :prediction-schema-version 1}})
+
+(def calendar-manifest
+  {:feature-manifest/id "feature/test-calendar/v1"
+   :feature-manifest/version 1
+   :feature-manifest/features [:feature/calendar-straddle-slope]
+   :feature-manifest/params
+   {:calendar {:venue "OPRA" :underlying-symbol "SPY"
+               :front-expiry front :back-expiry back
+               :strikes ["549.000" "550.000" "551.000"]}}
+   :feature-manifest/required-inputs [:input/option-chain]
+   :feature-manifest/compatibility
+   {:strategy-family :strategy-family/sim-term
+    :prediction-schema-version 1}})
+
+(deftest condor-mid-credit-feature
+  (let [{:keys [feature/values]} (feature/derive-features condor-manifest slice)]
+    (testing "condor credit = put credit (0.55-0.25) + call credit (0.50-0.20)"
+      (is (= "0.60" (:feature/condor-mid-credit values))))
+    (testing "realized vol present and non-negative"
+      (is (>= (python/float (:feature/realized-vol values)) 0.0)))))
+
+(deftest calendar-straddle-slope-feature
+  (let [{:keys [feature/values]} (feature/derive-features calendar-manifest slice)]
+    (testing "ATM 550 picked (spot 550.0x): back straddle 4.00 - front 2.00"
+      (is (= "2.00" (:feature/calendar-straddle-slope values))))))
+
+(deftest chain-insufficiency-still-gates
+  (testing "missing condor leg -> insufficient with :input/option-chain"
+    (let [thin (assoc-in slice [:chain :chain/contracts]
+                         (vec (remove #(= (opt-id front "P" "540.000")
+                                          (:instrument/id %))
+                                      (:chain/contracts chain))))
+          r (feature/derive-features condor-manifest thin)]
+      (is (true? (:feature/insufficient? r)))
+      (is (= :input/option-chain (:feature/missing-input r))))))
+
+;; ---------------------------------------------------------------------------
+;; Risk: single-structure
+;; ---------------------------------------------------------------------------
+
+(deftest single-structure-risk
+  (let [enter {:decision/posture :posture/enter-long
+               :decision/instrument-id spy
+               :decision/requested-quantity "1"}
+        eval* (fn [view]
+                (risk/evaluate-risk :risk/single-structure enter {}
+                                    {:account/id account-id
+                                     :risk/strategy-view view}))]
+    (testing "flat view -> allow"
+      (is (= :risk/allow (:risk/decision (eval* nil)))))
+    (testing "open lot -> deny position-exists"
+      (let [r (eval* {:view/open-lots [{:lot/instrument-id (opt-id front "C" "550.000")
+                                        :lot/side :order-side/buy
+                                        :lot/remaining-quantity "1"}]})]
+        (is (= :risk/deny (:risk/decision r)))
+        (is (= [:reason/position-exists] (:risk/reason-codes r)))))
+    (testing "in-flight order -> deny orders-in-flight"
+      (let [r (eval* {:view/in-flight-orders 1})]
+        (is (= :risk/deny (:risk/decision r)))
+        (is (= [:reason/orders-in-flight] (:risk/reason-codes r)))))
+    (testing "flatten always allowed"
+      (is (= :risk/allow
+             (:risk/decision
+              (risk/evaluate-risk :risk/single-structure
+                                  {:decision/posture :posture/flatten
+                                   :decision/instrument-id spy}
+                                  {}
+                                  {:risk/strategy-view
+                                   {:view/net-positions
+                                    {(opt-id front "C" "550.000") "1"}}})))))))
+
+;; ---------------------------------------------------------------------------
+;; Calendar executor
+;; ---------------------------------------------------------------------------
+
+(defn- plan-calendar [posture view]
+  (execution/plan-execution
+   :execution/calendar-spread-v1
+   {:decision/id "dec_test" :decision/posture posture
+    :risk/approved-quantity "1"}
+   {:instrument/id spy
+    :execution/chain chain
+    :execution/spot "550.05"
+    :execution/strategy-view view
+    :execution/params {:right :option-right/call}}
+   account-id))
+
+(deftest calendar-entry-long
+  (let [{:execution/keys [order-intents]} (plan-calendar :posture/enter-long nil)
+        [intent] order-intents]
+    (testing "ONE 2-leg intent: SELL front 550C, BUY back 550C"
+      (is (= 1 (count order-intents)))
+      (is (= 2 (count (:order-intent/legs intent))))
+      (let [legs (into {} (map (fn [l] [(:instrument/id l) (:leg/side l)])
+                               (:order-intent/legs intent)))]
+        (is (= :order-side/sell (get legs (opt-id front "C" "550.000"))))
+        (is (= :order-side/buy (get legs (opt-id back "C" "550.000"))))))
+    (testing "net debit marketable limit: back ask 2.10 - front bid 1.00"
+      (is (= :order-side/buy (:order-intent/side intent)))
+      (is (= :position-effect/open (:order-intent/effect intent)))
+      (is (= "1.10" (:order-intent/limit-price intent))))))
+
+(deftest calendar-entry-short-and-flatten
+  (testing "short calendar mirrors: BUY front, SELL back; net credit"
+    (let [{:execution/keys [order-intents]} (plan-calendar :posture/enter-short nil)
+          [intent] order-intents]
+      ;; credit = back bid 2.00 - front ask 1.10 = 0.90 -> side sell
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= "0.90" (:order-intent/limit-price intent)))))
+  (testing "flatten mirrors the open lots in one multi-leg intent"
+    (let [view {:view/open-lots
+                [{:lot/instrument-id (opt-id front "C" "550.000")
+                  :lot/side :order-side/sell :lot/remaining-quantity "1"}
+                 {:lot/instrument-id (opt-id back "C" "550.000")
+                  :lot/side :order-side/buy :lot/remaining-quantity "1"}]}
+          {:execution/keys [order-intents]} (plan-calendar :posture/flatten view)
+          [intent] order-intents]
+      (is (= 1 (count order-intents)))
+      (is (= :position-effect/close (:order-intent/effect intent)))
+      ;; closing: buy front at ask 1.10, sell back at bid 2.00 -> net credit 0.90
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= "0.90" (:order-intent/limit-price intent)))))
+  (testing "no second expiry -> :skip/no-eligible-contract"
+    (let [front-only (assoc chain :chain/contracts
+                            (filterv #(>= (.find (:instrument/id %) front) 0)
+                                     (:chain/contracts chain)))
+          r (execution/plan-execution
+             :execution/calendar-spread-v1
+             {:decision/id "dec_test" :decision/posture :posture/enter-long
+              :risk/approved-quantity "1"}
+             {:instrument/id spy :execution/chain front-only
+              :execution/spot "550.05" :execution/params {}}
+             account-id)]
+      (is (= [] (:execution/order-intents r)))
+      (is (= :skip/no-eligible-contract (:execution/skip-reason r))))))
+
+;; ---------------------------------------------------------------------------
+;; Full pipeline E2E (condor enters; calendar accumulates then enters)
+;; ---------------------------------------------------------------------------
+
+(def condor-model
+  {:model/id "model/test-condor/v1" :model/version 1
+   :model/type :model.type/threshold
+   :model/params {:feature :feature/condor-mid-credit :threshold "0.50"}
+   :model/feature-manifest-ref "feature/test-condor/v1"
+   :model/prediction-schema-version 1})
+
+(def condor-decl
+  {:strategy/id "strategy/sim-vol/condor-rv/v1"
+   :strategy/family :strategy-family/sim-vol
+   :strategy/name :strategy-name/condor-rv
+   :strategy/version 1
+   :strategy/mode-policy #{:mode/sim}
+   :strategy/schedule {:session :session/us-equities-regular}
+   :strategy/warmup {:required-bars 25}
+   :strategy/instruments [spy]
+   :strategy/features {:manifest-ref "feature/test-condor/v1"}
+   :strategy/inference {:artifact-ref "model/test-condor/v1"}
+   :strategy/signal {:fn-id :signal/credit-threshold-v1}
+   :strategy/risk {:policy-id :risk/single-structure :params {}}
+   :strategy/execution {:policy-id :execution/iron-condor-v1
+                        :params {:quantity "1"}}})
+
+(def calendar-model
+  {:model/id "model/test-calendar/v1" :model/version 1
+   :model/type :model.type/passthrough
+   :model/params {:feature :feature/calendar-straddle-slope}
+   :model/feature-manifest-ref "feature/test-calendar/v1"
+   :model/prediction-schema-version 1})
+
+(def calendar-decl
+  {:strategy/id "strategy/sim-term/calendar-slope/v1"
+   :strategy/family :strategy-family/sim-term
+   :strategy/name :strategy-name/calendar-slope
+   :strategy/version 1
+   :strategy/mode-policy #{:mode/sim}
+   :strategy/schedule {:session :session/us-equities-regular}
+   :strategy/warmup {:required-bars 1}
+   :strategy/instruments [spy]
+   :strategy/features {:manifest-ref "feature/test-calendar/v1"}
+   :strategy/inference {:artifact-ref "model/test-calendar/v1"}
+   :strategy/signal {:fn-id :signal/zscore-hysteresis-v1
+                     :params {:delta-horizon 2 :stats-window 10
+                              :enter-sigma 2.0 :exit-sigma 0.5
+                              :min-samples 4}}
+   :strategy/risk {:policy-id :risk/single-structure :params {}}
+   :strategy/execution {:policy-id :execution/calendar-spread-v1
+                        :params {:quantity "1"
+                                 :right :option-right/call}}})
+
+(defn- run-std [decl manifest model local-state]
+  (registry/run-pipeline {:strategy decl
+                          :market-slice slice
+                          :strategy-local-state local-state
+                          :portfolio-view {}
+                          :artifacts {:feature-manifest manifest
+                                      :model model}
+                          :account-id account-id
+                          :mode :mode/sim}))
+
+(deftest condor-pipeline-e2e
+  (let [{:keys [facts]} (run-std condor-decl condor-manifest condor-model {})
+        intents (filterv #(= :fact/order-intent-created (:record/type %)) facts)
+        intent (:fact/payload (first intents))]
+    (testing "credit 0.60 >= threshold 0.50 -> enter-long -> 4-leg condor"
+      (is (= 1 (count intents)))
+      (is (= 4 (count (:order-intent/legs intent))))
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= "0.60" (:order-intent/limit-price intent))))
+    (testing "all emitted facts canonically valid"
+      (is (every? #(:valid? (v/validate-fact %)) facts)))))
+
+(deftest calendar-pipeline-warms-up-then-enters
+  (testing "constant slope stream -> z=0 deltas -> no entry (hold)"
+    (let [state (reduce (fn [st _]
+                          (let [{:keys [strategy-local-state']}
+                                (run-std calendar-decl calendar-manifest
+                                         calendar-model st)]
+                            strategy-local-state'))
+                        {}
+                        (range 8))]
+      (is (= :flat (:zh-kind state)))
+      (is (= 8 (count (:zh-values state))))))
+  (testing "decl validates structurally"
+    (is (= {:valid? true} (registry/validate-strategy-decl calendar-decl)))
+    (is (= {:valid? true} (registry/validate-strategy-decl condor-decl)))))

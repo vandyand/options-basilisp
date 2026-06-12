@@ -448,8 +448,13 @@
       (let [prediction (inference/run-inference (:model artifacts) features)
             decision (signal/decide-signal strategy prediction market-slice
                                            strategy-local-state)
-            state' (assoc strategy-local-state
-                          :last-direction (:prediction/direction prediction))]
+            ;; a signal fn may own richer memory than :last-direction
+            ;; (e.g. zscore-hysteresis rolling stats) — it returns the
+            ;; updated map as :decision/local-state' (never persisted in
+            ;; the fact payload; the select-keys whitelists below drop it)
+            state' (or (:decision/local-state' decision)
+                       (assoc strategy-local-state
+                              :last-direction (:prediction/direction prediction)))]
         (if (= :posture/hold (:decision/posture decision))
           {:facts []
            :strategy-local-state' state'}
@@ -491,13 +496,27 @@
                                                :feature-manifest/params
                                                :spread])]
                              (instruments/vertical-spread-context spread-params))
+                ;; iron-condor leg configuration (manifest params
+                ;; :condor {:put-spread .. :call-spread ..}) — two
+                ;; vertical contexts, threaded to execution like :spread
+                condor-ctx (when-let [cp (get-in artifacts
+                                                 [:feature-manifest
+                                                  :feature-manifest/params
+                                                  :condor])]
+                             {:condor/put-spread (instruments/vertical-spread-context
+                                                  (:put-spread cp))
+                              :condor/call-spread (instruments/vertical-spread-context
+                                                   (:call-spread cp))})
+                strategy-view (get-in portfolio-view
+                                      [:portfolio/by-strategy (:strategy/id strategy)])
                 risk-result (risk/evaluate-risk
                              (get-in strategy [:strategy/risk :policy-id])
                              (assoc decision :decision/requested-quantity requested-qty)
                              portfolio-view
                              (cond-> {:account/id account-id
                                       :risk/params (get-in strategy
-                                                           [:strategy/risk :params])}
+                                                           [:strategy/risk :params])
+                                      :risk/strategy-view strategy-view}
                                (some? spread-ctx) (assoc :risk/spread spread-ctx)))
                 risk-fact
                 (pipeline-fact ctx :fact/risk-decision-recorded
@@ -516,8 +535,21 @@
                     (execution/plan-execution
                      (get-in strategy [:strategy/execution :policy-id])
                      (merge decision risk-result)
-                     (cond-> {:instrument/id instrument-id}
-                       (some? spread-ctx) (assoc :execution/spread spread-ctx))
+                     ;; chain/spot/strategy-view/params travel for the
+                     ;; chain-driven executors (calendar-spread picks its
+                     ;; legs from the live chain like the bridge option
+                     ;; policy); harmless extras for the leg-configured
+                     ;; policies
+                     (cond-> {:instrument/id instrument-id
+                              :execution/strategy-view strategy-view
+                              :execution/chain (:chain market-slice)
+                              :execution/spot (:bar/close
+                                               (peek (vec (:bars market-slice))))
+                              :execution/params (get-in strategy
+                                                        [:strategy/execution
+                                                         :params])}
+                       (some? spread-ctx) (assoc :execution/spread spread-ctx)
+                       (some? condor-ctx) (assoc :execution/condor condor-ctx))
                      account-id)]
                 (if (empty? order-intents)
                   {:facts base-facts

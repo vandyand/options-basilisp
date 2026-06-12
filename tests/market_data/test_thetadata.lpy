@@ -124,3 +124,65 @@
   (is (nil? (td/et->utc nil)))
   (testing "winter (EST) offset"
     (is (= "2026-01-10T21:14:56.000000Z" (td/et->utc "2026-01-10T16:14:56")))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-expiration merged snapshots (2026-06-12 — term/calendar feeds)
+;; ---------------------------------------------------------------------------
+
+(defn- per-exp-transport
+  "Serves a DIFFERENT snapshot per expiration compact date; unknown
+  expirations 500."
+  [by-exp]
+  (fn [{:keys [url]}]
+    (if-let [[_ body] (first (filter (fn [[exp _]]
+                                       (>= (.find url (str "expiration=" exp)) 0))
+                                     by-exp))]
+      {:status 200 :body body}
+      {:status 500 :body "boom"})))
+
+(def front-rows
+  [{"strike" 550.0 "right" "PUT" "bid" 2.15 "ask" 2.2 "bid_size" 5
+    "ask_size" 7 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:30:00.100"}])
+
+(def back-rows
+  [{"strike" 550.0 "right" "PUT" "bid" 3.4 "ask" 3.5 "bid_size" 4
+    "ask_size" 6 "expiration" "2026-06-13" "timestamp" "2026-06-10T15:30:00.500"}])
+
+(deftest multi-expiration-merged-snapshot
+  (let [src (td/make-thetadata-chain-source
+             {:symbol "SPY"
+              :underlying-id "equity/NASDAQ/SPY"
+              :expirations ["2026-06-12" "2026-06-13"]
+              :poll-seconds 0
+              :until "2099-01-01T00:00:00Z"
+              :transport (per-exp-transport {"20260612" (columnar front-rows)
+                                             "20260613" (columnar back-rows)})})
+        fact (first (:observations (mdp/next-observations src 0 1)))
+        payload (:fact/payload fact)
+        ids (mapv :instrument/id (:chain/contracts payload))]
+    (testing "ONE fact carries both expirations' contracts"
+      (is (= 2 (count ids)))
+      (is (some #(>= (.find % "2026-06-12") 0) ids))
+      (is (some #(>= (.find % "2026-06-13") 0) ids)))
+    (testing "front expiration + full list on the payload"
+      (is (= "2026-06-12" (:chain/expiration payload)))
+      (is (= ["2026-06-12" "2026-06-13"] (:chain/expirations payload))))
+    (testing "observed-at is the max across expirations"
+      (is (= "2026-06-10T19:30:00.500000Z" (:chain/observed-at payload))))
+    (testing "envelope still canonically valid"
+      (is (:valid? (v/validate-fact fact))))))
+
+(deftest multi-expiration-all-or-nothing
+  (testing "any failing expiration fails the WHOLE poll (no partial
+            snapshots — a term slope from half a chain is silent garbage)"
+    (let [src (td/make-thetadata-chain-source
+               {:symbol "SPY"
+                :underlying-id "equity/NASDAQ/SPY"
+                :expirations ["2026-06-12" "2026-06-13"]
+                :poll-seconds 0
+                :until "2099-01-01T00:00:00Z"
+                :block? false
+                :transport (per-exp-transport {"20260612" (columnar front-rows)})})
+          r (mdp/next-observations src 0 1)]
+      (is (= [] (:observations r)))
+      (is (false? (:source/healthy? (mdp/source-health src)))))))

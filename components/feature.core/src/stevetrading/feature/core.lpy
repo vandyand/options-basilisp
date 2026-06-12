@@ -37,7 +37,7 @@
   {:bars [{:bar/time .. :bar/close .. ...} ...]
    :chain {:chain/observed-at .. :chain/contracts [..] ..}
    :last-time ts}."
-  (:import decimal)
+  (:import decimal math)
   (:require [stevetrading.domain.instruments :as instruments]))
 
 (defn- ->dec
@@ -94,9 +94,105 @@
     (when (and (some? near-mid) (some? far-mid))
       (str (- near-mid far-mid)))))
 
+(defn- condor-mid-credit
+  "Net credit mid decimal string for the manifest's configured iron
+  condor (params :condor {:put-spread <spread-params> :call-spread
+  <spread-params>}): the SUM of both verticals' credits. nil when the
+  chain is missing or any of the four legs lacks a two-sided quote."
+  [manifest market-slice]
+  (let [cp (or (get-in manifest [:feature-manifest/params :condor])
+               (throw (ex-info "feature manifest missing :condor params"
+                               {:error/code :error/missing-feature-param
+                                :error/feature :feature/condor-mid-credit
+                                :error/manifest-id (:feature-manifest/id manifest)})))
+        contracts (into {}
+                        (map (fn [c] [(:instrument/id c) c])
+                             (get-in market-slice [:chain :chain/contracts])))
+        spread-credit (fn [params]
+                        (let [ctx (instruments/vertical-spread-context params)
+                              near (contract-mid (get contracts (:spread/near-instrument-id ctx)))
+                              far (contract-mid (get contracts (:spread/far-instrument-id ctx)))]
+                          (when (and near far) (- near far))))
+        put-credit (spread-credit (:put-spread cp))
+        call-credit (spread-credit (:call-spread cp))]
+    (when (and put-credit call-credit)
+      (str (+ put-credit call-credit)))))
+
+(defn- realized-vol
+  "Std-dev of 1-bar log returns over the last `window` bars (decimal
+  string, raw per-bar units — consumers threshold it, nothing
+  annualizes). Assumes (>= (count bars) (inc window))."
+  [bars window]
+  (let [closes (mapv #(python/float (:bar/close %)) (take-last (inc window) bars))
+        rets (mapv (fn [i] (math/log (/ (nth closes (inc i)) (nth closes i))))
+                   (range (dec (count closes))))
+        n (count rets)
+        mean (/ (reduce + 0.0 rets) n)
+        var (/ (reduce + 0.0 (map (fn [r] (let [d (- r mean)] (* d d))) rets)) n)]
+    (str (math/sqrt var))))
+
+(defn- straddle-mid
+  "ATM straddle mid Decimal for one expiry: call mid + put mid at
+  `strike`. nil when either side lacks a two-sided quote."
+  [by-id {:keys [venue underlying-symbol]} expiry strike]
+  (let [leg (fn [right]
+              (contract-mid
+               (get by-id (instruments/instrument-id
+                           {:instrument/asset-class :asset-class/option
+                            :instrument/venue venue
+                            :instrument/underlying underlying-symbol
+                            :instrument/expiry expiry
+                            :instrument/right right
+                            :instrument/strike strike}))))
+        c (leg :option-right/call)
+        p (leg :option-right/put)]
+    (when (and c p) (+ c p))))
+
+(defn- calendar-straddle-slope
+  "Term-slope proxy decimal string: ATM straddle mid (back expiry) minus
+  ATM straddle mid (front expiry), at the strike nearest the last bar
+  close that is fully two-sided (call+put) in BOTH expiries. Straddle
+  price ~ IV*sqrt(T), so this tracks the IV term slope without a native
+  IV solver (the model-driven bridge replaces it later). Manifest params
+  :calendar {:venue .. :underlying-symbol .. :front-expiry ..
+  :back-expiry .. :strikes [\"735.000\" ...]} — candidate strikes are
+  resolved by the launcher around spot. nil when no candidate strike is
+  fully quoted in both expiries (or no bars for spot)."
+  [manifest market-slice bars]
+  (let [cal (or (get-in manifest [:feature-manifest/params :calendar])
+                (throw (ex-info "feature manifest missing :calendar params"
+                                {:error/code :error/missing-feature-param
+                                 :error/feature :feature/calendar-straddle-slope
+                                 :error/manifest-id (:feature-manifest/id manifest)})))
+        spot (some-> (peek bars) :bar/close ->dec)
+        by-id (into {}
+                    (map (fn [c] [(:instrument/id c) c])
+                         (get-in market-slice [:chain :chain/contracts])))]
+    (when spot
+      (->> (:strikes cal)
+           (sort-by (fn [s] (python/tuple [(abs (- (->dec s) spot)) (->dec s)])))
+           (keep (fn [s]
+                   (let [front (straddle-mid by-id cal (:front-expiry cal) s)
+                         back (straddle-mid by-id cal (:back-expiry cal) s)]
+                     (when (and front back) (str (- back front))))))
+           first))))
+
+(def ^:private chain-features
+  #{:feature/chain-mid-width :feature/condor-mid-credit
+    :feature/calendar-straddle-slope})
+
+(defn- chain-feature-value
+  "Dispatch one chain-dependent feature (shared by derivation and the
+  insufficiency gate)."
+  [manifest market-slice bars feature-kw]
+  (case feature-kw
+    :feature/chain-mid-width (chain-mid-width manifest market-slice)
+    :feature/condor-mid-credit (condor-mid-credit manifest market-slice)
+    :feature/calendar-straddle-slope (calendar-straddle-slope manifest market-slice bars)))
+
 (defn- chain-required?
   [manifest]
-  (boolean (some #{:feature/chain-mid-width}
+  (boolean (some chain-features
                  (:feature-manifest/features manifest))))
 
 ;; ---------------------------------------------------------------------------
@@ -110,7 +206,11 @@
     :feature/sma-slow   (sma bars (feature-window manifest feature-kw :sma-slow))
     :feature/last-close (:bar/close (peek bars))
     :feature/bar-count  (str (count bars))
-    :feature/chain-mid-width (chain-mid-width manifest market-slice)
+    :feature/realized-vol (realized-vol
+                           bars (feature-window manifest feature-kw :realized-vol))
+    (:feature/chain-mid-width :feature/condor-mid-credit
+                              :feature/calendar-straddle-slope)
+    (chain-feature-value manifest market-slice bars feature-kw)
     (throw (ex-info (str "unknown feature: " feature-kw)
                     {:error/code :error/unknown-feature
                      :error/feature feature-kw
@@ -127,7 +227,12 @@
                      :feature/sma-fast (feature-window manifest feature-kw :sma-fast)
                      :feature/sma-slow (feature-window manifest feature-kw :sma-slow)
                      (:feature/last-close :feature/bar-count) 1
-                     :feature/chain-mid-width 0
+                     ;; log returns need window+1 closes
+                     :feature/realized-vol (inc (feature-window
+                                                 manifest feature-kw :realized-vol))
+                     (:feature/chain-mid-width :feature/condor-mid-credit) 0
+                     ;; slope needs spot from the last bar
+                     :feature/calendar-straddle-slope 1
                      1)))
           0
           (:feature-manifest/features manifest)))
@@ -151,7 +256,11 @@
        :feature/needed needed}
 
       (and (chain-required? manifest)
-           (nil? (chain-mid-width manifest market-slice)))
+           (some (fn [kw]
+                   (and (contains? chain-features kw)
+                        (nil? (chain-feature-value manifest market-slice
+                                                   bars kw))))
+                 (:feature-manifest/features manifest)))
       {:feature/insufficient? true
        :feature/needed needed
        :feature/missing-input :input/option-chain}

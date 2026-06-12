@@ -222,6 +222,51 @@
        :risk/reason-codes [:reason/no-action-requested]
        :risk/approved-quantity "0"})))
 
+;; ---------------------------------------------------------------------------
+;; :risk/single-structure
+;; ---------------------------------------------------------------------------
+
+(defn- single-structure
+  "Max ONE open structure per strategy (the vol-condor / calendar-spread
+  sim strategies): deny ANY entry while an unresolved order, open lot,
+  or nonzero net position exists in the strategy's sub-view
+  (account-ctx :risk/strategy-view). Flips therefore require an explicit
+  flatten first — multi-leg structures never overlap. Flatten always
+  allowed (approved quantity = total abs net, observability only — the
+  executors size closes from the view's lots)."
+  [signal _portfolio-view account-ctx]
+  (let [view (:risk/strategy-view account-ctx)
+        in-flight (or (:view/in-flight-orders view) 0)
+        nets (view-net-positions view)
+        open? (or (pos? in-flight)
+                  (seq (:view/open-lots view))
+                  (seq nets))]
+    (case (:decision/posture signal)
+      (:posture/enter-long :posture/enter-short)
+      (if open?
+        {:risk/decision :risk/deny
+         :risk/reason-codes [(if (pos? in-flight)
+                               :reason/orders-in-flight
+                               :reason/position-exists)]
+         :risk/approved-quantity "0"}
+        {:risk/decision :risk/allow
+         :risk/reason-codes [:reason/risk-allowed]
+         :risk/approved-quantity
+         (or (:decision/requested-quantity signal) "1")})
+
+      :posture/flatten
+      (let [total (reduce (fn [acc [_ net]] (+ acc (abs net)))
+                          dec-zero nets)]
+        {:risk/decision :risk/allow
+         :risk/reason-codes (if (zero? total)
+                              [:reason/risk-allowed :reason/no-open-position]
+                              [:reason/risk-allowed])
+         :risk/approved-quantity (str total)})
+
+      {:risk/decision :risk/deny
+       :risk/reason-codes [:reason/no-action-requested]
+       :risk/approved-quantity "0"})))
+
 (defn evaluate-risk
   "Evaluate a signal decision under a risk policy. signal is the canonical
   signal decision map enriched with :decision/instrument-id and (for
@@ -243,6 +288,8 @@
                  (defined-risk-spread signal portfolio-view account-ctx)
                  :risk/steve-v2-default
                  (steve-v2-default signal portfolio-view account-ctx)
+                 :risk/single-structure
+                 (single-structure signal portfolio-view account-ctx)
                  (throw (ex-info (str "unknown risk policy: " (pr-str policy))
                                  {:error/code :error/unknown-risk-policy
                                   :error/policy policy})))]

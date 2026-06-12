@@ -495,6 +495,152 @@
                               posture)))))
 
 ;; ---------------------------------------------------------------------------
+;; :execution/calendar-spread-v1
+;; ---------------------------------------------------------------------------
+
+(def ^:private dec-floor (decimal/Decimal "0.01"))
+
+(defn- contracts-by-expiry
+  "{expiry {strike-Decimal {:instrument/id ..}}} for two-sided contracts
+  of the wanted right in a (multi-expiration merged) chain."
+  [chain right]
+  (reduce
+   (fn [acc c]
+     (let [ref (instruments/parse-instrument-id (:instrument/id c))]
+       (if (and (some? (contract-mid c))
+                (= :asset-class/option (:instrument/asset-class ref))
+                (= right (:instrument/right ref)))
+         (assoc-in acc
+                   [(:instrument/expiry ref)
+                    (decimal/Decimal (:instrument/strike ref))]
+                   {:instrument/id (:instrument/id c)})
+         acc)))
+   {}
+   (:chain/contracts chain)))
+
+(defn- calendar-pair
+  "ATM front/back contract pair for a calendar spread: front = earliest
+  expiry in the chain, back = next; strike = closest to spot quoted
+  two-sided in BOTH expiries (ties -> lower strike). Returns
+  {:front-id .. :back-id ..} or nil."
+  [chain spot right]
+  (let [by-exp (contracts-by-expiry chain right)
+        exps (sort (keys by-exp))]
+    (when (>= (count exps) 2)
+      (let [[front-exp back-exp] exps
+            front (get by-exp front-exp)
+            back (get by-exp back-exp)
+            strike (->> (keys front)
+                        (filter #(contains? back %))
+                        (sort-by (fn [s] (python/tuple [(abs (- s spot)) s])))
+                        first)]
+        (when strike
+          {:front-id (get-in front [strike :instrument/id])
+           :back-id (get-in back [strike :instrument/id])})))))
+
+(defn- net-leg-limit
+  "Marketable net limit for a set of priced legs: buys pay the ASK,
+  sells receive the BID. Positive net = debit (intent side BUY);
+  negative = credit (intent side SELL). Returns
+  {:side .. :limit \"x.xx\"} or nil when any leg is unquoted (caller
+  falls back to a market order)."
+  [legs pxs]
+  (let [vals (map (fn [leg]
+                    (when-let [px (get pxs (:instrument/id leg))]
+                      (if (= :order-side/buy (:leg/side leg))
+                        (:ask px)
+                        (- (:bid px)))))
+                  legs)]
+    (when (every? some? vals)
+      (let [net (reduce + (decimal/Decimal "0") vals)]
+        (if (neg? net)
+          {:side :order-side/sell :limit (mid-2dp (max (- net) dec-floor))}
+          {:side :order-side/buy :limit (mid-2dp (max net dec-floor))})))))
+
+(defn- calendar-spread-v1
+  "TWO legs, SAME strike + right, DIFFERENT expirations, in ONE intent.
+  Long calendar (:posture/enter-long — slope widening): SELL the front
+  expiry, BUY the back; net debit, marketable limit (back ask - front
+  bid). Short calendar (:posture/enter-short): mirrored; net credit;
+  gated by :allow-short? (default TRUE — sim strategies). Flatten: one
+  multi-leg intent mirroring every open option lot in the strategy view
+  (market order when any leg is no longer quoted two-sided). Skips:
+  :skip/no-chain, :skip/no-spot, :skip/no-eligible-contract (no strike
+  two-sided in BOTH expiries)."
+  [risk-approved-signal instrument-ctx account-id]
+  (let [decision-id (:decision/id risk-approved-signal)
+        posture (:decision/posture risk-approved-signal)
+        quantity (:risk/approved-quantity risk-approved-signal)
+        chain (:execution/chain instrument-ctx)
+        spot-str (:execution/spot instrument-ctx)
+        params (:execution/params instrument-ctx)
+        right (or (:right params) :option-right/call)
+        lots (open-option-lots (:execution/strategy-view instrument-ctx))
+        pxs (chain-pxs chain)
+        intent (fn [{:keys [role effect legs slot]}]
+                 (let [priced (net-leg-limit legs pxs)]
+                   (order-intent {:decision-id decision-id
+                                  :intent-slot (or slot 0)
+                                  :role role
+                                  :side (or (:side priced) :order-side/buy)
+                                  :effect effect
+                                  :order-type (if priced
+                                                :order-type/limit
+                                                :order-type/market)
+                                  :tif :tif/day
+                                  :quantity quantity
+                                  :limit-price (:limit priced)
+                                  :legs legs
+                                  :account-id account-id})))
+        close-legs (when (seq lots)
+                     (mapv (fn [lot]
+                             {:instrument/id (:lot/instrument-id lot)
+                              :leg/side (if (= :order-side/sell (:lot/side lot))
+                                          :order-side/buy
+                                          :order-side/sell)
+                              :leg/quantity (:lot/remaining-quantity lot)})
+                           lots))
+        closes (fn []
+                 (if close-legs
+                   [(intent {:role :intent-role/exit
+                             :effect :position-effect/close
+                             :legs close-legs})]
+                   []))
+        enter (fn [front-side back-side]
+                (cond
+                  (zero-qty? quantity) []
+                  (nil? spot-str) (skip :skip/no-spot)
+                  :else
+                  (let [pair (calendar-pair chain (decimal/Decimal spot-str)
+                                            right)]
+                    (if (nil? pair)
+                      (skip :skip/no-eligible-contract)
+                      ;; flip: close any open structure first, then open
+                      (let [close-intents (closes)]
+                        (conj close-intents
+                              (intent {:role :intent-role/entry
+                                       :effect :position-effect/open
+                                       :slot (count close-intents)
+                                       :legs [{:instrument/id (:front-id pair)
+                                               :leg/side front-side
+                                               :leg/quantity quantity}
+                                              {:instrument/id (:back-id pair)
+                                               :leg/side back-side
+                                               :leg/quantity quantity}]})))))))]
+    (if (nil? chain)
+      (skip :skip/no-chain)
+      (case posture
+        ;; long calendar: sell front, buy back
+        :posture/enter-long (enter :order-side/sell :order-side/buy)
+        ;; short (reverse) calendar: buy front, sell back
+        :posture/enter-short
+        (if (false? (:allow-short? params))
+          (closes)
+          (enter :order-side/buy :order-side/sell))
+        :posture/flatten (closes)
+        (unplannable-posture! :execution/calendar-spread-v1 posture)))))
+
+;; ---------------------------------------------------------------------------
 ;; plan-execution
 ;; ---------------------------------------------------------------------------
 
@@ -526,6 +672,8 @@
                  (equity-direction-v1 risk-approved-signal instrument-ctx account-id)
                  :execution/single-leg-option-atm-v1
                  (single-leg-option-atm-v1 risk-approved-signal instrument-ctx account-id)
+                 :execution/calendar-spread-v1
+                 (calendar-spread-v1 risk-approved-signal instrument-ctx account-id)
                  (throw (ex-info (str "unknown execution policy: " (pr-str policy))
                                  {:error/code :error/unknown-execution-policy
                                   :error/policy policy})))

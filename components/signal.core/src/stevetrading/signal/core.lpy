@@ -37,6 +37,7 @@
   scope (the slice instrument), the source watermark tuple
   [instrument-id market-time], the decision timestamp, and the decision
   slot (0 — one decision per source event set in v0.1)."
+  (:import math)
   (:require [stevetrading.domain.schemas :as schemas]))
 
 (defn- posture-for
@@ -110,6 +111,85 @@
      :decision/market-time market-time
      :decision/instrument-id instrument-id
      :decision/net-credit (:prediction/value prediction)}))
+
+;; ---------------------------------------------------------------------------
+;; :signal/zscore-hysteresis-v1
+;; ---------------------------------------------------------------------------
+
+(defn- zscore-reason-codes
+  [posture]
+  (case posture
+    :posture/hold        [:reason/zscore-within-band]
+    :posture/enter-long  [:reason/zscore-above-enter]
+    :posture/enter-short [:reason/zscore-below-enter]
+    :posture/flatten     [:reason/zscore-exit-band]))
+
+(defn- zscore-hysteresis-decision
+  "Z-score hysteresis over the prediction-value DELTA stream (the
+  HAWK_TERM TermSlopeSignal shape, rule-based v1: V2 z-scores a model's
+  forward-slope-change PREDICTION against a frozen calibration; this v1
+  z-scores the OBSERVED slope change against its own rolling stats —
+  upgrade path is the model bridge, the hysteresis machine stays).
+
+  Signal params ([:strategy/signal :params]):
+    :delta-horizon  bars back for the change (default 30)
+    :stats-window   rolling deltas kept for mean/std (default 120)
+    :enter-sigma    entry threshold (default 2.0)
+    :exit-sigma     exit threshold while held (default 0.5)
+    :min-samples    deltas required before any entry (default 30)
+
+  Sign convention (verified hawk_term_main.py): z > +enter → enter-long
+  (LONG_CALENDAR, slope widening); z < -enter → enter-short
+  (SHORT_CALENDAR); |z| < exit while held → flatten; else hold.
+
+  strategy-local-state: {:zh-values [..] :zh-kind :flat|:long|:short}
+  (:zh-values capped at delta-horizon + stats-window)."
+  [strategy-decl prediction market-slice strategy-local-state]
+  (let [params (get-in strategy-decl [:strategy/signal :params])
+        horizon (or (:delta-horizon params) 30)
+        window (or (:stats-window params) 120)
+        enter-sigma (double (or (:enter-sigma params) 2.0))
+        exit-sigma (double (or (:exit-sigma params) 0.5))
+        min-samples (or (:min-samples params) 30)
+        instrument-id (first (:strategy/instruments strategy-decl))
+        market-time (or (:last-time market-slice)
+                        (:bar/time (peek (vec (:bars market-slice)))))
+        value (python/float (:prediction/value prediction))
+        values (conj (vec (take-last (+ horizon window)
+                                     (:zh-values strategy-local-state [])))
+                     value)
+        held (:zh-kind strategy-local-state :flat)
+        deltas (when (> (count values) horizon)
+                 (mapv (fn [i] (- (nth values (+ i horizon)) (nth values i)))
+                       (range (- (count values) horizon))))
+        z (when (and deltas (>= (count deltas) min-samples))
+            (let [n (count deltas)
+                  mean (/ (reduce + 0.0 deltas) n)
+                  var (/ (reduce + 0.0 (map (fn [d] (let [x (- d mean)] (* x x)))
+                                            deltas))
+                         n)
+                  sd (python/max 1e-12 (math/sqrt var))]
+              (/ (- (peek deltas) mean) sd)))
+        kind (cond
+               (nil? z) held
+               (> z enter-sigma) :long
+               (< z (- enter-sigma)) :short
+               (and (not= :flat held) (< (abs z) exit-sigma)) :flat
+               :else held)
+        posture (cond
+                  (= kind held) :posture/hold
+                  (= :long kind) :posture/enter-long
+                  (= :short kind) :posture/enter-short
+                  :else :posture/flatten)]
+    {:decision/id (decision-id-for strategy-decl instrument-id market-time)
+     :decision/posture posture
+     :decision/reason-codes (zscore-reason-codes posture)
+     :decision/market-time market-time
+     :decision/instrument-id instrument-id
+     :decision/zscore (when z (str z))
+     :decision/local-state' (assoc strategy-local-state
+                                   :zh-values values
+                                   :zh-kind kind)}))
 
 ;; ---------------------------------------------------------------------------
 ;; :signal/steve-v2-bridge
@@ -208,6 +288,10 @@
       :signal/credit-threshold-v1
       (credit-threshold-decision strategy-decl prediction market-slice
                                  strategy-local-state)
+
+      :signal/zscore-hysteresis-v1
+      (zscore-hysteresis-decision strategy-decl prediction market-slice
+                                  strategy-local-state)
 
       (throw (ex-info (str "unknown signal fn: " (pr-str fn-id))
                       {:error/code :error/unknown-signal-fn

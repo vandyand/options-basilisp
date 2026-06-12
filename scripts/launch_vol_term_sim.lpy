@@ -1,0 +1,269 @@
+;; Vol + calendar-term LIVE-SIM session (2026-06-12 dust-off): two
+;; rule-based strategies trading the LOCAL SIM BROKER on live market
+;; data (Alpaca SPY bars + ThetaData multi-expiration chains). Zero
+;; broker risk — fills price at observed marks (bar closes, chain mids).
+;;
+;;   strategy/sim-vol/condor-rv/v1       short-vol iron condor: enter
+;;     when the condor mid credit >= threshold (the vol-zoo verdict:
+;;     SHORT vol via condor is the trade; rule-based — the RV baseline
+;;     beat every model)
+;;   strategy/sim-term/calendar-slope/v1 calendar spread on the ATM
+;;     straddle term-slope CHANGE z-score (HAWK_TERM sign convention:
+;;     widening -> long calendar). Rule v1 — the model-driven bridge
+;;     (61-feature XGB) replaces the signal later; executor stays.
+;;
+;; Everything price-dependent (condor strikes, calendar candidates,
+;; expirations) resolves at LAUNCH; dated artifacts + manifest land
+;; under live_runtime/generated-sim/.
+;;
+;; Run (engine venv, no torch needed):
+;;   PYTHONPATH=$(cat .nrepl-pythonpath) .venv/bin/basilisp run scripts/launch_vol_term_sim.lpy
+;; Env: SIM_DRY_RUN=1 -> resolve + activate + print, skip run-live.
+(import datetime json os os.path re urllib.request zoneinfo)
+(require '[basilisp.edn :as edn]
+         '[stevetrading.base.engine-live :as live]
+         '[stevetrading.control-plane.file-store :as cpfs]
+         '[stevetrading.market-data.alpaca :as mda]
+         '[stevetrading.market-data.composite :as mdc]
+         '[stevetrading.market-data.thetadata :as td])
+
+(def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+(def dry-run? (= "1" (os/getenv "SIM_DRY_RUN")))
+
+;; data creds (bars only — the broker is SIM): chestnut from REF/.env
+(def env-text (slurp (str ref-root "/.env")))
+(defn- env-val [k]
+  (second (re-find (re-pattern (str "(?m)^" k "=(.+)$")) env-text)))
+(def key-id (.strip (env-val "ALPACA_CHESTNUT_API_KEY")))
+(def secret (.strip (env-val "ALPACA_CHESTNUT_API_SECRET")))
+
+(def session-date
+  (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
+(def compact-date (.replace session-date "-" ""))
+
+(defn- et->utc-str [hh mm]
+  (let [et-now (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York"))
+        at (.replace et-now ** :hour hh :minute mm :second 0 :microsecond 0)]
+    (.strftime (.astimezone at (.-utc datetime/timezone))
+               "%Y-%m-%dT%H:%M:%SZ")))
+(def until (et->utc-str 15 45))
+
+;; --- resolve spot + expirations ----------------------------------------------
+(def spy-price
+  (let [req (urllib.request/Request
+             "https://data.alpaca.markets/v2/stocks/SPY/trades/latest?feed=iex")
+        _ (.add-header req "APCA-API-KEY-ID" key-id)
+        _ (.add-header req "APCA-API-SECRET-KEY" secret)
+        resp (urllib.request/urlopen req ** :timeout 10)
+        data (json/loads (.decode (.read resp) "utf-8"))]
+    (python/float (get-in data ["trade" "p"]))))
+
+(def front-exp
+  (let [e (td/nearest-expiration {:transport @#'td/default-transport
+                                  :symbol "SPY"} session-date)]
+    (when (:error e) (println "FATAL front expiration:" e) (python/exit 1))
+    e))
+(def back-exp
+  (let [date-cls (.-date datetime)
+        day-after (let [d (.fromisoformat date-cls front-exp)]
+                    (str (.fromordinal date-cls (inc (.toordinal d)))))
+        e (td/nearest-expiration {:transport @#'td/default-transport
+                                  :symbol "SPY"} day-after)]
+    (when (:error e) (println "FATAL back expiration:" e) (python/exit 1))
+    e))
+
+(def atm (python/int (python/round spy-price)))
+(defn- k [n] (str n ".000"))
+
+;; --- generated artifacts + declarations --------------------------------------
+(def gen-root "live_runtime/generated-sim")
+(def artifact-root (str gen-root "/artifacts"))
+(def condor-feature-ref (str "feature/sim-vol/condor-" compact-date))
+(def condor-model-ref (str "model/sim-vol/condor-" compact-date))
+(def calendar-feature-ref (str "feature/sim-term/calendar-" compact-date))
+(def calendar-model-ref (str "model/sim-term/calendar-" compact-date))
+(def condor-sid "strategy/sim-vol/condor-rv/v1")
+(def calendar-sid "strategy/sim-term/calendar-slope/v1")
+
+(defn- write-edn! [path value]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (edn/write-string value)))
+
+(write-edn! (str artifact-root "/" condor-feature-ref ".edn")
+            {:feature-manifest/id condor-feature-ref
+             :feature-manifest/version 1
+             :feature-manifest/features [:feature/condor-mid-credit
+                                         :feature/realized-vol]
+             :feature-manifest/params
+             {:realized-vol {:window 20}
+              :condor {:put-spread {:venue "OPRA" :underlying-symbol "SPY"
+                                    :expiry front-exp
+                                    :right :option-right/put
+                                    :near-strike (k (- atm 6))
+                                    :far-strike (k (- atm 10))}
+                       :call-spread {:venue "OPRA" :underlying-symbol "SPY"
+                                     :expiry front-exp
+                                     :right :option-right/call
+                                     :near-strike (k (+ atm 6))
+                                     :far-strike (k (+ atm 10))}}}
+             :feature-manifest/required-inputs [:input/option-chain]
+             :feature-manifest/compatibility
+             {:strategy-family :strategy-family/sim-vol
+              :prediction-schema-version 1}})
+
+(write-edn! (str artifact-root "/" condor-model-ref ".edn")
+            {:model/id condor-model-ref
+             :model/version 1
+             :model/type :model.type/threshold
+             :model/params {:feature :feature/condor-mid-credit
+                            :threshold "0.50"}
+             :model/feature-manifest-ref condor-feature-ref
+             :model/prediction-schema-version 1})
+
+(write-edn! (str artifact-root "/" calendar-feature-ref ".edn")
+            {:feature-manifest/id calendar-feature-ref
+             :feature-manifest/version 1
+             :feature-manifest/features [:feature/calendar-straddle-slope]
+             :feature-manifest/params
+             {:calendar {:venue "OPRA" :underlying-symbol "SPY"
+                         :front-expiry front-exp
+                         :back-expiry back-exp
+                         :strikes (mapv k (range (- atm 3) (+ atm 4)))}}
+             :feature-manifest/required-inputs [:input/option-chain]
+             :feature-manifest/compatibility
+             {:strategy-family :strategy-family/sim-term
+              :prediction-schema-version 1}})
+
+(write-edn! (str artifact-root "/" calendar-model-ref ".edn")
+            {:model/id calendar-model-ref
+             :model/version 1
+             :model/type :model.type/passthrough
+             :model/params {:feature :feature/calendar-straddle-slope}
+             :model/feature-manifest-ref calendar-feature-ref
+             :model/prediction-schema-version 1})
+
+(def condor-decl-path (str gen-root "/strategies/condor-rv.edn"))
+(write-edn! condor-decl-path
+            {:strategy/id condor-sid
+             :strategy/family :strategy-family/sim-vol
+             :strategy/name :strategy-name/condor-rv
+             :strategy/version 1
+             :strategy/mode-policy #{:mode/sim}
+             :strategy/schedule {:session :session/us-equities-regular}
+             :strategy/warmup {:required-bars 25}
+             :strategy/instruments ["equity/NASDAQ/SPY"]
+             :strategy/features {:manifest-ref condor-feature-ref}
+             :strategy/inference {:artifact-ref condor-model-ref}
+             :strategy/signal {:fn-id :signal/credit-threshold-v1}
+             :strategy/risk {:policy-id :risk/single-structure :params {}}
+             :strategy/execution {:policy-id :execution/iron-condor-v1
+                                  :params {:quantity "1"}}})
+
+(def calendar-decl-path (str gen-root "/strategies/calendar-slope.edn"))
+(write-edn! calendar-decl-path
+            {:strategy/id calendar-sid
+             :strategy/family :strategy-family/sim-term
+             :strategy/name :strategy-name/calendar-slope
+             :strategy/version 1
+             :strategy/mode-policy #{:mode/sim}
+             :strategy/schedule {:session :session/us-equities-regular}
+             :strategy/warmup {:required-bars 1}
+             :strategy/instruments ["equity/NASDAQ/SPY"]
+             :strategy/features {:manifest-ref calendar-feature-ref}
+             :strategy/inference {:artifact-ref calendar-model-ref}
+             :strategy/signal {:fn-id :signal/zscore-hysteresis-v1
+                               :params {:delta-horizon 10 :stats-window 60
+                                        :enter-sigma 2.0 :exit-sigma 0.5
+                                        :min-samples 20}}
+             :strategy/risk {:policy-id :risk/single-structure :params {}}
+             :strategy/execution {:policy-id :execution/calendar-spread-v1
+                                  :params {:quantity "1"
+                                           :right :option-right/call
+                                           :allow-short? true}}})
+
+;; --- manifest -----------------------------------------------------------------
+(def revision (str "cp-sim-vt-" compact-date "-"
+                   (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+                              "%H%M%S")))
+(def manifest
+  {:control-plane/revision revision
+   :control-plane/generated-at (td/utc-now-str)
+   :control-plane/status :control-plane-status/proposed
+   :control-plane/strategies
+   (vec (for [[sid feature-ref model-ref] [[condor-sid condor-feature-ref condor-model-ref]
+                                           [calendar-sid calendar-feature-ref calendar-model-ref]]]
+          {:strategy/id sid
+           :strategy/enabled? true
+           :strategy/mode :mode/sim
+           :strategy/process "engine-sim-vol-term"
+           :strategy/account-route (str "route/" sid)
+           :strategy/artifacts {:model-ref model-ref
+                                :feature-manifest-ref feature-ref}
+           :strategy/schedule {:session :session/us-equities-regular}}))
+   :control-plane/accounts
+   [{:account/id "account/sim/vol-term"
+     :account/broker :broker/sim
+     :account/environment :environment/sim
+     :account/allowed-modes #{:mode/sim}
+     :account/live-enabled? false}]
+   :control-plane/processes
+   [{:process/id "engine-sim-vol-term"
+     :process/base :base/engine-live
+     :process/allowed-modes #{:mode/sim}
+     :process/strategies [condor-sid calendar-sid]}]
+   :control-plane/routes
+   (vec (for [sid [condor-sid calendar-sid]]
+          {:route/id (str "route/" sid)
+           :route/strategy-id sid
+           :route/account-id "account/sim/vol-term"
+           :route/broker :broker/sim}))
+   :control-plane/kill-switches
+   [{:kill-switch/scope :kill-switch-scope/global
+     :kill-switch/active? false :kill-switch/reason nil
+     :kill-switch/activated-at nil :kill-switch/actor nil}]
+   :control-plane/policies
+   {:policy/default-degradation :degradation-policy/default-paper}})
+
+(def cp-store (cpfs/make-file-control-plane-store "live_runtime/cp-sim-vt"))
+(def activation (cpfs/activate! cp-store manifest {:activation/actor "vol-term-sim-launcher"}))
+(when-not (:activated? activation)
+  (println "FATAL: activation failed:" activation) (python/exit 1))
+
+(println "=== VOL+TERM SIM PLAN ===")
+(prn {:spot spy-price :front front-exp :back back-exp
+      :condor {:puts [(k (- atm 6)) (k (- atm 10))]
+               :calls [(k (+ atm 6)) (k (+ atm 10))]
+               :threshold "0.50"}
+      :calendar {:strikes [(k (- atm 3)) "..." (k (+ atm 3))]}
+      :revision revision :until until})
+
+(if dry-run?
+  (println "DRY RUN — stopping before run-live.")
+  (let [bars-src (mda/make-alpaca-bars-source
+                  {:symbol "SPY" :instrument-id "equity/NASDAQ/SPY"
+                   :key-id key-id :secret secret
+                   :warmup-bars 30 :block? false :poll-seconds 10
+                   :until until})
+        chains-src (td/make-thetadata-chain-source
+                    {:symbol "SPY" :underlying-id "equity/NASDAQ/SPY"
+                     :expirations [front-exp back-exp]
+                     :strike-range [(str (- atm 15)) (str (+ atm 15))]
+                     :block? false :poll-seconds 45
+                     :until until
+                     :run-mode :mode/sim})
+        source (mdc/make-composite-source
+                {:sources [bars-src chains-src]
+                 :poll-seconds 2 :until until})
+        result (live/run-live
+                {:control-plane-root "live_runtime/cp-sim-vt"
+                 :process-id "engine-sim-vol-term"
+                 :out-dir (str "live_runtime/sim-vt-session-" session-date)
+                 :source source
+                 :mode :mode/sim
+                 :snapshot-every 50
+                 :strategy-paths [condor-decl-path calendar-decl-path]
+                 :artifact-root artifact-root})]
+    (println "=== SESSION RESULT ===")
+    (prn (select-keys result [:live/started? :live/refusal :run/id
+                              :facts-appended :orders]))
+    (prn (:portfolio result))))
