@@ -36,11 +36,21 @@ NEUTRALIZE_BUCKETS = {"ZERO_FILLED_LIVE", "BOTH_ZERO", "MISMATCH"}
 def main():
     rb = json.loads((PARITY / "rebucket_report.json").read_text())
     buckets = rb["buckets"]
-    neutralize = sorted(n for b, ns in buckets.items()
-                        if b in NEUTRALIZE_BUCKETS for n in ns)
+    neutralize = set(n for b, ns in buckets.items()
+                     if b in NEUTRALIZE_BUCKETS for n in ns)
+    # Phase B refinement (live capture): kept-live features that turned
+    # out DEGENERATE on live single-session data (v3 multi-day deltas
+    # that can't form intraday; mis-scaled |z|>8). Replay (training grids
+    # + in-window days) couldn't see this — the live capture did.
+    drop_path = PARITY / "phase_b_drop.json"
+    phase_b_drop = json.loads(drop_path.read_text()) if drop_path.exists() else []
+    neutralize.update(phase_b_drop)
+    neutralize = sorted(neutralize)
     kept = sorted(n for b, ns in buckets.items()
-                  if b not in NEUTRALIZE_BUCKETS for n in ns)
-    print(f"neutralize: {len(neutralize)}  kept-live: {len(kept)}")
+                  if b not in NEUTRALIZE_BUCKETS for n in ns
+                  if n not in set(phase_b_drop))
+    print(f"neutralize: {len(neutralize)} (+{len(phase_b_drop)} from Phase B)"
+          f"  kept-live: {len(kept)}")
 
     cs = np.load(PARITY / "feature_stats_raw_corrected.npz")
     for acct in ACCOUNTS:
@@ -56,7 +66,8 @@ def main():
             "feature_stats.npz replaced with recovered RAW train stats\n"
             "(original was identity — computed on standardized data).\n"
             "neutralize_features.json pins broken live sources to z=0.\n"
-            "Built by deploy_corrected_bundles.py on 2026-06-12.\n")
+            "Built by deploy_corrected_bundles.py on 2026-06-12,\n"
+            f"refined 2026-06-13 with {len(phase_b_drop)} Phase-B live drops.\n")
         print(f"  {dst.name}: stats replaced, {len(neutralize)} neutralized")
     print("done — launcher must point at *_corrected dirs")
     return 0
