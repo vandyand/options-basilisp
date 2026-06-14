@@ -32,6 +32,14 @@ log() { echo "$(date -u '+%FT%TZ') [orchestrator] $*"; }
 # weekend guard (cron 1-5 already filters; belt for manual runs)
 case "$(date +%u)" in 6|7) log "weekend — skipping"; exit 0 ;; esac
 
+# NYSE full-day holiday guard. The market is closed these dates, so don't
+# grab the shared ThetaData terminal or launch bots into a dead session.
+# (Remaining 2026 NYSE closures; half-days Nov 27 / Dec 24 stay open.)
+NYSE_HOLIDAYS="2026-06-19 2026-07-03 2026-09-07 2026-11-26 2026-12-25"
+case " $NYSE_HOLIDAYS " in
+  *" $(date +%F) "*) log "NYSE holiday ($(date +%F)) — skipping"; exit 0 ;;
+esac
+
 log "starting theta terminal"
 "$LIFECYCLE" start || { log "terminal start failed — aborting"; exit 1; }
 
