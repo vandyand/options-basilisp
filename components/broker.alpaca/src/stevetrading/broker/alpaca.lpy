@@ -449,7 +449,16 @@
     (if-let [exc (:exception resp)]
       {:ok? false :fault [:fault/transport-unavailable exc]}
       (let [{:keys [status body]} (:resp resp)
-            parsed (when (some? body) (parse-json body))]
+            ;; 204 No Content (a successful cancel) and other empty 2xx
+            ;; bodies arrive as "" — that is the ABSENCE of a JSON document,
+            ;; not an unparseable one. Only a NON-blank body that fails to
+            ;; parse is genuinely ambiguous. (Before 2026-06-15 every blank
+            ;; 204 cancel body was misread as :fault/ambiguous-response,
+            ;; faulting the cancel so the order never folded to :cancelled —
+            ;; in-flight stayed poisoned and no further entries were placed.)
+            blank-body? (or (nil? body)
+                            (and (string? body) (= "" (.strip body))))
+            parsed (when-not blank-body? (parse-json body))]
         (cond
           (and (>= status 200) (< status 300) (= ::unparseable parsed))
           {:ok? false :fault [:fault/ambiguous-response

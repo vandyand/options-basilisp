@@ -596,3 +596,65 @@
           heartbeat (bp/health broker)]
       (is (= :health/unreachable
              (get-in heartbeat [:fact/payload :health/connectivity]))))))
+
+;; ---------------------------------------------------------------------------
+;; Cancel HTTP 204 No Content (2026-06-15 regression)
+;;
+;; A successful DELETE /v2/orders/<id> returns 204 with an EMPTY body. The
+;; adapter must read that as a successful cancel and fold the order to
+;; :broker-status/cancelled — NOT a fault. Before the fix, the empty ""
+;; body parsed as ::unparseable and, being 2xx, was misclassified as
+;; :fault/ambiguous-response: every stale-order cancel faulted, the order
+;; never resolved, in-flight stayed poisoned, and no further entries were
+;; placed all session (observed live across all six bots on 2026-06-15).
+;; ---------------------------------------------------------------------------
+
+(defn- cancel-cmd
+  [oi boid]
+  (sch/command-envelope
+   {:record/type :command/cancel-broker-order
+    :record/mode :mode/paper
+    :record/account-id account-id
+    :record/source-system :engine/commands
+    :command/issued-at "2026-06-10T14:31:00Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key (str "cancel/intent/" oi)
+    :command/payload {:order-intent/id oi
+                      :command/idempotency-key (str "cancel/intent/" oi)
+                      :broker/account-id account-id
+                      :broker/order-id boid}}))
+
+(deftest cancel-204-no-content-folds-to-cancelled
+  (let [requests (atom [])
+        broker (make-broker
+                (recording-stub requests (fn [_] {:status 204 :body ""})))
+        facts (bp/cancel-broker-order! broker (cancel-cmd oi-equity "ord-9"))
+        f (first facts)]
+    (testing "DELETE dispatched for the broker order id"
+      (is (= 1 (count @requests)))
+      (is (= "DELETE" (:method (first @requests))))
+      (is (>= (.find (:url (first @requests)) "/v2/orders/ord-9") 0)))
+    (testing "204 empty body → cancelled status fact, never a fault"
+      (is (= 1 (count facts)))
+      (is (= :fact/broker-order-status-observed (:record/type f)))
+      (is (true? (:valid? (v/validate-fact f))))
+      (is (= :broker-status/cancelled
+             (get-in f [:fact/payload :broker/status])))
+      (is (= oi-equity (get-in f [:fact/payload :order-intent/id])))
+      (is (= "ord-9" (get-in f [:fact/payload :broker/order-id]))))))
+
+(deftest cancel-2xx-blank-whitespace-body-is-success
+  (testing "a 200 with a whitespace-only body is also empty, not ambiguous"
+    (let [broker (make-broker (fn [_] {:status 200 :body "   \n"}))
+          facts (bp/cancel-broker-order! broker (cancel-cmd oi-equity "ord-7"))]
+      (is (= :fact/broker-order-status-observed (:record/type (first facts))))
+      (is (= :broker-status/cancelled
+             (get-in (first facts) [:fact/payload :broker/status]))))))
+
+(deftest cancel-2xx-nonblank-unparseable-still-faults
+  (testing "a NON-empty 2xx body that is not JSON is still ambiguous"
+    (let [broker (make-broker (fn [_] {:status 200 :body "<html>nope</html>"}))
+          facts (bp/cancel-broker-order! broker (cancel-cmd oi-spread "ord-x"))]
+      (is (= :fact/fault-recorded (:record/type (first facts))))
+      (is (= :fault/ambiguous-response
+             (get-in (first facts) [:fact/payload :fault/category]))))))
