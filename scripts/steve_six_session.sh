@@ -40,9 +40,6 @@ case " $NYSE_HOLIDAYS " in
   *" $(date +%F) "*) log "NYSE holiday ($(date +%F)) — skipping"; exit 0 ;;
 esac
 
-log "starting theta terminal"
-"$LIFECYCLE" start || { log "terminal start failed — aborting"; exit 1; }
-
 SIM_PID=""
 cleanup() {
   # stop the sim session first if it is somehow still alive (it ends at
@@ -54,7 +51,31 @@ cleanup() {
   log "stopping theta terminal (handing session back)"
   "$LIFECYCLE" stop || true
 }
+# Arm cleanup BEFORE the terminal start so a failed/partial start can never
+# strand an orphan (the 06-18 failure mode: abort happened before the trap was
+# set, leaving a thrashed terminal running unmanaged for 2+ days).
 trap cleanup EXIT
+
+# Terminal start with retry. The 06-17/06-18 outage was a transient morning
+# DNS blip (could not resolve nexus-api.thetadata.us) that had recovered within
+# the hour — but the old `start || exit 1` killed the whole trading day on the
+# first failure. Retry across ~45 min so a recoverable network hiccup at the
+# open does not cost us the session. The lifecycle itself now waits for DNS and
+# starts patiently, so each attempt is already robust; this is the outer belt.
+start_terminal() {
+  local try
+  for try in 1 2 3 4 5; do
+    if "$LIFECYCLE" start; then return 0; fi
+    log "terminal start attempt $try/5 failed (transient DNS/network?) — retry in 10 min"
+    sleep 600
+  done
+  return 1
+}
+log "starting theta terminal (with retry)"
+if ! start_terminal; then
+  log "terminal could not start after 5 attempts over ~45 min — aborting day"
+  exit 1
+fi
 
 # secondary: vol/term sim trio, backgrounded, resilient (own log)
 log "launching vol/term sim trio (REF venv, sim broker)"
