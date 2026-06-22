@@ -526,8 +526,18 @@
   (doseq [sym stock-symbols
           bar (get bars-seed sym)]
     (on-bar! bridge (assoc bar :symbol sym)))
-  (doseq [snap chain-seed]
-    (on-chain! bridge snap))
+  ;; on-chain! requires a primed SPY bar buffer (it needs the underlying to
+  ;; build greeks grids). The cron fires 09:20 — 10 min BEFORE the open — so a
+  ;; thin pre-market IEX feed can return an EMPTY SPY bar seed, leaving
+  ;; spy-price nil. Seeding the chain then threw and crashed the whole session
+  ;; (observed 2026-06-22; the watchdog relaunched it after the open). Skip the
+  ;; chain seed when bars did not prime — the live loop builds grids as soon as
+  ;; SPY bars start flowing, so the session warms up cleanly instead of dying.
+  (if (spy-price bridge)
+    (doseq [snap chain-seed]
+      (on-chain! bridge snap))
+    (println "prime!: SPY bar buffer empty (pre-market / no IEX bars) —"
+             "skipping chain seed; grids build once bars flow"))
   nil)
 
 (defn predictions

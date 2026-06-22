@@ -248,3 +248,32 @@
           (is (contains? #{:long :short :flat} (get s bot)) (str bot)))
         (is (= (:oak s) (:parrot s))
             "OAK and PARROT share the mult-1.0 consensus vote")))))
+
+(deftest prime-tolerates-empty-bar-seed
+  "2026-06-22 regression: the 09:20 cron fires 10 min pre-market, so a thin IEX
+  feed can return an EMPTY SPY bar seed. on-chain! requires a primed SPY bar
+  buffer — priming the chain anyway threw and crashed the whole session. prime!
+  must instead SKIP the chain seed (spy-price nil) and not throw; the live loop
+  builds grids once bars flow."
+  (if-not (ref-env-available?)
+    (do (println "SKIP prime-tolerates-empty-bar-seed: torch/xgboost not importable")
+        (is true))
+    (let [mk #(str ref-root "/pipeline_data/" %)
+          bridge (b/make-bridge
+                  {:ref-root ref-root
+                   :bundle-dirs {:chestnut (mk "live_model_chestnut_multihead")
+                                 :lynx (mk "live_model_lynx_multihead")
+                                 :moose (mk "live_model_moose_multihead")}
+                   :calibrations
+                   {:chestnut (mk "calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
+                    :lynx (mk "calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
+                    :moose (mk "calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}})
+          ;; a chain snapshot that WOULD build a grid if it ran — proves the
+          ;; skip is driven by the empty bar buffer, not by an empty chain.
+          chain-seed [{:observed-at nil
+                       :contracts [{:strike 600.0 :right "CALL" :bid 1.0 :ask 1.1
+                                    :expiration "2026-06-30"}]}]]
+      (testing "empty SPY bar seed → prime! skips chain, does not throw"
+        (is (nil? (b/prime! bridge {} chain-seed))))
+      (testing "bar buffer is still unprimed (chain was skipped, not crashed)"
+        (is (nil? (#'b/spy-price bridge)))))))
