@@ -370,7 +370,11 @@
                                    :session flatten-now}))))))
 
 (deftest session-force-flatten-closes-option-lot
-  (testing "force-flatten sells an open option lot at the BID"
+  (testing "force-flatten closes an open option lot with a MARKET order end-to-end
+            (2026-06-22 fix: the old limit-at-bid rested unfilled when the chain
+            feed was dead/stale at 15:45 and 0DTE lots expired worthless; a
+            mandatory session-close must guarantee the fill, and force-flatten?
+            must thread registry -> executor)"
     (let [lot {:lot/instrument-id "option/OPRA/SPY/2026-06-12/C/550.000"
                :lot/side :order-side/buy
                :lot/remaining-quantity "1"}
@@ -387,7 +391,8 @@
           [intent] (intent-payloads facts)]
       (is (= :order-side/sell (:order-intent/side intent)))
       (is (= :position-effect/close (:order-intent/effect intent)))
-      (is (= "2.10" (:order-intent/limit-price intent))))))
+      (is (= :order-type/market (:order-intent/order-type intent)))
+      (is (nil? (:order-intent/limit-price intent))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Option bridge pipeline (oak)

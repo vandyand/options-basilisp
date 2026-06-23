@@ -408,7 +408,7 @@
   the engine's model): selling a long lot prices at the BID, buying back
   a short lot prices at the ASK; market order when the contract is no
   longer quoted two-sided."
-  [{:keys [decision-id account-id lots pxs]}]
+  [{:keys [decision-id account-id lots pxs force?]}]
   (vec
    (map-indexed
     (fn [slot lot]
@@ -417,7 +417,9 @@
             closing-side (if (= :order-side/sell (:lot/side lot))
                            :order-side/buy
                            :order-side/sell)
-            limit (when px
+            ;; force? = mandatory session-close: ALWAYS market, never trust a
+            ;; (possibly stale) quote. Otherwise marketable limit at bid/ask.
+            limit (when (and (not force?) px)
                     (if (= :order-side/buy closing-side)
                       (:ask px)
                       (:bid px)))]
@@ -448,13 +450,15 @@
         quantity (:risk/approved-quantity risk-approved-signal)
         chain (:execution/chain instrument-ctx)
         spot-str (:execution/spot instrument-ctx)
+        force? (boolean (:execution/force-flatten? instrument-ctx))
         lots (open-option-lots (:execution/strategy-view instrument-ctx))
         pxs (chain-pxs chain)
         closes (fn [] (close-option-lot-intents
                        {:decision-id decision-id
                         :account-id account-id
                         :lots lots
-                        :pxs pxs}))
+                        :pxs pxs
+                        :force? force?}))
         enter (fn [right]
                 (cond
                   (zero-qty? quantity) []
@@ -485,14 +489,16 @@
                                 :limit-price (mid-2dp (or ask (:mid pick)))
                                 :instrument-id (:instrument/id pick)
                                 :account-id account-id})))))))]
-    (if (nil? chain)
-      (skip :skip/no-chain)
-      (case posture
-        :posture/enter-long  (enter :option-right/call)
-        :posture/enter-short (enter :option-right/put)
-        :posture/flatten     (closes)
-        (unplannable-posture! :execution/single-leg-option-atm-v1
-                              posture)))))
+    ;; A flatten must never be held hostage by a dead/absent chain feed —
+    ;; closing lots needs only the open-lots (instrument-id is known) and,
+    ;; without quotes, prices as market. Only ENTERs need the live chain.
+    (case posture
+      :posture/flatten     (closes)
+      :posture/enter-long  (if (nil? chain) (skip :skip/no-chain)
+                               (enter :option-right/call))
+      :posture/enter-short (if (nil? chain) (skip :skip/no-chain)
+                               (enter :option-right/put))
+      (unplannable-posture! :execution/single-leg-option-atm-v1 posture))))
 
 ;; ---------------------------------------------------------------------------
 ;; :execution/calendar-spread-v1

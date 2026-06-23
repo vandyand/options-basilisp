@@ -42,11 +42,12 @@
    (exe/plan-execution :execution/equity-direction-v1
                        (ras posture qty) (equity-ctx net) acct)))
 
-(defn- option-ctx [{:keys [chain* spot view]}]
+(defn- option-ctx [{:keys [chain* spot view force?]}]
   {:instrument/id spy
    :execution/strategy-view view
    :execution/chain chain*
-   :execution/spot spot})
+   :execution/spot spot
+   :execution/force-flatten? force?})
 
 (defn- plan-option [posture qty ctx-opts]
   (exe/plan-execution :execution/single-leg-option-atm-v1
@@ -155,10 +156,11 @@
           (plan-option :posture/enter-long "1" {:spot "550.20"})]
       (is (= [] order-intents))
       (is (= :skip/no-chain skip-reason))))
-  (testing "no chain skips flatten too"
-    (is (= :skip/no-chain
-           (:execution/skip-reason
-            (plan-option :posture/flatten "1" {:spot "550.20"})))))
+  (testing "no chain does NOT skip a flatten (2026-06-22: a dead feed must never block a close)"
+    (let [r (plan-option :posture/flatten "1" {:spot "550.20"})]
+      ;; no open lots here, so nothing to close — but NOT :skip/no-chain
+      (is (= [] (:execution/order-intents r)))
+      (is (nil? (:execution/skip-reason r)))))
   (testing "chain without a two-sided contract of the wanted right -> :skip/no-eligible-contract"
     (let [calls-only (update chain :chain/contracts
                              (fn [cs]
@@ -206,6 +208,23 @@
           [intent] order-intents]
       (is (= :order-type/market (:order-intent/order-type intent)))
       (is (nil? (:order-intent/limit-price intent)))
+      (is (= :order-side/sell (:order-intent/side intent)))))
+  (testing "2026-06-22 FIX: forced session-close ALWAYS markets, even with a live two-sided quote (the quote may be STALE on a dead feed and a limit would never fill — 0DTE expiry)"
+    (let [[intent] (:execution/order-intents
+                    (plan-option :posture/flatten "1"
+                                 {:chain* chain :spot "550.20"
+                                  :view long-call-view :force? true}))]
+      (is (= :order-type/market (:order-intent/order-type intent)))
+      (is (nil? (:order-intent/limit-price intent)))
+      (is (= :order-side/sell (:order-intent/side intent)))
+      (is (= :position-effect/close (:order-intent/effect intent)))))
+  (testing "2026-06-22 FIX: flatten with open lots but a DEAD feed (no chain) still closes — as MARKET, not skipped"
+    (let [ints (:execution/order-intents
+                (plan-option :posture/flatten "1"
+                             {:spot "550.20" :view long-call-view}))
+          [intent] ints]
+      (is (= 1 (count ints)))
+      (is (= :order-type/market (:order-intent/order-type intent)))
       (is (= :order-side/sell (:order-intent/side intent)))))
   (testing "flatten with no open option lots plans nothing"
     (is (= [] (:execution/order-intents

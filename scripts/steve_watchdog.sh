@@ -1,29 +1,33 @@
 #!/usr/bin/env bash
-# steve_watchdog.sh — auth-free liveness watchdog for the six-bot paper session.
+# steve_watchdog.sh — auth-free self-healing watchdog for the six-bot session.
 #
-# WHY THIS EXISTS (2026-06-20): the week of 06-15 exposed that our monitoring
-# leaned on a live Claude session, which died when the Anthropic login dropped
-# (a machine sleep/resume). And the 06-17/06-18 trading days were lost because a
-# transient morning DNS blip made the orchestrator abort with no retry, and
-# nothing noticed for days. The trading itself runs from system cron (good), but
-# nothing was watching it that did not itself depend on an auth token.
+# WHY (2026-06-20, hardened 2026-06-22): our monitoring used to lean on a live
+# Claude session that died when the Anthropic login dropped; trading days were
+# then lost silently. This watchdog is the auth-free safety net: PURE bash, no
+# Claude, no Anthropic, no permission classifier — a system cron that just runs
+# and FIXES things, with no human in the loop.
 #
-# This watchdog is that missing piece: PURE bash, no Claude, no Anthropic, no
-# network auth. Run it from system cron every ~15 min during market hours. It:
-#   1. checks it is a trading day + inside the active session window,
-#   2. checks the six-bot launcher process is alive and the theta terminal is
-#      serving data,
-#   3. SELF-HEALS — if the launcher is down inside the window, it relaunches the
-#      orchestrator (guarded against double-launch: never relaunch while a
-#      launcher already runs; lock file; capped attempts/day),
-#   4. ALERTS — every problem is appended to the alerts log and (if configured)
-#      pushed to your phone via ntfy.sh, so you find out without a live session.
+# 2026-06-22 incident that drove the upgrade: the ThetaData terminal lost its
+# session mid-day; the engine's decision/execution loop WEDGED (no signals, no
+# orders, and critically the 15:45 flatten never fired — 0DTE positions decayed
+# to full loss) while equity-bar ingestion kept running. The process stayed
+# ALIVE, so the old `pgrep` liveness check passed and nothing recovered. The fix
+# below detects a STALL (data flowing but the decision side frozen), not just a
+# dead process, and recovers by tearing down + relaunching the whole session.
 #
-# Cron (every 15 min, 09:35-15:35 ET, weekdays):
-#   */15 9-15 * * 1-5 /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/scripts/steve_watchdog.sh >> /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/live_runtime/watchdog.cron.log 2>&1
+# Checks each run (inside the session window):
+#   1. launcher process alive?              no  -> recover (relaunch)
+#   2. decision pipeline progressing?        no  -> recover (kill stalled + relaunch)
+#   3. theta terminal serving data?          no  -> reclaim terminal (pre-empt a stall)
+# Recovery is bounded (lock + N/day cap) so a persistent fault (e.g. Steve
+# holding the shared ThetaData account) escalates to an alert instead of looping
+# forever. Every action is pushed to ntfy so you find out without watching.
 #
-# Optional phone push: export STEVE_NTFY_TOPIC=some-unguessable-topic in the
-# cron environment (or ~/.bashrc) and subscribe to ntfy.sh/<topic> on your phone.
+# Cron (every ~5 min, 09:34-15:51 ET, weekdays — tighter than before so a stall
+# is caught fast and a late stall can still be rescued before the 15:45 flatten):
+#   */5 9-15 * * 1-5 .../scripts/steve_watchdog.sh >> .../live_runtime/watchdog.cron.log 2>&1
+#
+# Optional phone push: export STEVE_NTFY_TOPIC=<topic> in the cron environment.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -34,7 +38,9 @@ ORCH_LOG="$REPO/live_runtime/steve_six.cron.log"
 ALERTS="$REPO/live_runtime/watchdog.alerts.log"
 LOCK="$REPO/live_runtime/watchdog.relaunch.lock"
 HEAL_COUNT="$REPO/live_runtime/watchdog.heals.$(TZ=America/New_York date +%F)"
-MAX_HEALS_PER_DAY=3
+MAX_HEALS_PER_DAY=4
+STALL_SECONDS=900          # decisions silent > 15 min while bars flow = stalled
+BAR_FRESH_SECONDS=420      # bars within 7 min = the engine is alive/ingesting
 NTFY_TOPIC="${STEVE_NTFY_TOPIC:-}"
 
 NYSE_HOLIDAYS="2026-06-19 2026-07-03 2026-09-07 2026-11-26 2026-12-25"
@@ -52,44 +58,85 @@ alert() {
 }
 
 is_session_window() {
-    # trading day (weekday, not a holiday) AND 09:35-15:35 ET — inside the live
-    # session but clear of the 09:20 launch ramp and the 15:45 close-out.
+    # trading day AND 09:34-15:51 ET. Window now extends past the 15:45 flatten
+    # so a stall arising right before close can still be rescued (a fresh launch
+    # force-flattens immediately once its clock sees now > 15:45).
     local dow today hm
     dow=$(TZ=America/New_York date '+%u'); today=$(TZ=America/New_York date '+%F')
     hm=$(TZ=America/New_York date '+%H%M')
     [[ "$dow" -ge 6 ]] && return 1
     [[ " $NYSE_HOLIDAYS " == *" $today "* ]] && return 1
-    [[ "$hm" > "0934" && "$hm" < "1536" ]]
+    [[ "$hm" > "0933" && "$hm" < "1552" ]]
 }
 
 launcher_alive() { pgrep -f "launch_steve_six\.lpy" >/dev/null 2>&1; }
 
 terminal_healthy() {
-    # reuse the lifecycle's own health classification (auth-free, local curl)
     [[ "$("$LIFECYCLE" status 2>/dev/null | awk -F': ' '/^health/{print $2}')" == "ok" ]]
+}
+
+# Decision-pipeline liveness via the append-only ledger: a healthy RTH session
+# writes a decision-side fact (signal / risk / order-intent) every cycle, even
+# when flat. If equity bars are FRESH (engine ingesting) but the newest decision
+# fact is older than STALL_SECONDS, the decision/execution loop is wedged — the
+# 06-22 failure. Returns 0 (stalled) / 1 (fine or can't tell — fail safe).
+decisions_stalled() {
+    local db last_bar last_dec now bar_epoch dec_epoch
+    db=$(ls -t "$REPO"/live_runtime/steve-session-*/facts.db 2>/dev/null | head -1)
+    [[ -f "$db" ]] || return 1
+    last_bar=$(sqlite3 "$db" \
+      "select max(occurred_at) from facts where fact_type=':fact/market-bar-observed';" 2>/dev/null)
+    last_dec=$(sqlite3 "$db" \
+      "select max(occurred_at) from facts where fact_type in \
+       (':fact/signal-decision-produced',':fact/risk-decision-recorded',':fact/order-intent-created');" 2>/dev/null)
+    [[ -n "$last_bar" ]] || return 1
+    now=$(date -u +%s)
+    bar_epoch=$(date -u -d "$last_bar" +%s 2>/dev/null) || return 1
+    dec_epoch=$(date -u -d "${last_dec:-1970-01-01T00:00:00Z}" +%s 2>/dev/null || echo 0)
+    # stalled iff bars are fresh AND decisions are stale
+    (( now - bar_epoch < BAR_FRESH_SECONDS )) && (( now - dec_epoch > STALL_SECONDS ))
 }
 
 heals_today() { [[ -f "$HEAL_COUNT" ]] && cat "$HEAL_COUNT" || echo 0; }
 
-relaunch() {
-    # double-launch guard: NEVER relaunch while a launcher already runs (two
-    # sessions would double-trade the six real accounts). Lock + daily cap.
-    if launcher_alive; then
-        log "relaunch skipped — a launcher is already running"; return 0
-    fi
+reclaim_terminal() {
+    # our systemctl only controls OUR terminal process, never Steve's PC — safe.
+    log "reclaiming theta terminal (stop+start)"
+    "$LIFECYCLE" stop  >/dev/null 2>&1 || true
+    "$LIFECYCLE" start >/dev/null 2>&1 || true
+}
+
+recover() {
+    # Full session recovery: tear down a down/stalled session and relaunch the
+    # orchestrator fresh (it reclaims the terminal + the engine snapshot-replays
+    # and broker-reconciles on start). Bounded by lock + daily cap so a
+    # persistent fault escalates to a human instead of looping.
+    local reason="$1"
     if ! ( set -o noclobber; echo $$ > "$LOCK" ) 2>/dev/null; then
-        log "relaunch skipped — another watchdog holds the lock"; return 0
+        log "recover skipped — another watchdog holds the lock"; return 0
     fi
     trap 'rm -f "$LOCK"' RETURN
     local n; n=$(heals_today)
     if (( n >= MAX_HEALS_PER_DAY )); then
-        alert "launcher DOWN but heal cap reached ($n/$MAX_HEALS_PER_DAY today) — NOT relaunching; needs a human"
+        alert "session fault ($reason) but heal cap reached ($n/$MAX_HEALS_PER_DAY) — NOT relaunching; NEEDS A HUMAN (likely Steve holding the ThetaData account)"
         return 0
     fi
     echo $((n + 1)) > "$HEAL_COUNT"
-    alert "launcher DOWN in session window — self-healing: relaunching orchestrator (heal $((n+1))/$MAX_HEALS_PER_DAY)"
+    alert "RECOVERING ($reason) — heal $((n+1))/$MAX_HEALS_PER_DAY: tearing down + relaunching"
+    # tear down any running/stalled launcher + sim; the orchestrator's own
+    # cleanup then stops the terminal as its foreground launcher exits.
+    pkill -f "launch_steve_six\.lpy"    2>/dev/null || true
+    pkill -f "launch_vol_term_sim\.lpy" 2>/dev/null || true
+    sleep 8
+    if launcher_alive; then
+        log "launcher still alive after TERM — SIGKILL"
+        pkill -9 -f "launch_steve_six\.lpy" 2>/dev/null || true
+        pkill -9 -f "launch_vol_term_sim\.lpy" 2>/dev/null || true
+        sleep 3
+    fi
+    # relaunch fresh (orchestrator reclaims terminal + starts both sessions)
     setsid nohup "$ORCH" >> "$ORCH_LOG" 2>&1 < /dev/null &
-    log "relaunched orchestrator (pid $!) — engine will snapshot-replay + broker-reconcile on start"
+    log "relaunched orchestrator (pid $!) — engine reconciles with the broker on start"
 }
 
 main() {
@@ -97,18 +144,21 @@ main() {
         log "outside session window — nothing to check"; exit 0
     fi
 
-    local problems=0
-    if ! terminal_healthy; then
-        problems=1
-        alert "theta terminal not serving data ($("$LIFECYCLE" status 2>/dev/null | awk -F': ' '/^network/{print $2}'))"
-    fi
     if ! launcher_alive; then
-        problems=1
-        relaunch              # the important self-heal: bots are not running
-    fi
-
-    if (( problems == 0 )); then
-        log "OK — launcher alive, terminal serving data"
+        recover "launcher process DOWN"
+    elif decisions_stalled; then
+        recover "decision pipeline STALLED (equity bars flowing but no signal/order facts > ${STALL_SECONDS}s)"
+    elif ! terminal_healthy; then
+        # bots alive + still deciding, but the terminal is flaky/invalid-session.
+        # reclaim it now to pre-empt the stall; alert if it does not recover.
+        reclaim_terminal
+        if terminal_healthy; then
+            alert "theta terminal was down — reclaimed, serving data again"
+        else
+            alert "theta terminal DOWN and reclaim failed ($("$LIFECYCLE" status 2>/dev/null | awk -F': ' '/^network/{print $2}')) — Steve may hold the account"
+        fi
+    else
+        log "OK — launcher alive, decisions progressing, terminal serving data"
     fi
 }
 

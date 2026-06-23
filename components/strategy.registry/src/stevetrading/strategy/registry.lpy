@@ -384,7 +384,12 @@
                   :execution/chain (:chain market-slice)
                   :execution/spot (:bar/close (peek (vec (:bars market-slice))))
                   :execution/params (get-in strategy
-                                            [:strategy/execution :params])}
+                                            [:strategy/execution :params])
+                  ;; a forced session-close (15:45 ET) must CLOSE — market
+                  ;; orders, no dependence on the chain feed. 2026-06-22: with
+                  ;; the feed dead, the option flatten priced limits off STALE
+                  ;; quotes that never filled and 0DTE positions expired.
+                  :execution/force-flatten? force-flatten?}
                  account-id)]
             (if (empty? order-intents)
               {:facts base-facts
