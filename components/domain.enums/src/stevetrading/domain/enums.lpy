@@ -162,7 +162,8 @@
   #{:fact/cash-movement-recorded
     :fact/position-lot-opened
     :fact/position-lot-closed
-    :fact/position-mark-recorded})
+    :fact/position-mark-recorded
+    :fact/option-settlement-recorded})
 
 (def control-fact-types
   #{:fact/control-plane-activated

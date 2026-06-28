@@ -26,12 +26,18 @@
     fill at the chain mids current AT FILL TIME, deterministically.
   - Per-leg pricing (one :fact/fill-observed per leg per tranche; fill
     ids \"<broker-order-id>-fill-<n>\" with n monotonic across the order):
-    * single leg: limit price or the leg's mark, preference ordered by
-      :price-source (:limit default | :mark);
-    * multi-leg: each leg fills at its mark when one exists; otherwise
-      the intent's net limit price is split evenly (limit / leg-count);
+    * single leg: limit price, the leg's mark, or side-specific quote
+      bid/ask, preference ordered by :price-source
+      (:limit default | :mark | :quote);
+    * multi-leg: each leg fills at its mark when one exists (or bid/ask when
+      :price-source :quote is explicit); otherwise the intent's net limit
+      price is split evenly (limit / leg-count);
     * no resolvable price for any leg → the submit is REJECTED with
       :broker-rejection/no-price-source (no magic default prices);
+    * :price-improvement (decimal string, quote source only) moves buys
+      down from ask and sells up from bid, capped at mid; this models the
+      empirically observed Alpaca paper behavior without optimistic
+      better-than-mid execution.
     * :slippage (decimal string, default \"0.00\") is applied
       directionally: buy legs pay +slippage, sell legs receive -slippage.
   - Idempotency (§9): submits are journaled by the payload
@@ -53,9 +59,11 @@
     reconciliation; it is NOT canonical truth — the engine appends the
     facts it receives. The simulator is single-threaded by design (test
     infrastructure); journal updates are read-modify-reset."
-  (:import datetime decimal)
-  (:require [stevetrading.broker.protocol :as p]
+  (:import datetime decimal os os.path sqlite3)
+  (:require [basilisp.edn :as edn]
+            [stevetrading.broker.protocol :as p]
             [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.instruments :as instruments]
             [stevetrading.domain.schemas :as sch]
             [stevetrading.domain.validation :as v]))
 
@@ -64,6 +72,19 @@
   (if (instance? decimal/Decimal x) x (decimal/Decimal x)))
 
 (def ^:private dec-zero (decimal/Decimal "0"))
+(def ^:private dec-one (decimal/Decimal "1"))
+(def ^:private option-contract-multiplier (decimal/Decimal "100"))
+
+(defn- instrument-multiplier
+  [instrument-id]
+  (try
+    (if (= :asset-class/option
+           (:instrument/asset-class
+            (instruments/parse-instrument-id instrument-id)))
+      option-contract-multiplier
+      dec-one)
+    (catch python/Exception _
+      dec-one)))
 
 (defn- resolve-marks
   "Resolve the configured :marks to a map: a zero-arg fn is called at the
@@ -130,21 +151,109 @@
 ;; Pricing
 ;; ---------------------------------------------------------------------------
 
+(defn- mark-mid
+  "A mark entry may be a legacy price string/Decimal or a quote map carrying
+  :quote/mid plus bid/ask. Return the mid/mark price when available."
+  [mark]
+  (cond
+    (map? mark) (or (:quote/mid mark)
+                    (when (and (some? (:quote/bid mark))
+                               (some? (:quote/ask mark)))
+                      (/ (+ (->dec (:quote/bid mark))
+                            (->dec (:quote/ask mark)))
+                         (decimal/Decimal "2"))))
+    (some? mark) mark
+    :else nil))
+
+(defn- mark-quote-price
+  "Return the side-specific executable quote price from a quote-shaped mark:
+  buys lift ask; sells hit bid. Nil for legacy mid-only marks."
+  [mark side]
+  (when (map? mark)
+    (if (= :order-side/sell side)
+      (:quote/bid mark)
+      (:quote/ask mark))))
+
+(defn- quote-spread-bucket
+  [mark]
+  (when (and (map? mark)
+             (some? (:quote/bid mark))
+             (some? (:quote/ask mark)))
+    (let [spread (- (->dec (:quote/ask mark)) (->dec (:quote/bid mark)))]
+      (cond
+        (<= spread (decimal/Decimal "0.01")) :spread/tight
+        (<= spread (decimal/Decimal "0.03")) :spread/normal
+        (<= spread (decimal/Decimal "0.10")) :spread/wide
+        :else :spread/very-wide))))
+
+(defn- calibration-improvement
+  "Resolve a conservative calibrated quote improvement, if a fill calibration
+  artifact was attached to the policy. Bucket estimates are already shrunk by
+  the offline estimator; fall back to global conservative improvement."
+  [fill-policy mark side]
+  (let [cal (:fill-calibration fill-policy)]
+    (when cal
+      (let [bucket-key {:side side :spread-bucket (quote-spread-bucket mark)}
+            bucket (first
+                    (filter #(= bucket-key (:bucket/key %))
+                            (:buckets cal)))
+            value (or (:shrunk-conservative-price-improvement bucket)
+                      (:conservative-price-improvement bucket)
+                      (get-in cal [:global
+                                   :conservative-price-improvement]))]
+        (when (some? value)
+          (->dec (str value)))))))
+
+(defn- policy-price-improvement
+  [fill-policy mark side]
+  (or (calibration-improvement fill-policy mark side)
+      (->dec (or (:price-improvement fill-policy) "0.00"))))
+
+(defn- improve-quote-price
+  "Apply capped price improvement toward mid for quote fills. Positive
+  improvement improves execution quality for both sides; slippage remains
+  a separate directional penalty/bonus applied later."
+  [fill-policy mark side base]
+  (let [improvement (policy-price-improvement fill-policy mark side)
+        mid (mark-mid mark)]
+    (if (and (pos? improvement) (some? mid))
+      (let [base (->dec base)
+            mid (->dec mid)]
+        (if (= :order-side/sell side)
+          (min mid (+ base improvement))
+          (max mid (- base improvement))))
+      base)))
+
+(defn- base-leg-price
+  [fill-policy mark limit side leg-count]
+  (cond
+    (= :quote (:price-source fill-policy))
+    (let [quote (mark-quote-price mark side)]
+      (cond
+        (some? quote) (improve-quote-price fill-policy mark side quote)
+        (some? (mark-mid mark)) (mark-mid mark)
+        :else limit))
+
+    (= 1 leg-count)
+    (if (= :mark (:price-source fill-policy))
+      (or (mark-mid mark) limit)
+      (or limit (mark-mid mark)))
+
+    (some? (mark-mid mark))
+    (mark-mid mark)
+
+    (some? limit)
+    (/ (->dec limit) (->dec (str leg-count)))
+
+    :else nil))
+
 (defn- leg-price
   "Resolve one leg's fill price (Decimal) per the documented pricing
   rules, or nil when unpriceable."
   [fill-policy marks intent leg leg-count]
   (let [mark (get marks (:instrument/id leg))
         limit (:order-intent/limit-price intent)
-        base (cond
-               (= 1 leg-count)
-               (if (= :mark (:price-source fill-policy))
-                 (or mark limit)
-                 (or limit mark))
-
-               (some? mark) mark
-               (some? limit) (/ (->dec limit) (->dec (str leg-count)))
-               :else nil)]
+        base (base-leg-price fill-policy mark limit (:leg/side leg) leg-count)]
     (when (some? base)
       (let [slip (->dec (or (:slippage fill-policy) "0.00"))]
         (if (= :order-side/sell (:leg/side leg))
@@ -214,6 +323,404 @@
                [n facts]
                legs)]
           (recur (next tranches) n facts))))))
+
+(defn- total-fill-ratio
+  "Total filled spread-unit ratio for the configured policy. Immediate and
+  on-poll fill the whole intent. Partial fills only the configured tranches."
+  [fill-policy intent]
+  (let [qty (->dec (:order-intent/quantity intent))
+        total (if (= :partial (:mode fill-policy))
+                (reduce + dec-zero (map ->dec (:tranches fill-policy)))
+                qty)]
+    (if (zero? qty) dec-zero (/ total qty))))
+
+(defn- expected-leg-quantities
+  "Requested total fill quantity per leg for this submit under the fill
+  policy, before any broker-side validation. The simulator reports leg
+  quantities, not spread-unit quantities."
+  [fill-policy intent]
+  (let [ratio (total-fill-ratio fill-policy intent)]
+    (mapv (fn [leg]
+            [(select-keys leg [:instrument/id :leg/side])
+             (* (->dec (:leg/quantity leg)) ratio)])
+          (:order-intent/legs intent))))
+
+(defn- opposite-side
+  [side]
+  (if (= :order-side/sell side) :order-side/buy :order-side/sell))
+
+(defn- leg-side-for
+  [intent instrument-id]
+  (or (some #(when (= instrument-id (:instrument/id %)) (:leg/side %))
+            (:order-intent/legs intent))
+      (:order-intent/side intent)))
+
+(defn- position-add
+  [positions account-id instrument-id side qty]
+  (update-in positions [account-id instrument-id side]
+             (fn [old] (+ (or old dec-zero) qty))))
+
+(defn- broker-fill-key
+  [account-id boid fill-id]
+  (str "broker/sim/" account-id "/" boid "/" fill-id))
+
+(defn- broker-lot-id
+  [account-id boid fill-id]
+  (str "lot-" (broker-fill-key account-id boid fill-id)))
+
+(defn- journal-positions
+  "Rebuild broker-side positions from journaled fills. This is broker truth
+  for validation only; the canonical ledger remains the engine facts."
+  ([journal]
+   (journal-positions journal {}))
+  ([journal initial-positions]
+   (let [positions
+         (reduce
+          (fn [positions boid]
+            (let [entry (get-in journal [:orders boid])
+                  intent (:order/intent entry)
+                  account-id (:broker/account-id entry)]
+              (if (contains? #{:rejected :cancelled} (:status entry))
+                positions
+                (reduce
+                 (fn [positions fill]
+                   (let [payload (:fact/payload fill)
+                         instrument-id (:fill/instrument-id payload)
+                         side (leg-side-for intent instrument-id)
+                         qty (->dec (:fill/quantity payload))]
+                     (if (= :position-effect/open (:order-intent/effect intent))
+                       (position-add positions account-id instrument-id side qty)
+                       ;; close consumes the opposite open side. Clamp at zero so
+                       ;; old bad journals do not make future availability negative.
+                       (let [open-side (opposite-side side)
+                             current (get-in positions [account-id instrument-id
+                                                        open-side] dec-zero)
+                             next (max dec-zero (- current qty))]
+                         (assoc-in positions [account-id instrument-id open-side]
+                                   next)))))
+                 positions
+                 (:fill-facts entry)))))
+          initial-positions
+          (:order-seq journal))]
+     (reduce
+      (fn [positions settlement]
+        (let [pl (:fact/payload settlement)
+              open-side (:lot/side pl)
+              current (get-in positions [(:settlement/account-id pl)
+                                         (:settlement/instrument-id pl)
+                                         open-side]
+                              dec-zero)
+              next (max dec-zero
+                        (- current (->dec (:settlement/quantity pl))))]
+          (assoc-in positions [(:settlement/account-id pl)
+                               (:settlement/instrument-id pl)
+                               open-side]
+                    next)))
+      positions
+      (:settlements journal)))))
+
+(defn- seed-positions
+  "Position seed supplied by a recovering replay engine. Shape is open lots
+  from :portfolio/open-lots; nil/empty means no seed."
+  [position-seed]
+  (let [lots (cond
+               (fn? position-seed) (position-seed)
+               (map? position-seed) (:portfolio/open-lots position-seed)
+               :else position-seed)]
+    (reduce (fn [positions lot]
+              (position-add positions
+                            (:lot/account-id lot)
+                            (:lot/instrument-id lot)
+                            (:lot/side lot)
+                            (->dec (:lot/remaining-quantity lot))))
+            {}
+            (or lots []))))
+
+(defn- close-over-request
+  "Return a validation message when a close request exceeds current broker
+  positions; nil when it is safely covered."
+  [journal fill-policy position-seed account-id intent]
+  (when (= :position-effect/close (:order-intent/effect intent))
+    (let [positions (journal-positions journal
+                                       (seed-positions position-seed))]
+      (some (fn [[leg qty]]
+              (let [instrument-id (:instrument/id leg)
+                    open-side (opposite-side (:leg/side leg))
+                    available (get-in positions [account-id instrument-id
+                                                 open-side]
+                                      dec-zero)]
+                (when (> qty available)
+                  (str "close quantity " qty " exceeds available "
+                       available " for " instrument-id))))
+            (expected-leg-quantities fill-policy intent)))))
+
+(defn- instrument-mark
+  [marks instrument-id]
+  (mark-mid (get marks instrument-id)))
+
+(defn- cash-delta
+  [side instrument-id price qty]
+  (let [principal (* price qty (instrument-multiplier instrument-id))]
+    (if (= :order-side/buy side) (- principal) principal)))
+
+(defn- net-positions
+  [open-lots]
+  (reduce (fn [m lot]
+            (update m (:lot/instrument-id lot)
+                    (fn [old]
+                      (let [q (->dec (or old "0"))
+                            rem (->dec (:lot/remaining-quantity lot))
+                            signed (if (= :order-side/sell (:lot/side lot))
+                                     (- rem)
+                                     rem)]
+                        (str (+ q signed))))))
+          {}
+          open-lots))
+
+(defn- option-expired?
+  [ts ref settlement-time]
+  (let [expiry (:instrument/expiry ref)
+        date (subs ts 0 10)]
+    (or (> (compare date expiry) 0)
+        (and (= date expiry)
+             (>= (compare ts (str expiry "T" settlement-time)) 0)))))
+
+(defn- underlying-mark
+  [marks underlying]
+  (mark-mid
+   (or (get marks (str "equity/NASDAQ/" underlying))
+       (get marks (str "equity/ARCA/" underlying))
+       (some (fn [[iid mark]]
+               (when (and (.startswith (str iid) "equity/")
+                          (.endswith (str iid) (str "/" underlying)))
+                 mark))
+             marks))))
+
+(defn- intrinsic-value
+  [ref underlying-price]
+  (let [spot (->dec underlying-price)
+        strike (->dec (:instrument/strike ref))]
+    (str (max dec-zero
+              (if (= :option-right/call (:instrument/right ref))
+                (- spot strike)
+                (- strike spot))))))
+
+(defn- settlement-fact
+  [ts lot ref underlying-price intrinsic]
+  (let [qty (->dec (:lot/remaining-quantity lot))
+        multiplier (instrument-multiplier (:lot/instrument-id lot))
+        price (->dec intrinsic)
+        cash (if (= :order-side/buy (:lot/side lot))
+               (* price qty multiplier)
+               (- (* price qty multiplier)))
+        open-price (->dec (:lot/price lot))
+        pnl (if (= :order-side/buy (:lot/side lot))
+              (* (- price open-price) qty multiplier)
+              (* (- open-price price) qty multiplier))
+        settlement-id (str "settlement/sim/" (:lot/account-id lot) "/"
+                           (:lot/id lot) "/" (:instrument/expiry ref))]
+    (broker-fact {} ts
+                 {:record/type :fact/option-settlement-recorded
+                  :record/account-id (:lot/account-id lot)
+                  :record/strategy-id (:lot/strategy-id lot)
+                  :record/instrument-id (:lot/instrument-id lot)
+                  :fact/dedupe-key settlement-id
+                  :fact/payload
+                  {:settlement/id settlement-id
+                   :settlement/type :settlement/option-expiration
+                   :settlement/account-id (:lot/account-id lot)
+                   :settlement/strategy-id (:lot/strategy-id lot)
+                   :settlement/instrument-id (:lot/instrument-id lot)
+                   :settlement/underlying (:instrument/underlying ref)
+                   :settlement/expiry (:instrument/expiry ref)
+                   :settlement/right (:instrument/right ref)
+                   :settlement/strike (:instrument/strike ref)
+                   :settlement/quantity (str qty)
+                   :settlement/price (str price)
+                   :settlement/intrinsic-value (str price)
+                   :settlement/underlying-price (str (->dec underlying-price))
+                   :settlement/cash-amount (str cash)
+                   :settlement/realized-pnl (str pnl)
+                   :settlement/settled-at ts
+                   :lot/id (:lot/id lot)
+                   :lot/side (:lot/side lot)}})))
+
+(defn- apply-settlement-to-state
+  [state settlement]
+  (let [pl (:fact/payload settlement)
+        lot-id (:lot/id pl)
+        qty (->dec (:settlement/quantity pl))]
+    (loop [lots (:open-lots state)
+           out []
+           realized (:realized state)]
+      (if (empty? lots)
+        (-> state
+            (assoc :open-lots out)
+            (update :cash + (->dec (:settlement/cash-amount pl)))
+            (assoc :realized (+ realized
+                                (->dec (:settlement/realized-pnl pl)))))
+        (let [lot (first lots)
+              match? (= lot-id (:lot/id lot))
+              rem (->dec (:lot/remaining-quantity lot))
+              rem' (if match? (max dec-zero (- rem qty)) rem)]
+          (recur (rest lots)
+                 (cond-> out
+                   (pos? rem') (conj (assoc lot
+                                            :lot/remaining-quantity
+                                            (str rem'))))
+                 realized))))))
+
+(defn- account-summary
+  "Alpaca-like account view derived from the sim broker journal. This is
+  operational broker state, not canonical engine ledger state."
+  [journal account-id marks]
+  (let [state
+        (reduce
+         (fn [state boid]
+           (let [entry (get-in journal [:orders boid])
+                 intent (:order/intent entry)]
+             (if (or (not= account-id (:broker/account-id entry))
+                     (contains? #{:rejected :cancelled} (:status entry)))
+               state
+               (reduce
+                (fn [state fill]
+                  (let [payload (:fact/payload fill)
+                        iid (:fill/instrument-id payload)
+                        side (leg-side-for intent iid)
+                        qty (->dec (:fill/quantity payload))
+                        price (->dec (:fill/price payload))
+                        multiplier (instrument-multiplier iid)
+                        cash (cash-delta side iid price qty)
+                        state (update state :cash + cash)]
+                    (if (= :position-effect/open (:order-intent/effect intent))
+                        (update state :open-lots conj
+                              {:lot/id (broker-lot-id account-id
+                                                       (get-in fill [:fact/payload
+                                                                     :broker/order-id])
+                                                       (get-in fill [:fact/payload
+                                                                     :fill/id]))
+                               :lot/strategy-id (:record/strategy-id fill)
+                               :lot/account-id account-id
+                               :lot/instrument-id iid
+                               :lot/side side
+                               :lot/quantity (str qty)
+                               :lot/remaining-quantity (str qty)
+                               :lot/price (str price)
+                               :lot/opened-at (:fact/occurred-at fill)})
+                      (let [open-side (opposite-side side)]
+                        (loop [lots (:open-lots state)
+                               remaining qty
+                               out []
+                               realized (:realized state)]
+                          (if (empty? lots)
+                            (assoc state :open-lots out :realized realized)
+                            (let [lot (first lots)
+                                  match? (and (= iid (:lot/instrument-id lot))
+                                              (= open-side (:lot/side lot)))
+                                  lot-rem (->dec (:lot/remaining-quantity lot))
+                                  take (if match?
+                                         (min remaining lot-rem)
+                                         dec-zero)
+                                  lot-rem' (- lot-rem take)
+                                  remaining' (- remaining take)
+                                  pnl (if (zero? take)
+                                        dec-zero
+                                        (if (= :order-side/buy (:lot/side lot))
+                                          (* (- price (->dec (:lot/price lot)))
+                                             take multiplier)
+                                          (* (- (->dec (:lot/price lot)) price)
+                                             take multiplier)))
+                                  lot' (assoc lot :lot/remaining-quantity
+                                              (str lot-rem'))]
+                              (recur (rest lots)
+                                     remaining'
+                                     (cond-> out
+                                       (pos? lot-rem') (conj lot'))
+                                     (+ realized pnl)))))))))
+                state
+                (:fill-facts entry)))))
+         {:cash dec-zero :realized dec-zero :open-lots []}
+         (:order-seq journal))
+        state (reduce apply-settlement-to-state
+                      state
+                      (filter #(= account-id
+                                  (get-in % [:fact/payload
+                                             :settlement/account-id]))
+                              (:settlements journal)))
+        open-lots (:open-lots state)
+        notionals (map (fn [lot]
+                         (let [price (->dec (or (instrument-mark marks
+                                                                  (:lot/instrument-id lot))
+                                                 (:lot/price lot)))
+                               n (* price
+                                    (->dec (:lot/remaining-quantity lot))
+                                    (instrument-multiplier
+                                     (:lot/instrument-id lot)))]
+                           (if (= :order-side/sell (:lot/side lot)) (- n) n)))
+                       open-lots)
+        marked-unreal
+        (keep (fn [lot]
+                (when-let [mark (instrument-mark marks (:lot/instrument-id lot))]
+                  (let [diff (- (->dec mark) (->dec (:lot/price lot)))
+                        qty (->dec (:lot/remaining-quantity lot))
+                        multiplier (instrument-multiplier
+                                    (:lot/instrument-id lot))]
+                    (if (= :order-side/sell (:lot/side lot))
+                      (* (- diff) qty multiplier)
+                      (* diff qty multiplier)))))
+              open-lots)
+        unmarked (into #{}
+                       (remove #(contains? marks %)
+                               (map :lot/instrument-id open-lots)))]
+    {:cash (str (:cash state))
+     :realized-pnl (str (:realized state))
+     :open-lots open-lots
+     :net-positions (net-positions open-lots)
+     :gross-exposure (str (reduce + dec-zero
+                                  (map #(if (< % dec-zero) (- %) %)
+                                       notionals)))
+     :net-exposure (str (reduce + dec-zero notionals))
+     :unrealized-pnl (cond
+                       (empty? open-lots) "0"
+                       (empty? marked-unreal) nil
+                       :else (str (reduce + dec-zero marked-unreal)))
+     :unmarked-instruments unmarked}))
+
+(declare save-journal!)
+
+(defn- due-settlement-facts
+  [journal account-id marks ts settlement-time]
+  (let [summary (account-summary journal account-id marks)
+        settled (:settled-lot-ids journal)]
+    (keep (fn [lot]
+            (let [ref (instruments/parse-instrument-id
+                       (:lot/instrument-id lot))]
+              (when (and (= :asset-class/option
+                            (:instrument/asset-class ref))
+                         (not (contains? settled (:lot/id lot)))
+                         (option-expired? ts ref settlement-time))
+                (when-let [underlying-price
+                           (underlying-mark marks
+                                            (:instrument/underlying ref))]
+                  (settlement-fact ts lot ref underlying-price
+                                   (intrinsic-value ref
+                                                    underlying-price))))))
+          (:open-lots summary))))
+
+(defn- materialize-settlements!
+  [journal store account-id marks ts settlement-time]
+  (let [facts (vec (due-settlement-facts @journal account-id marks ts
+                                         settlement-time))]
+    (when (seq facts)
+      (swap! journal
+             (fn [j]
+               (-> j
+                   (update :settlements into facts)
+                   (update :settled-lot-ids into
+                           (map #(get-in % [:fact/payload :lot/id])
+                                facts)))))
+      (save-journal! store journal))
+    facts))
 
 (defn- filled-status
   "Order status after fills: tranche quantities are compared against the
@@ -356,7 +863,51 @@
 (def ^:private empty-journal
   {:orders {}      ;; broker-order-id → entry
    :by-key {}      ;; idempotency key → broker-order-id
-   :order-seq []}) ;; broker-order-ids in submit order (determinism)
+   :order-seq []   ;; broker-order-ids in submit order (determinism)
+   :settlements []
+   :settled-lot-ids #{}})
+
+(def ^:private create-journal-sql
+  "CREATE TABLE IF NOT EXISTS sim_journal (
+     id TEXT PRIMARY KEY,
+     record TEXT NOT NULL,
+     updated_at TEXT NOT NULL)")
+
+(defn- open-journal-store
+  [path]
+  (when (some? path)
+    (let [parent (os.path/dirname path)]
+      (when (seq parent)
+        (os/makedirs parent ** :exist_ok true)))
+    (let [conn (sqlite3/connect path ** :check_same_thread false)]
+      (.execute conn "PRAGMA journal_mode=WAL")
+      (.execute conn create-journal-sql)
+      (.commit conn)
+      conn)))
+
+(defn- load-journal
+  [conn]
+  (if (nil? conn)
+    empty-journal
+    (let [cur (.execute conn "SELECT record FROM sim_journal WHERE id = ?"
+                        (python/tuple ["main"]))
+          row (.fetchone cur)]
+      (if (nil? row)
+        empty-journal
+        (merge empty-journal (edn/read-string (nth row 0)))))))
+
+(defn- save-journal!
+  [conn journal]
+  (when (some? conn)
+    (let [ts (.strftime (datetime.datetime/now datetime.timezone/utc)
+                        "%Y-%m-%dT%H:%M:%SZ")]
+      (.execute conn
+                "INSERT INTO sim_journal (id, record, updated_at)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET record = excluded.record,
+                                                updated_at = excluded.updated_at"
+                (python/tuple ["main" (edn/write-string @journal) ts]))
+      (.commit conn))))
 
 (defn- journal-entry
   [journal boid]
@@ -382,12 +933,13 @@
 ;; SimBroker
 ;; ---------------------------------------------------------------------------
 
-(defrecord SimBroker [journal opts]
+(defrecord SimBroker [journal opts store]
   p/Broker
 
   (submit-order-intent! [this cmd]
-    (let [{:keys [fill-policy marks clock reject-next]} opts
+    (let [{:keys [fill-policy marks clock reject-next position-seed]} opts
           marks (resolve-marks marks)
+          _ (when (seq marks) (swap! journal assoc :marks marks))
           payload (:command/payload cmd)
           idem-key (:command/idempotency-key payload)
           intent (:order-intent/payload payload)
@@ -402,6 +954,13 @@
               validation-error (submit-validation-error payload)
               forced? (and (some? reject-next) @reject-next)
               _ (when forced? (reset! reject-next false))
+              over-close-message
+              (when (and (nil? validation-error)
+                         (some? intent))
+                (close-over-request @journal fill-policy
+                                    position-seed
+                                    (:broker/account-id payload)
+                                    intent))
               rejection
               (cond
                 (some? validation-error)
@@ -410,6 +969,9 @@
                 forced?
                 [:broker-rejection/simulated-reject
                  "rejected by :reject-next test hook"]
+
+                (some? over-close-message)
+                [:broker-rejection/over-close over-close-message]
 
                 (unpriceable? fill-policy marks intent)
                 [:broker-rejection/no-price-source
@@ -431,6 +993,7 @@
                                :status :rejected
                                :fill-facts []
                                :pending-fill? false}))
+              (save-journal! store journal)
               [ack])
             (let [ack (accepted-ack cmd-meta ts payload boid)
                   entry {:broker/order-id boid
@@ -450,6 +1013,7 @@
                                                              marks clock)
                                  :status (filled-status entry fill-policy)))]
               (journal-put! journal idem-key boid entry)
+              (save-journal! store journal)
               (into [ack] (:fill-facts entry))))))))
 
   (cancel-broker-order! [this cmd]
@@ -483,6 +1047,7 @@
                  :status :cancelled
                  :pending-fill? false
                  :cancel-fact fact)
+          (save-journal! store journal)
           [fact]))))
 
   (open-orders [this account-id]
@@ -493,8 +1058,9 @@
              (open-status-fact e ts)))))
 
   (fills-since [this account-id cursor]
-    (let [{:keys [fill-policy marks clock]} opts
+    (let [{:keys [fill-policy marks clock settlement-time]} opts
           marks (resolve-marks marks)]
+      (when (seq marks) (swap! journal assoc :marks marks))
       ;; materialize pending :on-poll fills for this account
       (doseq [e (filter :pending-fill? (entries-in-order @journal account-id))]
         (let [fills (fill-facts-for e fill-policy marks clock)]
@@ -502,18 +1068,40 @@
                  :fill-facts fills
                  :pending-fill? false
                  :status (filled-status e fill-policy))))
-      (vec (for [e (entries-in-order @journal account-id)
-                 fact (:fill-facts e)
-                 :when (or (nil? cursor)
-                           (>= (compare (:fact/occurred-at fact) cursor) 0))]
-             fact))))
+      (let [settlement-ts (clock)]
+        (materialize-settlements! journal store account-id
+                                  (merge (or (:marks @journal) {}) marks)
+                                  settlement-ts settlement-time))
+      (save-journal! store journal)
+      (vec (concat
+            (for [e (entries-in-order @journal account-id)
+                  fact (:fill-facts e)
+                  :when (or (nil? cursor)
+                            (>= (compare (:fact/occurred-at fact) cursor) 0))]
+              fact)
+            (for [fact (:settlements @journal)
+                  :when (and (= account-id
+                                (get-in fact [:fact/payload
+                                              :settlement/account-id]))
+                             (or (nil? cursor)
+                                 (>= (compare (:fact/occurred-at fact)
+                                              cursor)
+                                     0)))]
+              fact)))))
 
   (account-state [this account-id]
-    (let [{:keys [clock]} opts
+    (let [{:keys [clock marks settlement-time]} opts
+          marks (merge (or (:marks @journal) {}) (resolve-marks marks))
+          _ (when (seq marks)
+              (do (swap! journal assoc :marks marks)
+                  (save-journal! store journal)))
           ts (clock)
+          _ (materialize-settlements! journal store account-id marks ts
+                                      settlement-time)
           open (count (filter #(contains? #{:accepted :partially-filled}
                                           (:status %))
-                              (entries-in-order @journal account-id)))]
+                              (entries-in-order @journal account-id)))
+          summary (account-summary @journal account-id marks)]
       (broker-fact {} ts
                    {:record/type :fact/broker-account-observed
                     :record/account-id account-id
@@ -521,7 +1109,16 @@
                     {:broker/account-id account-id
                      :broker/source-system :broker/sim
                      :broker/observed-at ts
-                     :account/open-order-count open}})))
+                     :account/open-order-count open
+                     :account/cash (:cash summary)
+                     :account/realized-pnl (:realized-pnl summary)
+                     :account/unrealized-pnl (:unrealized-pnl summary)
+                     :account/gross-exposure (:gross-exposure summary)
+                     :account/net-exposure (:net-exposure summary)
+                     :account/net-positions (:net-positions summary)
+                     :account/open-lots (:open-lots summary)
+                     :account/unmarked-instruments
+                     (:unmarked-instruments summary)}})))
 
   (health [this]
     (let [{:keys [clock]} opts
@@ -540,21 +1137,32 @@
 (def ^:private default-fill-policy
   {:mode :immediate
    :price-source :limit
+   :price-improvement "0.00"
    :slippage "0.00"})
 
 (defn make-sim-broker
   "Build a deterministic sim broker. opts:
   {:fill-policy {:mode :immediate|:on-poll|:partial
-                 :price-source :limit|:mark
+                 :price-source :limit|:mark|:quote
+                 :price-improvement \"0.00\" ;; quote mode only, capped at mid
                  :slippage \"0.00\"
                  :tranches [\"1\" \"2\"]}   ;; :partial mode only
-   :marks {instrument-id price-str} | (fn [] {instrument-id price-str})
+   :marks {instrument-id price-str|quote-map} | (fn [] ...)
    :clock (fn [] iso-ts)        ;; default: synthetic counter clock
-   :reject-next (atom false)}   ;; test hook: reject the next submit"
+   :reject-next (atom false)    ;; test hook: reject the next submit
+   :position-seed lots|(fn [] lots)
+   :settlement-time \"20:00:00Z\"
+   :store-path \"path/to/sim-broker.db\"} ;; optional durable SQLite journal"
   ([] (make-sim-broker {}))
   ([opts]
-   (->SimBroker (atom empty-journal)
-                {:fill-policy (merge default-fill-policy (:fill-policy opts))
-                 :marks (or (:marks opts) {})
-                 :clock (or (:clock opts) (default-clock))
-                 :reject-next (or (:reject-next opts) (atom false))})))
+   (let [store (open-journal-store (:store-path opts))
+         journal (atom (load-journal store))]
+     (->SimBroker journal
+                  {:fill-policy (merge default-fill-policy (:fill-policy opts))
+                   :marks (or (:marks opts) {})
+                   :clock (or (:clock opts) (default-clock))
+                   :reject-next (or (:reject-next opts) (atom false))
+                   :position-seed (:position-seed opts)
+                   :settlement-time (or (:settlement-time opts)
+                                        "20:00:00Z")}
+                  store))))

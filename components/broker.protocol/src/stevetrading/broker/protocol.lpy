@@ -19,6 +19,7 @@
     :fact/broker-ack-rejected
     :fact/broker-order-status-observed
     :fact/fill-observed
+    :fact/option-settlement-recorded
     :fact/broker-account-observed})
 
 (defn broker-command?

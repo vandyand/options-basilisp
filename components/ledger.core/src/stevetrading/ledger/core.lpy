@@ -72,6 +72,7 @@
     the envelope's :record/id, which the fold ignores)."
   (:import decimal)
   (:require [stevetrading.domain.enums :as enums]
+            [stevetrading.domain.instruments :as instruments]
             [stevetrading.domain.schemas :as sch]))
 
 (def ledger-version 1)
@@ -107,6 +108,19 @@
   (decimal/Decimal (or s "0")))
 
 (def ^:private dec-zero (decimal/Decimal "0"))
+(def ^:private dec-one (decimal/Decimal "1"))
+(def ^:private option-contract-multiplier (decimal/Decimal "100"))
+
+(defn- instrument-multiplier
+  [instrument-id]
+  (try
+    (if (= :asset-class/option
+           (:instrument/asset-class
+            (instruments/parse-instrument-id instrument-id)))
+      option-contract-multiplier
+      dec-one)
+    (catch python/Exception _
+      dec-one)))
 
 (defn- kw-str
   "Render a keyword as \"ns/name\" (no leading colon) for identity strings."
@@ -252,7 +266,8 @@
         fk (fill-key fill-fact account-id)
         qty (->dec (:fill/quantity payload))
         price (->dec (:fill/price payload))
-        principal (* price qty)
+        multiplier (instrument-multiplier instrument-id)
+        principal (* price qty multiplier)
         occurred-at (or (:fill/occurred-at payload)
                         (:fact/occurred-at fill-fact))
         ;; cash sign by side: buy pays, sell receives
@@ -301,9 +316,11 @@
                                remaining)
                     open-price (->dec (:lot/price lot))
                     ;; long lot: close - open; short lot: open - close
+                    lot-multiplier (instrument-multiplier
+                                    (:lot/instrument-id lot))
                     pnl (if (= :order-side/buy (:lot/side lot))
-                          (* (- price open-price) take-qty)
-                          (* (- open-price price) take-qty))
+                          (* (- price open-price) take-qty lot-multiplier)
+                          (* (- open-price price) take-qty lot-multiplier))
                     close-fact
                     (derived-envelope
                      fill-fact :fact/position-lot-closed
@@ -322,8 +339,10 @@
                       (:order-intent/id intent-ctx)
                       :lot-close/closing-fill-id (:fill/id payload)
                       :lot-close/closing-fill-key fk
-                      :lot-close/basis (str (* open-price take-qty))
-                      :lot-close/proceeds (str (* price take-qty))
+                      :lot-close/basis (str (* open-price take-qty
+                                                lot-multiplier))
+                      :lot-close/proceeds (str (* price take-qty
+                                                   lot-multiplier))
                       :lot-close/realized-pnl (str pnl)})]
                 (recur (rest lots) (- remaining take-qty)
                        (conj acc close-fact))))))]
@@ -387,6 +406,61 @@
             {:mark/price (:mark/price payload)
              :mark/at (or (:mark/at payload) (:fact/occurred-at fact))}))
 
+(defn- apply-option-settlement
+  "Fold one durable option-expiration settlement. The settlement fact is a
+  canonical ledger input, not a synthetic fill: it closes exactly one open
+  lot and applies the settlement cash movement in one idempotent step."
+  [ledger payload dedupe-key]
+  (let [lot (get-in ledger [:ledger/lots (:lot/id payload)])]
+    (if (nil? lot)
+      (update ledger :ledger/anomalies conj
+              {:anomaly/kind :ledger/settlement-for-unknown-lot
+               :lot/id (:lot/id payload)
+               :fact/dedupe-key dedupe-key})
+      (let [qty (->dec (:settlement/quantity payload))
+            price (->dec (:settlement/price payload))
+            open-price (->dec (:lot/price lot))
+            multiplier (instrument-multiplier (:lot/instrument-id lot))
+            cash-amount (:settlement/cash-amount payload)
+            pnl (if (= :order-side/buy (:lot/side lot))
+                  (* (- price open-price) qty multiplier)
+                  (* (- open-price price) qty multiplier))
+            closed-at (:settlement/settled-at payload)
+            close-record {:lot/id (:lot/id payload)
+                          :lot/instrument-id (:lot/instrument-id lot)
+                          :lot/account-id (:lot/account-id lot)
+                          :lot/strategy-id (:lot/strategy-id lot)
+                          :lot/side (:lot/side lot)
+                          :lot-close/quantity (str qty)
+                          :lot-close/price (str price)
+                          :lot-close/closed-at closed-at
+                          :lot-close/closing-order-intent-id nil
+                          :lot-close/closing-fill-id nil
+                          :lot-close/closing-fill-key
+                          (:settlement/id payload)
+                          :lot-close/basis (str (* open-price qty
+                                                    multiplier))
+                          :lot-close/proceeds (str (* price qty
+                                                       multiplier))
+                          :lot-close/realized-pnl (str pnl)}
+            cash-record {:cash/category :cash/option-settlement
+                         :cash/amount cash-amount
+                         :cash/account-id (:lot/account-id lot)
+                         :cash/strategy-id (:lot/strategy-id lot)
+                         :cash/instrument-id (:lot/instrument-id lot)
+                         :cash/fill-key (:settlement/id payload)
+                         :cash/occurred-at closed-at}]
+        (-> ledger
+            (assoc-in [:ledger/lots (:lot/id payload)
+                       :lot/remaining-quantity]
+                      (str (- (->dec (:lot/remaining-quantity lot)) qty)))
+            (update :ledger/closed-lots conj
+                    (assoc close-record
+                           :lot-close/realized-pnl
+                           (or (:settlement/realized-pnl payload)
+                               (:lot-close/realized-pnl close-record))))
+            (apply-cash-movement cash-record))))))
+
 (defn fold-ledger-fact
   "Pure fold of one DERIVED ledger fact (never a raw fill) into ledger
   state. Idempotent per :fact/dedupe-key — a fact whose dedupe key has
@@ -417,6 +491,9 @@
 
                 (= :fact/position-mark-recorded fact-type)
                 (apply-mark-recorded ledger fact payload)
+
+                (= :fact/option-settlement-recorded fact-type)
+                (apply-option-settlement ledger payload dedupe-key)
 
                 :else ledger)
               (mark-applied dedupe-key)))))))

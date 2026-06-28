@@ -4,6 +4,7 @@
   duplicate observation; partial then full fill; cancel race;
   reconciliation with unresolved orders), plus fold integration through
   engine.fold and the recovery-seam adapter."
+  (:import os.path tempfile)
   (:require [basilisp.test :refer [deftest is testing]]
             [stevetrading.broker.protocol :as p]
             [stevetrading.broker.sim :as sim]
@@ -16,6 +17,7 @@
 (def strategy-id "strategy/simple-direction/sma-cross/v1")
 (def spy "equity/ARCA/SPY")
 (def qqq "equity/NASDAQ/QQQ")
+(def spy-call-550 "option/OPRA/SPY/2026-06-19/C/550.000")
 
 (defn intent-identity
   [legs quantity]
@@ -64,6 +66,50 @@
      :broker/account-id acct
      :broker/route {:broker/source-system :broker/sim}
      :order-intent/payload (intent-payload oi legs quantity "550.00")}}))
+
+(defn submit-cmd*
+  [oi legs quantity limit-price side effect]
+  (sch/command-envelope
+   {:record/type :command/submit-order-intent
+    :record/mode :mode/sim
+    :record/strategy-id strategy-id
+    :record/account-id acct
+    :command/issued-at "2026-06-19T19:59:00Z"
+    :command/target-adapter :adapter/broker
+    :command/idempotency-key (str "submit/intent/" oi)
+    :command/payload
+    {:order-intent/id oi
+     :command/idempotency-key (str "submit/intent/" oi)
+     :broker/account-id acct
+     :broker/route {:broker/source-system :broker/sim}
+     :order-intent/payload
+     {:order-intent/id oi
+      :order-intent/side side
+      :order-intent/effect effect
+      :order-intent/order-type :order-type/limit
+      :order-intent/time-in-force :tif/day
+      :order-intent/quantity quantity
+      :order-intent/limit-price limit-price
+      :order-intent/legs legs}}}))
+
+(defn option-open-cmd
+  [oi]
+  (submit-cmd* oi
+               [{:instrument/id spy-call-550
+                 :leg/side :order-side/buy
+                 :leg/quantity "1"}]
+               "1"
+               "2.00"
+               :order-side/buy
+               :position-effect/open))
+
+(defn seq-clock
+  [times]
+  (let [xs (atom times)]
+    (fn []
+      (let [t (first @xs)]
+        (swap! xs #(if (next %) (vec (rest %)) %))
+        t))))
 
 (defn cancel-cmd
   [oi]
@@ -173,6 +219,106 @@
           [_ fill] (p/submit-order-intent! broker (submit-cmd oi (single-leg "2") "2"))]
       (is (= "551.05" (get-in fill [:fact/payload :fill/price]))))))
 
+(deftest submit-accepted-quote-source
+  (testing "quote price source crosses bid/ask instead of filling at mid"
+    (let [sell-leg [{:instrument/id spy-call-550
+                     :leg/side :order-side/sell
+                     :leg/quantity "1"}]
+          buy-leg [{:instrument/id spy-call-550
+                    :leg/side :order-side/buy
+                    :leg/quantity "1"}]
+          marks {spy-call-550 {:quote/bid "1.20"
+                               :quote/ask "1.30"
+                               :quote/mid "1.25"}}
+          sell-oi (sch/order-intent-id (intent-identity sell-leg "1"))
+          buy-oi (sch/order-intent-id (intent-identity buy-leg "1"))
+          broker (sim/make-sim-broker {:fill-policy {:price-source :quote}
+                                       :marks marks})
+          [_ sell-fill] (p/submit-order-intent! broker
+                                                (submit-cmd sell-oi sell-leg "1"))
+          [_ buy-fill] (p/submit-order-intent! broker
+                                               (submit-cmd buy-oi buy-leg "1"))]
+      (is (= "1.20" (get-in sell-fill [:fact/payload :fill/price])))
+      (is (= "1.30" (get-in buy-fill [:fact/payload :fill/price]))))))
+
+(deftest submit-accepted-quote-source-price-improvement
+  (testing "quote improvement moves execution toward mid and caps there"
+    (let [sell-leg [{:instrument/id spy-call-550
+                     :leg/side :order-side/sell
+                     :leg/quantity "1"}]
+          buy-leg [{:instrument/id spy-call-550
+                    :leg/side :order-side/buy
+                    :leg/quantity "1"}]
+          marks {spy-call-550 {:quote/bid "1.20"
+                               :quote/ask "1.30"
+                               :quote/mid "1.25"}}
+          sell-oi (sch/order-intent-id (intent-identity sell-leg "1"))
+          buy-oi (sch/order-intent-id (intent-identity buy-leg "1"))
+          broker (sim/make-sim-broker {:fill-policy {:price-source :quote
+                                                     :price-improvement "0.02"}
+                                       :marks marks})
+          [_ sell-fill] (p/submit-order-intent! broker
+                                                (submit-cmd sell-oi sell-leg "1"))
+          [_ buy-fill] (p/submit-order-intent! broker
+                                               (submit-cmd buy-oi buy-leg "1"))]
+      (is (= "1.22" (get-in sell-fill [:fact/payload :fill/price])))
+      (is (= "1.28" (get-in buy-fill [:fact/payload :fill/price])))))
+  (testing "large improvement does not cross mid"
+    (let [buy-leg [{:instrument/id spy-call-550
+                    :leg/side :order-side/buy
+                    :leg/quantity "1"}]
+          oi (sch/order-intent-id (intent-identity buy-leg "1"))
+          broker (sim/make-sim-broker
+                  {:fill-policy {:price-source :quote
+                                 :price-improvement "0.50"}
+                   :marks {spy-call-550 {:quote/bid "1.20"
+                                         :quote/ask "1.30"
+                                         :quote/mid "1.25"}}})
+          [_ fill] (p/submit-order-intent! broker
+                                           (submit-cmd oi buy-leg "1"))]
+      (is (= "1.25" (get-in fill [:fact/payload :fill/price]))))))
+
+(deftest submit-accepted-quote-source-calibrated-improvement
+  (testing "calibration artifact overrides static optimistic improvement"
+    (let [buy-leg [{:instrument/id spy-call-550
+                    :leg/side :order-side/buy
+                    :leg/quantity "1"}]
+          oi (sch/order-intent-id (intent-identity buy-leg "1"))
+          broker (sim/make-sim-broker
+                  {:fill-policy {:price-source :quote
+                                 :price-improvement "0.02"
+                                 :fill-calibration
+                                 {:global
+                                  {:conservative-price-improvement 0.0}
+                                  :buckets []}}
+                   :marks {spy-call-550 {:quote/bid "1.20"
+                                         :quote/ask "1.30"
+                                         :quote/mid "1.25"}}})
+          [_ fill] (p/submit-order-intent! broker
+                                           (submit-cmd oi buy-leg "1"))]
+      (is (= "1.30" (get-in fill [:fact/payload :fill/price])))))
+  (testing "matching side/spread bucket uses shrunk conservative improvement"
+    (let [sell-leg [{:instrument/id spy-call-550
+                     :leg/side :order-side/sell
+                     :leg/quantity "1"}]
+          oi (sch/order-intent-id (intent-identity sell-leg "1"))
+          broker (sim/make-sim-broker
+                  {:fill-policy {:price-source :quote
+                                 :fill-calibration
+                                 {:global
+                                  {:conservative-price-improvement 0.0}
+                                  :buckets
+                                  [{:bucket/key {:side :order-side/sell
+                                                 :spread-bucket :spread/normal}
+                                    :shrunk-conservative-price-improvement
+                                    0.03}]}}
+                   :marks {spy-call-550 {:quote/bid "1.20"
+                                         :quote/ask "1.23"
+                                         :quote/mid "1.215"}}})
+          [_ fill] (p/submit-order-intent! broker
+                                           (submit-cmd oi sell-leg "1"))]
+      (is (= "1.215" (get-in fill [:fact/payload :fill/price]))))))
+
 (deftest submit-accepted-multi-leg
   (testing "one fill per leg, same broker-order-id, per-leg mark prices"
     (let [legs [{:instrument/id spy :leg/side :order-side/buy :leg/quantity "1"}
@@ -193,6 +339,57 @@
              (mapv #(get-in % [:fact/payload :fill/instrument-id]) fills)))
       (is (= ["550.00" "480.00"]
              (mapv #(get-in % [:fact/payload :fill/price]) fills))))))
+
+(deftest close-over-available-is-rejected-before-it-can-corrupt-cash
+  (testing "multi-leg close quantity cannot exceed the sim broker position"
+    (let [open-legs [{:instrument/id spy :leg/side :order-side/sell
+                      :leg/quantity "1"}
+                     {:instrument/id qqq :leg/side :order-side/buy
+                      :leg/quantity "1"}]
+          open-oi (sch/order-intent-id (intent-identity open-legs "1"))
+          close-legs [{:instrument/id spy :leg/side :order-side/buy
+                       :leg/quantity "4"}
+                      {:instrument/id qqq :leg/side :order-side/sell
+                       :leg/quantity "4"}]
+          close-oi (sch/order-intent-id
+                    {:identity/version 1
+                     :identity/decision-id "dec_close"
+                     :identity/intent-slot 0
+                     :identity/account-id acct
+                     :identity/role :intent-role/exit
+                     :identity/order-shape {:side :order-side/buy
+                                            :effect :position-effect/close
+                                            :order-type :order-type/limit
+                                            :time-in-force :tif/day
+                                            :quantity "4"
+                                            :limit-price "1.00"
+                                            :legs close-legs}})
+          close-payload {:order-intent/id close-oi
+                         :order-intent/side :order-side/buy
+                         :order-intent/effect :position-effect/close
+                         :order-intent/order-type :order-type/limit
+                         :order-intent/time-in-force :tif/day
+                         :order-intent/quantity "4"
+                         :order-intent/limit-price "1.00"
+                         :order-intent/legs close-legs}
+          close-cmd (-> (submit-cmd close-oi close-legs "4")
+                        (assoc-in [:command/idempotency-key]
+                                  (str "submit/intent/" close-oi))
+                        (assoc-in [:command/payload :order-intent/id]
+                                  close-oi)
+                        (assoc-in [:command/payload :command/idempotency-key]
+                                  (str "submit/intent/" close-oi))
+                        (assoc-in [:command/payload :order-intent/payload]
+                                  close-payload))
+          broker (sim/make-sim-broker {:marks {spy "550.00" qqq "480.00"}})
+          _ (p/submit-order-intent! broker
+                                    (submit-cmd open-oi open-legs "1"))
+          res (p/submit-order-intent! broker close-cmd)
+          [rejected] res]
+      (is (= 1 (count res)))
+      (is (= :fact/broker-ack-rejected (:record/type rejected)))
+      (is (= :broker-rejection/over-close
+             (get-in rejected [:fact/payload :broker/rejection-code]))))))
 
 ;; ---------------------------------------------------------------------------
 ;; §6 case 2 — submit rejected
@@ -406,6 +603,28 @@
         (is (= :fact/fill-observed (:record/type (first fills))))
         (is (all-valid? fills))))))
 
+(deftest durable-sim-journal-survives-broker-restart
+  (let [dir (tempfile/mkdtemp)
+        path (os.path/join dir "sim-broker.db")
+        oi (fresh-oi)
+        broker1 (sim/make-sim-broker {:store-path path
+                                      :fill-policy {:mode :on-poll}})
+        _ (p/submit-order-intent! broker1 (submit-cmd oi (single-leg "2") "2"))
+        broker2 (sim/make-sim-broker {:store-path path
+                                      :fill-policy {:mode :on-poll}})
+        open (p/open-orders broker2 acct)
+        fills (p/fills-since broker2 acct nil)
+        broker3 (sim/make-sim-broker {:store-path path
+                                      :fill-policy {:mode :on-poll}})]
+    (testing "pending order reloads as open"
+      (is (= 1 (count open)))
+      (is (= oi (get-in (first open) [:fact/payload :order-intent/id]))))
+    (testing "materialized fills persist across the next restart"
+      (is (= 1 (count fills)))
+      (is (= oi (get-in (first fills) [:fact/payload :order-intent/id])))
+      (is (= [] (p/open-orders broker3 acct)))
+      (is (= fills (p/fills-since broker3 acct nil))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Account state + health (§4.5, §4.6, §11)
 ;; ---------------------------------------------------------------------------
@@ -424,13 +643,57 @@
       (is (= acct (get-in account-fact [:fact/payload :broker/account-id])))
       (is (= :broker/sim (get-in account-fact [:fact/payload :broker/source-system])))
       (is (string? (get-in account-fact [:fact/payload :broker/observed-at])))
-      (is (= 1 (get-in account-fact [:fact/payload :account/open-order-count]))))
+      (is (= 1 (get-in account-fact [:fact/payload :account/open-order-count])))
+      (is (= "0" (get-in account-fact [:fact/payload :account/cash])))
+      (is (= {} (get-in account-fact [:fact/payload :account/net-positions]))))
     (testing "health heartbeat fact, no orders submitted by health checks"
       (is (= :fact/health-heartbeat-recorded (:record/type health-fact)))
       (is (:valid? (v/validate-fact health-fact)))
       (is (= :health/connected
              (get-in health-fact [:fact/payload :health/connectivity])))
       (is (= 1 (count (p/open-orders broker acct)))))))
+
+(deftest option-expiration-settlement-is-durable-and-idempotent
+  (let [store-path (os.path/join (tempfile/mkdtemp) "sim-broker.db")
+        oi "oi_option_expiry_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        mk-broker (fn []
+                    (sim/make-sim-broker
+                     {:store-path store-path
+                      :clock (seq-clock ["2026-06-19T19:59:00Z"
+                                         "2026-06-19T19:59:01Z"
+                                         "2026-06-19T20:00:00Z"
+                                         "2026-06-19T20:00:01Z"
+                                         "2026-06-19T20:00:02Z"])
+                      :marks {spy "555.00"}}))
+        broker (mk-broker)
+        _ (p/submit-order-intent! broker (option-open-cmd oi))
+        facts (p/fills-since broker acct nil)
+        settlements (filterv #(= :fact/option-settlement-recorded
+                                 (:record/type %))
+                             facts)
+        account-fact (p/account-state broker acct)
+        broker2 (mk-broker)
+        facts2 (p/fills-since broker2 acct nil)
+        settlements2 (filterv #(= :fact/option-settlement-recorded
+                                  (:record/type %))
+                              facts2)]
+    (is (= 1 (count settlements)))
+    (is (every? #(:valid? (v/validate-fact %)) settlements))
+    (is (= "5.000" (get-in (first settlements)
+                           [:fact/payload
+                            :settlement/intrinsic-value])))
+    (is (= "300.000" (get-in (first settlements)
+	                             [:fact/payload
+	                              :settlement/realized-pnl])))
+    (is (= "300.000" (get-in account-fact [:fact/payload
+	                                            :account/cash])))
+    (is (= "300.000" (get-in account-fact [:fact/payload
+	                                            :account/realized-pnl])))
+    (is (= {} (get-in account-fact [:fact/payload
+                                    :account/net-positions])))
+    (is (= (mapv :fact/dedupe-key settlements)
+           (mapv :fact/dedupe-key settlements2)))
+    (is (= 1 (count settlements2)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Determinism

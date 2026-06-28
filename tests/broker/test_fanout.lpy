@@ -1,0 +1,57 @@
+(ns broker.test-fanout
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.broker.fanout :as fanout]
+            [stevetrading.broker.protocol :as p]))
+
+(defn- recording-broker
+  [tag calls]
+  (reify p/Broker
+    (submit-order-intent! [this cmd]
+      (swap! calls conj [tag :submit cmd])
+      [{:record/type :fact/broker-ack-accepted :stub/tag tag}])
+    (cancel-broker-order! [this cmd]
+      (swap! calls conj [tag :cancel cmd])
+      [{:record/type :fact/broker-order-status-observed :stub/tag tag}])
+    (open-orders [this account-id] [])
+    (fills-since [this account-id cursor] [])
+    (account-state [this account-id]
+      {:record/type :fact/broker-account-observed :stub/tag tag})
+    (health [this]
+      {:record/type :fact/health-heartbeat-recorded :stub/tag tag})))
+
+(def base-cmd
+  {:record/id "cmd_1"
+   :record/account-id "account/alpaca/chestnut-paper"
+   :command/payload
+   {:broker/account-id "account/alpaca/chestnut-paper"
+    :broker/route {:broker/source-system :broker/alpaca-paper}
+    :order-intent/id "oi_1"
+    :order-intent/payload
+    {:order-intent/id "oi_1"
+     :order-intent/account-id "account/alpaca/chestnut-paper"}}})
+
+(deftest fanout-returns-primary-facts-and-mirrors-rewritten-command
+  (let [calls (atom [])
+        primary (recording-broker :primary calls)
+        mirror (recording-broker :mirror calls)
+        broker (fanout/make-fanout-broker
+                {:primary primary
+                 :mirrors [{:broker mirror
+                            :account-id "account/sim/chestnut-mirror"
+                            :broker-route {:broker/source-system
+                                           :broker/sim}}]})
+        facts (p/submit-order-intent! broker base-cmd)
+        [_ _ mirror-cmd] (second @calls)]
+    (is (= [:primary] (mapv :stub/tag facts)))
+    (is (= [:primary :mirror] (mapv first @calls)))
+    (testing "mirror command is routed to the sim account"
+      (is (= "account/sim/chestnut-mirror"
+             (:record/account-id mirror-cmd)))
+      (is (= "account/sim/chestnut-mirror"
+             (get-in mirror-cmd [:command/payload :broker/account-id])))
+      (is (= :broker/sim
+             (get-in mirror-cmd [:command/payload :broker/route
+                                 :broker/source-system])))
+      (is (= "account/sim/chestnut-mirror"
+             (get-in mirror-cmd [:command/payload :order-intent/payload
+                                 :order-intent/account-id]))))))

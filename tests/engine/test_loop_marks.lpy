@@ -1,0 +1,21 @@
+(ns engine.test-loop-marks
+  "Replay-position pricing marks for sim execution."
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.engine.loop :as eloop]))
+
+(deftest option-chain-marks-preserve-quotes
+  (testing "option-chain observations keep bid/ask plus mid for quote-aware sim"
+    (let [instrument "option/OPRA/SPY/2026-06-19/C/550.000"
+          marks (eloop/apply-payload-marks
+                 {}
+                 :fact/option-chain-observed
+                 nil
+                 {:chain/contracts
+                  [{:instrument/id instrument
+                    :quote/bid "1.20"
+                    :quote/ask "1.30"}]})]
+      (is (= {:quote/bid "1.20"
+              :quote/ask "1.30"
+              :quote/mid "1.25"}
+             (get marks instrument))))))
+

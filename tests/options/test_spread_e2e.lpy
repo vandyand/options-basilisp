@@ -167,15 +167,16 @@
         (is (= 2 (count closed)))
         (is (empty? (:portfolio/open-lots portfolio)))
         (is (empty? (:portfolio/positions portfolio)))
-        ;; short near: 2.15 -> 1.00 = +1.15; long far: 0.95 -> 0.60 = -0.35
-        (is (= #{"1.15" "-0.35"}
-               (set (map :lot-close/realized-pnl closed))))))
+        ;; option contracts use the broker-like 100-share multiplier:
+        ;; short near: 2.15 -> 1.00 = +115; long far: 0.95 -> 0.60 = -35
+        (is (= #{"115.00" "-35.00"}
+	               (set (map :lot-close/realized-pnl closed))))))
 
-    (testing "realized P&L = credit - debit - fees = 1.20 - 0.40 - 0"
+    (testing "realized P&L = credit - debit - fees = 120 - 40 - 0"
       (let [portfolio (:portfolio res)]
-        (is (= "0.80" (:portfolio/realized-pnl portfolio)))
+        (is (= "80.00" (:portfolio/realized-pnl portfolio)))
         (is (= "0" (:portfolio/fees portfolio)))
-        (is (= "0.80" (get-in portfolio [:portfolio/cash acct])))))))
+        (is (= "80.00" (get-in portfolio [:portfolio/cash acct])))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Iron condor: 4 canonical legs, sim broker round trip

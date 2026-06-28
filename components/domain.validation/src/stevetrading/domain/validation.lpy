@@ -91,6 +91,12 @@
     :lot-close/basis
     :lot-close/proceeds
     :lot-close/realized-pnl
+    :settlement/quantity
+    :settlement/price
+    :settlement/cash-amount
+    :settlement/underlying-price
+    :settlement/intrinsic-value
+    :settlement/realized-pnl
     ;; durable position marks (:fact/position-mark-recorded, ledger.core fold)
     :mark/price})
 
@@ -113,6 +119,7 @@
     :snapshot/written-at
     :fill/occurred-at
     :broker/observed-at
+    :settlement/settled-at
     :bar/time
     :decision/market-time
     :prediction/at})

@@ -53,6 +53,8 @@
 (def close-sell (ctx :position-effect/close :order-side/sell
                      :intent-id "oi_close"))
 
+(def option-id "option/OPRA/SPY/2026-06-19/C/550.000")
+
 (defn derive+fold
   "Derive from a fill against ledger, fold the derived facts, return
   [ledger' derived-facts]."
@@ -315,3 +317,52 @@
 (deftest fold-ignores-raw-fill-facts
   (let [fill (fill-fact {:fill-id "t1" :qty "2" :price "550.00"})]
     (is (= led/empty-ledger (led/fold-ledger-fact led/empty-ledger fill)))))
+
+(deftest option-settlement-closes-lot-and-records-cash
+  (let [open-fill (assoc (fill-fact {:fill-id "opt-open"
+                                     :qty "1"
+                                     :price "2.00"})
+                         :record/instrument-id option-id)
+        open-ctx (assoc open-buy :order-intent/instrument-id option-id)
+        [l1 _] (derive+fold led/empty-ledger open-fill open-ctx)
+        lot (first (led/open-lots l1))
+        settlement (sch/fact-envelope
+                    {:record/type :fact/option-settlement-recorded
+                     :record/mode :mode/sim
+                     :record/strategy-id strategy-id
+                     :record/account-id account-id
+                     :record/instrument-id option-id
+                     :record/source-system :broker/sim
+                     :fact/dedupe-key (str "settlement/sim/" account-id
+                                           "/" (:lot/id lot)
+                                           "/2026-06-19")
+                     :fact/occurred-at "2026-06-19T20:00:00Z"
+                     :fact/recorded-at "2026-06-19T20:00:00Z"
+                     :fact/payload
+                     {:settlement/id (str "settlement/sim/" account-id
+                                          "/" (:lot/id lot)
+                                          "/2026-06-19")
+                      :settlement/type :settlement/option-expiration
+                      :settlement/account-id account-id
+                      :settlement/strategy-id strategy-id
+                      :settlement/instrument-id option-id
+                      :settlement/underlying "SPY"
+                      :settlement/expiry "2026-06-19"
+                      :settlement/right :option-right/call
+                      :settlement/strike "550.000"
+                      :settlement/quantity "1"
+                      :settlement/price "5.00"
+                      :settlement/intrinsic-value "5.00"
+                      :settlement/underlying-price "555.00"
+	                      :settlement/cash-amount "500.00"
+	                      :settlement/realized-pnl "300.00"
+                      :settlement/settled-at "2026-06-19T20:00:00Z"
+                      :lot/id (:lot/id lot)
+                      :lot/side :order-side/buy}})
+        l2 (led/fold-ledger-fact l1 settlement)]
+    (is (:valid? (v/validate-fact settlement)))
+    (is (empty? (led/open-lots l2)))
+    (is (= "300.00" (:lot-close/realized-pnl
+	                   (last (:ledger/closed-lots l2)))))
+    (is (= "300.00" (get-in l2 [:ledger/cash-by-account account-id])))
+    (is (= l2 (led/fold-ledger-fact l2 settlement)))))

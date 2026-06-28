@@ -1,0 +1,79 @@
+(ns stevetrading.broker.fanout
+  "Primary-returning broker fanout.
+
+  The primary broker is canonical for the engine process: its facts are
+  returned to the loop and folded into order lifecycle/ledger state. Mirrors
+  receive rewritten commands for independent broker-side state, but their
+  facts are intentionally not returned into the primary engine fact stream."
+  (:require [stevetrading.broker.protocol :as p]))
+
+(defn- rewrite-account
+  [cmd account-id broker-route]
+  (-> cmd
+      (assoc :record/account-id account-id)
+      (assoc-in [:command/payload :broker/account-id] account-id)
+      (assoc-in [:command/payload :broker/route] broker-route)
+      (assoc-in [:command/payload :order-intent/payload
+                 :order-intent/account-id]
+                account-id)))
+
+(defn- mirror-submit!
+  [mirror cmd]
+  (let [cmd' (rewrite-account cmd (:account-id mirror) (:broker-route mirror))]
+    (p/submit-order-intent! (:broker mirror) cmd')))
+
+(defn- mirror-cancel!
+  [mirror cmd]
+  ;; Cancel mirroring is best-effort. The primary broker-order-id is not
+  ;; generally the mirror broker-order-id, so callers should rely on mirror
+  ;; session controls/flattening for full lifecycle parity.
+  (let [cmd' (rewrite-account cmd (:account-id mirror) (:broker-route mirror))]
+    (p/cancel-broker-order! (:broker mirror) cmd')))
+
+(defrecord FanoutBroker [primary mirrors]
+  p/Broker
+
+  (submit-order-intent! [this cmd]
+    (let [primary-facts (p/submit-order-intent! primary cmd)]
+      (doseq [mirror mirrors]
+        (try
+          (mirror-submit! mirror cmd)
+          (catch python/Exception _e
+            ;; Mirrors must not block primary trading.
+            nil)))
+      primary-facts))
+
+  (cancel-broker-order! [this cmd]
+    (let [primary-facts (p/cancel-broker-order! primary cmd)]
+      (doseq [mirror mirrors]
+        (try
+          (mirror-cancel! mirror cmd)
+          (catch python/Exception _e nil)))
+      primary-facts))
+
+  (open-orders [this account-id]
+    (p/open-orders primary account-id))
+
+  (fills-since [this account-id cursor]
+    (p/fills-since primary account-id cursor))
+
+  (account-state [this account-id]
+    (p/account-state primary account-id))
+
+  (health [this]
+    {:fanout/primary (p/health primary)
+     :fanout/mirrors (mapv (fn [mirror]
+                             {:account-id (:account-id mirror)
+                              :health (p/health (:broker mirror))})
+                           mirrors)}))
+
+(defn make-fanout-broker
+  "Build a primary-returning fanout broker.
+
+  opts:
+    :primary Broker
+    :mirrors [{:broker Broker
+               :account-id \"account/sim/mirror\"
+               :broker-route {:broker/source-system :broker/sim}}]"
+  [{:keys [primary mirrors]}]
+  (->FanoutBroker primary (vec mirrors)))

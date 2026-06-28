@@ -11,6 +11,8 @@
 ;;     straddle term-slope CHANGE z-score (HAWK_TERM sign convention:
 ;;     widening -> long calendar). Rule v1 — the model-driven bridge
 ;;     (61-feature XGB) replaces the signal later; executor stays.
+;;   strategy/sim-direction/sma-cross/v1 SMA(3/5) SPY equity baseline to
+;;     exercise the single-leg equity path in the sim broker.
 ;;
 ;; Everything price-dependent (condor strikes, calendar candidates,
 ;; expirations) resolves at LAUNCH; dated artifacts + manifest land
@@ -29,13 +31,31 @@
          '[stevetrading.market-data.composite :as mdc]
          '[stevetrading.market-data.thetadata :as td])
 
-(def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+(def ref-root (or (os/getenv "STEVE_REF_ROOT")
+                  "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"))
 (def dry-run? (= "1" (os/getenv "SIM_DRY_RUN")))
 ;; wiring-run overrides (verification only — defaults are the strategy)
 (def condor-threshold (or (os/getenv "SIM_CONDOR_THRESHOLD") "0.50"))
+(def vertical-threshold (or (os/getenv "SIM_VERTICAL_THRESHOLD") "0.05"))
 (def enter-sigma (python/float (or (os/getenv "SIM_ENTER_SIGMA") "2.0")))
 (def min-samples (python/int (or (os/getenv "SIM_MIN_SAMPLES") "20")))
+(def enable-sma? (not= "0" (os/getenv "SIM_ENABLE_SMA")))
+(def sim-equity-qty (or (os/getenv "SIM_EQUITY_QTY") "50"))
+(def sim-option-qty (or (os/getenv "SIM_OPTION_QTY") "1"))
+(def sim-spread-qty (or (os/getenv "SIM_SPREAD_QTY") sim-option-qty))
 (def out-suffix (or (os/getenv "SIM_OUT_SUFFIX") ""))
+(def sim-fill-calibration-path (os/getenv "SIM_FILL_CALIBRATION"))
+(def sim-fill-calibration
+  (when (and sim-fill-calibration-path
+             (os.path/exists sim-fill-calibration-path))
+    (edn/read-string (slurp sim-fill-calibration-path))))
+(def sim-fill-policy
+  (into {}
+        (filter (comp some? val)
+                {:price-source (keyword (or (os/getenv "SIM_PRICE_SOURCE") "quote"))
+                 :price-improvement (or (os/getenv "SIM_PRICE_IMPROVEMENT") "0.00")
+                 :slippage (or (os/getenv "SIM_SLIPPAGE") "0.00")
+                 :fill-calibration sim-fill-calibration})))
 
 ;; data creds (bars only — the broker is SIM): chestnut from REF/.env
 (def env-text (slurp (str ref-root "/.env")))
@@ -46,6 +66,7 @@
 
 (def session-date
   (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
+(def out-dir (str "live_runtime/sim-vt-session-" session-date out-suffix))
 (def compact-date (.replace session-date "-" ""))
 
 (defn- et->utc-str [hh mm]
@@ -53,7 +74,9 @@
         at (.replace et-now ** :hour hh :minute mm :second 0 :microsecond 0)]
     (.strftime (.astimezone at (.-utc datetime/timezone))
                "%Y-%m-%dT%H:%M:%SZ")))
-(def until (et->utc-str 15 45))
+(def entry-cutoff (et->utc-str 15 30))
+(def flatten-at (et->utc-str 15 45))
+(def until (et->utc-str 15 55))
 
 ;; --- resolve spot + expirations ----------------------------------------------
 (def spy-price
@@ -89,8 +112,12 @@
 (def condor-model-ref (str "model/sim-vol/condor-" compact-date))
 (def calendar-feature-ref (str "feature/sim-term/calendar-" compact-date))
 (def calendar-model-ref (str "model/sim-term/calendar-" compact-date))
+(def vertical-feature-ref (str "feature/sim-vol/vertical-" compact-date))
+(def vertical-model-ref (str "model/sim-vol/vertical-" compact-date))
 (def condor-sid "strategy/sim-vol/condor-rv/v1")
 (def calendar-sid "strategy/sim-term/calendar-slope/v1")
+(def vertical-sid "strategy/sim-vol/put-credit-spread/v1")
+(def sma-sid "strategy/sim-direction/sma-cross/v1")
 
 (defn- write-edn! [path value]
   (os/makedirs (os.path/dirname path) ** :exist_ok true)
@@ -149,6 +176,40 @@
              :model/feature-manifest-ref calendar-feature-ref
              :model/prediction-schema-version 1})
 
+(write-edn! (str artifact-root "/" vertical-feature-ref ".edn")
+            {:feature-manifest/id vertical-feature-ref
+             :feature-manifest/version 1
+             :feature-manifest/features [:feature/chain-mid-width]
+             :feature-manifest/params
+             {:spread {:venue "OPRA"
+                       :underlying-symbol "SPY"
+                       :expiry front-exp
+                       :right :option-right/put
+                       :near-strike (k (- atm 3))
+                       :far-strike (k (- atm 8))}}
+             :feature-manifest/required-inputs [:input/option-chain]
+             :feature-manifest/compatibility
+             {:strategy-family :strategy-family/sim-vol
+              :prediction-schema-version 1}})
+
+(write-edn! (str artifact-root "/" vertical-model-ref ".edn")
+            {:model/id vertical-model-ref
+             :model/version 1
+             :model/type :model.type/threshold
+             :model/params {:feature :feature/chain-mid-width
+                            :threshold vertical-threshold}
+             :model/feature-manifest-ref vertical-feature-ref
+             :model/prediction-schema-version 1})
+
+;; Static SMA artifacts are copied into the generated artifact root so this
+;; launcher still has a single artifact store.
+(write-edn! (str artifact-root "/feature/simple-direction/v1.edn")
+            (edn/read-string
+             (slurp "resources/artifacts/feature/simple-direction/v1.edn")))
+(write-edn! (str artifact-root "/model/simple-direction/v1.edn")
+            (edn/read-string
+             (slurp "resources/artifacts/model/simple-direction/v1.edn")))
+
 (def condor-decl-path (str gen-root "/strategies/condor-rv.edn"))
 (write-edn! condor-decl-path
             {:strategy/id condor-sid
@@ -162,9 +223,9 @@
              :strategy/features {:manifest-ref condor-feature-ref}
              :strategy/inference {:artifact-ref condor-model-ref}
              :strategy/signal {:fn-id :signal/credit-threshold-v1}
-             :strategy/risk {:policy-id :risk/single-structure :params {}}
-             :strategy/execution {:policy-id :execution/iron-condor-v1
-                                  :params {:quantity "1"}}})
+	             :strategy/risk {:policy-id :risk/single-structure :params {}}
+	             :strategy/execution {:policy-id :execution/iron-condor-v1
+	                                  :params {:quantity sim-spread-qty}}})
 
 (def calendar-decl-path (str gen-root "/strategies/calendar-slope.edn"))
 (write-edn! calendar-decl-path
@@ -182,11 +243,46 @@
                                :params {:delta-horizon 10 :stats-window 60
                                         :enter-sigma enter-sigma :exit-sigma 0.5
                                         :min-samples min-samples}}
-             :strategy/risk {:policy-id :risk/single-structure :params {}}
-             :strategy/execution {:policy-id :execution/calendar-spread-v1
-                                  :params {:quantity "1"
-                                           :right :option-right/call
-                                           :allow-short? true}}})
+	             :strategy/risk {:policy-id :risk/single-structure :params {}}
+	             :strategy/execution {:policy-id :execution/calendar-spread-v1
+	                                  :params {:quantity sim-option-qty
+	                                           :right :option-right/call
+	                                           :allow-short? true}}})
+
+(def vertical-decl-path (str gen-root "/strategies/put-credit-spread.edn"))
+(write-edn! vertical-decl-path
+            {:strategy/id vertical-sid
+             :strategy/family :strategy-family/sim-vol
+             :strategy/name :strategy-name/put-credit-spread
+             :strategy/version 1
+             :strategy/mode-policy #{:mode/sim}
+             :strategy/schedule {:session :session/us-equities-regular}
+             :strategy/warmup {:required-bars 1}
+             :strategy/instruments ["equity/NASDAQ/SPY"]
+             :strategy/features {:manifest-ref vertical-feature-ref}
+             :strategy/inference {:artifact-ref vertical-model-ref}
+             :strategy/signal {:fn-id :signal/credit-threshold-v1}
+	             :strategy/risk {:policy-id :risk/defined-risk-spread
+	                             :params {:max-spreads 1 :max-risk "6.00"}}
+	             :strategy/execution {:policy-id :execution/vertical-credit-spread-v1
+	                                  :params {:quantity sim-spread-qty}}})
+
+(def sma-decl-path (str gen-root "/strategies/sma-cross.edn"))
+(write-edn! sma-decl-path
+            {:strategy/id sma-sid
+             :strategy/family :strategy-family/simple-direction
+             :strategy/name :strategy-name/sma-cross
+             :strategy/version 1
+             :strategy/mode-policy #{:mode/sim}
+             :strategy/schedule {:session :session/us-equities-regular}
+             :strategy/warmup {:required-bars 5}
+             :strategy/instruments ["equity/NASDAQ/SPY"]
+             :strategy/features {:manifest-ref "feature/simple-direction/v1"}
+             :strategy/inference {:artifact-ref "model/simple-direction/v1"}
+             :strategy/signal {:fn-id :signal/sma-crossover-v1}
+	             :strategy/risk {:policy-id :risk/simple-direction-default}
+	             :strategy/execution {:policy-id :execution/market-equity-v1
+	                                  :params {:quantity sim-equity-qty}}})
 
 ;; --- HAWK_TERM_SPY_V2 (model-driven Phase 2) ---------------------------------
 ;; V2 brains via bridge.v2-term: 61-feature XGB slope-change prediction
@@ -205,11 +301,11 @@
              :strategy/instruments ["equity/NASDAQ/SPY"]
              :strategy/bridge {:bot :hawk-term-spy}
              :strategy/signal {:fn-id :signal/steve-v2-bridge}
-             :strategy/risk {:policy-id :risk/single-structure :params {}}
-             :strategy/execution {:policy-id :execution/calendar-spread-v1
-                                  :params {:quantity "1"
-                                           :right :option-right/call
-                                           :allow-short? true}}})
+	             :strategy/risk {:policy-id :risk/single-structure :params {}}
+	             :strategy/execution {:policy-id :execution/calendar-spread-v1
+	                                  :params {:quantity sim-option-qty
+	                                           :right :option-right/call
+	                                           :allow-short? true}}})
 
 (def v2-bridge
   (when-not dry-run?
@@ -225,14 +321,26 @@
 (def revision (str "cp-sim-vt-" compact-date "-"
                    (.strftime (datetime.datetime/now (.-utc datetime/timezone))
                               "%H%M%S")))
+(def strategy-artifact-rows
+  (vec (concat [[condor-sid condor-feature-ref condor-model-ref]
+                [calendar-sid calendar-feature-ref calendar-model-ref]
+                [vertical-sid vertical-feature-ref vertical-model-ref]]
+               (when enable-sma?
+                 [[sma-sid "feature/simple-direction/v1"
+                   "model/simple-direction/v1"]])
+               [[hawk-sid "feature/v2-term/bridge/v2"
+                 "model/v2-term/bridge/v2"]])))
+(def process-strategy-ids (mapv first strategy-artifact-rows))
+(def strategy-paths
+  (vec (concat [condor-decl-path calendar-decl-path vertical-decl-path]
+               (when enable-sma? [sma-decl-path])
+               [hawk-decl-path])))
 (def manifest
   {:control-plane/revision revision
    :control-plane/generated-at (td/utc-now-str)
    :control-plane/status :control-plane-status/proposed
    :control-plane/strategies
-   (vec (for [[sid feature-ref model-ref] [[condor-sid condor-feature-ref condor-model-ref]
-                                           [calendar-sid calendar-feature-ref calendar-model-ref]
-                                           [hawk-sid "feature/v2-term/bridge/v2" "model/v2-term/bridge/v2"]]]
+   (vec (for [[sid feature-ref model-ref] strategy-artifact-rows]
           {:strategy/id sid
            :strategy/enabled? true
            :strategy/mode :mode/sim
@@ -251,9 +359,9 @@
    [{:process/id "engine-sim-vol-term"
      :process/base :base/engine-live
      :process/allowed-modes #{:mode/sim}
-     :process/strategies [condor-sid calendar-sid hawk-sid]}]
+     :process/strategies process-strategy-ids}]
    :control-plane/routes
-   (vec (for [sid [condor-sid calendar-sid hawk-sid]]
+   (vec (for [sid process-strategy-ids]
           {:route/id (str "route/" sid)
            :route/strategy-id sid
            :route/account-id "account/sim/vol-term"
@@ -275,8 +383,18 @@
       :condor {:puts [(k (- atm 6)) (k (- atm 10))]
                :calls [(k (+ atm 6)) (k (+ atm 10))]
                :threshold condor-threshold}
-      :calendar {:strikes [(k (- atm 3)) "..." (k (+ atm 3))]}
-      :revision revision :until until})
+      :vertical {:puts [(k (- atm 3)) (k (- atm 8))]
+                 :threshold vertical-threshold}
+      :sma (if enable-sma?
+             {:bars 5}
+             :disabled-by-env)
+	      :calendar {:strikes [(k (- atm 3)) "..." (k (+ atm 3))]}
+	      :sizing {:equity sim-equity-qty
+	               :option sim-option-qty
+	               :spread sim-spread-qty}
+	      :session-clock {:entry-cutoff entry-cutoff
+	                      :flatten-at flatten-at}
+	      :revision revision :until until})
 
 (if dry-run?
   (println "DRY RUN — stopping before run-live.")
@@ -298,12 +416,16 @@
         result (live/run-live
                 {:control-plane-root "live_runtime/cp-sim-vt"
                  :process-id "engine-sim-vol-term"
-                 :out-dir (str "live_runtime/sim-vt-session-" session-date out-suffix)
+                 :out-dir out-dir
                  :source source
                  :mode :mode/sim
                  :snapshot-every 50
-                 :strategy-paths [condor-decl-path calendar-decl-path
-                                  hawk-decl-path]
+                 :sim-store-path (str out-dir "/sim-broker.db")
+	                 :sim-fill-policy sim-fill-policy
+	                 :suppress-pre-run-trading? true
+	                 :session-clock {:entry-cutoff entry-cutoff
+	                                 :flatten-at flatten-at}
+	                 :strategy-paths strategy-paths
                  :artifact-root artifact-root
                  :bridge-ctx {hawk-sid {:signals-fn (:signals-fn v2-bridge)}}})]
     (println "=== SESSION RESULT ===")

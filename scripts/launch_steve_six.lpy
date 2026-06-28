@@ -6,6 +6,9 @@
 ;;   PYTHONPATH=$(cat .nrepl-pythonpath) REF/.venv/bin/basilisp run scripts/launch_steve_six.lpy
 ;;
 ;; Env: STEVE_DRY_RUN=1 → wire + prime + one signals call, skip run-live.
+;;      BROKER_TARGET=alpaca|sim|both (default alpaca). sim submits only
+;;      to the durable local sim broker; both keeps Alpaca canonical and
+;;      mirrors submissions into sim.
 ;;
 ;; Session clock (2026-06-11, operator-specified):
 ;; - 15:30 ET entry cutoff — no NEW entries (flips still close, never
@@ -26,7 +29,8 @@
          '[stevetrading.market-data.composite :as mdc]
          '[stevetrading.market-data.thetadata :as td])
 
-(def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+(def ref-root (or (os/getenv "STEVE_REF_ROOT")
+                  "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"))
 (def terminal "http://127.0.0.1:25503")
 (def dry-run? (= "1" (os/getenv "STEVE_DRY_RUN")))
 (def session-date
@@ -41,6 +45,8 @@
 (def entry-cutoff (et->utc-str 15 30))
 (def flatten-at (et->utc-str 15 45))
 (def until (et->utc-str 15 55))
+(def broker-target (keyword (or (os/getenv "BROKER_TARGET") "alpaca")))
+(def out-dir (str "live_runtime/steve-session-" session-date))
 
 (def bots [:chestnut :lynx :moose :parrot :oak :dolphin])
 (def stock-syms ["SPY" "HYG" "TLT" "VXX"])
@@ -290,10 +296,12 @@
   (let [result (live/run-live
                 {:control-plane-root "live_runtime/cp-steve"
                  :process-id "engine-paper-steve"
-                 :out-dir (str "live_runtime/steve-session-" session-date)
+                 :out-dir out-dir
                  :source source
                  :mode :mode/paper
                  :snapshot-every 50
+                 :broker-target broker-target
+                 :sim-store-path (str out-dir "/sim-broker.db")
                  :strategy-paths (mapv #(str "resources/strategies/steve/"
                                              (name %)
                                              (if (#{:chestnut :lynx :moose} %)
@@ -302,6 +310,7 @@
                  :alpaca-accounts (into {} (map (fn [bot] [(account-id bot) (get creds bot)]) bots))
                  :session-clock {:entry-cutoff entry-cutoff
                                  :flatten-at flatten-at}
+                 :suppress-pre-run-trading? true
                  ;; cancel any broker-acked order resting unfilled >90s
                  ;; (2026-06-12: one resting limit suppressed DOLPHIN all
                  ;; day and stalled CHESTNUT's 15:45 close-out)

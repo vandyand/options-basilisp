@@ -159,9 +159,10 @@
 
 (defn apply-payload-marks
   "Fold one observation into the marks map (replay-position pricing):
-  bars mark the bar instrument at its close; option-chain snapshots mark
-  every two-sided contract at its (bid+ask)/2 mid. Works for both fixture
-  inputs and emitted fact envelopes (same payload shapes)."
+  bars mark the bar instrument at its close; option-chain snapshots retain
+  bid/ask plus mid so sim pricing can either mark at mid or execute against
+  the side-specific quote. Works for both fixture inputs and emitted fact
+  envelopes (same payload shapes)."
   [marks fact-type instrument-id payload]
   (cond
     (and (= :fact/market-bar-observed fact-type) (some? instrument-id))
@@ -173,7 +174,10 @@
                        (some? (:quote/bid contract))
                        (some? (:quote/ask contract)))
                 (assoc m (:instrument/id contract)
-                       (mid-str (:quote/bid contract) (:quote/ask contract)))
+                       {:quote/bid (:quote/bid contract)
+                        :quote/ask (:quote/ask contract)
+                        :quote/mid (mid-str (:quote/bid contract)
+                                            (:quote/ask contract))})
                 m))
             marks
             (:chain/contracts payload))
@@ -297,11 +301,21 @@
 (defn- observation-relevant?
   "Pipeline trigger gate: instrument-scoped market observation for one of
   the strategy's declared instruments."
-  [obs decl]
+  [obs strategy]
   (and (contains? enums/market-fact-types (:record/type obs))
        (some? (:record/instrument-id obs))
        (some #(= (:record/instrument-id obs) %)
-             (:strategy/instruments decl))))
+             (:strategy/instruments (:decl strategy)))
+       (let [required (get-in strategy [:artifacts :feature-manifest
+                                        :feature-manifest/required-inputs])
+             input-kind (case (:record/type obs)
+                          :fact/market-bar-observed :input/bar-1m
+                          :fact/option-chain-observed :input/option-chain
+                          nil)]
+         ;; Bridge strategies do not declare feature artifacts, so they keep
+         ;; the legacy instrument-scoped trigger behavior.
+         (or (empty? required)
+             (contains? (set required) input-kind)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Ledger integration (derive → append → fold; never fold raw fills)
@@ -348,8 +362,9 @@
   (let [open (into []
                    (keep (fn [[oi entry]]
                            (when-not (:order/resolved? entry) oi)))
-                   (:engine/unresolved-orders state))]
-    (if (empty? open)
+                   (:engine/unresolved-orders state))
+        open-lots (get-in state [:engine/portfolio :portfolio/open-lots])]
+    (if (and (empty? open) (empty? open-lots))
       {:state state :ledger ledger :appended-count 0 :skipped-fills []}
       (let [facts (vec
                    (mapcat
@@ -366,9 +381,13 @@
             state (:state foldp)
             fills (filterv #(= :fact/fill-observed (:record/type %))
                            poll-new)
+            ledger-facts (filterv #(contains? enums/ledger-fact-types
+                                               (:record/type %))
+                                  poll-new)
             ledger-res (apply-fills-to-ledger! append! state ledger fills)
-            ledger' (:ledger ledger-res)
-            state (if (seq fills)
+            ledger' (ledger/fold-ledger-facts (:ledger ledger-res)
+                                              ledger-facts)
+            state (if (or (seq fills) (seq ledger-facts))
                     (assoc state :engine/portfolio
                            (portfolio/derive-portfolio ledger'))
                     state)]
@@ -628,6 +647,11 @@
                     (see cancel-stale-orders! — the 2026-06-12 resting-
                     limit incident)
     :on-observation (fn [obs new?]) hook (optional; see ns docstring)
+    :suppress-pre-run-trading? when true, observations whose market
+                    timestamp is before :run/started-at update market
+                    state and warmups but do not run strategy pipelines.
+                    This is for live sources that seed historical bars
+                    at startup; replay leaves it false for determinism.
     :on-facts       (fn [facts]) newly-appended-facts hook (optional)
     :crash-after-fact  (fn [fact] bool) crash-injection predicate
                        (optional; see ns docstring — test only)
@@ -641,8 +665,8 @@
   [{:keys [fact-store snapshot-store broker source strategies account-id
            run-id run-mode state0 ledger0 cursor0 snapshot-every
            snapshot-scope max-facts broker-route session-clock
-           stale-order-seconds on-observation on-facts crash-after-fact
-           crash-before-fact]}]
+           stale-order-seconds on-observation suppress-pre-run-trading?
+           on-facts crash-after-fact crash-before-fact]}]
   (let [snapshot-every (or snapshot-every default-snapshot-every)
         snapshot-scope (or snapshot-scope default-snapshot-scope)
         cursor0 (or cursor0 0)
@@ -682,6 +706,12 @@
                     (on-observation obs (boolean (seq obs-new))))
                 ;; lifecycle: warmup advancement from accumulated history
                 state (advance-warmups state strategies)
+                tradeable-observation?
+                (or (not suppress-pre-run-trading?)
+                    (>= (compare (:fact/occurred-at obs)
+                                 (get-in state [:engine/run
+                                                :run/started-at]))
+                        0))
                 ;; session clock: wall-clock UTC vs the configured
                 ;; cutoffs, once per cycle (ISO-8601 Z strings compare
                 ;; lexicographically). nil when no clock is configured.
@@ -698,11 +728,12 @@
                 cycle-res
                 (reduce
                  (fn [acc strategy]
-                   (let [sid (get-in strategy [:decl :strategy/id])
-                         lifecycle (:strategy/lifecycle
+                     (let [sid (get-in strategy [:decl :strategy/id])
+                           lifecycle (:strategy/lifecycle
                                     (st/strategy-state (:state acc) sid))]
-                     (if (and (= :active lifecycle)
-                              (observation-relevant? obs (:decl strategy)))
+                     (if (and tradeable-observation?
+                              (= :active lifecycle)
+                              (observation-relevant? obs strategy))
                        (let [res (run-strategy-cycle!
                                   {:append! append!
                                    :broker broker

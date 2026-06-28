@@ -224,6 +224,46 @@
       (is (= :skip/no-eligible-contract (:execution/skip-reason r))))))
 
 ;; ---------------------------------------------------------------------------
+;; Iron condor executor
+;; ---------------------------------------------------------------------------
+
+(defn- plan-condor [posture view approved-qty]
+  (execution/plan-execution
+   :execution/iron-condor-v1
+   {:decision/id "dec_condor" :decision/posture posture
+    :decision/net-credit "0.60"
+    :risk/approved-quantity approved-qty}
+   {:instrument/id spy
+    :execution/strategy-view view
+    :execution/condor
+    {:condor/put-spread {:spread/near-instrument-id (opt-id front "P" "544.000")
+                         :spread/far-instrument-id (opt-id front "P" "540.000")}
+     :condor/call-spread {:spread/near-instrument-id (opt-id front "C" "556.000")
+                          :spread/far-instrument-id (opt-id front "C" "560.000")}}}
+   account-id))
+
+(deftest condor-flatten-sizes-from-open-lots-not-risk-aggregate
+  (let [view {:view/open-lots
+              [{:lot/instrument-id (opt-id front "P" "544.000")
+                :lot/side :order-side/sell :lot/remaining-quantity "1"}
+               {:lot/instrument-id (opt-id front "P" "540.000")
+                :lot/side :order-side/buy :lot/remaining-quantity "1"}
+               {:lot/instrument-id (opt-id front "C" "556.000")
+                :lot/side :order-side/sell :lot/remaining-quantity "1"}
+               {:lot/instrument-id (opt-id front "C" "560.000")
+                :lot/side :order-side/buy :lot/remaining-quantity "1"}]}
+        ;; Regression for 2026-06-23 sim: risk saw four net legs and approved
+        ;; quantity 4, but the close must submit one condor unit, not 4/leg.
+        {:execution/keys [order-intents]} (plan-condor :posture/flatten view "4")
+        [intent] order-intents]
+    (is (= 1 (count order-intents)))
+    (is (= :position-effect/close (:order-intent/effect intent)))
+    (is (= "1" (:order-intent/quantity intent)))
+    (is (= #{"1"} (set (map :leg/quantity (:order-intent/legs intent)))))
+    (is (= #{:order-side/buy :order-side/sell}
+           (set (map :leg/side (:order-intent/legs intent)))))))
+
+;; ---------------------------------------------------------------------------
 ;; Full pipeline E2E (condor enters; calendar accumulates then enters)
 ;; ---------------------------------------------------------------------------
 

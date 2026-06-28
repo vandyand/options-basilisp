@@ -205,14 +205,20 @@
                        :error/policy policy
                        :error/key k}))))
 
+(defn- open-option-lots
+  [strategy-view]
+  (filterv #(.startswith (str (:lot/instrument-id %)) "option/")
+           (:view/open-lots strategy-view)))
+
 (defn- multi-leg-intent
-  [{:keys [risk-approved-signal account-id legs policy]}]
+  [{:keys [risk-approved-signal account-id legs policy quantity]}]
   (let [posture (:decision/posture risk-approved-signal)
+        quantity (or quantity (:risk/approved-quantity risk-approved-signal))
         base {:decision-id (:decision/id risk-approved-signal)
               :intent-slot 0
               :order-type :order-type/limit
               :tif :tif/day
-              :quantity (:risk/approved-quantity risk-approved-signal)
+              :quantity quantity
               :limit-price (:decision/net-credit risk-approved-signal)
               :legs legs
               :account-id account-id}]
@@ -257,15 +263,30 @@
   (let [condor (require-ctx instrument-ctx :execution/condor
                             :execution/iron-condor-v1)
         quantity (:risk/approved-quantity risk-approved-signal)
-        exit? (= :posture/flatten (:decision/posture risk-approved-signal))]
+        exit? (= :posture/flatten (:decision/posture risk-approved-signal))
+        close-lots (open-option-lots (:execution/strategy-view instrument-ctx))
+        close-legs (when (and exit? (seq close-lots))
+                     (mapv (fn [lot]
+                             {:instrument/id (:lot/instrument-id lot)
+                              :leg/side (if (= :order-side/sell (:lot/side lot))
+                                          :order-side/buy
+                                          :order-side/sell)
+                              :leg/quantity (:lot/remaining-quantity lot)})
+                           close-lots))
+        close-quantity (when (seq close-legs)
+                         (str (reduce min
+                                      (map #(decimal/Decimal (:leg/quantity %))
+                                           close-legs))))]
     (if (zero-qty? quantity)
       []
       (multi-leg-intent {:risk-approved-signal risk-approved-signal
                          :account-id account-id
-                         :legs (into (spread-legs (:condor/put-spread condor)
-                                                  quantity exit?)
-                                     (spread-legs (:condor/call-spread condor)
-                                                  quantity exit?))
+                         :legs (or close-legs
+                                   (into (spread-legs (:condor/put-spread condor)
+                                                      quantity exit?)
+                                         (spread-legs (:condor/call-spread condor)
+                                                      quantity exit?)))
+                         :quantity close-quantity
                          :policy :execution/iron-condor-v1}))))
 
 ;; ---------------------------------------------------------------------------
@@ -395,11 +416,6 @@
                      {:bid (decimal/Decimal bid)
                       :ask (decimal/Decimal ask)}]))))
         (:chain/contracts chain)))
-
-(defn- open-option-lots
-  [strategy-view]
-  (filterv #(.startswith (str (:lot/instrument-id %)) "option/")
-           (:view/open-lots strategy-view)))
 
 (defn- close-option-lot-intents
   "One close intent per open option lot, FIFO slot order. Side opposite

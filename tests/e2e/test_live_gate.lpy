@@ -196,6 +196,22 @@
           (is (contains? types "audit/order"))
           (is (contains? types "audit/broker")))))))
 
+(deftest pre-run-observations-warm-but-do-not-trade-when-suppressed
+  (let [root (activate-into! (-> (sim-manifest)
+                                 (assoc :control-plane/revision
+                                        "cp-sim-suppress-prerun-000001")))
+        out-dir (tempfile/mkdtemp)
+        result (el/run-live {:control-plane-root root
+                             :process-id "engine-sim-main"
+                             :out-dir out-dir
+                             :fixture-path fixture-path
+                             :suppress-pre-run-trading? true})]
+    (is (true? (:live/started? result)))
+    (let [types (fact-types out-dir)]
+      (is (contains? types :fact/market-bar-observed))
+      (is (not (contains? types :fact/order-intent-created)))
+      (is (not (contains? types :fact/fill-observed))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Stale-feed safety gate
 ;; ---------------------------------------------------------------------------
@@ -347,3 +363,33 @@
                     :alpaca {:transport stub}
                     :alpaca-accounts {"account/alpaca/paper-a"
                                       {:key-id "k" :secret "s"}}})))))))
+
+(deftest broker-target-both-wraps-alpaca-child-with-sim-fanout
+  (let [stub (fn [_] {:status 200 :body "{}"})
+        built (el/build-brokers
+               {:routes [{:route/broker :broker/alpaca-paper
+                          :route/account-id "account/alpaca/paper-a"}]
+                :alpaca {:transport stub :base-url "https://stub"}
+                :broker-target :both
+                :sim-opts {}})
+        health (bp/health (:broker built))]
+    (is (false? (:router? built)))
+    (is (contains? health :fanout/primary))
+    (is (= 1 (count (:fanout/mirrors health))))
+    (is (= "account/sim/mirror/paper-a"
+           (get-in health [:fanout/mirrors 0 :account-id])))))
+
+(deftest broker-target-sim-replaces-alpaca-child-with-sim-broker
+  (let [calls (atom 0)
+        stub (fn [_] (swap! calls inc) {:status 200 :body "{}"})
+        built (el/build-brokers
+               {:routes [{:route/broker :broker/alpaca-paper
+                          :route/account-id "account/alpaca/paper-a"}]
+                :alpaca {:transport stub :base-url "https://stub"}
+                :broker-target :sim
+                :sim-opts {}})
+        health (bp/health (:broker built))]
+    (is (false? (:router? built)))
+    (is (= :fact/health-heartbeat-recorded (:record/type health)))
+    (is (= :broker/sim (:record/source-system health)))
+    (is (= 0 @calls))))

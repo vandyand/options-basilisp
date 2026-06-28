@@ -155,8 +155,10 @@
         artifact-store (afs/make-file-artifact-store artifact-root)
         market-clock (atom (:input/at (first (:fixture/inputs fixture*))))
         marks (atom {})
+        position-seed (atom [])
         broker (sim/make-sim-broker {:marks (fn [] @marks)
-                                     :clock (fn [] @market-clock)})
+                                     :clock (fn [] @market-clock)
+                                     :position-seed (fn [] @position-seed)})
         ;; 2. strategies + engine state (fresh or recovered)
         strategies (mapv #(eloop/load-strategy artifact-store run-mode %)
                          strategy-paths)
@@ -189,6 +191,9 @@
                  (st/init-run (st/fresh-state) run-info))
         ledger0 (if recovery (:recovery/ledger recovery) ledger/empty-ledger)
         state0 (eloop/enable-strategies state0 strategies)
+        _ (reset! position-seed
+                  (get-in state0 [:engine/portfolio
+                                  :portfolio/open-lots] []))
         cursor0 (or (st/cursor state0 :market-data) 0)
         _ (when-let [wm (get-in state0 [:engine/watermarks :watermark/market])]
             (reset! market-clock wm))

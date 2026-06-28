@@ -45,6 +45,7 @@ pythonpath = [
   "components/control-plane.protocol/src",
   "components/artifact.protocol/src",
   "components/broker.alpaca/src",
+  "components/broker.fanout/src",
   "components/broker.router/src",
   "components/broker.sim/src",
   "components/market-data.polygon/src",
@@ -57,6 +58,7 @@ pythonpath = [
   "components/observability.structured-log/src",
   "components/control-plane.file-store/src",
   "components/artifact.file-store/src",
+  "components/analysis.core/src",
   "components/time.core/src",
   "components/calendar.core/src",
   "components/config.core/src",
@@ -75,4 +77,3 @@ testpaths = [
 
 [tool.setuptools]
 include-package-data = true
-

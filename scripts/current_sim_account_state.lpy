@@ -1,0 +1,33 @@
+;; Print one durable sim broker account-state as TSV for scripts/current_pnl.py.
+;;
+;; Keep the broker accounting in Basilisp so Python does not need to reimplement
+;; option multipliers, lot signs, marks, or unrealized P&L semantics.
+(import os)
+(require '[stevetrading.broker.protocol :as bp]
+         '[stevetrading.broker.sim :as sim])
+
+(def store-path (os/getenv "SIM_STORE_PATH"))
+(def account-id (or (os/getenv "SIM_ACCOUNT_ID") "account/sim/vol-term"))
+
+(when-not store-path
+  (println "FATAL\tSIM_STORE_PATH is required")
+  (python/exit 2))
+
+(def broker (sim/make-sim-broker {:store-path store-path}))
+(def payload (:fact/payload (bp/account-state broker account-id)))
+(def open-lots (or (:account/open-lots payload) []))
+(def long-count (count (filter #(= :order-side/buy (:lot/side %)) open-lots)))
+(def short-count (count (filter #(= :order-side/sell (:lot/side %)) open-lots)))
+
+(println
+ (str (:broker/account-id payload) "\t"
+      (:account/cash payload) "\t"
+      (:account/realized-pnl payload) "\t"
+      (or (:account/unrealized-pnl payload) "") "\t"
+      (:account/gross-exposure payload) "\t"
+      (:account/open-order-count payload) "\t"
+      (count open-lots) "\t"
+      long-count "\t"
+      short-count "\t"
+      (pr-str (:account/net-positions payload)) "\t"
+      (pr-str (:account/unmarked-instruments payload))))

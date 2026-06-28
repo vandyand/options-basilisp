@@ -56,6 +56,7 @@
   (:import os os.path sys)
   (:require [stevetrading.artifact.file-store :as afs]
             [stevetrading.broker.alpaca :as alpaca]
+            [stevetrading.broker.fanout :as fanout]
             [stevetrading.broker.protocol :as bp]
             [stevetrading.broker.router :as router]
             [stevetrading.broker.sim :as sim]
@@ -258,6 +259,10 @@
                      wiring even for one account
     :sim-opts        broker.sim opts ({:marks :clock}); ALL :broker/sim
                      routes share ONE sim broker instance
+    :broker-target   :alpaca|:sim|:both. :sim replaces alpaca-paper
+                     children with the shared sim broker; :both wraps
+                     alpaca-paper accounts in a primary-returning fanout
+                     with a shared sim mirror
 
   ONE distinct account and no :alpaca-accounts → the original
   single-broker wiring, unchanged. Otherwise → one child per account
@@ -265,28 +270,46 @@
 
   Returns {:broker b :router? bool :children {account-id child}}
   (:children only when :router? is true)."
-  [{:keys [routes alpaca alpaca-accounts sim-opts]}]
+  [{:keys [routes alpaca alpaca-accounts sim-opts broker-target]}]
   (let [routes (vec (distinct routes))
         account-ids (vec (distinct (map :route/account-id routes)))
-        multi? (or (> (count account-ids) 1) (some? alpaca-accounts))]
+        broker-target (or broker-target :alpaca)
+        multi? (or (> (count account-ids) 1) (some? alpaca-accounts))
+        shared-sim (delay (sim/make-sim-broker (or sim-opts {})))
+        mirror-account-id (fn [account-id]
+                            (str "account/sim/mirror/"
+                                 (last (.split account-id "/"))))
+        alpaca-child (fn [account-id]
+                       (if (= :sim broker-target)
+                         @shared-sim
+                         (let [primary (alpaca/make-alpaca-broker
+                                        (merge (or alpaca {})
+                                               (get alpaca-accounts
+                                                    account-id)))]
+                           (if (= :both broker-target)
+                             (fanout/make-fanout-broker
+                              {:primary primary
+                               :mirrors [{:broker @shared-sim
+                                          :account-id
+                                          (mirror-account-id account-id)
+                                          :broker-route
+                                          {:broker/source-system
+                                           :broker/sim}}]})
+                             primary))))]
     (if-not multi?
       {:router? false
        :broker (case (:route/broker (first routes))
-                 :broker/sim (sim/make-sim-broker (or sim-opts {}))
+                 :broker/sim @shared-sim
                  :broker/alpaca-paper
-                 (alpaca/make-alpaca-broker (or alpaca {})))}
-      (let [shared-sim (delay (sim/make-sim-broker (or sim-opts {})))
-            children
+                 (alpaca-child (:route/account-id (first routes))))}
+      (let [children
             (into {}
                   (map (fn [route]
                          [(:route/account-id route)
                           (case (:route/broker route)
                             :broker/sim @shared-sim
                             :broker/alpaca-paper
-                            (alpaca/make-alpaca-broker
-                             (merge (or alpaca {})
-                                    (get alpaca-accounts
-                                         (:route/account-id route)))))])
+                            (alpaca-child (:route/account-id route)))])
                        routes))]
         {:router? true
          :children children
@@ -331,10 +354,17 @@
                          account); presence forces broker.router wiring
                          (see build-brokers) — required whenever several
                          alpaca-paper accounts are routed
+    :sim-store-path      durable SQLite journal path for :broker/sim
+                         routes (default <out-dir>/sim-broker.db)
+    :broker-target       :alpaca|:sim|:both, defaults to :alpaca for
+                         alpaca routes and no-op for pure sim routes
     :session-clock       {:entry-cutoff iso-utc :flatten-at iso-utc}
                          engine.loop wall-clock session gating (no new
                          entries at/after :entry-cutoff; forced flatten
                          at/after :flatten-at) — see engine.loop/run-loop
+    :suppress-pre-run-trading?
+                         when true, startup historical observations can
+                         warm state but cannot dispatch strategy orders
 
   Returns {:live/started? false :live/refusal reason ...} on a gate
   refusal (after durably recording the violation fact), or the session
@@ -342,8 +372,10 @@
   :portfolio {..} :health-view {..} ...}."
   [{:keys [control-plane-root process-id out-dir fixture-path scope mode
            allow-replay-feed? strategy-paths artifact-root snapshot-every
-           max-facts resume? alpaca alpaca-accounts bridge-ctx
-           session-clock stale-order-seconds on-observation
+           max-facts resume? alpaca alpaca-accounts sim-store-path
+           broker-target bridge-ctx sim-fill-policy
+           session-clock stale-order-seconds suppress-pre-run-trading?
+           on-observation
            crash-after-fact crash-before-fact]
     injected-source :source}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
@@ -400,8 +432,15 @@
                        {:routes routes
                         :alpaca alpaca
                         :alpaca-accounts alpaca-accounts
-                        :sim-opts {:marks (fn [] @marks)
-                                   :clock (fn [] @market-clock)}})
+                        :broker-target broker-target
+                        :sim-opts (merge {:marks (fn [] @marks)
+                                          :clock (fn [] @market-clock)
+                                          :store-path (or sim-store-path
+                                                          (os.path/join
+                                                           out-dir
+                                                           "sim-broker.db"))}
+                                         (when sim-fill-policy
+                                           {:fill-policy sim-fill-policy}))})
                 broker (:broker built)
                 ;; strategy decls: load, then check the manifest's
                 ;; assignment + artifact refs against the declarations
@@ -580,6 +619,8 @@
                         :broker-route {:broker/source-system broker-kw}
                         :session-clock session-clock
                         :stale-order-seconds stale-order-seconds
+                        :suppress-pre-run-trading?
+                        suppress-pre-run-trading?
                         :on-facts on-facts
                         :on-observation
                         (fn [obs new?]
@@ -662,12 +703,14 @@
       --control-plane-root <dir> --process-id <id> --out-dir <dir> \\
       --fixture <fixture.edn> [--scope <scope>] [--allow-replay-feed] \\
       [--strategies p1,p2] [--artifact-root dir] [--snapshot-every n]
+      [--broker-target alpaca|sim|both]
 
   Exits 1 on a gate refusal (the violation fact is durably recorded
   first)."
   [& args]
   (let [{:keys [control-plane-root process-id out-dir fixture scope
-                allow-replay-feed strategies artifact-root snapshot-every]}
+                allow-replay-feed strategies artifact-root snapshot-every
+                broker-target]}
         (parse-args args)]
     (when (some nil? [control-plane-root process-id out-dir fixture])
       (println "usage: basilisp run -n stevetrading.base.engine-live --"
@@ -687,7 +730,9 @@
                                      (vec (.split strategies ",")))
                    :artifact-root artifact-root
                    :snapshot-every (when snapshot-every
-                                     (int snapshot-every))})]
+                                     (int snapshot-every))
+                   :broker-target (when broker-target
+                                    (keyword broker-target))})]
       (println (pr-str (dissoc result :engine/state :ledger)))
       (when-not (:live/started? result)
         (sys/exit 1))
