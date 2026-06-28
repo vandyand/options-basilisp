@@ -8,8 +8,11 @@ Initial projects:
 - `engine-replay`
 - `control-plane`
 - `reports`
+- `ops`
 - `test`
 
-These are intentionally empty at first.
+Most projections are intentionally lightweight. `projects/ops` is active and
+contains the canonical deployment, systemd, report-service, and VPS runbook
+material.
 
 The goal is to establish ownership and intended projection boundaries before adding tooling files.

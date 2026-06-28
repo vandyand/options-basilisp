@@ -36,17 +36,33 @@ Also add the new src dir to `pyproject.toml`
 and re-run `scripts/nrepl.sh` so `.nrepl-pythonpath` includes it for the
 next restart.
 
-After editing an existing file, `(require 'the.ns :reload)` to pick up the
+After editing an existing file, `(require 'the.ns :reload)` picks up the
 change.
+
+## Adding Components Or Bases
+
+When adding a new component/base:
+
+1. Create the `components/<name>/src` or `bases/<name>/src` tree.
+2. Add the src path to `pyproject.toml` under `tool.pytest.ini_options.pythonpath`.
+3. Restart the REPL with `scripts/nrepl.sh`.
+4. Add focused tests under `tests/<area>/`.
+
+Do not add generated `__pycache__`, `.lpyc`, `.pyc`, `live_runtime/`, or local
+operator state to git.
 
 ## Tests
 
 ```bash
-scripts/test.sh                       # full suite (~4 min)
+scripts/test.sh                       # full suite; several minutes
 scripts/test.sh tests/engine/         # narrow, per area
 scripts/test.sh tests/recovery/test_crash_scenarios.lpy
 scripts/lint.sh                       # compile check + dependency direction
 ```
+
+Use `scripts/test.sh` for Basilisp tests. Running raw `python -m pytest` can
+use the wrong Basilisp/Python environment and produce misleading importer-cache
+failures.
 
 Test layout conventions (Phase 0 findings — do not regress):
 
