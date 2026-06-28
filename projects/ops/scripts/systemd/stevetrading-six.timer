@@ -1,0 +1,11 @@
+[Unit]
+Description=Start SteveTrading six Alpaca paper strategies before market open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:20:00 America/New_York
+AccuracySec=1min
+Persistent=false
+Unit=stevetrading-six.service
+
+[Install]
+WantedBy=timers.target

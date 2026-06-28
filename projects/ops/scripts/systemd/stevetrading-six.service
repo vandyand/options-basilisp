@@ -1,0 +1,20 @@
+[Unit]
+Description=SteveTrading six Alpaca paper strategies
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+ExecStart=/opt/stevetrading/current/scripts/steve_six_session.sh
+Restart=on-failure
+RestartSec=60
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=append:/var/log/stevetrading/six.log
+StandardError=append:/var/log/stevetrading/six.log
+
+[Install]
+WantedBy=multi-user.target

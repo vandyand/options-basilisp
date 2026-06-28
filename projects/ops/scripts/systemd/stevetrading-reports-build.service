@@ -1,0 +1,14 @@
+[Unit]
+Description=Build SteveTrading reports
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+Environment=REPORTS_MODE=incremental
+ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_reports.sh
+StandardOutput=append:/var/log/stevetrading/reports-systemd.log
+StandardError=append:/var/log/stevetrading/reports-systemd.log

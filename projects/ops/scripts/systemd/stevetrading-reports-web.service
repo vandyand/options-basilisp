@@ -1,0 +1,18 @@
+[Unit]
+Description=Serve SteveTrading reports
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/reports.env
+ExecStart=/usr/bin/python3 /opt/stevetrading/current/projects/ops/scripts/reports_static_server.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/stevetrading/reports-web.log
+StandardError=append:/var/log/stevetrading/reports-web.log
+
+[Install]
+WantedBy=multi-user.target

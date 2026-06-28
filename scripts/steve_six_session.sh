@@ -16,16 +16,29 @@
 # the chestnut data key (sim, market data only). The terminal is a
 # shared single session handed back to Steve on stop.
 #
+# Broker target override: set BROKER_TARGET=sim to run the six accounts
+# against the durable local sim broker only, or BROKER_TARGET=both to keep
+# Alpaca paper canonical while mirroring intents into sim
+# (<session>/sim-broker.db). Default is BROKER_TARGET=alpaca.
+#
 # Cron (09:20 ET gives the bridges ~10 min to load bundles + prime):
 #   20 9 * * 1-5 /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/scripts/steve_six_session.sh >> /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/live_runtime/steve_six.cron.log 2>&1
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-REF="$HOME/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"
-LIFECYCLE="$REF/thetadata_lifecycle.sh"
-PYPATH="$(cat "$REPO/.nrepl-pythonpath")"
-BASILISP="$REF/.venv/bin/basilisp"
+REPO="${STEVE_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DEFAULT_REF="$HOME/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"
+if [ -z "${STEVE_REF_ROOT:-}" ] && [ -d /opt/stevetrading/shared/Data-Preprocessor ]; then
+  DEFAULT_REF="/opt/stevetrading/shared/Data-Preprocessor"
+fi
+REF="${STEVE_REF_ROOT:-$DEFAULT_REF}"
+LIFECYCLE="${STEVE_THETADATA_LIFECYCLE:-$REF/thetadata_lifecycle.sh}"
+BASILISP="${BASILISP_BIN:-$REF/.venv/bin/basilisp}"
 cd "$REPO"
+
+# Keep the launcher environment aligned with the workspace. A stale
+# .nrepl-pythonpath can make market-open startup fail after adding a component.
+ls -d components/*/src bases/*/src | paste -sd: - > .nrepl-pythonpath
+PYPATH="$(cat .nrepl-pythonpath)"
 
 log() { echo "$(date -u '+%FT%TZ') [orchestrator] $*"; }
 
@@ -39,6 +52,12 @@ NYSE_HOLIDAYS="2026-06-19 2026-07-03 2026-09-07 2026-11-26 2026-12-25"
 case " $NYSE_HOLIDAYS " in
   *" $(date +%F) "*) log "NYSE holiday ($(date +%F)) — skipping"; exit 0 ;;
 esac
+
+log "running live import preflight"
+if ! PYTHONPATH="$PYPATH" "$BASILISP" run "$REPO/scripts/preflight_live_imports.lpy"; then
+  log "live import preflight failed — aborting before terminal start"
+  exit 1
+fi
 
 SIM_PID=""
 cleanup() {

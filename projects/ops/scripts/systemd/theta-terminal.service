@@ -1,0 +1,17 @@
+[Unit]
+Description=ThetaData Terminal for SteveTrading
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=bot
+WorkingDirectory=/opt/stevetrading/shared/Data-Preprocessor
+ExecStart=/bin/java -Xms1G -Xmx3G -jar /opt/stevetrading/shared/Data-Preprocessor/ThetaTerminalv3.jar --creds-file=/opt/stevetrading/shared/Data-Preprocessor/creds.txt --log-directory=/opt/stevetrading/shared/Data-Preprocessor/pipeline_data/paper_trading_logs
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run SteveTrading watchdog every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=false
+Unit=stevetrading-watchdog.service
+
+[Install]
+WantedBy=timers.target

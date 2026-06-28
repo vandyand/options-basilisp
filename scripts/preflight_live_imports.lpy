@@ -1,0 +1,18 @@
+;; Import-only preflight for the live trading launcher.
+;;
+;; This must stay side-effect-light: require components/bases that market-open
+;; launchers depend on, but do not load strategy artifacts, call Alpaca, start
+;; ThetaData, or submit broker commands.
+(require '[stevetrading.base.engine-live :as live]
+         '[stevetrading.broker.alpaca :as alpaca]
+         '[stevetrading.broker.fanout :as fanout]
+         '[stevetrading.broker.router :as router]
+         '[stevetrading.broker.sim :as sim]
+         '[stevetrading.bridge.steve-v2 :as bridge]
+         '[stevetrading.bridge.v2-term :as v2-term]
+         '[stevetrading.control-plane.file-store :as cpfs]
+         '[stevetrading.market-data.alpaca :as mda]
+         '[stevetrading.market-data.composite :as mdc]
+         '[stevetrading.market-data.thetadata :as td])
+
+(println "live import preflight OK")
