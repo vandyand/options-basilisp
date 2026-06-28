@@ -1,0 +1,16 @@
+(ns export-live-tape
+  (:require [stevetrading.analysis.core :as analysis]))
+
+(defn -main
+  [& args]
+  (let [{:keys [facts out]} (analysis/parse-args args)]
+    (when (or (not= 1 (count facts)) (nil? out))
+      (println "usage: basilisp run scripts/export_live_tape.lpy -- --facts <facts.db> --out <tape.csv>")
+      (python/exit 2))
+    (let [summary (analysis/write-live-tape! {:facts-db (first facts)
+                                              :out out})]
+      (println (str "wrote " (:rows summary) " live tape rows to " out))
+      (println (pr-str (:counts summary)))
+      summary)))
+
+(apply -main *command-line-args*)

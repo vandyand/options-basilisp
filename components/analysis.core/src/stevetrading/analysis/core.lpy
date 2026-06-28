@@ -1,0 +1,670 @@
+(ns stevetrading.analysis.core
+  "Offline evidence tooling for live-vs-backtest parity and sim-fill
+  calibration. This namespace is read-only with respect to live trading state:
+  it opens facts.db snapshots, derives normalized tapes, and writes explicit
+  artifacts for review/application elsewhere."
+  (:import csv datetime math os os.path re sqlite3)
+  (:require [basilisp.edn :as edn]
+            [basilisp.string :as bstr]))
+
+(def fill-fact :fact/fill-observed)
+(def intent-fact :fact/order-intent-created)
+(def signal-fact :fact/signal-decision-produced)
+(def option-chain-fact :fact/option-chain-observed)
+
+(def ^:private fill-price-re (re/compile ":fill/price \"([^\"]+)\""))
+(def ^:private fill-qty-re (re/compile ":fill/quantity \"([^\"]+)\""))
+(def ^:private fill-id-re (re/compile ":fill/id \"([^\"]+)\""))
+(def ^:private fill-symbol-re (re/compile ":fill/symbol \"([^\"]+)\""))
+(def ^:private decision-id-re (re/compile ":decision/id \"([^\"]+)\""))
+(def ^:private posture-re (re/compile ":decision/posture :(posture/[^\\s\\}]+)"))
+(def ^:private bot-re (re/compile ":decision/bot :([^\\s\\}]+)"))
+(def ^:private bridge-kind-re (re/compile ":decision/bridge-kind :([^\\s\\}]+)"))
+(def ^:private intent-role-re (re/compile ":order-intent/role :(intent-role/[^\\s\\}]+)"))
+(def ^:private order-type-re (re/compile ":order-intent/order-type :(order-type/[^\\s\\}]+)"))
+(def ^:private effect-re (re/compile ":order-intent/effect :(position-effect/[^\\s\\}]+)"))
+(def ^:private side-re (re/compile ":order-intent/side :(order-side/[^\\s\\}]+)"))
+(def ^:private limit-price-re (re/compile ":order-intent/limit-price \"([^\"]+)\""))
+(def ^:private intent-qty-re (re/compile ":order-intent/quantity \"([^\"]+)\""))
+(def ^:private leg-re
+  (re/compile "\\{:leg/side :(order-side/[^\\s\\}]+) :leg/quantity \"([^\"]+)\" :instrument/id \"([^\"]+)\"\\}"))
+(def ^:private quote-re
+  (re/compile "\\{:quote/bid \"([^\"]+)\" :quote/ask \"([^\"]+)\" :instrument/id \"([^\"]+)\"\\}"))
+
+(defn- kw-text
+  [x]
+  (when (some? x) (str x)))
+
+(defn- parse-float
+  [x]
+  (when (some? x)
+    (float x)))
+
+(defn- re-one
+  [pattern text]
+  (let [m (.search pattern text)]
+    (when m
+      (.group m 1))))
+
+(defn- colonize
+  [s]
+  (when (some? s)
+    (str ":" s)))
+
+(defn- placeholders
+  [n]
+  (bstr/join "," (repeat n "?")))
+
+(defn read-facts
+  "Read canonical EDN fact envelopes from a SQLite facts.db. fact-types may be
+  nil/empty to read all facts, or a collection of keywords/string fact_type
+  values."
+  [facts-db fact-types]
+  (let [conn (sqlite3/connect facts-db)
+        fact-types (seq fact-types)
+        [sql params] (if fact-types
+                       [(str "SELECT record FROM facts WHERE fact_type IN ("
+                             (placeholders (count fact-types))
+                             ") ORDER BY \"offset\" ASC")
+                        (mapv kw-text fact-types)]
+                       ["SELECT record FROM facts ORDER BY \"offset\" ASC"
+                        []])]
+    (try
+      (mapv (fn [row] (edn/read-string (nth row 0)))
+            (.fetchall (.execute conn sql (python/tuple params))))
+      (finally
+        (.close conn)))))
+
+(defn read-fact-rows
+  "Read raw SQLite fact rows without EDN parsing. Used by CLI analyzers where
+  indexed columns plus small regex extractions are enough and full EDN parse is
+  too slow for large live sessions."
+  [facts-db fact-types]
+  (let [conn (sqlite3/connect facts-db)
+        fact-types (seq fact-types)
+        [sql params] (if fact-types
+                       [(str "SELECT \"offset\", fact_type, account_id, strategy_id, "
+                             "instrument_id, order_intent_id, broker_order_id, "
+                             "occurred_at, correlation_id, record "
+                             "FROM facts WHERE fact_type IN ("
+                             (placeholders (count fact-types))
+                             ") ORDER BY \"offset\" ASC")
+                        (mapv kw-text fact-types)]
+                       [(str "SELECT \"offset\", fact_type, account_id, strategy_id, "
+                             "instrument_id, order_intent_id, broker_order_id, "
+                             "occurred_at, correlation_id, record "
+                             "FROM facts ORDER BY \"offset\" ASC")
+                        []])]
+    (try
+      (mapv (fn [row]
+              {:offset (nth row 0)
+               :fact-type (nth row 1)
+               :account-id (nth row 2)
+               :strategy-id (nth row 3)
+               :instrument-id (nth row 4)
+               :order-intent-id (nth row 5)
+               :broker-order-id (nth row 6)
+               :occurred-at (nth row 7)
+               :correlation-id (nth row 8)
+               :record (nth row 9)})
+            (.fetchall (.execute conn sql (python/tuple params))))
+      (finally
+        (.close conn)))))
+
+(defn fact-counts
+  [facts]
+  (into {}
+        (sort-by (comp str first)
+                 (map (fn [[t rows]] [t (count rows)])
+                      (group-by :record/type facts)))))
+
+(defn- row-base
+  [event-type fact]
+  (let [pl (:fact/payload fact)]
+    {:event-type event-type
+     :occurred-at (:fact/occurred-at fact)
+     :account-id (or (:record/account-id fact)
+                     (:broker/account-id pl)
+                     (:order-intent/account-id pl))
+     :strategy-id (:record/strategy-id fact)
+     :instrument-id (or (:record/instrument-id fact)
+                        (:decision/instrument-id pl)
+                        (:fill/instrument-id pl))
+     :source-system (:record/source-system fact)
+     :correlation-id (:record/correlation-id fact)
+     :record-id (:record/id fact)}))
+
+(defn signal-row
+  [fact]
+  (let [pl (:fact/payload fact)]
+    (merge (row-base "signal" fact)
+           {:decision-id (:decision/id pl)
+            :posture (:decision/posture pl)
+            :bot (:decision/bot pl)
+            :bridge-kind (:decision/bridge-kind pl)
+            :reason-codes (:decision/reason-codes pl)})))
+
+(defn intent-row
+  [fact]
+  (let [pl (:fact/payload fact)
+        legs (vec (:order-intent/legs pl))
+        first-leg (first legs)]
+    (merge (row-base "intent" fact)
+           {:decision-id (:order-intent/decision-id pl)
+            :order-intent-id (:order-intent/id pl)
+            :intent-role (:order-intent/role pl)
+            :order-type (:order-intent/order-type pl)
+            :effect (:order-intent/effect pl)
+            :side (:order-intent/side pl)
+            :quantity (:order-intent/quantity pl)
+            :limit-price (:order-intent/limit-price pl)
+            :leg-count (count legs)
+            :leg-instruments (mapv :instrument/id legs)
+            :instrument-id (or (:instrument/id first-leg)
+                               (:record/instrument-id fact))})))
+
+(defn fill-row
+  [fact]
+  (let [pl (:fact/payload fact)]
+    (merge (row-base "fill" fact)
+           {:order-intent-id (:order-intent/id pl)
+            :broker-order-id (:broker/order-id pl)
+            :fill-id (:fill/id pl)
+            :instrument-id (:fill/instrument-id pl)
+            :quantity (:fill/quantity pl)
+            :fill-price (:fill/price pl)
+            :fill-quantity (:fill/quantity pl)
+            :fill-symbol (:fill/symbol pl)})))
+
+(defn live-tape-rows
+  "Normalize signal, intent, and fill facts into one chronological behavior
+  tape. This is the first layer needed before any performance significance
+  claim: it makes behavior differences inspectable."
+  [facts]
+  (->> facts
+       (keep (fn [f]
+               (case (:record/type f)
+                 :fact/signal-decision-produced (signal-row f)
+                 :fact/order-intent-created (intent-row f)
+                 :fact/fill-observed (fill-row f)
+                 nil)))
+       vec))
+
+(def live-tape-columns
+  [:event-type :occurred-at :account-id :strategy-id :decision-id :posture
+   :bot :bridge-kind :order-intent-id :intent-role :order-type :effect :side
+   :instrument-id :quantity :limit-price :fill-price :fill-quantity
+   :broker-order-id :fill-id :leg-count :leg-instruments :source-system
+   :correlation-id :record-id :reason-codes])
+
+(declare live-tape-rows-fast calibration-artifact-fast)
+
+(defn- csv-cell
+  [v]
+  (cond
+    (nil? v) ""
+    (keyword? v) (str v)
+    (coll? v) (pr-str v)
+    :else (str v)))
+
+(defn write-csv!
+  [path columns rows]
+  (let [parent (os.path/dirname path)]
+    (when (and parent (not= "" parent))
+      (os/makedirs parent ** :exist_ok true))
+    (with-open [fh (python/open path "w" ** :newline "")]
+      (let [writer (csv/writer fh)]
+        (.writerow writer (mapv name columns))
+        (doseq [row rows]
+          (.writerow writer (mapv #(csv-cell (get row %)) columns)))))
+    path))
+
+(defn write-live-tape!
+  [{:keys [facts-db out]}]
+  (let [raw-rows (read-fact-rows facts-db [signal-fact intent-fact fill-fact])
+        rows (live-tape-rows-fast raw-rows)]
+    (write-csv! out live-tape-columns rows)
+    {:facts-db facts-db
+     :out out
+     :rows (count rows)
+     :counts (frequencies (map :fact-type raw-rows))}))
+
+(defn- event-type-of
+  [fact-type]
+  (case fact-type
+    ":fact/signal-decision-produced" "signal"
+    ":fact/order-intent-created" "intent"
+    ":fact/fill-observed" "fill"
+    "unknown"))
+
+(defn- fast-base
+  [row]
+  {:event-type (event-type-of (:fact-type row))
+   :occurred-at (:occurred-at row)
+   :account-id (:account-id row)
+   :strategy-id (:strategy-id row)
+   :instrument-id (:instrument-id row)
+   :correlation-id (:correlation-id row)
+   :record-id (str (:offset row))})
+
+(defn- leg-matches
+  [record]
+  (mapv (fn [m]
+          {:side (str ":" (nth m 0))
+           :quantity (nth m 1)
+           :instrument-id (nth m 2)})
+        (.findall leg-re record)))
+
+(defn fast-live-tape-row
+  [row]
+  (let [record (:record row)]
+    (case (:fact-type row)
+      ":fact/signal-decision-produced"
+      (merge (fast-base row)
+             {:decision-id (re-one decision-id-re record)
+              :posture (colonize (re-one posture-re record))
+              :bot (colonize (re-one bot-re record))
+              :bridge-kind (colonize (re-one bridge-kind-re record))})
+
+      ":fact/order-intent-created"
+      (let [legs (leg-matches record)
+            first-leg (first legs)]
+        (merge (fast-base row)
+               {:decision-id (re-one decision-id-re record)
+                :order-intent-id (:order-intent-id row)
+                :intent-role (colonize (re-one intent-role-re record))
+                :order-type (colonize (re-one order-type-re record))
+                :effect (colonize (re-one effect-re record))
+                :side (colonize (re-one side-re record))
+                :quantity (re-one intent-qty-re record)
+                :limit-price (re-one limit-price-re record)
+                :leg-count (count legs)
+                :leg-instruments (mapv :instrument-id legs)
+                :instrument-id (or (:instrument-id first-leg)
+                                   (:instrument-id row))}))
+
+      ":fact/fill-observed"
+      (merge (fast-base row)
+             {:order-intent-id (:order-intent-id row)
+              :broker-order-id (:broker-order-id row)
+              :fill-id (re-one fill-id-re record)
+              :instrument-id (:instrument-id row)
+              :quantity (re-one fill-qty-re record)
+              :fill-price (re-one fill-price-re record)
+              :fill-quantity (re-one fill-qty-re record)
+              :fill-symbol (re-one fill-symbol-re record)})
+
+      (fast-base row))))
+
+(defn live-tape-rows-fast
+  [raw-rows]
+  (mapv fast-live-tape-row raw-rows))
+
+;; ---------------------------------------------------------------------------
+;; Sim fill calibration
+;; ---------------------------------------------------------------------------
+
+(defn- parse-time
+  [s]
+  (datetime.datetime/fromisoformat (.replace s "Z" "+00:00")))
+
+(defn- seconds-between
+  [a b]
+  (abs (.total_seconds (- (parse-time a) (parse-time b)))))
+
+(defn- option-instrument?
+  [instrument-id]
+  (and (string? instrument-id) (.startswith instrument-id "option/")))
+
+(defn intent-index
+  [facts]
+  (into {}
+        (map (fn [f]
+               (let [pl (:fact/payload f)]
+                 [(:order-intent/id pl) f]))
+             (filter #(= intent-fact (:record/type %)) facts))))
+
+(defn leg-side-for
+  [intent-fact instrument-id]
+  (let [pl (:fact/payload intent-fact)
+        leg (first (filter #(= instrument-id (:instrument/id %))
+                           (:order-intent/legs pl)))]
+    (or (:leg/side leg) (:order-intent/side pl))))
+
+(defn fill-records
+  [facts]
+  (let [intents (intent-index facts)]
+    (->> facts
+         (filter #(= fill-fact (:record/type %)))
+         (keep (fn [f]
+                 (let [pl (:fact/payload f)
+                       oi (:order-intent/id pl)
+                       instrument-id (:fill/instrument-id pl)
+                       intent (get intents oi)
+                       side (when intent (leg-side-for intent instrument-id))]
+                   (when (and (option-instrument? instrument-id)
+                              (some? (:fill/price pl)))
+                     {:occurred-at (:fact/occurred-at f)
+                      :account-id (or (:record/account-id f)
+                                      (:broker/account-id pl))
+                      :strategy-id (or (:record/strategy-id f)
+                                       (:record/strategy-id intent))
+                      :order-intent-id oi
+                      :instrument-id instrument-id
+                      :side side
+                      :price (parse-float (:fill/price pl))
+                      :quantity (parse-float (:fill/quantity pl))})))))))
+
+(defn quote-records
+  [facts]
+  (reduce
+   (fn [acc f]
+     (let [ts (:fact/occurred-at f)]
+       (reduce
+        (fn [acc* contract]
+          (let [instrument-id (:instrument/id contract)
+                bid (parse-float (:quote/bid contract))
+                ask (parse-float (:quote/ask contract))]
+            (if (and (option-instrument? instrument-id)
+                     (some? bid)
+                     (some? ask)
+                     (<= bid ask))
+              (update acc* instrument-id
+                      (fnil conj [])
+                      {:observed-at ts
+                       :instrument-id instrument-id
+                       :bid bid
+                       :ask ask
+                       :mid (/ (+ bid ask) 2.0)
+                       :spread (- ask bid)})
+              acc*)))
+        acc
+        (get-in f [:fact/payload :chain/contracts]))))
+   {}
+   (filter #(= option-chain-fact (:record/type %)) facts)))
+
+(defn nearest-quote
+  [quotes fill-ts max-lag-seconds]
+  (let [candidate (first
+                   (sort-by :lag-seconds
+                            (map (fn [q]
+                                   (assoc q :lag-seconds
+                                          (seconds-between fill-ts
+                                                           (:observed-at q))))
+                                 quotes)))]
+    (when (and candidate (<= (:lag-seconds candidate) max-lag-seconds))
+      candidate)))
+
+(defn matched-fill-rows
+  [facts max-lag-seconds]
+  (let [quotes-by-instrument (quote-records facts)]
+    (->> (fill-records facts)
+         (keep (fn [fill]
+                 (let [quote (nearest-quote
+                              (get quotes-by-instrument
+                                   (:instrument-id fill))
+                              (:occurred-at fill)
+                              max-lag-seconds)]
+                   (when quote
+                     (let [side (:side fill)
+                           improvement (case side
+                                         :order-side/buy
+                                         (- (:ask quote) (:price fill))
+                                         :order-side/sell
+                                         (- (:price fill) (:bid quote))
+                                         nil)
+                           spread (:spread quote)]
+                       (when (some? improvement)
+                         (merge fill
+                                {:quote-observed-at (:observed-at quote)
+                                 :bid (:bid quote)
+                                 :ask (:ask quote)
+                                 :mid (:mid quote)
+                                 :spread spread
+                                 :lag-seconds (:lag-seconds quote)
+                                 :improvement improvement
+                                 :improvement-frac
+                                 (when (pos? spread)
+                                   (/ improvement spread))})))))))
+         vec)))
+
+(defn mean
+  [xs]
+  (when (seq xs)
+    (/ (reduce + 0.0 xs) (count xs))))
+
+(defn quantile
+  "Nearest-rank-ish quantile for small audit tables. q is [0,1]."
+  [q xs]
+  (when (seq xs)
+    (let [v (vec (sort xs))
+          idx (int (math/floor (* q (dec (count v)))))]
+      (nth v (max 0 (min idx (dec (count v))))))))
+
+(defn spread-bucket
+  [spread]
+  (cond
+    (nil? spread) :spread/unknown
+    (<= spread 0.01) :spread/tight
+    (<= spread 0.03) :spread/normal
+    (<= spread 0.10) :spread/wide
+    :else :spread/very-wide))
+
+(defn summarize-calibration-rows
+  [rows]
+  (let [improvements (mapv :improvement rows)
+        spreads (mapv :spread rows)
+        lags (mapv :lag-seconds rows)
+        positive-improvements (filterv pos? improvements)]
+    {:n (count rows)
+     :mean-improvement (mean improvements)
+     :median-improvement (quantile 0.50 improvements)
+     :p25-improvement (quantile 0.25 improvements)
+     :p10-improvement (quantile 0.10 improvements)
+     :positive-rate (when (seq improvements)
+                      (float (/ (count positive-improvements)
+                                (count improvements))))
+     :mean-spread (mean spreads)
+     :median-spread (quantile 0.50 spreads)
+     :median-lag-seconds (quantile 0.50 lags)
+     ;; Conservative default: never assume better than the lower quartile, and
+     ;; never let an adverse lower quartile become negative price improvement.
+     :conservative-price-improvement
+     (max 0.0 (or (quantile 0.25 improvements) 0.0))}))
+
+(defn bucket-key
+  [row]
+  {:side (:side row)
+   :spread-bucket (spread-bucket (:spread row))})
+
+(defn shrink
+  [bucket-value global-value n prior-strength]
+  (let [w (/ n (+ n prior-strength))]
+    (+ (* w bucket-value) (* (- 1.0 w) global-value))))
+
+(defn bucket-summaries
+  [rows global prior-strength]
+  (->> rows
+       (group-by bucket-key)
+       (map (fn [[k rs]]
+              (let [s (summarize-calibration-rows rs)
+                    raw (:conservative-price-improvement s)
+                    g (:conservative-price-improvement global)]
+                (assoc s
+                       :bucket/key k
+                       :raw-conservative-price-improvement raw
+                       :shrunk-conservative-price-improvement
+                       (shrink raw g (:n s) prior-strength)))))
+       (sort-by (juxt #(kw-text (get-in % [:bucket/key :side]))
+                      #(kw-text (get-in % [:bucket/key :spread-bucket]))))
+       vec))
+
+(defn calibration-artifact
+  [{:keys [facts-dbs max-lag-seconds prior-strength generated-at]}]
+  (let [facts (mapcat #(read-facts % [fill-fact intent-fact option-chain-fact])
+                      facts-dbs)
+        fills (fill-records facts)
+        rows (matched-fill-rows facts max-lag-seconds)
+        global (summarize-calibration-rows rows)]
+    {:calibration/version 1
+     :calibration/kind :sim-fill/alpaca-paper-empirical-bayes-v1
+     :calibration/generated-at (or generated-at
+                                   (.isoformat
+                                    (datetime.datetime/now
+                                     (.-utc datetime/timezone))))
+     :source/facts-dbs (vec facts-dbs)
+     :matching/max-lag-seconds max-lag-seconds
+     :estimator/prior-strength prior-strength
+     :input/option-fills (count fills)
+     :input/matched-fills (count rows)
+     :global global
+     :buckets (bucket-summaries rows global prior-strength)}))
+
+(defn fast-intent-side-index
+  [raw-rows]
+  (into {}
+        (mapcat
+         (fn [row]
+           (let [oi (:order-intent-id row)
+                 record (:record row)
+                 default-side (some-> (re-one side-re record) keyword)
+                 legs (leg-matches record)]
+             (if (seq legs)
+               (map (fn [leg]
+                      [[oi (:instrument-id leg)] (keyword (subs (:side leg) 1))])
+                    legs)
+               [[[oi (:instrument-id row)] default-side]])))
+         (filter #(= ":fact/order-intent-created" (:fact-type %)) raw-rows))))
+
+(defn fast-fill-records
+  [raw-rows]
+  (let [sides (fast-intent-side-index raw-rows)]
+    (->> raw-rows
+         (filter #(= ":fact/fill-observed" (:fact-type %)))
+         (keep (fn [row]
+                 (let [instrument-id (:instrument-id row)
+                       record (:record row)
+                       price (parse-float (re-one fill-price-re record))]
+                   (when (and (option-instrument? instrument-id)
+                              (some? price))
+                     {:occurred-at (:occurred-at row)
+                      :account-id (:account-id row)
+                      :strategy-id (:strategy-id row)
+                      :order-intent-id (:order-intent-id row)
+                      :instrument-id instrument-id
+                      :side (get sides [(:order-intent-id row) instrument-id])
+                      :price price
+                      :quantity (parse-float (re-one fill-qty-re record))})))))))
+
+(defn fast-quote-records
+  [raw-rows]
+  (reduce
+   (fn [acc row]
+     (let [ts (:occurred-at row)]
+       (reduce
+        (fn [acc* m]
+          (let [bid (parse-float (nth m 0))
+                ask (parse-float (nth m 1))
+                instrument-id (nth m 2)]
+            (if (and (option-instrument? instrument-id)
+                     (some? bid)
+                     (some? ask)
+                     (<= bid ask))
+              (update acc* instrument-id
+                      (fnil conj [])
+                      {:observed-at ts
+                       :instrument-id instrument-id
+                       :bid bid
+                       :ask ask
+                       :mid (/ (+ bid ask) 2.0)
+                       :spread (- ask bid)})
+              acc*)))
+        acc
+        (.findall quote-re (:record row)))))
+   {}
+   (filter #(= ":fact/option-chain-observed" (:fact-type %)) raw-rows)))
+
+(defn matched-fill-rows-fast
+  [raw-rows max-lag-seconds]
+  (let [quotes-by-instrument (fast-quote-records raw-rows)]
+    (->> (fast-fill-records raw-rows)
+         (keep (fn [fill]
+                 (let [quote (nearest-quote
+                              (get quotes-by-instrument
+                                   (:instrument-id fill))
+                              (:occurred-at fill)
+                              max-lag-seconds)]
+                   (when quote
+                     (let [side (:side fill)
+                           improvement (case side
+                                         :order-side/buy
+                                         (- (:ask quote) (:price fill))
+                                         :order-side/sell
+                                         (- (:price fill) (:bid quote))
+                                         nil)
+                           spread (:spread quote)]
+                       (when (some? improvement)
+                         (merge fill
+                                {:quote-observed-at (:observed-at quote)
+                                 :bid (:bid quote)
+                                 :ask (:ask quote)
+                                 :mid (:mid quote)
+                                 :spread spread
+                                 :lag-seconds (:lag-seconds quote)
+                                 :improvement improvement
+                                 :improvement-frac
+                                 (when (pos? spread)
+                                   (/ improvement spread))})))))))
+         vec)))
+
+(defn calibration-artifact-fast
+  [{:keys [facts-dbs max-lag-seconds prior-strength generated-at]}]
+  (let [raw-rows (mapcat #(read-fact-rows % [fill-fact intent-fact option-chain-fact])
+                         facts-dbs)
+        fills (fast-fill-records raw-rows)
+        rows (matched-fill-rows-fast raw-rows max-lag-seconds)
+        global (summarize-calibration-rows rows)]
+    {:calibration/version 1
+     :calibration/kind :sim-fill/alpaca-paper-empirical-bayes-v1
+     :calibration/generated-at (or generated-at
+                                   (.isoformat
+                                    (datetime.datetime/now
+                                     (.-utc datetime/timezone))))
+     :source/facts-dbs (vec facts-dbs)
+     :matching/max-lag-seconds max-lag-seconds
+     :estimator/prior-strength prior-strength
+     :input/option-fills (count fills)
+     :input/matched-fills (count rows)
+     :global global
+     :buckets (bucket-summaries rows global prior-strength)}))
+
+(defn write-calibration!
+  [{:keys [facts-dbs out max-lag-seconds prior-strength]}]
+  (let [artifact (calibration-artifact-fast
+                  {:facts-dbs facts-dbs
+                   :max-lag-seconds (or max-lag-seconds 90.0)
+                   :prior-strength (or prior-strength 30.0)})
+        parent (os.path/dirname out)]
+    (when (and parent (not= "" parent))
+      (os/makedirs parent ** :exist_ok true))
+    (spit out (str (edn/write-string artifact) "\n"))
+    artifact))
+
+(defn parse-args
+  "Small CLI parser. Repeated --facts flags are accumulated as a vector."
+  [args]
+  (loop [xs (seq args) acc {}]
+    (if (nil? xs)
+      acc
+      (let [flag (first xs)
+            value (second xs)
+            k (when (and (string? flag) (.startswith flag "--"))
+                (keyword (subs flag 2)))]
+        (cond
+          (nil? k) (recur (next xs) acc)
+          (= :facts k) (recur (nnext xs) (update acc :facts (fnil conj []) value))
+          :else (recur (nnext xs) (assoc acc k value)))))))
+
+(defn parse-double-arg
+  [x default]
+  (if (some? x) (float x) default))

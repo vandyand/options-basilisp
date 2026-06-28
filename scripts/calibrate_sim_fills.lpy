@@ -1,0 +1,25 @@
+(ns calibrate-sim-fills
+  (:require [basilisp.edn :as edn]
+            [stevetrading.analysis.core :as analysis]))
+
+(defn -main
+  [& args]
+  (let [{:keys [facts out max-lag-seconds prior-strength]} (analysis/parse-args args)
+        max-lag (analysis/parse-double-arg max-lag-seconds 90.0)
+        prior (analysis/parse-double-arg prior-strength 30.0)]
+    (when (or (empty? facts) (nil? out))
+      (println "usage: basilisp run scripts/calibrate_sim_fills.lpy -- --facts <facts.db> [--facts <facts2.db>] --out <calibration.edn> [--max-lag-seconds 90] [--prior-strength 30]")
+      (python/exit 2))
+    (let [artifact (analysis/write-calibration!
+                    {:facts-dbs facts
+                     :out out
+                     :max-lag-seconds max-lag
+                     :prior-strength prior})]
+      (println (str "wrote sim fill calibration to " out))
+      (println (edn/write-string
+                (select-keys artifact [:input/option-fills
+                                       :input/matched-fills
+                                       :global])))
+      artifact)))
+
+(apply -main *command-line-args*)

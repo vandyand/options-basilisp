@@ -1,0 +1,110 @@
+(ns analysis.test-core
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.analysis.core :as analysis]))
+
+(def signal-fact
+  {:record/type :fact/signal-decision-produced
+   :record/source-system :system/strategy-pipeline
+   :record/account-id "account/alpaca/chestnut-paper"
+   :record/strategy-id "strategy/steve-v2/chestnut/v1"
+   :record/instrument-id "equity/NASDAQ/SPY"
+   :record/correlation-id "dec-1"
+   :record/id "sig-1"
+   :fact/occurred-at "2026-06-25T14:18:00Z"
+   :fact/payload {:decision/id "dec-1"
+                  :decision/posture :posture/enter-short
+                  :decision/bot :chestnut
+                  :decision/bridge-kind :short
+                  :decision/reason-codes [:reason/bridge-short]}})
+
+(def intent-fact
+  {:record/type :fact/order-intent-created
+   :record/source-system :system/strategy-pipeline
+   :record/account-id "account/alpaca/chestnut-paper"
+   :record/strategy-id "strategy/steve-v2/chestnut/v1"
+   :record/instrument-id "equity/NASDAQ/SPY"
+   :record/correlation-id "dec-1"
+   :record/id "intent-rec-1"
+   :fact/occurred-at "2026-06-25T14:24:50Z"
+   :fact/payload {:order-intent/id "oi-1"
+                  :order-intent/account-id "account/alpaca/chestnut-paper"
+                  :order-intent/decision-id "dec-1"
+                  :order-intent/role :intent-role/entry
+                  :order-intent/order-type :order-type/limit
+                  :order-intent/effect :position-effect/open
+                  :order-intent/side :order-side/buy
+                  :order-intent/quantity "1"
+                  :order-intent/limit-price "2.30"
+                  :order-intent/legs [{:leg/side :order-side/buy
+                                       :leg/quantity "1"
+                                       :instrument/id
+                                       "option/OPRA/SPY/2026-06-25/P/735.000"}]}})
+
+(def fill-fact
+  {:record/type :fact/fill-observed
+   :record/source-system :broker/alpaca-paper
+   :record/account-id "account/alpaca/chestnut-paper"
+   :record/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+   :record/id "fill-rec-1"
+   :fact/occurred-at "2026-06-25T14:24:56Z"
+   :fact/payload {:broker/source-system :broker/alpaca-paper
+                  :order-intent/id "oi-1"
+                  :fill/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+                  :fill/id "fill-1"
+                  :fill/quantity "1"
+                  :fill/price "2.29"
+                  :broker/account-id "account/alpaca/chestnut-paper"
+                  :broker/order-id "bo-1"}})
+
+(def quote-fact
+  {:record/type :fact/option-chain-observed
+   :record/source-system :market-data/thetadata
+   :fact/occurred-at "2026-06-25T14:24:55Z"
+   :fact/payload {:chain/contracts
+                  [{:instrument/id "option/OPRA/SPY/2026-06-25/P/735.000"
+                    :quote/bid "2.27"
+                    :quote/ask "2.30"}]}})
+
+(deftest live-tape-normalizes-core-events
+  (let [rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])]
+    (is (= 3 (count rows)))
+    (testing "signal posture is explicit"
+      (is (= :posture/enter-short (:posture (first rows)))))
+    (testing "intent row carries target option leg"
+      (let [row (second rows)]
+        (is (= "intent" (:event-type row)))
+        (is (= "oi-1" (:order-intent-id row)))
+        (is (= "option/OPRA/SPY/2026-06-25/P/735.000"
+               (:instrument-id row)))))
+    (testing "fill row carries broker fill economics"
+      (let [row (nth rows 2)]
+        (is (= "fill" (:event-type row)))
+        (is (= "2.29" (:fill-price row)))
+        (is (= "bo-1" (:broker-order-id row)))))))
+
+(deftest calibration-matches-fill-to-nearest-quote
+  (let [rows (analysis/matched-fill-rows [intent-fact fill-fact quote-fact] 90.0)
+        row (first rows)]
+    (is (= 1 (count rows)))
+    (is (= :order-side/buy (:side row)))
+    (is (= 2.30 (:ask row)))
+    (is (= 2.29 (:price row)))
+    (is (< (abs (- 0.01 (:improvement row))) 1e-9))
+    (is (< (abs (- (/ 1.0 3.0) (:improvement-frac row))) 1e-9))))
+
+(deftest calibration-artifact-shrinks-sparse-buckets
+  (let [rows [{:side :order-side/buy :spread 0.01 :improvement 0.02
+               :lag-seconds 1.0}
+              {:side :order-side/buy :spread 0.01 :improvement 0.01
+               :lag-seconds 1.0}
+              {:side :order-side/sell :spread 0.05 :improvement -0.01
+               :lag-seconds 1.0}]
+        global (analysis/summarize-calibration-rows rows)
+        buckets (analysis/bucket-summaries rows global 30.0)]
+    (is (= 3 (:n global)))
+    (is (= 2 (count buckets)))
+    (is (every? #(contains? % :shrunk-conservative-price-improvement)
+                buckets))
+    (is (every? #(>= (:shrunk-conservative-price-improvement %) 0.0)
+                buckets))))
+
