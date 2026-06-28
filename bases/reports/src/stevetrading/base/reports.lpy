@@ -19,8 +19,9 @@
 
   CLI:
     basilisp run -n stevetrading.base.reports -- \\
-      --facts <out-dir>/facts.db --out <report-dir>"
-  (:import os os.path)
+      --facts <out-dir>/facts.db --out <report-dir> \\
+      [--sim-store <out-dir>/sim-broker.db]"
+  (:import os os.path sqlite3)
   (:require [stevetrading.domain.enums :as enums]
             [stevetrading.ledger.core :as ledger]
             [stevetrading.persistence.fact-store :as fs]
@@ -78,6 +79,57 @@
                     :net-positions (:view/net-positions view)}])
              views)))
 
+(defn- broker-account-observations
+  "Latest broker account-state observations by account id. These are
+  operational broker snapshots emitted by reconciliation/polling, not the
+  canonical ledger P&L projection."
+  [facts]
+  (reduce
+   (fn [acc f]
+     (let [pl (:fact/payload f)
+           aid (or (:broker/account-id pl) (:record/account-id f))]
+       (assoc acc aid
+              (select-keys pl [:broker/source-system
+                               :broker/observed-at
+                               :account/open-order-count
+                               :account/cash
+                               :account/realized-pnl
+                               :account/unrealized-pnl
+                               :account/gross-exposure
+                               :account/net-exposure
+                               :account/net-positions
+                               :account/open-lots
+                               :account/unmarked-instruments]))))
+   {}
+   (filter #(= :fact/broker-account-observed (:record/type %)) facts)))
+
+(defn sim-store-summary
+  "Read-only metadata from a durable sim broker SQLite journal."
+  [sim-store-path]
+  (cond
+    (nil? sim-store-path)
+    nil
+
+    (not (os.path/exists sim-store-path))
+    {:sim-store/path sim-store-path
+     :sim-store/exists? false}
+
+    :else
+    (try
+      (let [conn (sqlite3/connect sim-store-path)
+            row (.fetchone
+                 (.execute conn
+                           "SELECT updated_at, length(record) FROM sim_journal WHERE id = 'main'"))]
+        (.close conn)
+        {:sim-store/path sim-store-path
+         :sim-store/exists? true
+         :sim-store/updated-at (when row (nth row 0))
+         :sim-store/journal-bytes (or (when row (nth row 1)) 0)})
+      (catch python/Exception e
+        {:sim-store/path sim-store-path
+         :sim-store/exists? true
+         :sim-store/error (str e)}))))
+
 (defn build-summary
   "Pure: full ordered fact log (facts-since 0 output — envelopes with
   :fact-log/offset) → summary map. Shape:
@@ -97,8 +149,12 @@
                    :pnl/by-account {account-id view}}
      :summary/recovery [recovery event payloads, in order]
      :summary/faults [fault payloads, in order]
+     :summary/settlements [{:settlement/id .. :instrument/id ..
+                            :account/id .. :settlement/cash-amount ..} ...]
      :summary/skipped-ledger-fills [fill record ids without lineage]}"
-  [facts]
+  ([facts]
+   (build-summary facts {}))
+  ([facts {:keys [sim-store-path]}]
   (let [ctx-index (intent-ctx-index facts)
         {:keys [ledger skipped-fills]}
         (ledger/replay-ledger (ledger-stream facts)
@@ -133,7 +189,8 @@
         (->> facts
              (filter #(= :fact/fault-recorded (:record/type %)))
              (mapv (fn [f] (assoc (:fact/payload f)
-                                  :fact/occurred-at (:fact/occurred-at f)))))]
+                                  :fact/occurred-at (:fact/occurred-at f)))))
+        account-observations (broker-account-observations facts)]
     {:summary/fact-count (count facts)
      :summary/orders
      {:orders/intents-created (count-type facts :fact/order-intent-created)
@@ -165,7 +222,28 @@
       :pnl/by-account (pnl-views (:portfolio/by-account port))}
      :summary/recovery recovery-events
      :summary/faults faults
-     :summary/skipped-ledger-fills (vec skipped-fills)}))
+     :summary/settlements
+     (mapv (fn [f]
+             (let [pl (:fact/payload f)]
+               {:settlement/id (:settlement/id pl)
+                :settlement/type (:settlement/type pl)
+                :settlement/settled-at (:settlement/settled-at pl)
+                :instrument/id (:settlement/instrument-id pl)
+                :account/id (:settlement/account-id pl)
+                :strategy/id (:settlement/strategy-id pl)
+                :settlement/quantity (:settlement/quantity pl)
+                :settlement/price (:settlement/price pl)
+                :settlement/underlying-price
+                (:settlement/underlying-price pl)
+                :settlement/cash-amount (:settlement/cash-amount pl)
+                :settlement/realized-pnl
+                (:settlement/realized-pnl pl)}))
+           (filter #(= :fact/option-settlement-recorded
+                       (:record/type %))
+                   facts))
+     :summary/skipped-ledger-fills (vec skipped-fills)
+     :summary/broker-account-observations account-observations
+     :summary/sim-store (sim-store-summary sim-store-path)})))
 
 ;; ---------------------------------------------------------------------------
 ;; Markdown rendering
@@ -174,8 +252,9 @@
 (defn render-markdown
   "Human-readable summary.md content."
   [summary]
-  (let [{:summary/keys [orders fills pnl recovery faults fact-count
-                        skipped-ledger-fills]} summary
+  (let [{:summary/keys [orders fills settlements pnl recovery faults fact-count
+                        skipped-ledger-fills broker-account-observations
+                        sim-store]} summary
         lines
         (concat
          ["# Session Summary"
@@ -208,6 +287,23 @@
                         " | " (:account/id f) " |"))
                  fills)))
          [""
+          "## Option Settlements"
+          ""]
+         (if (empty? settlements)
+           ["(none)"]
+           (concat
+            ["| at | instrument | qty | price | cash | realized | account |"
+             "|---|---|---|---|---|---|---|"]
+            (map (fn [s]
+                   (str "| " (:settlement/settled-at s)
+                        " | " (:instrument/id s)
+                        " | " (:settlement/quantity s)
+                        " | " (:settlement/price s)
+                        " | " (:settlement/cash-amount s)
+                        " | " (:settlement/realized-pnl s)
+                        " | " (:account/id s) " |"))
+                 settlements)))
+         [""
           "## P&L"
           ""
           (str "Realized: " (:pnl/realized pnl)
@@ -227,6 +323,29 @@
            (map (fn [[aid view]]
                   (str "- " aid ": " (:realized-pnl view)))
                 (:pnl/by-account pnl)))
+         [""
+          "## Broker Account Observations"
+          ""]
+         (if (empty? broker-account-observations)
+           ["(none)"]
+           (map (fn [[aid obs]]
+                  (str "- " aid
+                       ": cash " (:account/cash obs)
+                       ", realized " (:account/realized-pnl obs)
+                       ", unrealized " (:account/unrealized-pnl obs)
+                       ", open orders " (:account/open-order-count obs)
+                       ", observed " (:broker/observed-at obs)))
+                broker-account-observations))
+         (when sim-store
+           [""
+            "## Sim Broker Store"
+            ""
+            (str "- path: " (:sim-store/path sim-store))
+            (str "- exists: " (:sim-store/exists? sim-store))
+            (str "- updated: " (or (:sim-store/updated-at sim-store) "-"))
+            (str "- journal bytes: "
+                 (or (:sim-store/journal-bytes sim-store) 0))
+            (str "- error: " (or (:sim-store/error sim-store) "-"))])
          [""
           (str "## Recovery Events (" (count recovery) ")")
           ""]
@@ -260,10 +379,10 @@
 (defn write-report!
   "Open the fact db, build the summary, write <out>/summary.edn and
   <out>/summary.md. Returns the summary."
-  [{:keys [facts-path out-dir]}]
+  [{:keys [facts-path out-dir sim-store-path]}]
   (let [store (fs/make-fact-store facts-path)
         facts (p/facts-since store 0)
-        summary (build-summary facts)]
+        summary (build-summary facts {:sim-store-path sim-store-path})]
     (os/makedirs out-dir ** :exist_ok true)
     (spit (os.path/join out-dir "summary.edn") (pr-str summary))
     (spit (os.path/join out-dir "summary.md") (render-markdown summary))
@@ -283,15 +402,18 @@
 (defn -main
   "CLI entry:
     basilisp run -n stevetrading.base.reports -- \\
-      --facts <dir>/facts.db --out <report-dir>"
+      --facts <dir>/facts.db --out <report-dir> \\
+      [--sim-store <dir>/sim-broker.db]"
   [& args]
-  (let [{:keys [facts out]} (parse-args args)]
+  (let [{:keys [facts out sim-store]} (parse-args args)]
     (when (or (nil? facts) (nil? out))
       (println "usage: basilisp run -n stevetrading.base.reports --"
                "--facts <facts.db> --out <dir>")
       (throw (ex-info "missing required --facts/--out"
                       {:error/code :error/missing-cli-args})))
-    (let [summary (write-report! {:facts-path facts :out-dir out})]
+    (let [summary (write-report! {:facts-path facts
+                                  :out-dir out
+                                  :sim-store-path sim-store})]
       (println (str "wrote " (os.path/join out "summary.edn")
                     " and " (os.path/join out "summary.md")))
       summary)))

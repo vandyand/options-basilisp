@@ -2,7 +2,7 @@
   "Phase 11 reports base tests: the summary over a completed replay
   session must agree with (a) raw fact-log counts and (b) the portfolio
   derivation the runtime itself produced."
-  (:import os.path tempfile)
+  (:import os.path sqlite3 tempfile)
   (:require [basilisp.edn :as edn]
             [basilisp.test :refer [deftest is testing]]
             [helpers.recovery-helpers :as h]
@@ -102,7 +102,66 @@
       (is (.startswith md "# Session Summary"))
       (is (>= (.find md "## Orders") 0))
       (is (>= (.find md "## Fills") 0))
+      (is (>= (.find md "## Option Settlements") 0))
       (is (>= (.find md "## P&L") 0))
       (is (>= (.find md "Realized: ") 0))
       (is (>= (.find md "## Recovery Events") 0))
       (is (>= (.find md "## Faults") 0)))))
+
+(deftest summary-includes-sim-store-and-broker-account-observations
+  (let [sim-db (os.path/join (tempfile/mkdtemp) "sim-broker.db")
+        conn (sqlite3/connect sim-db)
+        _ (.execute conn
+                    "CREATE TABLE sim_journal (id TEXT PRIMARY KEY, record TEXT NOT NULL, updated_at TEXT NOT NULL)")
+        _ (.execute conn
+                    "INSERT INTO sim_journal (id, record, updated_at) VALUES ('main', '{:orders {}}', '2026-06-23T20:55:00Z')")
+        _ (.commit conn)
+        _ (.close conn)
+        facts [{:record/type :fact/broker-account-observed
+                :record/account-id "account/sim/test"
+                :fact/payload
+                {:broker/source-system :broker/sim
+                 :broker/account-id "account/sim/test"
+                 :broker/observed-at "2026-06-23T20:55:01Z"
+                 :account/open-order-count 0
+                 :account/cash "12.34"
+                 :account/realized-pnl "1.00"
+                 :account/unrealized-pnl "0.50"
+                 :account/net-positions {}}}
+               {:record/type :fact/option-settlement-recorded
+                :record/account-id "account/sim/test"
+                :record/instrument-id
+                "option/OPRA/SPY/2026-06-19/C/550.000"
+                :fact/occurred-at "2026-06-19T20:00:00Z"
+                :fact/recorded-at "2026-06-19T20:00:00Z"
+                :fact/dedupe-key "settlement/sim/test"
+                :fact/payload
+                {:settlement/id "settlement/sim/test"
+                 :settlement/type :settlement/option-expiration
+                 :settlement/account-id "account/sim/test"
+                 :settlement/strategy-id "strategy/test"
+                 :settlement/instrument-id
+                 "option/OPRA/SPY/2026-06-19/C/550.000"
+                 :settlement/quantity "1"
+                 :settlement/price "5.00"
+                 :settlement/underlying-price "555.00"
+                 :settlement/cash-amount "5.00"
+                 :settlement/realized-pnl "3.00"
+                 :settlement/settled-at "2026-06-19T20:00:00Z"
+                 :lot/id "lot-test"
+                 :lot/side :order-side/buy}}]
+        summary (rep/build-summary facts {:sim-store-path sim-db})
+        md (rep/render-markdown summary)]
+    (is (= true (get-in summary [:summary/sim-store
+                                 :sim-store/exists?])))
+    (is (= "2026-06-23T20:55:00Z"
+           (get-in summary [:summary/sim-store
+                            :sim-store/updated-at])))
+    (is (= "12.34"
+           (get-in summary [:summary/broker-account-observations
+                            "account/sim/test"
+                            :account/cash])))
+    (is (= 1 (count (:summary/settlements summary))))
+    (is (>= (.find md "## Broker Account Observations") 0))
+    (is (>= (.find md "## Option Settlements") 0))
+    (is (>= (.find md "## Sim Broker Store") 0))))
