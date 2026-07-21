@@ -144,6 +144,8 @@ log "installing systemd units"
 ssh "$HOST" "sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/theta-terminal.service' /etc/systemd/system/theta-terminal.service && \
   sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-six.service' /etc/systemd/system/stevetrading-six.service && \
   sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-six.timer' /etc/systemd/system/stevetrading-six.timer && \
+  sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-broker-flatten.service' /etc/systemd/system/stevetrading-broker-flatten.service && \
+  sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-broker-flatten.timer' /etc/systemd/system/stevetrading-broker-flatten.timer && \
   sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-watchdog.service' /etc/systemd/system/stevetrading-watchdog.service && \
   sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-watchdog.timer' /etc/systemd/system/stevetrading-watchdog.timer && \
   sudo cp '$REMOTE_RELEASE/projects/ops/scripts/systemd/stevetrading-reports-build.service' /etc/systemd/system/stevetrading-reports-build.service && \
@@ -196,6 +198,7 @@ if [[ "${DISABLE_LIVE_AFTER_DEPLOY:-0}" == "1" ]]; then
   ssh "$HOST" "sudo systemctl disable --now stevetrading-six.service >/dev/null 2>&1 || true; \
     sudo systemctl disable --now stevetrading-six.timer >/dev/null 2>&1 || true; \
     sudo systemctl disable --now stevetrading-watchdog.timer >/dev/null 2>&1 || true; \
+    sudo systemctl disable --now stevetrading-broker-flatten.timer >/dev/null 2>&1 || true; \
     sudo systemctl disable --now stevetrading-market-evidence-preflight.timer >/dev/null 2>&1 || true; \
     sudo systemctl disable --now stevetrading-market-evidence-capture-smoke.timer >/dev/null 2>&1 || true; \
     sudo systemctl disable --now stevetrading-market-evidence-collect.timer >/dev/null 2>&1 || true; \
@@ -205,5 +208,5 @@ else
 fi
 
 log "deployed $RELEASE_ID"
-log "cutover when ready: ssh $HOST 'sudo systemctl enable --now stevetrading-six.timer stevetrading-watchdog.timer stevetrading-reports-build.timer stevetrading-status-dashboard.timer stevetrading-market-evidence-preflight.timer stevetrading-market-evidence-capture-smoke.timer stevetrading-market-evidence-collect.timer stevetrading-raw-thetadata-parity.timer'"
+log "cutover when ready: ssh $HOST 'sudo systemctl enable --now stevetrading-six.timer stevetrading-watchdog.timer stevetrading-broker-flatten.timer stevetrading-reports-build.timer stevetrading-status-dashboard.timer stevetrading-market-evidence-preflight.timer stevetrading-market-evidence-capture-smoke.timer stevetrading-market-evidence-collect.timer stevetrading-raw-thetadata-parity.timer'"
 log "manual market-hours incident start: ssh $HOST 'sudo systemctl start stevetrading-six.service'"

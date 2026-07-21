@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the independent paper-broker end-of-day flatten safeguard
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 15:46:00 America/New_York
+Persistent=true
+Unit=stevetrading-broker-flatten.service
+
+[Install]
+WantedBy=timers.target

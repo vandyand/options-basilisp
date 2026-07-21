@@ -64,6 +64,22 @@
                             "Restart=on-failure"
                             "RestartSec=5min"])))
 
+(deftest broker-flatten-is-independent-of-the-strategy-session
+  (let [timer (read-file "projects/ops/scripts/systemd/stevetrading-broker-flatten.timer")
+        service (read-file "projects/ops/scripts/systemd/stevetrading-broker-flatten.service")
+        safety (read-file "scripts/alpaca_position_safety.py")
+        session (read-file "scripts/steve_six_session.sh")]
+    (contains-all? timer ["OnCalendar=Mon..Fri *-*-* 15:46:00 America/New_York"
+                          "Unit=stevetrading-broker-flatten.service"
+                          "Persistent=true"])
+    (contains-all? service ["alpaca_position_safety.py --mode flatten"
+                            "Restart=on-failure"])
+    (contains-all? safety ["GET", "/positions", "DELETE", "/orders"
+                           "close request for"])
+    (contains-all? session ["reconciling Alpaca paper positions"
+                            "alpaca_position_safety.py"
+                            "--mode flatten"])))
+
 (deftest theta-terminal-restarts-only-on-real-failure
   (let [service (read-file "projects/ops/scripts/systemd/theta-terminal.service")]
     (contains-all? service ["Restart=on-failure"
