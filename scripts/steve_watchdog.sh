@@ -49,6 +49,7 @@ BAR_FRESH_SECONDS=420      # bars within 7 min = the engine is alive/ingesting
 NTFY_TOPIC="${STEVE_NTFY_TOPIC:-}"
 SYSTEMD_SIX_UNIT="${STEVE_SIX_SYSTEMD_UNIT:-stevetrading-six.service}"
 POST_RELAUNCH_VERIFY_SECONDS="${STEVE_POST_RELAUNCH_VERIFY_SECONDS:-20}"
+export STEVE_REPO_ROOT="$REPO"
 
 NYSE_HOLIDAYS="2026-06-19 2026-07-03 2026-09-07 2026-11-26 2026-12-25"
 
@@ -77,6 +78,15 @@ is_session_window() {
 }
 
 launcher_alive() { pgrep -f "launch_steve_six\.lpy" >/dev/null 2>&1; }
+
+service_active() {
+    command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet "$SYSTEMD_SIX_UNIT" >/dev/null 2>&1
+}
+
+session_alive() {
+    launcher_alive || service_active
+}
 
 terminal_healthy() {
     [[ "$("$LIFECYCLE" status 2>/dev/null | awk -F': ' '/^health/{print $2}')" == "ok" ]]
@@ -188,7 +198,7 @@ recover() {
     fi
 
     sleep "$POST_RELAUNCH_VERIFY_SECONDS"
-    if launcher_alive; then
+    if session_alive; then
         log "orchestrator relaunch verified alive after ${POST_RELAUNCH_VERIFY_SECONDS}s"
     else
         alert "session fault ($reason): relaunch did not stay alive after ${POST_RELAUNCH_VERIFY_SECONDS}s. Last orchestrator lines: $(tail -20 "$ORCH_LOG" 2>/dev/null | tr '\n' ' ' | tail -c 1000)"
@@ -200,7 +210,7 @@ main() {
         log "outside session window — nothing to check"; exit 0
     fi
 
-    if ! launcher_alive; then
+    if ! session_alive; then
         recover "launcher process DOWN"
     elif decisions_stalled; then
         recover "decision pipeline STALLED (equity bars flowing but no signal/order facts > ${STALL_SECONDS}s)"

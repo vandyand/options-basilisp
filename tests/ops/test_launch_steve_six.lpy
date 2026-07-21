@@ -1,0 +1,47 @@
+(ns ops.test-launch-steve-six
+  (:import basilisp.lang.reader os pathlib re)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def launcher (.joinpath root "scripts" "launch_steve_six.lpy"))
+
+(defn read-launcher []
+  (.read_text launcher))
+
+(deftest launch-steve-six-reader-valid
+  (with-open [r (open (str launcher))]
+    (let [forms (vec (iterator-seq (basilisp.lang.reader/read r)))]
+      (is (> (count forms) 80)))))
+
+(deftest launch-steve-six-uses-host-method-call-for-datetime-parsing
+  (let [text (read-launcher)]
+    (is (nil? (re/search #"dt-cls/fromisoformat" text)))
+    (is (str/includes? text "(.fromisoformat dt-cls"))))
+
+(deftest launch-steve-six-throttles-extra-option-surface-refresh
+  (let [text (read-launcher)]
+    (is (str/includes? text "STEVE_EXTRA_OPTION_REFRESH_SECONDS"))
+    (is (str/includes? text "(def extra-option-refresh-mono"))
+    (is (str/includes? text "(refresh-extra-option-surfaces! br \"prime\")"))
+    (is (str/includes? text "(>= (- now @extra-option-refresh-mono)"))))
+
+(deftest launch-steve-six-seed-falls-back-to-thetadata-history
+  (let [text (read-launcher)]
+    (is (str/includes? text "(defn- fetch-theta-bars-for-date"))
+    (is (str/includes? text "/v3/stock/history/ohlc"))
+    (is (str/includes? text "(defn fetch-seed-bars"))
+    (is (str/includes? text "seed fallback: using ThetaData bars"))
+    (is (some? (re/search #"\(def bars-seed\s+\(into \{\} \(map \(fn \[s\] \[s \(fetch-seed-bars s seed-bar-count\)\]\) stock-syms\)\)\)" text)))
+    (is (nil? (re/search #"\(def bars-seed\s+\(into \{\} \(map \(fn \[s\] \[s \(fetch-bars s seed-bar-count\)\]\) stock-syms\)\)\)" text)))))
+
+(deftest launch-steve-six-preserves-live-bar-vwap-and-count
+  (let [text (read-launcher)]
+    (is (str/includes? text ":vwap (python/float (or (:bar/vwap payload)"))
+    (is (str/includes? text ":trade-count (python/int (or (:bar/trade-count payload) 0))"))))
+
+(deftest launch-steve-six-has-opt-in-thetadata-stock-source
+  (let [text (read-launcher)]
+    (is (str/includes? text "STEVE_STOCK_BAR_SOURCE"))
+    (is (str/includes? text "make-thetadata-stock-bars-source"))
+    (is (str/includes? text ":seed-latest? true"))))

@@ -1,0 +1,1228 @@
+(ns stevetrading.current-pnl.core
+  "Current-day P&L table generation.
+
+  This is the Basilisp port of scripts/current_pnl.py. It is read-only:
+  live Alpaca rows come from broker REST observations, and sim rows come from
+  local facts.db/sim-broker.db projections."
+  (:import datetime decimal glob json math os os.path re sqlite3 urllib.request
+           zoneinfo)
+  (:require [basilisp.string :as bstr]))
+
+(def et (zoneinfo/ZoneInfo "America/New_York"))
+(def bots ["CHESTNUT" "LYNX" "MOOSE" "PARROT" "OAK" "DOLPHIN"])
+
+(def section-live "HETZNER / LIVE ALPACA PAPER")
+(def section-sim-shadow "LOCAL / SIM SHADOWS")
+(def section-sim-experiments "LOCAL / SIM EXPERIMENTS")
+(def section-other-alpaca "ALPACA / OTHER")
+
+(defn default-ref-env
+  []
+  (or (first (filter os.path/exists
+                     [(os.path/expanduser
+                       "~/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor/.env")
+                      "/opt/stevetrading/shared/Data-Preprocessor/.env"
+                      "/etc/stevetrading/env"]))
+      (os.path/expanduser
+       "~/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor/.env")))
+
+(defn default-bashrc
+  []
+  (os.path/expanduser "~/.bashrc"))
+
+(defn default-repo-root
+  []
+  (os.path/abspath
+   (os.path/join (os.path/dirname (or (.-__file__ *ns*) "scripts/current_pnl.lpy"))
+                 "..")))
+
+(defn- now-et
+  []
+  (datetime.datetime/now et))
+
+(defn- today-iso
+  []
+  (.isoformat (.date (now-et))))
+
+(defn- session-open
+  []
+  (let [n (now-et)
+        d (.date n)]
+    (datetime.datetime/combine d (datetime/time 9 30) et)))
+
+(defn- session-close
+  []
+  (let [n (now-et)
+        d (.date n)]
+    (datetime.datetime/combine d (datetime/time 16 0) et)))
+
+(defn- clamp-dt
+  [dt lower upper]
+  (cond
+    (< (.timestamp dt) (.timestamp lower)) lower
+    (> (.timestamp dt) (.timestamp upper)) upper
+    :else dt))
+
+(defn safe-slurp
+  [path]
+  (try
+    (slurp path)
+    (catch python/Exception _ "")))
+
+(defn env-creds
+  [text prefix]
+  (let [pat (re/compile (str "^(?:export )?" prefix "_API_KEY=(.+)$") re/M)
+        spat (re/compile (str "^(?:export )?" prefix "_API_SECRET=(.+)$") re/M)
+        k (.search pat text)
+        s (.search spat text)]
+    (when (and k s)
+      [(.strip (.group k 1)) (.strip (.group s 1))])))
+
+(defn default-http-json
+  [url key secret]
+  (let [req (urllib.request/Request url)]
+    (.add-header req "APCA-API-KEY-ID" key)
+    (.add-header req "APCA-API-SECRET-KEY" secret)
+    (.add-header req "Accept" "application/json")
+    (let [resp (urllib.request/urlopen req ** :timeout 15)]
+      (json/loads (.decode (.read resp) "utf-8")))))
+
+(defn- ->float
+  ([x] (->float x 0.0))
+  ([x default]
+   (if (nil? x) default (python/float x))))
+
+(defn- ->dec
+  ([x] (->dec x "0"))
+  ([x default]
+   (decimal/Decimal (str (if (nil? x) default x)))))
+
+(defn- dec-abs
+  [x]
+  (if (< (compare x (->dec "0")) 0)
+    (- x)
+    x))
+
+(defn- env-or
+  [k default]
+  (or (os/getenv k) default))
+
+(defn fmt-money
+  [value]
+  (try
+    (if (nil? value)
+      "n/a"
+      (let [n (python/float value)]
+        (if (math/isfinite n)
+          (python/format n "+,.2f")
+          "n/a")))
+    (catch python/Exception _ "n/a")))
+
+(defn fmt-plain-money
+  [value]
+  (try
+    (if (nil? value)
+      "n/a"
+      (let [n (python/float value)]
+        (if (math/isfinite n)
+          (python/format n ",.2f")
+          "n/a")))
+    (catch python/Exception _ "n/a")))
+
+(defn fmt-md-money
+  [value]
+  (let [formatted (fmt-money value)]
+    (if (= formatted "n/a") "n/a" (str "$" formatted))))
+
+(defn fmt-md-plain-money
+  [value]
+  (let [formatted (fmt-plain-money value)]
+    (if (= formatted "n/a") "n/a" (str "$" formatted))))
+
+(defn md-cell
+  [value]
+  (-> (str value)
+      (.replace "|" "\\|")
+      (.replace "\n" " ")))
+
+(defn fmt-qty
+  [value]
+  (let [text (python/format (.normalize (->dec value)) "f")]
+    (if (>= (.find text ".") 0)
+      (.rstrip (.rstrip text "0") ".")
+      text)))
+
+(def ^:private occ-re (re/compile "^([A-Z]+)(\\d{6})([CP])(\\d{8})$"))
+
+(defn format-alpaca-symbol
+  [symbol]
+  (let [m (.match occ-re (or symbol ""))]
+    (if-not m
+      symbol
+      (let [root (.group m 1)
+            yymmdd (.group m 2)
+            right (.group m 3)
+            strike (/ (->dec (.group m 4)) (->dec "1000"))]
+        (str root " 20" (subs yymmdd 0 2) "-" (subs yymmdd 2 4)
+             "-" (subs yymmdd 4 6) " " right (fmt-qty strike))))))
+
+(defn- parse-fill-time
+  [s]
+  (.astimezone
+   (datetime.datetime/fromisoformat (.replace s "Z" "+00:00"))
+   et))
+
+(defn today-fills
+  [http-json key secret]
+  (loop [fills []
+         token nil]
+    (let [url (str "https://paper-api.alpaca.markets/v2/account/activities/FILL"
+                   "?date=" (today-iso) "&page_size=100"
+                   (when token (str "&page_token=" token)))
+          batch (http-json url key secret)]
+      (if (or (nil? batch) (zero? (count batch)))
+        (vec (sort-by #(get % "transaction_time") fills))
+        (let [fills' (vec (concat fills batch))]
+          (if (< (count batch) 100)
+            (vec (sort-by #(get % "transaction_time") fills'))
+            (recur fills' (get (last batch) "id"))))))))
+
+(defn episode-stats
+  [fills open-positions]
+  (let [open (session-open)
+        close (session-close)
+        now (clamp-dt (now-et) open close)
+        explained (atom {})]
+    (doseq [f fills]
+      (let [side (if (.startswith (get f "side") "buy") 1.0 -1.0)
+            sym (get f "symbol")]
+        (swap! explained update sym (fnil + 0.0) (* side (->float (get f "qty"))))))
+    (let [carry (boolean
+                 (some (fn [p]
+                         (> (math/fabs (- (->float (get p "qty"))
+                                           (get @explained (get p "symbol") 0.0)))
+                            1e-9))
+                       open-positions))
+          initial-since (when carry open)
+          state (loop [remaining (seq fills)
+                       qty {}
+                       episodes []
+                       since initial-since]
+                  (if-not remaining
+                    {:qty qty :episodes episodes :since since}
+                    (let [f (first remaining)
+                          t (parse-fill-time (get f "transaction_time"))
+                          side (if (.startswith (get f "side") "buy") 1.0 -1.0)
+                          sym (get f "symbol")
+                          was-flat (every? #(< (math/fabs %) 1e-9) (vals qty))
+                          qty' (update qty sym (fnil + 0.0)
+                                       (* side (->float (get f "qty"))))
+                          is-flat (every? #(< (math/fabs %) 1e-9) (vals qty'))]
+                      (cond
+                        (and was-flat (not is-flat) (nil? since))
+                        (recur (next remaining) qty' episodes t)
+
+                        (and (not was-flat) is-flat (some? since))
+                        (recur (next remaining) qty' (conj episodes [since t]) nil)
+
+                        :else
+                        (recur (next remaining) qty' episodes since)))))
+          open-episode (some? (:since state))
+          episodes (if open-episode
+                     (conj (:episodes state) [(:since state) now])
+                     (:episodes state))
+            in-mkt (reduce + 0.0 (map (fn [[a b]]
+                                         (max 0.0 (- (.timestamp b) (.timestamp a))))
+                                      episodes))
+            session (max 1.0 (- (.timestamp now) (.timestamp open)))
+            completed (if open-episode (vec (butlast episodes)) episodes)
+            avg-min (when (seq completed)
+                      (/ (reduce + 0.0
+                                 (map (fn [[a b]]
+                                        (- (.timestamp b) (.timestamp a)))
+                                      completed))
+                         (count completed)
+                         60.0))
+            n (count completed)]
+        {:trades (if open-episode (str n "+1o") (str n))
+         :closed-trades n
+         :open-trades (if open-episode 1 0)
+         :pct-in-mkt (min 100.0 (* 100.0 (/ in-mkt session)))
+         :avg-trade-min avg-min
+         :fills (count fills)})))
+
+(defn alpaca-account-row
+  [{:keys [name key secret section http-json]}]
+  (let [http-json (or http-json default-http-json)]
+    (try
+      (let [acct (http-json "https://paper-api.alpaca.markets/v2/account" key secret)
+            positions (http-json "https://paper-api.alpaca.markets/v2/positions" key secret)
+            equity (->float (get acct "equity"))
+            last-equity (->float (get acct "last_equity"))
+            cash (->float (get acct "cash"))
+            buying-power (->float (get acct "buying_power"))
+            pnl (- equity last-equity)
+            unrealized (reduce + 0.0
+                               (map #(->float (or (get % "unrealized_intraday_pl")
+                                                  (get % "unrealized_pl")
+                                                  0.0))
+                                    positions))
+            realized (- pnl unrealized)
+            gross-mv (reduce + 0.0
+                             (map #(math/fabs (->float (get % "market_value")))
+                                  positions))
+            long-positions (count (filter #(> (->float (get % "qty")) 0.0)
+                                          positions))
+            short-positions (count (filter #(< (->float (get % "qty")) 0.0)
+                                           positions))
+            pos (let [p (bstr/join
+                         ", "
+                         (map #(str (format-alpaca-symbol (get % "symbol"))
+                                    ":" (get % "qty"))
+                              positions))]
+                  (if (empty? p) "flat" p))
+            stats (merge (episode-stats (today-fills http-json key secret) positions)
+                         {:section (or section section-live)
+                          :equity equity
+                          :last-equity last-equity
+                          :cash cash
+                          :buying-power buying-power
+                          :unrealized unrealized
+                          :realized-est realized
+                          :gross-mv gross-mv
+                          :open-positions (count positions)
+                          :long-positions long-positions
+                          :short-positions short-positions
+                          :include-in-total true})]
+        {:name name :pnl pnl :stats stats :position pos})
+      (catch python/Exception e
+        {:name name
+         :pnl nil
+         :stats {:trades "?"
+                 :pct-in-mkt 0.0
+                 :closed-trades 0
+                 :open-trades 0
+                 :avg-trade-min nil
+                 :fills 0
+                 :equity nil
+                 :last-equity nil
+                 :cash nil
+                 :buying-power nil
+                 :unrealized nil
+                 :realized-est nil
+                 :gross-mv nil
+                 :open-positions 0
+                 :long-positions 0
+                 :short-positions 0
+                 :include-in-total false
+                 :source-error true
+                 :section (or section section-live)}
+         :position (str "(" (.-__name__ (python/type e)) ")")}))))
+
+(defn- record-decimal
+  ([record key] (record-decimal record key nil))
+  ([record key default]
+   (let [m (.search (re/compile (str (re/escape key) " \"([^\"]+)\""))
+                    (or record ""))]
+     (if m (->dec (.group m 1)) default))))
+
+(defn- record-string
+  ([record key] (record-string record key nil))
+  ([record key default]
+   (let [m (.search (re/compile (str (re/escape key) " \"([^\"]+)\""))
+                    (or record ""))]
+     (if m (.group m 1) default))))
+
+(defn- record-keyword
+  ([record key] (record-keyword record key nil))
+  ([record key default]
+   (let [m (.search (re/compile (str (re/escape key)
+                                      " (:?[A-Za-z0-9_./-]+)"))
+                    (or record ""))]
+     (if m (.group m 1) default))))
+
+(defn instrument-multiplier
+  [instrument-id]
+  (if (.startswith (str instrument-id) "option/") (->dec "100") (->dec "1")))
+
+(defn instrument-short-name
+  [instrument-id]
+  (let [parts (.split (str instrument-id) "/")]
+    (if (and (>= (count parts) 6) (= "option" (first parts)))
+      (str (nth parts 2) " " (nth parts 3) " " (nth parts 4)
+           (fmt-qty (nth parts 5)))
+      (if (seq parts) (last parts) (str instrument-id)))))
+
+(defn- part-after
+  [parts marker]
+  (try
+    (nth parts (inc (.index parts marker)))
+    (catch python/Exception _ nil)))
+
+(defn short-sim-strategy-label
+  [strategy-id]
+  (if (empty? (str strategy-id))
+    "LOCAL-UNKNOWN"
+    (let [parts (.split (str strategy-id) "/")]
+      (cond
+        (and (>= (count parts) 3)
+             (= "strategy" (first parts))
+             (contains? {"sim-direction" "SIM-DIR"
+                         "sim-term" "SIM-TERM"
+                         "sim-vol" "SIM-VOL"
+                         "v2-term" "V2-TERM"
+                         "v2-vol" "V2-VOL"}
+                        (second parts)))
+        (str (get {"sim-direction" "SIM-DIR"
+                   "sim-term" "SIM-TERM"
+                   "sim-vol" "SIM-VOL"
+                   "v2-term" "V2-TERM"
+                   "v2-vol" "V2-VOL"}
+                  (second parts))
+             "-"
+             (.upper (nth parts 2)))
+
+        (some #{"sim-local-sma"} parts)
+        (let [name (part-after parts "sim-local-sma")
+              m (when name (.match (re/compile "sma-(\\d+)-(\\d+)$") name))]
+          (if m
+            (str "LOCAL-SMA-" (.group m 1) "/" (.group m 2))
+            (str "LOCAL-SMA-" (.replace (or name "") "sma-" ""))))
+
+        (some #{"sim-local-canary"} parts)
+        (let [suffix (or (part-after parts "sim-local-canary") "unknown")]
+          (str "LOCAL-CAN-" (.upper (last (.split suffix "-")))))
+
+        :else
+        (str "LOCAL-" (.upper (.replace (nth parts (max 0 (- (count parts) 2)))
+                                        "-" "")))))))
+
+(defn sim-account-label
+  [account-id]
+  (cond
+    (and (.startswith account-id "account/alpaca/")
+         (.endswith account-id "-paper"))
+    (str (.upper (.replace (last (.split account-id "/")) "-paper" "")) "-SIM")
+
+    (= account-id "account/sim/local-fleet") "LOCAL-FLEET"
+    (= account-id "account/sim/vol-term") "VOL-TERM"
+    (= account-id "account/sim/v2-vol") "V2-VOL"
+    :else (.upper (last (.split account-id "/")))))
+
+(defn sim-section-for-account
+  [account-id]
+  (if (.startswith account-id "account/alpaca/")
+    section-sim-shadow
+    section-sim-experiments))
+
+(defn sim-account-ids-for-store
+  [store]
+  (cond
+    (>= (.find store "v2vol") 0) ["account/sim/v2-vol"]
+    (>= (.find store "sim-local-fleet-") 0) ["account/sim/local-fleet"]
+    (>= (.find store "steve-session-") 0)
+    (mapv #(str "account/alpaca/" (.lower %) "-paper") bots)
+    :else ["account/sim/vol-term"]))
+
+(defn sim-store-candidates
+  [repo-root]
+  (let [today (today-iso)
+        patterns [(os.path/join repo-root "live_runtime"
+                                (str "sim-vt-session-" today "*")
+                                "sim-broker.db")
+                  (os.path/join repo-root "live_runtime"
+                                (str "sim-local-fleet-" today "*")
+                                "sim-broker.db")
+                  (os.path/join repo-root "live_runtime"
+                                (str "steve-session-" today "*")
+                                "sim-broker.db")]
+        candidates (atom [])]
+    (doseq [pattern patterns
+            path (glob/glob pattern)]
+      (when (> (os.path/getsize path) 0)
+        (try
+          (let [facts-db (os.path/join (os.path/dirname path) "facts.db")
+                fact-ts (when (os.path/exists facts-db)
+                          (let [conn (sqlite3/connect facts-db)]
+                            (try
+                              (let [row (.fetchone
+                                         (.execute conn
+                                                   "select max(occurred_at) from facts"))]
+                                (when row (nth row 0)))
+                              (finally (.close conn)))))
+                conn (sqlite3/connect path)
+                journal-ts (try
+                             (let [row (.fetchone
+                                        (.execute conn
+                                                  "select updated_at from sim_journal where id = 'main'"))]
+                               (when row (nth row 0)))
+                             (finally (.close conn)))]
+            (when (or fact-ts journal-ts)
+              (swap! candidates conj [(or fact-ts "") (or journal-ts "") path])))
+          (catch sqlite3/Error _ nil))))
+    @candidates))
+
+(defn latest-sim-stores-by-account
+  [repo-root]
+  (let [latest (atom {})]
+    (doseq [[fact-ts journal-ts path] (sim-store-candidates repo-root)]
+      (let [key [fact-ts journal-ts path]]
+        (doseq [account-id (sim-account-ids-for-store path)]
+          (when (or (not (contains? @latest account-id))
+                    (pos? (compare key (first (get @latest account-id)))))
+            (swap! latest assoc account-id [key path account-id])))))
+    (mapv (fn [[_ [_ path account-id]]] [path account-id])
+          (sort-by (fn [[_ [key _ _]]] key) @latest))))
+
+(defn sim-counts
+  [facts-db {:keys [account-id strategy-id strategy-ids]}]
+  (if-not (os.path/exists facts-db)
+    {:fills 0 :trades "0" :closed-trades 0 :open-trades 0
+     :pct-in-mkt 0.0 :avg-trade-min nil}
+    (let [open (session-open)
+          close (session-close)
+          now (clamp-dt (now-et) open close)
+          filters (atom [])
+          params (atom [])]
+      (when account-id
+        (swap! filters conj "account_id = ?")
+        (swap! params conj account-id))
+      (when strategy-id
+        (swap! filters conj "strategy_id = ?")
+        (swap! params conj strategy-id))
+      (when (seq strategy-ids)
+        (swap! filters conj (str "strategy_id in ("
+                                 (bstr/join "," (repeat (count strategy-ids) "?"))
+                                 ")"))
+        (swap! params into strategy-ids))
+      (let [where-extra (if (seq @filters)
+                          (str " and " (bstr/join " and " @filters))
+                          "")
+            conn (sqlite3/connect facts-db)
+            fills (nth (.fetchone
+                        (.execute conn
+                                  (str "select count(*) from facts where "
+                                       "fact_type = ':fact/fill-observed'"
+                                       where-extra)
+                                  (python/tuple @params)))
+                       0)
+            rows (try
+                   (.fetchall
+                    (.execute conn
+                              (str "select fact_type, occurred_at from facts "
+                                   "where fact_type in "
+                                   "(':fact/position-lot-opened',"
+                                   "':fact/position-lot-closed')"
+                                   where-extra
+                                   " order by occurred_at, \"offset\"")
+                              (python/tuple @params)))
+                   (finally (.close conn)))
+            state (loop [remaining (seq rows)
+                         open-lots 0
+                         episodes []
+                         since nil]
+                    (if-not remaining
+                      {:open-lots open-lots :episodes episodes :since since}
+                      (let [[fact-type occurred-at] (first remaining)
+                            ts (.astimezone
+                                (datetime.datetime/fromisoformat
+                                 (.replace occurred-at "Z" "+00:00"))
+                                et)
+                            was-flat (zero? open-lots)
+                            open-lots' (if (= fact-type ":fact/position-lot-opened")
+                                         (inc open-lots)
+                                         (max 0 (- open-lots 1)))
+                            is-flat (zero? open-lots')]
+                        (cond
+                          (and was-flat (not is-flat) (nil? since))
+                          (recur (next remaining) open-lots' episodes ts)
+
+                          (and (not was-flat) is-flat (some? since))
+                          (recur (next remaining) open-lots'
+                                 (conj episodes [since ts]) nil)
+
+                          :else
+                          (recur (next remaining) open-lots' episodes since)))))
+            open-episode (some? (:since state))
+            episodes (if open-episode
+                       (conj (:episodes state) [(:since state) now])
+                       (:episodes state))]
+        (let [open-episode open-episode
+              episodes episodes
+              in-mkt (reduce + 0.0
+                             (map (fn [[a b]]
+                                    (max 0.0 (- (.timestamp b) (.timestamp a))))
+                                  episodes))
+              session (max 1.0 (- (.timestamp now) (.timestamp open)))
+              completed (if open-episode (vec (butlast episodes)) episodes)
+              avg-min (when (seq completed)
+                        (/ (reduce + 0.0
+                                   (map (fn [[a b]]
+                                          (- (.timestamp b) (.timestamp a)))
+                                        completed))
+                           (count completed)
+                           60.0))]
+          {:fills (python/int (or fills 0))
+           :trades (if open-episode
+                     (str (count completed) "+1o")
+                     (str (count completed)))
+           :closed-trades (count completed)
+           :open-trades (if open-episode 1 0)
+           :pct-in-mkt (min 100.0 (* 100.0 (/ in-mkt session)))
+           :avg-trade-min avg-min})))))
+
+(defn latest-market-marks
+  [facts-db]
+  (let [marks (atom {})]
+    (when (os.path/exists facts-db)
+      (let [conn (sqlite3/connect facts-db)
+            rows (.fetchall
+                  (.execute conn
+                            "select instrument_id, record from facts where fact_type = ':fact/market-bar-observed' and instrument_id is not null order by occurred_at, \"offset\""))
+            option-rows (.fetchall
+                         (.execute conn
+                                   "select record from facts where fact_type = ':fact/option-chain-observed' order by occurred_at, \"offset\""))
+            contract-re (re/compile "\\{[^{}]*:instrument/id \"option/[^\"]+\"[^{}]*\\}")]
+        (.close conn)
+        (doseq [[instrument-id record] rows]
+          (when-let [close (record-decimal record ":bar/close")]
+            (swap! marks assoc instrument-id close)))
+        (doseq [[record] option-rows]
+          (doseq [contract (.findall contract-re (or record ""))]
+            (let [bid (record-decimal contract ":quote/bid")
+                  ask (record-decimal contract ":quote/ask")
+                  instrument-id (record-string contract ":instrument/id")]
+              (when (and bid ask instrument-id)
+                (swap! marks assoc instrument-id (/ (+ bid ask) (->dec "2")))))))))
+    @marks))
+
+(defn- empty-sim-stats
+  []
+  {:unrealized (->dec "0")
+   :gross-mv (->dec "0")
+   :open-positions 0
+   :long-positions 0
+   :short-positions 0
+   :net-qty {}})
+
+(defn- net-position-text
+  [net-qty]
+  (let [text (bstr/join
+              ", "
+              (keep (fn [[iid qty]]
+                      (when (not (zero? (compare qty (->dec "0"))))
+                        (str (instrument-short-name iid) ":" (fmt-qty qty))))
+                    (sort-by first net-qty)))]
+    (if (empty? text) "flat" text)))
+
+(defn- aggregate-net-qty
+  [by-group group-ids]
+  (reduce
+   (fn [acc g]
+     (reduce
+      (fn [inner [iid qty]]
+        (update inner iid (fnil + (->dec "0")) qty))
+      acc
+      (get-in by-group [g :net-qty] {})))
+   {}
+   group-ids))
+
+(defn direct-sim-group-rows
+  [store groups {:keys [aggregate-label strategy-breakdown]}]
+  (let [facts-db (os.path/join (os.path/dirname store) "facts.db")]
+    (if (not (os.path/exists facts-db))
+      []
+      (let [marks (latest-market-marks facts-db)
+            realized (atom {})
+            cash-delta (atom {})
+            open-lots (atom {})
+            seen-groups (atom #{})
+            group-key (fn [account-id strategy-id]
+                        (if strategy-breakdown
+                          (or strategy-id "unknown")
+                          (or account-id "unknown")))
+            placeholders (bstr/join "," (repeat (count groups) "?"))
+            conn (sqlite3/connect facts-db)
+            rows (.fetchall
+                  (.execute
+                   conn
+                   (str "select fact_type, account_id, strategy_id, instrument_id, record "
+                        "from facts where account_id in (" placeholders ") "
+                        "and fact_type in (':fact/position-lot-opened',"
+                        "':fact/position-lot-closed',':fact/cash-movement-recorded',"
+                        "':fact/option-settlement-recorded',':fact/prediction-produced',"
+                        "':fact/signal-decision-produced',':fact/risk-decision-recorded',"
+                        "':fact/order-intent-created',':fact/execution-plan-produced',"
+                        "':fact/command-dispatched',':fact/broker-ack-accepted',"
+                        "':fact/broker-ack-rejected',':fact/fill-observed') "
+                        "order by occurred_at, \"offset\"")
+                   (python/tuple groups)))]
+        (do
+        (.close conn)
+        (doseq [[fact-type account-id strategy-id instrument-id record] rows]
+          (let [g (group-key account-id strategy-id)]
+            (swap! seen-groups conj g)
+            (cond
+              (= fact-type ":fact/cash-movement-recorded")
+              (swap! cash-delta update g (fnil + (->dec "0"))
+                     (record-decimal record ":cash/amount" (->dec "0")))
+
+              (= fact-type ":fact/option-settlement-recorded")
+              (do
+                (swap! realized update g (fnil + (->dec "0"))
+                       (record-decimal record ":settlement/realized-pnl" (->dec "0")))
+                (when-let [lot-id (record-string record ":lot/id")]
+                  (swap! open-lots dissoc lot-id)))
+
+              (= fact-type ":fact/position-lot-opened")
+              (let [lot-id (record-string record ":lot/id")
+                    lot-strategy (record-string record ":lot/strategy-id" strategy-id)
+                    g2 (group-key account-id lot-strategy)]
+                (swap! seen-groups conj g2)
+                (when lot-id
+                  (swap! open-lots assoc lot-id
+                         {:group g2
+                          :account-id account-id
+                          :strategy-id lot-strategy
+                          :instrument-id (or instrument-id
+                                             (record-string record ":lot/instrument-id"))
+                          :side (record-keyword record ":lot/side" ":order-side/buy")
+                          :price (record-decimal record ":lot/price" (->dec "0"))
+                          :quantity (record-decimal record ":lot/quantity" (->dec "0"))
+                          :remaining (record-decimal record ":lot/quantity" (->dec "0"))})))
+
+              (= fact-type ":fact/position-lot-closed")
+              (let [lot-id (record-string record ":lot/id")
+                    close-qty (record-decimal record ":lot-close/quantity" (->dec "0"))
+                    lot-strategy (record-string record ":lot/strategy-id" strategy-id)
+                    g2 (group-key account-id lot-strategy)]
+                (swap! seen-groups conj g2)
+                (swap! realized update g2 (fnil + (->dec "0"))
+                       (record-decimal record ":lot-close/realized-pnl" (->dec "0")))
+                (when (and lot-id (contains? @open-lots lot-id))
+                  (let [rem (max (->dec "0") (- (get-in @open-lots [lot-id :remaining])
+                                              close-qty))]
+                    (if (zero? (compare rem (->dec "0")))
+                      (swap! open-lots dissoc lot-id)
+                      (swap! open-lots assoc-in [lot-id :remaining] rem)))))))))
+        (let [by-group (atom (into {} (map (fn [g] [g (empty-sim-stats)])
+                                           @seen-groups)))]
+          (doseq [lot (vals @open-lots)]
+            (let [g (:group lot)
+                  mark (get marks (:instrument-id lot))
+                  qty (:remaining lot)
+                  price (:price lot)
+                  side (:side lot)
+                  multiplier (instrument-multiplier (:instrument-id lot))]
+              (swap! by-group update g #(or % (empty-sim-stats)))
+              (swap! by-group update-in [g :net-qty (:instrument-id lot)]
+                     (fnil (if (= side ":order-side/sell") - +) (->dec "0"))
+                     qty)
+              (when mark
+                (swap! by-group update-in [g :unrealized] +
+                       (* (if (= side ":order-side/sell")
+                            (- price mark)
+                            (- mark price))
+                          qty multiplier))
+                (swap! by-group update-in [g :gross-mv] +
+                       (dec-abs (* mark qty multiplier))))
+              (swap! by-group update-in [g :open-positions] inc)
+              (swap! by-group update-in
+                     [g (if (= side ":order-side/sell")
+                          :short-positions
+                          :long-positions)]
+                     inc)))
+          (letfn [(make-row [g include-in-total]
+                    (let [stats (get @by-group g (empty-sim-stats))
+                          account-id (when-not strategy-breakdown g)
+                          strategy-id (when strategy-breakdown g)
+                          counts (sim-counts facts-db
+                                             {:account-id account-id
+                                              :strategy-id strategy-id})
+                          r (get @realized g (->dec "0"))
+                          u (:unrealized stats)
+                          pnl (+ r u)
+                          starting-equity (->dec (env-or "SIM_STARTING_EQUITY" "100000"))
+                          net-positions (net-position-text (:net-qty stats))
+                          section (if strategy-breakdown
+                                    section-sim-experiments
+                                    (sim-section-for-account g))]
+                      {:name (if strategy-breakdown
+                               (short-sim-strategy-label g)
+                               (sim-account-label g))
+                       :pnl (python/float pnl)
+                       :stats (merge counts
+                                     {:equity (when-not strategy-breakdown
+                                                (python/float (+ starting-equity pnl)))
+                                      :last-equity (when-not strategy-breakdown
+                                                     (python/float starting-equity))
+                                      :cash (when-not strategy-breakdown
+                                              (python/float (+ starting-equity
+                                                               (get @cash-delta g (->dec "0")))))
+                                      :buying-power (when-not strategy-breakdown
+                                                      (python/float (+ starting-equity
+                                              (get @cash-delta g (->dec "0")))))
+                                      :unrealized (python/float u)
+                                      :realized-est (python/float r)
+                                      :gross-mv (python/float (:gross-mv stats))
+                                      :open-positions (:open-positions stats)
+                                      :long-positions (:long-positions stats)
+                                      :short-positions (:short-positions stats)
+                                      :include-in-total include-in-total
+                                      :section section})
+                       :position net-positions}))]
+            (if strategy-breakdown
+              (let [rows-out (mapv #(make-row % false) (sort @seen-groups))
+                    sma-groups (vec (sort (filter #(>= (.find % "/sim-local-sma/") 0)
+                                                  @seen-groups)))
+                    total-realized (reduce + (->dec "0")
+                                           (map #(get @realized % (->dec "0"))
+                                                @seen-groups))
+                    total-unrealized (reduce + (->dec "0")
+                                             (map #(get-in @by-group [% :unrealized]
+                                                           (->dec "0"))
+                                                  @seen-groups))
+                    total-gross (reduce + (->dec "0")
+                                        (map #(get-in @by-group [% :gross-mv]
+                                                      (->dec "0"))
+                                             @seen-groups))
+                    total-positions (reduce + 0 (map #(get-in @by-group [% :open-positions] 0)
+                                                     @seen-groups))
+                    total-longs (reduce + 0 (map #(get-in @by-group [% :long-positions] 0)
+                                                 @seen-groups))
+                    total-shorts (reduce + 0 (map #(get-in @by-group [% :short-positions] 0)
+                                                  @seen-groups))
+                    total-cash (reduce + (->dec "0")
+                                       (map #(get @cash-delta % (->dec "0"))
+                                            @seen-groups))
+                    aggregate-net (aggregate-net-qty @by-group @seen-groups)
+                    starting-equity (->dec (env-or "SIM_STARTING_EQUITY" "100000"))
+                    aggregate-counts (sim-counts facts-db
+                                                 {:account-id (when (= 1 (count groups))
+                                                                (first groups))})
+                    aggregate {:name (or aggregate-label "SIM-AGG")
+                               :pnl (python/float (+ total-realized total-unrealized))
+                               :stats (merge aggregate-counts
+                                             {:equity (python/float
+                                               (+ starting-equity total-realized
+                                                  total-unrealized))
+                                              :last-equity (python/float starting-equity)
+                                              :cash (python/float (+ starting-equity total-cash))
+                                              :buying-power (python/float (+ starting-equity total-cash))
+                                              :unrealized (python/float total-unrealized)
+                                              :realized-est (python/float total-realized)
+                                              :gross-mv (python/float total-gross)
+                                              :open-positions total-positions
+                                              :long-positions total-longs
+                                              :short-positions total-shorts
+                                              :include-in-total true
+                                              :section section-sim-experiments})
+                               :position (net-position-text aggregate-net)}
+                    extra-aggregates
+                    (if (seq sma-groups)
+                      (let [sma-realized (reduce + (->dec "0")
+                                                (map #(get @realized % (->dec "0"))
+                                                     sma-groups))
+                            sma-unrealized (reduce + (->dec "0")
+                                                  (map #(get-in @by-group [% :unrealized]
+                                                                (->dec "0"))
+                                                       sma-groups))
+                            sma-gross (reduce + (->dec "0")
+                                              (map #(get-in @by-group [% :gross-mv]
+                                                            (->dec "0"))
+                                                   sma-groups))
+                            sma-positions (reduce + 0
+                                                  (map #(get-in @by-group [% :open-positions] 0)
+                                                       sma-groups))
+                            sma-longs (reduce + 0
+                                              (map #(get-in @by-group [% :long-positions] 0)
+                                                   sma-groups))
+                            sma-shorts (reduce + 0
+                                               (map #(get-in @by-group [% :short-positions] 0)
+                                                    sma-groups))
+                            sma-net (aggregate-net-qty @by-group sma-groups)
+                            sma-counts (sim-counts facts-db {:strategy-ids sma-groups})]
+                        [{:name "LOCAL-SMA-AGG"
+                          :pnl (python/float (+ sma-realized sma-unrealized))
+                          :stats (merge sma-counts
+                                        {:equity nil
+                                         :last-equity nil
+                                         :cash nil
+                                         :buying-power nil
+                                         :unrealized (python/float sma-unrealized)
+                                         :realized-est (python/float sma-realized)
+                                         :gross-mv (python/float sma-gross)
+                                         :open-positions sma-positions
+                                         :long-positions sma-longs
+                                         :short-positions sma-shorts
+                                         :include-in-total false
+                                         :section section-sim-experiments})
+                          :position (net-position-text sma-net)}])
+                      [])]
+                (vec (concat [aggregate]
+                             extra-aggregates
+                             (sort-by #(- (or (:pnl %) 0.0)) rows-out))))
+	              (vec (sort-by #(- (or (:pnl %) 0.0))
+	                            (map #(make-row % true) @seen-groups))))))))))
+
+(defn- sim-source-error-row
+  [groups {:keys [aggregate-label strategy-breakdown]} e]
+  (let [group (first groups)
+        section (if strategy-breakdown
+                  section-sim-experiments
+                  (if group (sim-section-for-account group) section-sim-experiments))]
+    {:name (or aggregate-label
+               (when (and group (not strategy-breakdown)) (sim-account-label group))
+               "SIM-SOURCE")
+     :pnl nil
+     :stats {:trades "?"
+             :pct-in-mkt 0.0
+             :closed-trades 0
+             :open-trades 0
+             :avg-trade-min nil
+             :fills 0
+             :equity nil
+             :last-equity nil
+             :cash nil
+             :buying-power nil
+             :unrealized nil
+             :realized-est nil
+             :gross-mv nil
+             :open-positions 0
+             :long-positions 0
+             :short-positions 0
+             :include-in-total false
+             :source-error true
+             :section section}
+     :position (str "(" (.-__name__ (python/type e)) ")")}))
+
+(defn- safe-direct-sim-group-rows
+  [store groups opts]
+  (try
+    (direct-sim-group-rows store groups opts)
+    (catch python/Exception e
+      [(sim-source-error-row groups opts e)])))
+
+(defn sim-account-rows
+  [repo-root]
+  (if-let [explicit-store (os/getenv "SIM_STORE_PATH")]
+    (cond
+      (>= (.find explicit-store "sim-local-fleet-") 0)
+      (safe-direct-sim-group-rows explicit-store ["account/sim/local-fleet"]
+                                  {:aggregate-label "LOCAL-FLEET"
+                                   :strategy-breakdown true})
+      (>= (.find explicit-store "sim-vt-session-") 0)
+      (let [account-id (first (sim-account-ids-for-store explicit-store))]
+        (safe-direct-sim-group-rows explicit-store [account-id]
+                                    {:aggregate-label (sim-account-label account-id)
+                                     :strategy-breakdown true}))
+      :else
+      (safe-direct-sim-group-rows explicit-store (sim-account-ids-for-store explicit-store)
+                                  {}))
+    (vec
+     (mapcat (fn [[store account-id]]
+               (if (>= (.find store "sim-local-fleet-") 0)
+                 (safe-direct-sim-group-rows store ["account/sim/local-fleet"]
+                                             {:aggregate-label "LOCAL-FLEET"
+                                              :strategy-breakdown true})
+                 (if (>= (.find store "sim-vt-session-") 0)
+                   (safe-direct-sim-group-rows store [account-id]
+                                               {:aggregate-label (sim-account-label account-id)
+                                                :strategy-breakdown true})
+                   (safe-direct-sim-group-rows store [account-id] {}))))
+             (latest-sim-stores-by-account repo-root)))))
+
+(defn parse-args
+  [args]
+  (let [valid-groups #{"all" "alpaca" "venturevd" "sim"}
+        groups (atom [])
+        output (atom :terminal)]
+    (doseq [arg args]
+      (let [normalized (.lower arg)]
+        (cond
+          (contains? #{"--markdown" "--md"} normalized)
+          (reset! output :markdown)
+          (contains? #{"--raw" "--terminal" "--text"} normalized)
+          (reset! output :terminal)
+          (contains? valid-groups normalized)
+          (swap! groups conj normalized)
+          :else
+          (throw (python/ValueError
+                  (str "unknown current-pnl selector: " arg
+                       " (expected one of all, alpaca, venturevd, sim)"))))))
+    {:groups (set (if (seq @groups) @groups ["all"]))
+     :output @output}))
+
+(defn accumulate
+  [target pnl stats]
+  (letfn [(safe-float [x]
+            (try
+              (let [n (->float x)]
+                (if (math/isfinite n) n 0.0))
+              (catch python/Exception _ 0.0)))
+          (safe-int [x]
+            (try
+              (python/int x)
+              (catch python/Exception _ 0)))]
+    (-> target
+        (update :pnl + (safe-float pnl))
+        (update :realized + (safe-float (:realized-est stats)))
+        (update :unrealized + (safe-float (:unrealized stats)))
+        (update :equity + (safe-float (:equity stats)))
+        (update :cash + (safe-float (:cash stats)))
+        (update :gross-mv + (safe-float (:gross-mv stats)))
+        (update :positions + (safe-int (:open-positions stats)))
+        (update :fills + (safe-int (:fills stats)))
+        (update :closed-trades + (safe-int (:closed-trades stats)))
+        (update :open-trades + (safe-int (:open-trades stats))))))
+
+(defn- finite-float
+  [x]
+  (try
+    (when-not (boolean? x)
+      (let [n (->float x)]
+        (when (math/isfinite n) n)))
+    (catch python/Exception _ nil)))
+
+(defn- non-negative-int?
+  [x]
+  (and (not (boolean? x))
+       (try
+         (let [n (python/int x)]
+           (and (= x n) (not (< n 0))))
+         (catch python/Exception _ false))))
+
+(defn- material-gap?
+  [a b]
+  (let [a' (finite-float a)
+        b' (finite-float b)]
+    (and (some? a')
+         (some? b')
+         (> (math/fabs (- a' b')) 0.01))))
+
+(defn- sort-pnl
+  [row]
+  (- (or (finite-float (:pnl row)) 0.0)))
+
+(defn- fmt-pct
+  [x]
+  (if-let [n (finite-float x)]
+    (str (python/format n ".0f") "%")
+    "n/a"))
+
+(defn- exception-position-text?
+  [position]
+  (.startswith (str position) "("))
+
+(defn- flat-position-text?
+  [position]
+  (= "flat" (.lower (.strip (str position)))))
+
+(defn- position-identity-text?
+  [position]
+  (let [text (.strip (str (or position "")))]
+    (and (not= "" text)
+         (not (flat-position-text? text))
+         (not (exception-position-text? text)))))
+
+(defn row-issues
+  [row]
+  (let [s (:stats row)
+        pnl (:pnl row)
+        realized (:realized-est s)
+        unrealized (:unrealized s)
+        open-positions (or (:open-positions s) 0)
+        long-positions (or (:long-positions s) 0)
+        short-positions (or (:short-positions s) 0)
+        closed-trades (or (:closed-trades s) 0)
+        open-trades (or (:open-trades s) 0)
+        fills (or (:fills s) 0)
+        pct-in-mkt (:pct-in-mkt s)
+        pct-in-mkt-float (finite-float pct-in-mkt)
+        position (:position row)
+        counter-fields [[:open-positions open-positions]
+                        [:long-positions long-positions]
+                        [:short-positions short-positions]
+                        [:closed-trades closed-trades]
+                        [:open-trades open-trades]
+                        [:fills fills]]
+        money-fields [[:pnl pnl]
+                      [:realized-est realized]
+                      [:unrealized unrealized]
+                      [:equity (:equity s)]
+                      [:cash (:cash s)]
+                      [:gross-mv (:gross-mv s)]
+                      [:pct-in-mkt pct-in-mkt]]]
+    (vec
+     (keep identity
+           (concat
+            (map (fn [[field value]]
+                   (when (and (some? value)
+                              (nil? (finite-float value)))
+                     (str "bad-number:" (name field))))
+                 money-fields)
+            (map (fn [[field value]]
+                   (when-not (non-negative-int? value)
+                     (str "bad-count:" (name field))))
+                 counter-fields)
+            [(when (and (some? pnl)
+                        (some? realized)
+                        (some? unrealized)
+                        (material-gap? pnl (+ (or (finite-float realized) 0.0)
+                                              (or (finite-float unrealized) 0.0))))
+              "pnl!=real+unrl")
+            (when (and (every? non-negative-int?
+                               [open-positions long-positions short-positions])
+                       (not= open-positions (+ long-positions short-positions)))
+              "pos-count!=long+short")
+            (when (and (non-negative-int? fills)
+                       (non-negative-int? closed-trades)
+                       (zero? fills)
+                       (pos? closed-trades))
+              "closed-trades-without-fills")
+            (when (and (non-negative-int? open-trades)
+                       (non-negative-int? open-positions)
+                       (pos? open-trades)
+                       (zero? open-positions))
+              "open-trades-without-position")
+            (when (and (some? pct-in-mkt)
+                       (some? pct-in-mkt-float)
+                       (or (< pct-in-mkt-float 0.0)
+                           (> pct-in-mkt-float 100.0)))
+              "pct-in-mkt-out-of-range")
+            (when (and (non-negative-int? open-positions)
+                       (pos? open-positions)
+                       (flat-position-text? position))
+              "open-pos-flat-text")
+            (when (and (non-negative-int? open-positions)
+                       (pos? open-positions)
+                       (not (flat-position-text? position))
+                       (not (position-identity-text? position)))
+              "open-pos-missing-position-text")
+            (when (and (non-negative-int? open-positions)
+                       (zero? open-positions)
+                       (not (flat-position-text? position))
+                       (not (exception-position-text? position)))
+              "flat-count-position-text")
+            (when (:source-error s)
+              "source-error")
+            (when (and (:include-in-total s true)
+                       (or (nil? pnl)
+                           (nil? (finite-float pnl))))
+              "included-total-without-pnl")])))))
+
+(def empty-total
+  {:pnl 0.0 :realized 0.0 :unrealized 0.0 :equity 0.0 :cash 0.0
+   :gross-mv 0.0 :positions 0 :fills 0 :closed-trades 0 :open-trades 0})
+
+(defn render-markdown-total
+  [label values]
+  (str "| **" (md-cell label) "** | **" (fmt-md-money (:pnl values)) "** | "
+       "**" (fmt-md-money (:realized values)) "** | "
+       "**" (fmt-md-money (:unrealized values)) "** | "
+       "**" (fmt-md-plain-money (:equity values)) "** | "
+       "**" (fmt-md-plain-money (:cash values)) "** | "
+       "**" (fmt-md-plain-money (:gross-mv values)) "** | "
+       "**" (python/int (:positions values)) "** | "
+       "**" (python/int (:closed-trades values)) "/"
+       (python/int (:open-trades values)) "** |  | "
+       "**" (python/int (:fills values)) "** |  | |"))
+
+(defn row-totalable?
+  [row issues]
+  (let [blocking? (fn [issue]
+                    (or (contains? #{"pnl!=real+unrl"
+                                      "source-error"
+                                      "included-total-without-pnl"}
+                                    issue)
+                        (.startswith (str issue) "bad-number:pnl")))]
+    (and (get-in row [:stats :include-in-total] true)
+         (not-any? blocking? issues))))
+
+(defn render-markdown
+  [rows now]
+  (let [header "| Account | Day P&L | Realized* | Unrealized | Equity | Cash | Gross MV | Pos | Closed/Open | % Mkt | Fills | Position | Issues |"
+        separator "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|"
+        section-order [section-live section-sim-shadow section-sim-experiments
+                       section-other-alpaca]
+        rows-by-section (group-by #(get-in % [:stats :section] "OTHER") rows)
+        all-sections (concat section-order
+                             (sort (remove (set section-order)
+                                           (keys rows-by-section))))
+        totals (atom empty-total)
+        lines (atom [(str "**Current-day P&L** `" now "`")])]
+    (if-not (seq rows)
+      (bstr/join "\n" (conj @lines "\nNo account rows found."))
+      (do
+        (doseq [section all-sections]
+          (let [section-rows (get rows-by-section section)]
+            (when (seq section-rows)
+              (swap! lines conj "" (str "**" section "**") header separator)
+              (let [section-totals (atom empty-total)]
+                (doseq [row (sort-by sort-pnl section-rows)]
+                  (let [s (:stats row)
+                        pct (fmt-pct (:pct-in-mkt s))
+                        issues (row-issues row)]
+                    (swap! lines conj
+                           (str "| " (md-cell (:name row)) " | "
+                                (fmt-md-money (:pnl row)) " | "
+                                (fmt-md-money (:realized-est s)) " | "
+                                (fmt-md-money (:unrealized s)) " | "
+                                (fmt-md-plain-money (:equity s)) " | "
+                                (fmt-md-plain-money (:cash s)) " | "
+                                (fmt-md-plain-money (:gross-mv s)) " | "
+                                (:long-positions s) "/" (:short-positions s)
+                                " (" (:open-positions s) ") | "
+                                (:closed-trades s) "/" (:open-trades s) " | "
+                                pct " | " (:fills s) " | "
+                                (md-cell (:position row)) " | "
+                                (md-cell (bstr/join ", " issues)) " |"))
+                    (when (row-totalable? row issues)
+                      (swap! totals accumulate (:pnl row) s)
+                      (swap! section-totals accumulate (:pnl row) s))))
+                (swap! lines conj (render-markdown-total "SECTION TOTAL"
+                                                         @section-totals))))))
+        (swap! lines conj "" "**Grand Total**" header separator
+               (render-markdown-total "GRAND TOTAL" @totals)
+               ""
+               "`*Realized is estimated as day P&L minus open-position unrealized P&L.`")
+        (bstr/join "\n" @lines)))))
+
+(defn rows
+  [{:keys [groups ref-env bashrc repo-root http-json]}]
+  (let [groups (or groups #{"all"})
+        repo-root (or repo-root (default-repo-root))
+        out (atom [])]
+    (when (some groups ["all" "alpaca"])
+      (let [ref (safe-slurp (or ref-env (default-ref-env)))]
+        (doseq [bot bots]
+          (when-let [[key secret] (env-creds ref (str "ALPACA_" bot))]
+            (swap! out conj (alpaca-account-row {:name bot
+                                                 :key key
+                                                 :secret secret
+                                                 :section section-live
+                                                 :http-json http-json}))))))
+    (when (some groups ["all" "venturevd"])
+      (when-let [[key secret] (env-creds (safe-slurp (or bashrc (default-bashrc)))
+                                         "ALPACA_VENTUREVD")]
+        (swap! out conj (alpaca-account-row {:name "VENTUREVD"
+                                             :key key
+                                             :secret secret
+                                             :section section-other-alpaca
+                                             :http-json http-json}))))
+    (when (some groups ["all" "sim"])
+      (swap! out into (sim-account-rows repo-root)))
+    @out))
+
+(defn render
+  [{:keys [groups output ref-env bashrc repo-root http-json]}]
+  (let [rows (rows {:groups groups
+                    :ref-env ref-env
+                    :bashrc bashrc
+                    :repo-root repo-root
+                    :http-json http-json})
+        now (.strftime (now-et) "%Y-%m-%d %H:%M:%S %Z")]
+    (case output
+      :markdown (render-markdown rows now)
+      ;; Keep terminal mode simple for now; the skill and API use markdown.
+      (render-markdown rows now))))

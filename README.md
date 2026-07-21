@@ -114,7 +114,7 @@ broker can answer open orders, fills, account state, and option settlements.
 Useful status helpers:
 
 ```bash
-scripts/sim_broker_status.py
+.venv/bin/basilisp run scripts/sim_broker_status.lpy
 SIM_STORE_PATH=live_runtime/<session>/sim-broker.db \
   .venv/bin/basilisp run scripts/current_sim_account_state.lpy
 ```
@@ -126,7 +126,6 @@ Production paper-trading ops live in the `projects/ops` projection.
 - `projects/ops/scripts/deploy_live_vps.sh` deploys a release to Hetzner.
 - `projects/ops/scripts/systemd/` contains canonical unit/timer files.
 - `projects/ops/docs/live-vps-rollout.md` is the VPS rollout runbook.
-- `scripts/ops/*` are compatibility wrappers only.
 
 Do not edit `/opt/stevetrading/current` directly on the VPS. Deploy a release,
 run preflight, then promote. During market hours, do not restart live services
@@ -152,7 +151,7 @@ See `projects/ops/docs/analysis-and-sim-fill-calibration.md`.
 
 Polylith layout: `components/` hold all logic, `bases/` are thin imperative
 shells that wire adapters around the shared engine loop, and dependency
-direction is enforced by `scripts/check_deps.py` (core never imports
+direction is enforced by `scripts/check_deps.lpy` (core never imports
 adapters; protocols are importable by anyone).
 
 | Area | Bricks |

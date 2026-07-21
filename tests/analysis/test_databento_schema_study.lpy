@@ -1,0 +1,73 @@
+(ns analysis.test-databento-schema-study
+  (:import pandas)
+  (:require [basilisp.test :refer [deftest is]]
+            [stevetrading.analysis.databento-schema-study :as study]))
+
+(deftest nested-schema-normalization-is-explicit
+  (is (= "trades" (study/normalize-schema "Trades")))
+  (is (= "tbbo" (study/normalize-schema "TBBO")))
+  (is (= "mbp-1" (study/normalize-schema "mbp_1")))
+  (is (nil? (study/normalize-schema "ohlcv-1s"))))
+
+(deftest steve-gcp-parquet-layout-is-parsed-without-reading-market-rows
+  (let [partition (study/parquet-partition
+                   "G:/bucket/EQUS.MINI/stock/mbp-1/SPY/20260717.parquet")]
+    (is (= "EQUS.MINI" (get partition "dataset")))
+    (is (= "mbp-1" (get partition "schema")))
+    (is (= "SPY" (get partition "symbol")))
+    (is (= "20260717" (get partition "date")))))
+
+(deftest universe-reconciliation-fails-visible-and-never-mutates
+  (let [audit (study/reconcile-universe ["SPY" "QQQ" "GME"] ["SPY" "QQQ" "IWM"])]
+    (is (= "mismatch" (get audit "status")))
+    (is (= ["IWM"] (get audit "missing_from_corpus")))
+    (is (= ["GME"] (get audit "outside_expected_universe")))
+    (is (= false (get audit "automatic_mutation_authorized")))))
+
+(deftest inventory-compares-storage-and-events-without-copying
+  (let [rows [{"schema" "trades" "bytes" 100 "events" 10 "path" "trades/a"}
+              {"schema" "tbbo" "bytes" 150 "events" 10 "path" "tbbo/a"}
+              {"schema" "mbp-1" "bytes" 900 "events" 90 "path" "mbp-1/a"}]
+        result (study/summarize-descriptors "fixture" rows 0 [] "exact")
+        schemas (into {} (map (fn [row] [(get row "schema") row])
+                              (get result "schemas")))]
+    (is (= 3 (get result "files_profiled")))
+    (is (= 10 (get (get schemas "trades") "events")))
+    (is (= 1.5 (get (get schemas "tbbo") "storage_vs_trades")))
+    (is (= 9.0 (get (get schemas "mbp-1") "storage_vs_trades")))
+    (is (= "mbp-1" (get (get result "retention_contract") "canonical_bulk_schema")))
+    (is (= false (get (get result "retention_contract") "deletion_authorized")))))
+
+(deftest canonical-projections-form-nested-information-sets
+  (let [frame (pandas/DataFrame
+               (python/dict
+                [#py ("ts_event" [1 2 3])
+                 #py ("publisher_id" [1 1 1])
+                 #py ("instrument_id" [10 10 10])
+                 #py ("action" ["A" "T" "C"])
+                 #py ("side" ["B" "A" "A"])
+                 #py ("price" [100.0 100.5 100.0])
+                 #py ("size" [5 2 5])
+                 #py ("flags" [0 0 0])
+                 #py ("ts_in_delta" [1 2 3])
+                 #py ("sequence" [11 12 13])
+                 #py ("bid_px_00" [100.0 100.0 99.5])
+                 #py ("ask_px_00" [100.5 100.5 100.5])
+                 #py ("bid_sz_00" [5 5 4])
+                 #py ("ask_sz_00" [6 6 6])
+                 #py ("bid_ct_00" [1 1 1])
+                 #py ("ask_ct_00" [1 1 1])]))
+        trades (study/project-frame frame "trades")
+        tbbo (study/project-frame frame "tbbo")
+        mbp (study/project-frame frame "mbp-1")
+        native-trades (.copy trades)
+        comparison (study/compare-native-frame frame native-trades "trades")]
+    (is (= 1 (python/len trades)))
+    (is (= 1 (python/len tbbo)))
+    (is (= 3 (python/len mbp)))
+    (is (not (contains? (set (vec (.tolist (.-columns trades)))) "bid_px_00")))
+    (is (contains? (set (vec (.tolist (.-columns tbbo)))) "bid_px_00"))
+    (is (= true (get comparison "ordered_field_exact")))
+    (is (= 1 (get comparison "native_events")))
+    (is (= [1 2 3] (vec (map #(get % "information_rank")
+                              (study/nested-view-specs)))))))

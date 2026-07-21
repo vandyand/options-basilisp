@@ -1,0 +1,71 @@
+(ns feature-parity.test-build-verified-feature-corpus-cli
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "build_verified_feature_corpus.lpy"))
+(def basilisp-bin (or (os.environ/get "BASILISP_BIN")
+                      (str (.joinpath root ".venv/bin/basilisp"))))
+
+(defn provenance [implementation]
+  (json/dumps (python/dict {"feature_contract" "steve-v2-canonical-input/v2"
+                            "stock" (python/dict {"bar_status" "completed"})
+                            "capture" (python/dict {"feature_implementation" implementation})})))
+
+(defn write-cohort! [path implementation]
+  (numpy/savez_compressed
+   path
+   ** :times (numpy/array ["2026-07-09T15:30:00Z"])
+      :X (numpy/zeros [1 3] ** :dtype numpy/float32)
+      :grids (numpy/zeros [1 6 21 8] ** :dtype numpy/float32)
+      :grid_histories (numpy/zeros [1 1 6 21 8] ** :dtype numpy/float32)
+      :bar_buffers_json (numpy/array ["{}"] ** :dtype object)
+      :option_chain_json (numpy/array ["{}"] ** :dtype object)
+      :provenance_json (numpy/array [(provenance implementation)] ** :dtype object)))
+
+(defn write-audit! [path certifiable]
+  (.write_text path (json/dumps (python/dict {"certifiable" certifiable}))))
+
+(defn run-builder [args]
+  (subprocess/run (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+                  ** :cwd (str root) :text true :capture_output true :check false))
+
+(defn read-json [path] (json/loads (.read_text path)))
+
+(deftest build-verified-feature-corpus-admits-only-native-certified-cohorts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          audit (.joinpath tmp "audit.json")
+          cohort (.joinpath tmp "cohort.npz")
+          out (.joinpath tmp "corpus.npz")
+          manifest (.joinpath tmp "corpus.json")]
+      (write-audit! audit true)
+      (write-cohort! cohort "native")
+      (let [result (run-builder ["--source-audit" (str audit)
+                                 "--historical-inputs" (str cohort)
+                                 "--out-npz" (str out)
+                                 "--out-json" (str manifest)])
+            payload (read-json manifest)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "ready" (.get payload "status")))
+        (is (= 1 (.get payload "rows")))
+        (is (= 3 (.get payload "features")))
+        (is (.exists out))))))
+
+(deftest build-verified-feature-corpus-rejects-legacy-feature-implementation
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          audit (.joinpath tmp "audit.json")
+          cohort (.joinpath tmp "cohort.npz")
+          out (.joinpath tmp "corpus.npz")
+          manifest (.joinpath tmp "corpus.json")]
+      (write-audit! audit true)
+      (write-cohort! cohort "legacy-python")
+      (let [result (run-builder ["--source-audit" (str audit)
+                                 "--historical-inputs" (str cohort)
+                                 "--out-npz" (str out)
+                                 "--out-json" (str manifest)])
+            payload (read-json manifest)]
+        (is (= 1 (.-returncode result)))
+        (is (= "rejected" (.get payload "status")))
+        (is (not (.exists out)))))))

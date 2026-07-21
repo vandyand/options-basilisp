@@ -1,0 +1,98 @@
+{:schema-version 1
+ :purpose :raw-live-historical-parity
+ :raw-landing-root "/mnt/d/stevetrading/thetadata-parity-v1"
+ :feature-selection :intentionally-deferred
+ :vendor-greeks :excluded-from-required-corpus
+
+ ;; This is a small, immutable evidence corpus.  Do not add derived bars,
+ ;; features, or vendor-normalized fields to either landing tree.
+ :stream-receipt-required-fields
+ [:started-at :finished-at :session-date :transport :websocket-url :plan-file
+  :event-path :event-sha256 :event-bytes :request-path :request-sha256
+  :event-schema-fingerprint :summary :status]
+
+ :snapshot-receipt-required-fields
+ [:captured-at :session-date :side :family :symbol :request :payload-path
+  :payload-sha256 :row-count :schema-fields :schema-fingerprint]
+
+ ;; Terminal version and entitlement remain session-level capability evidence,
+ ;; captured separately because the stream protocol does not return them.
+ :capability-receipt-required-fields
+ [:terminal-version :entitlement :endpoint :parameters :schema-fingerprint :payload-sha256]
+
+ :landing-layout
+ {:snapshot-live "live/YYYY-MM-DD/<family>/<symbol>/"
+  :snapshot-historical "historical/YYYY-MM-DD/<family>/<symbol>/"
+  :stream-live "live/YYYY-MM-DD/stream-events/<run-id>/"
+  :stream-receipts "receipts/YYYY-MM-DD/stream-events/<run-id>.json"
+  :snapshot-receipts "receipts/YYYY-MM-DD/<family>/<symbol>/"
+  :historical-event-responses "historical/<request-index>-<venue>.json"
+  :comparison "comparisons/YYYY-MM-DD/<family>/<symbol>/"}
+
+ :diagnostic-session-dates ["2026-07-08" "2026-07-09" "2026-07-10"]
+
+ :classes
+ [{:id :option-nbbo-quote
+   :tier :primary
+   :symbols ["SPY" "SPX" "SPXW" "VIX" "VIXW"]
+   :live {:transport :websocket :event "OPTION QUOTE"}
+   :historical {:endpoint "/v3/option/history/quote" :interval "tick"}
+   :canonical :event
+   :rule "Compare the last historical NBBO at or before each live receipt watermark. Persist the selected contract universe with every receipt."}
+
+  {:id :option-trade
+   :tier :primary
+   :symbols ["SPY" "SPX" "SPXW" "VIX" "VIXW"]
+   :live {:transport :websocket :event "OPTION TRADE"}
+   :historical {:endpoint "/v3/option/history/trade" :interval "tick"}
+   :canonical :event
+   :rule "Retain independently from quotes. Any trade-quote relation is a later local event-time join, never a vendor-field assumption."}
+
+  {:id :index-price
+   :tier :primary
+   :symbols ["SPX" "VIX"]
+   :live {:transport :websocket :event "INDEX TRADE"}
+   :historical {:endpoint "/v3/index/history/price" :interval "tick"}
+   :canonical :event
+   :rule "Index updates are sparse. Replay must use the last observed value until a new event arrives; compare that carry-forward state at identical watermarks."}
+
+  {:id :stock-nbbo-quote
+   :tier :quarantined
+   :symbols ["SPY" "HYG" "TLT" "VXX"]
+   :live {:transport :websocket :event "STOCK QUOTE" :venue "nqb"}
+   :historical {:endpoint "/v3/stock/history/quote" :interval "tick" :venues ["nqb" "utp_cta"]}
+   :canonical :event
+   :rule "Capture separately. Do not admit to a training corpus until the live NQB and historical UTP/CTA feed-retention contract is demonstrated across the selected horizon."}
+
+  {:id :stock-trade
+   :tier :quarantined
+   :symbols ["SPY" "HYG" "TLT" "VXX"]
+   :live {:transport :websocket :event "STOCK TRADE" :venue "nqb"}
+   :historical {:endpoint "/v3/stock/history/trade" :interval "tick" :venues ["nqb" "utp_cta"]}
+   :canonical :event
+   :rule "Same feed-retention admission gate as stock quotes."}
+
+  {:id :option-open-interest
+   :tier :daily-state
+   :symbols ["SPY" "SPX" "SPXW" "VIX" "VIXW"]
+   :live {:transport :rest :endpoint "/v3/option/snapshot/open_interest"}
+   :historical {:endpoint "/v3/option/history/open_interest"}
+   :canonical :daily-state
+   :rule "Open interest is prior-session daily state, not an intraminute event. Capture and compare its OPRA snapshot/history payload using the reported timestamp and prior-session as-of semantics."}]
+
+ :collection-plan
+ {:phase-1 {:sessions :diagnostic-session-dates
+            :purpose "Exercise historical readers and establish raw response schemas; this alone cannot prove live parity."
+            :contract-selection "Use a frozen expiration and moneyness window persisted in each receipt."}
+  :phase-2 {:sessions 3
+            :purpose "During three market sessions, record live raw events and matching historical pull receipts for every primary class."}
+  :phase-3 {:sessions 20
+            :purpose "After class admission, retain a 20-session seed corpus and measure bytes, events, and retrieval time before expanding."}}
+
+ :admission-criteria
+ [:identical-or-versioned-schema
+  :documented-watermark-and-timezone
+  :contract-universe-coverage
+  :timestamp-and-value-parity-within-class-tolerance
+  :reproducible-historical-receipt
+  :no-unexplained-feed-or-venue-difference]}

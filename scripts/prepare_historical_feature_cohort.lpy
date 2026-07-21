@@ -1,0 +1,248 @@
+;; Prepare a matched historical feature tensor for Steve's parity cohort.
+(import datetime json numpy os os.path sys zoneinfo)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def et (zoneinfo/ZoneInfo "America/New_York"))
+(def utc (zoneinfo/ZoneInfo "UTC"))
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/prepare_historical_feature_cohort.lpy -- "
+                "--live-capture PATH --historical-source PATH --feature-names PATH "
+                "--out-npz PATH --out-json PATH --target-date YYYY-MM-DD "
+                "[--date-map PATH] [--source-array NAME] [--min-rows N]")))
+
+(defn option-value [remaining flag]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " flag))))
+    value))
+
+(defn parse-int [value flag]
+  (try
+    (int value)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid integer for " flag ": " value))))))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:live-capture nil
+              :historical-source nil
+              :feature-names nil
+              :out-npz nil
+              :out-json nil
+              :target-date nil
+              :date-map nil
+              :source-array "X"
+              :min-rows 60}]
+    (if-not remaining
+      (do
+        (doseq [required [:live-capture :historical-source :feature-names :out-npz :out-json :target-date]]
+          (when-not (get out required)
+            (throw (python/ValueError (str "missing required --" (.replace (name required) "_" "-"))))))
+        out)
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--live-capture") (recur (nnext remaining) (assoc out :live-capture (option-value remaining arg)))
+          (= arg "--historical-source") (recur (nnext remaining) (assoc out :historical-source (option-value remaining arg)))
+          (= arg "--feature-names") (recur (nnext remaining) (assoc out :feature-names (option-value remaining arg)))
+          (= arg "--out-npz") (recur (nnext remaining) (assoc out :out-npz (option-value remaining arg)))
+          (= arg "--out-json") (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+          (= arg "--date-map") (recur (nnext remaining) (assoc out :date-map (option-value remaining arg)))
+          (= arg "--source-array") (recur (nnext remaining) (assoc out :source-array (option-value remaining arg)))
+          (= arg "--min-rows") (recur (nnext remaining) (assoc out :min-rows (parse-int (option-value remaining arg) arg)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn parse-time [value]
+  (let [raw0 (.strip (str value))
+        raw1 (if (and (.startswith raw0 "#inst \"") (.endswith raw0 "\""))
+               (subs raw0 7 (dec (count raw0)))
+               raw0)
+        raw (.replace raw1 "Z" "+00:00")
+        parsed (datetime.datetime/fromisoformat raw)
+        with-tz (if (nil? (.-tzinfo parsed)) (.replace parsed ** :tzinfo utc) parsed)]
+    (.astimezone with-tz utc)))
+
+(defn compact-date [value]
+  (.strftime (datetime.datetime/fromisoformat value) "%Y%m%d"))
+
+(defn minute-index-et [ts]
+  (let [local (.astimezone ts et)]
+    (- (+ (* (.-hour local) 60) (.-minute local)) (+ (* 9 60) 30))))
+
+(defn load-feature-names [path]
+  (let [names (fp/read-json path)]
+    (when (or (not (python/isinstance names python/list)) (= (len names) 0))
+      (throw (python/ValueError (str "feature names must be a non-empty JSON list: " path))))
+    (vec (map str (python/list names)))))
+
+(defn load-date-map [path]
+  (if (nil? path)
+    {}
+    (let [payload (fp/read-json path)]
+      (when-not (map? payload)
+        (throw (python/ValueError (str "date map must be a JSON object: " path))))
+      (into {} (for [[k v] payload] [(int k) (.replace (str v) "-" "")])))))
+
+(defn reject [reason out-json & [details]]
+  (os/makedirs (os.path/dirname out-json) ** :exist_ok true)
+  (let [details (or details {})
+        payload (cond-> {"status" "error"
+                 "ok" false
+                 "reason" reason
+                         "generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                                   "%Y-%m-%dT%H:%M:%SZ")
+                         "details" details}
+                  (get details "target_date")
+                  (assoc "target_date" (get details "target_date")))]
+    (spit out-json (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+    (binding [*out* *err*] (println reason))
+    1))
+
+(defn npz-files [source]
+  (set (map str (.-files source))))
+
+(defn canonical-time-key [value]
+  (.strftime (parse-time value) "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn align-by-times [source live-times]
+  (let [hist-times (.__getitem__ source "times")
+        hist-by-time (atom {})]
+    (doseq [idx (range (len hist-times))]
+      (let [key (canonical-time-key (.__getitem__ hist-times idx))]
+        (when-not (contains? @hist-by-time key)
+          (swap! hist-by-time assoc key idx))))
+    (let [indexes (atom [])
+          matched-times (atom [])]
+      (doseq [idx (range (len live-times))]
+        (let [key (canonical-time-key (.__getitem__ live-times idx))]
+          (when (contains? @hist-by-time key)
+            (swap! indexes conj (get @hist-by-time key))
+            (swap! matched-times conj key))))
+      [(numpy/asarray @indexes ** :dtype numpy/int64) @matched-times])))
+
+(defn align-by-date-map [source live-times target-date date-map]
+  (let [files (npz-files source)]
+    (when-not (contains? files "day_ids")
+      (throw (python/ValueError "historical source has no times array and no day_ids array")))
+    (when (empty? date-map)
+      (throw (python/ValueError "historical source has day_ids but no date map"))))
+  (let [target-compact (compact-date target-date)
+        day-ids (numpy/asarray (.__getitem__ source "day_ids"))
+        target-day-ids (vec (for [[day-id day] date-map :when (= day target-compact)] day-id))]
+    (when (empty? target-day-ids)
+      (throw (python/ValueError (str "date map does not contain target date " target-date))))
+    (let [target-day (last target-day-ids)
+          day-rows (numpy/flatnonzero (= day-ids target-day))]
+      (when (= (.-size day-rows) 0)
+        (throw (python/ValueError (str "historical source has no rows for day_id " target-day))))
+      (let [indexes (atom [])
+            matched-times (atom [])]
+        (doseq [i (range (len live-times))]
+          (let [ts (parse-time (.__getitem__ live-times i))
+                idx (minute-index-et ts)]
+            (when (and (<= 0 idx) (< idx (.-size day-rows)))
+              (swap! indexes conj (int (.__getitem__ day-rows idx)))
+              (swap! matched-times conj (.strftime ts "%Y-%m-%dT%H:%M:%SZ")))))
+        [(numpy/asarray @indexes ** :dtype numpy/int64) @matched-times]))))
+
+(defn run-main [opts]
+  (let [names (load-feature-names (:feature-names opts))
+        expected-features (count names)
+        out-json (:out-json opts)]
+    (cond
+      (not (os.path/exists (:live-capture opts)))
+      (reject "live capture NPZ missing" out-json {"live_capture" (:live-capture opts)})
+
+      (not (os.path/exists (:historical-source opts)))
+      (reject "historical feature source NPZ missing"
+              out-json
+              {"historical_source" (:historical-source opts)
+               "required_shape" (str "(n, " expected-features ")")
+               "acceptable_sources" ["NPZ with arrays: times, X"
+                                     "NPZ with arrays: X, day_ids plus --date-map JSON"]})
+
+      :else
+      (let [live (numpy/load (:live-capture opts) ** :allow_pickle true)
+            source (numpy/load (:historical-source opts) ** :allow_pickle true)
+            live-files (npz-files live)
+            source-files (npz-files source)]
+        (cond
+          (not (contains? live-files "times"))
+          (reject "live capture missing times array" out-json)
+
+          (not (contains? source-files (:source-array opts)))
+          (reject "historical feature source missing source array"
+                  out-json
+                  {"source_array" (:source-array opts)
+                   "arrays" (vec (.-files source))})
+
+          :else
+            (let [x (numpy/asarray (.__getitem__ source (:source-array opts)))
+                shape (.-shape x)]
+            (if (or (not= (len shape) 2) (not= (.__getitem__ shape 1) expected-features))
+              (reject "historical feature source has wrong feature width"
+                      out-json
+                      {"historical_shape" (vec shape)
+                       "expected_features" expected-features
+                       "feature_names" (:feature-names opts)})
+                (let [live-times (.__getitem__ live "times")
+                    [indexes matched-times alignment] (if (contains? source-files "times")
+                                                        (let [[idx times] (align-by-times source live-times)]
+                                                          [idx times "times"])
+                                                        (let [[idx times] (align-by-date-map source
+                                                                                            live-times
+                                                                                            (:target-date opts)
+                                                                                            (load-date-map (:date-map opts)))]
+                                                          [idx times "date_map_minute_index"]))]
+                (if (< (len indexes) (:min-rows opts))
+                  (reject "insufficient matched historical rows"
+                          out-json
+                          {"matched_rows" (int (len indexes))
+                           "min_rows" (:min-rows opts)
+                           "live_rows" (int (len live-times))
+                           "alignment" alignment})
+                  (let [hist (.astype (.__getitem__ x indexes) numpy/float32 ** :copy false)
+                        out-npz (:out-npz opts)
+                        payload {"status" "ok"
+                                 "ok" true
+                                 "target_date" (:target-date opts)
+                                 "alignment" alignment
+                                 "matched_rows" (int (.__getitem__ (.-shape hist) 0))
+                                 "features" (int (.__getitem__ (.-shape hist) 1))
+                                 "historical_source" (:historical-source opts)
+                                 "out_npz" out-npz}]
+                    (os/makedirs (os.path/dirname out-npz) ** :exist_ok true)
+                    (numpy/savez_compressed out-npz ** :times (numpy/asarray matched-times) :X hist)
+                    (os/makedirs (os.path/dirname out-json) ** :exist_ok true)
+                    (spit out-json (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+                    (println (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+                    0))))))))))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (let [args (try (parse-args (vec *command-line-args*))
+                    (catch python/Exception _ nil))]
+      (if (and args (:out-json args))
+        (python/exit (reject (str "historical cohort preparation failed: " e)
+                             (:out-json args)
+                             {"target_date" (:target-date args)}))
+        (do
+          (binding [*out* *err*] (println (str e)))
+          (python/exit 2)))))
+  (catch python/Exception e
+    (let [args (try (parse-args (vec *command-line-args*))
+                    (catch python/Exception _ nil))]
+      (if (and args (:out-json args))
+        (python/exit (reject (str "historical cohort preparation failed: " e)
+                             (:out-json args)
+                             {"target_date" (:target-date args)}))
+        (do
+          (binding [*out* *err*] (println (str e)))
+          (python/exit 1))))))

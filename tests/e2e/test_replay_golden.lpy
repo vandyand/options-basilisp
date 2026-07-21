@@ -21,6 +21,28 @@
                          :out-dir out-dir}
                         opts)))
 
+(deftest replay-rejects-malformed-control-options-before-running
+  (doseq [[opts expected] [[{:snapshot-every 0}
+                            "invalid :snapshot-every: 0"]
+                           [{:snapshot-every 1.5}
+                            "invalid :snapshot-every: 1.5"]
+                           [{:snapshot-every true}
+                            "invalid :snapshot-every: true"]
+                           [{:max-facts 0}
+                            "invalid :max-facts: 0"]
+                           [{:max-facts 2.5}
+                            "invalid :max-facts: 2.5"]
+                           [{:max-facts true}
+                            "invalid :max-facts: true"]]]
+    (let [out-dir (tempfile/mkdtemp)]
+      (try
+        (run!* out-dir opts)
+        (is false (str "expected replay option validation failure: "
+                       (pr-str opts)))
+        (catch python/ValueError e
+          (is (not= -1 (.find (str e) expected))
+              (str opts " -> " e)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; 1. Happy path
 ;; ---------------------------------------------------------------------------

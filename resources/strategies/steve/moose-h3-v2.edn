@@ -14,7 +14,7 @@
  :strategy/family :strategy-family/steve-v2
  :strategy/name :strategy-name/moose
  :strategy/version 1
- :strategy/mode-policy #{:mode/paper :mode/sim}
+ :strategy/mode-policy #{:mode/paper :mode/sim :mode/replay}
  :strategy/schedule {:session :session/us-equities-regular}
  :strategy/warmup {:required-bars 1}
  :strategy/instruments ["equity/NASDAQ/SPY"]

@@ -1,0 +1,273 @@
+(ns feature-parity.test-cli-contracts
+  (:import os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def basilisp-bin
+  (pathlib/Path (or (os.environ/get "BASILISP_BIN")
+                    (os.path/join (str root) ".venv/bin/basilisp"))))
+
+(def scripts
+  {"parity-gate" (pathlib/Path (os.path/join (str root) "scripts/live_feature_parity_gate.lpy"))
+   "prediction-delta" (pathlib/Path (os.path/join (str root) "scripts/live_feature_prediction_delta.lpy"))
+   "baseline" (pathlib/Path (os.path/join (str root) "scripts/live_feature_parity_baseline.lpy"))
+   "model-usage" (pathlib/Path (os.path/join (str root) "scripts/live_feature_model_usage_audit.lpy"))
+   "neutralization" (pathlib/Path (os.path/join (str root) "scripts/neutralization_audit.lpy"))
+   "matched-parity" (pathlib/Path (os.path/join (str root) "scripts/matched_feature_parity_report.lpy"))})
+
+(defn run-script-cwd
+  [name cwd args]
+  (let [env (.copy os/environ)]
+    (.__setitem__ env "STEVE_REPO_ROOT" (str root))
+    (subprocess/run
+     (python/list (concat [(str basilisp-bin) "run" (str (get scripts name)) "--"] args))
+     ** :cwd (str cwd)
+        :env env
+        :text true
+        :capture_output true
+        :check false)))
+
+(defn run-script
+  [name & args]
+  (run-script-cwd name root args))
+
+(defn contains?
+  [haystack needle]
+  (not= -1 (.find (str haystack) needle)))
+
+(deftest live-feature-parity-gate-cli-contract
+  (let [missing (run-script "parity-gate" "--baseline-csv")
+        flagged (run-script "parity-gate" "--baseline-csv" "--out-dir" "x")
+        unknown (run-script "parity-gate" "--baseline-cvs" "typo")
+        help (run-script "parity-gate" "--help")]
+    (is (= 2 (.-returncode missing)))
+    (is (contains? (.-stderr missing) "missing value for --baseline-csv"))
+    (is (= 2 (.-returncode flagged)))
+    (is (contains? (.-stderr flagged) "missing value for --baseline-csv"))
+    (is (= 2 (.-returncode unknown)))
+    (is (contains? (.-stderr unknown) "unknown argument: --baseline-cvs"))
+    (doseq [target-date ["20260705" "2026-02-31" "2026-07-05T14:00:00Z"]]
+      (let [result (run-script "parity-gate" "--target-date" target-date)]
+        (is (= 2 (.-returncode result)))
+        (is (contains? (.-stderr result) "invalid --target-date"))
+        (is (contains? (.-stderr result) target-date))))
+    (is (= 0 (.-returncode help)))
+    (is (contains? (.-stdout help) "--baseline-csv PATH"))
+    (is (contains? (.-stdout help) "--prediction-delta-csv PATH"))
+    (with-open [tmp (tempfile/TemporaryDirectory)]
+      (let [from-other-cwd (run-script-cwd "parity-gate" (pathlib/Path tmp) ["--help"])]
+        (is (= 0 (.-returncode from-other-cwd)))
+        (is (contains? (.-stdout from-other-cwd) "usage:"))))))
+
+(deftest live-feature-prediction-delta-cli-contract
+  (let [help (run-script "prediction-delta" "--help")
+        invalid-mode (run-script "prediction-delta" "--candidate-mode" "bad-mode")]
+    (is (= 0 (.-returncode help)))
+    (is (contains? (.-stdout help) "--dates"))
+    (is (contains? (.-stdout help) "YYYYMMDD"))
+    (is (not (contains? (.-stderr help) "No module named 'torch'")))
+    (doseq [date-value ["2026-07-05" "20260732" "notadate"]]
+      (let [result (run-script "prediction-delta" "--dates" date-value)]
+        (is (= 2 (.-returncode result)))
+        (is (contains? (.-stderr result) "expected YYYYMMDD calendar date"))
+        (is (not (contains? (.-stderr result) "No module named 'torch'")))))
+    (with-open [tmp (tempfile/TemporaryDirectory)]
+      (let [missing-captures (run-script-cwd "prediction-delta" root
+                                             ["--capture-dir" tmp "--dates" "20260705"])]
+        (is (= 1 (.-returncode missing-captures)))
+        (is (contains? (.-stderr missing-captures) "no matching capture files"))
+        (is (not (contains? (.-stderr missing-captures) "No module named 'torch'")))))
+    (is (= 2 (.-returncode invalid-mode)))
+    (is (contains? (.-stderr invalid-mode) "argument --candidate-mode: invalid choice"))
+    (is (not (contains? (.-stderr invalid-mode) "No module named 'torch'")))))
+
+(deftest live-feature-prediction-delta-writes-explicit-unavailable-artifact
+  (with-open [tmp (tempfile/TemporaryDirectory)]
+    (let [tmp-path (pathlib/Path tmp)
+          out-dir (.joinpath tmp-path "out")
+          result (run-script "prediction-delta"
+                             "--capture-dir" (str (.joinpath tmp-path "captures"))
+                             "--out-dir" (str out-dir)
+                             "--candidate-mode" "aggregate"
+                             "--baseline-csv" (str (.joinpath tmp-path "missing_baseline.csv"))
+                             "--dates" "20260709"
+                             "--write-unavailable"
+                             "--unavailable-reason" "baseline missing")
+          json-path (.joinpath out-dir "live_feature_prediction_delta_aggregate_20260709.json")
+          md-path (.joinpath out-dir "live_feature_prediction_delta_aggregate_20260709.md")
+          csv-path (.joinpath out-dir "live_feature_prediction_delta_aggregate_20260709.csv")
+          text (.read_text json-path)]
+      (is (= 1 (.-returncode result)))
+      (is (.exists json-path))
+      (is (.exists md-path))
+      (is (.exists csv-path))
+      (is (contains? text "\"status\": \"unavailable\""))
+      (is (contains? text "\"unavailable_reason\": \"baseline missing\""))
+      (is (contains? text "\"20260709\": []"))
+      (is (contains? (.read_text md-path) "baseline missing")))))
+
+(deftest middle-feature-parity-clis-write-explicit-unavailable-artifacts
+  (with-open [tmp (tempfile/TemporaryDirectory)]
+    (let [tmp-path (pathlib/Path tmp)
+          out-dir (.joinpath tmp-path "out")
+          missing-baseline (.joinpath tmp-path "missing_baseline.csv")
+          missing-usage (.joinpath tmp-path "missing_usage.csv")
+          parity (run-script "parity-gate"
+                             "--baseline-csv" (str missing-baseline)
+                             "--out-dir" (str out-dir)
+                             "--target-date" "2026-07-09"
+                             "--write-unavailable"
+                             "--unavailable-reason" "baseline missing")
+          usage (run-script "model-usage"
+                            "--baseline-csv" (str missing-baseline)
+                            "--out-dir" (str out-dir)
+                            "--target-date" "2026-07-09"
+                            "--write-unavailable"
+                            "--unavailable-reason" "baseline missing")
+          neutralization (run-script "neutralization"
+                                     "--baseline-csv" (str missing-baseline)
+                                     "--usage-csv" (str missing-usage)
+                                     "--out-dir" (str out-dir)
+                                     "--target-date" "2026-07-09"
+                                     "--write-unavailable"
+                                     "--unavailable-reason" "usage missing")
+          parity-json (.joinpath out-dir "live_feature_parity_gate_20260709.json")
+          usage-json (.joinpath out-dir "live_feature_model_usage_20260709.json")
+          usage-csv (.joinpath out-dir "live_feature_model_usage_20260709.csv")
+          neutralization-json (.joinpath out-dir "neutralization_audit_20260709.json")
+          neutralization-csv (.joinpath out-dir "neutralization_audit_20260709.csv")]
+      (is (= 1 (.-returncode parity)) (.-stderr parity))
+      (is (= 1 (.-returncode usage)) (.-stderr usage))
+      (is (= 1 (.-returncode neutralization)) (.-stderr neutralization))
+      (is (.exists parity-json))
+      (is (.exists usage-json))
+      (is (.exists usage-csv))
+      (is (.exists neutralization-json))
+      (is (.exists neutralization-csv))
+      (is (contains? (.read_text parity-json) "\"status\": \"unavailable\""))
+      (is (contains? (.read_text parity-json) "\"verdict\": \"FAIL\""))
+      (is (contains? (.read_text usage-json) "\"status\": \"unavailable\""))
+      (is (contains? (.read_text neutralization-json) "\"status\": \"unavailable\""))
+      (is (contains? (.read_text neutralization-json) "\"blocked_count\": 0")))))
+
+(deftest middle-feature-parity-cli-contracts
+  (let [baseline-missing (run-script "baseline" "--target-date")
+        baseline-unknown (run-script "baseline" "--target-date" "2026-07-05" "--capture-dri" "typo")
+        empty-dates (run-script "baseline" "--dates")
+        flagged-dates (run-script "baseline" "--dates" "--target-date" "2026-07-05")
+        baseline-help (run-script "baseline" "--help")
+        usage-missing (run-script "model-usage" "--baseline-csv")
+        usage-unknown (run-script "model-usage" "--target-date" "2026-07-05" "--baseline-cvs" "typo")
+        usage-help (run-script "model-usage" "--help")
+        usage-ref-root (run-script "model-usage" "--target-date" "2026-07-05" "--ref-root" "/tmp/ref")
+        neut-missing (run-script "neutralization" "--usage-csv")
+        neut-unknown (run-script "neutralization" "--target-date" "2026-07-05" "--usage-cvs" "typo")
+        neut-help (run-script "neutralization" "--help")]
+    (is (= 2 (.-returncode baseline-missing)))
+    (is (contains? (.-stderr baseline-missing) "missing value for --target-date"))
+    (is (= 2 (.-returncode baseline-unknown)))
+    (is (contains? (.-stderr baseline-unknown) "unknown argument: --capture-dri"))
+    (doseq [name ["baseline" "model-usage" "neutralization"]]
+      (doseq [target-date ["20260705" "2026-02-31" "2026-07-05T14:00:00Z"]]
+        (let [result (run-script name "--target-date" target-date)]
+          (is (= 2 (.-returncode result)))
+          (is (contains? (.-stderr result) "invalid --target-date"))
+          (is (contains? (.-stderr result) target-date)))))
+    (is (= 2 (.-returncode empty-dates)))
+    (is (contains? (.-stderr empty-dates) "missing value for --dates"))
+    (is (= 2 (.-returncode flagged-dates)))
+    (is (contains? (.-stderr flagged-dates) "missing value for --dates"))
+    (doseq [date-value ["2026-07-05" "20260732" "notadate"]]
+      (let [result (run-script "baseline" "--dates" date-value)]
+        (is (= 2 (.-returncode result)))
+        (is (contains? (.-stderr result) "invalid --dates"))
+        (is (contains? (.-stderr result) date-value))))
+    (is (= 0 (.-returncode baseline-help)))
+    (is (contains? (.-stdout baseline-help) "--dates YYYYMMDD ..."))
+    (is (contains? (.-stdout baseline-help) "--write-unavailable"))
+    (is (= 2 (.-returncode usage-missing)))
+    (is (contains? (.-stderr usage-missing) "missing value for --baseline-csv"))
+    (is (= 2 (.-returncode usage-unknown)))
+    (is (contains? (.-stderr usage-unknown) "unknown argument: --baseline-cvs"))
+    (is (= 0 (.-returncode usage-help)))
+    (is (contains? (.-stdout usage-help) "--baseline-csv PATH"))
+    (is (contains? (.-stdout usage-help) "--bundle DIR"))
+    (is (contains? (.-stdout usage-help) "--ref-root DIR"))
+    (is (#{1 2} (.-returncode usage-ref-root)))
+    (is (not (contains? (.-stderr usage-ref-root) "unknown argument: --ref-root")))
+    (is (= 2 (.-returncode neut-missing)))
+    (is (contains? (.-stderr neut-missing) "missing value for --usage-csv"))
+    (is (= 2 (.-returncode neut-unknown)))
+    (is (contains? (.-stderr neut-unknown) "unknown argument: --usage-cvs"))
+    (is (= 0 (.-returncode neut-help)))
+    (is (contains? (.-stdout neut-help) "--baseline-csv PATH"))
+    (is (contains? (.-stdout neut-help) "--option-cache PATH"))
+    (with-open [tmp (tempfile/TemporaryDirectory)]
+      (doseq [name ["baseline" "model-usage" "neutralization"]]
+        (let [result (run-script-cwd name (pathlib/Path tmp) ["--help"])]
+          (is (= 0 (.-returncode result)))
+          (is (contains? (.-stdout result) "usage:")))))))
+
+(deftest live-feature-baseline-writes-explicit-unavailable-artifact
+  (with-open [tmp (tempfile/TemporaryDirectory)]
+    (let [tmp-path (pathlib/Path tmp)
+          out-dir (.joinpath tmp-path "out")
+          result (run-script "baseline"
+                             "--target-date" "2026-07-09"
+                             "--out-dir" (str out-dir)
+                             "--write-unavailable"
+                             "--unavailable-reason" "capture missing")
+          json-path (.joinpath out-dir "live_feature_parity_baseline_20260709.json")
+          md-path (.joinpath out-dir "live_feature_parity_baseline_20260709.md")
+          csv-path (.joinpath out-dir "live_feature_parity_baseline_20260709.csv")]
+      (is (= 1 (.-returncode result)) (.-stderr result))
+      (is (.exists json-path))
+      (is (.exists md-path))
+      (is (.exists csv-path))
+      (is (contains? (.read_text json-path) "\"status\": \"unavailable\""))
+      (is (contains? (.read_text json-path) "\"available\": false"))
+      (is (contains? (.read_text json-path) "\"unavailable_reason\": \"capture missing\""))
+      (is (contains? (.read_text md-path) "capture missing"))
+      (is (contains? (.read_text csv-path) "feature,family,status")))))
+
+(deftest matched-feature-parity-cli-writes-unavailable-artifact-on-request
+  (with-open [tmp (tempfile/TemporaryDirectory)]
+    (let [tmp-path (pathlib/Path tmp)
+          features (.joinpath tmp-path "feature_names.json")
+          out-dir (.joinpath tmp-path "out")
+          _ (.write_text features "[\"SPY_close\"]")
+          result (run-script "matched-parity"
+                             "--live-capture" (str (.joinpath tmp-path "missing_live.npz"))
+                             "--historical-npz" (str (.joinpath tmp-path "missing_hist.npz"))
+                             "--feature-names" (str features)
+                             "--out-dir" (str out-dir)
+                             "--target-date" "2026-07-09"
+                             "--write-unavailable-on-error")
+          json-path (.joinpath out-dir "matched_feature_parity_20260709.json")
+          md-path (.joinpath out-dir "matched_feature_parity_20260709.md")
+          csv-path (.joinpath out-dir "matched_feature_parity_20260709.csv")]
+      (is (= 1 (.-returncode result)))
+      (is (.exists json-path))
+      (is (.exists md-path))
+      (is (.exists csv-path))
+      (is (contains? (.read_text json-path) "\"status\": \"unavailable\""))
+      (is (contains? (.read_text json-path) "missing_live.npz")))))
+
+(deftest matched-feature-parity-cli-writes-explicit-unavailable-artifact
+  (with-open [tmp (tempfile/TemporaryDirectory)]
+    (let [tmp-path (pathlib/Path tmp)
+          out-dir (.joinpath tmp-path "out")
+          result (run-script "matched-parity"
+                             "--out-dir" (str out-dir)
+                             "--target-date" "2026-07-09"
+                             "--write-unavailable"
+                             "--unavailable-reason" "historical tensor missing")
+          json-path (.joinpath out-dir "matched_feature_parity_20260709.json")
+          md-path (.joinpath out-dir "matched_feature_parity_20260709.md")
+          csv-path (.joinpath out-dir "matched_feature_parity_20260709.csv")]
+      (is (= 1 (.-returncode result)))
+      (is (.exists json-path))
+      (is (.exists md-path))
+      (is (.exists csv-path))
+      (is (contains? (.read_text json-path) "\"status\": \"unavailable\""))
+      (is (contains? (.read_text json-path) "historical tensor missing")))))

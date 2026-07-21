@@ -1,0 +1,829 @@
+(ns report-metrics.test-core
+  (:import datetime json os os.path subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.report-metrics.core :as rm]))
+
+(def et (datetime/timezone (datetime/timedelta ** :hours -4)))
+(def t0 (datetime/datetime 2026 6 9 9 35 0 0 et))
+(def spy-call "SPY260610C00680000")
+(def spy-put "SPY260610P00650000")
+
+(defn fo
+  ([symbol side price] (fo symbol side price 1 0 "oak"))
+  ([symbol side price qty minute account]
+   {:account account
+    :order-id (str symbol "-" side "-" minute)
+    :symbol symbol
+    :side side
+    :filled-at (+ t0 (datetime/timedelta ** :minutes minute))
+    :filled-avg-price price
+    :qty qty
+    :order-type "market"}))
+
+(defn- run-report-metrics-cli
+  [payload]
+  (let [dir (tempfile/mkdtemp)
+        repo-root (os.path/abspath ".")
+        input-path (os.path/join dir "metrics.json")
+        _ (spit input-path payload)]
+    (subprocess/run (python/list [(os.path/join repo-root ".venv/bin/basilisp")
+                                  "run"
+                                  (os.path/join repo-root "scripts/report_metrics.lpy")
+                                  "--"
+                                  input-path])
+                    ** :capture_output true
+                       :text true
+                       :check false
+                       :cwd dir
+                       :env (doto (os.environ/copy)
+                              (.update (python/dict
+                                        {"STEVE_REPO_ROOT" repo-root}))))))
+
+(deftest open-buy-with-no-close-becomes-open-entry
+  (let [{:keys [round-trips open-entries]} (rm/pair-round-trips [(fo spy-call "BUY" 1.20)])]
+    (is (empty? round-trips))
+    (is (= 1 (count open-entries)))
+    (let [e (first open-entries)]
+      (is (= spy-call (:symbol e)))
+      (is (= "BUY" (:side e)))
+      (is (true? (:is-option e)))
+      (is (true? (:is-long e)))
+      (is (= 1.20 (:open-price e))))))
+
+(deftest long-call-round-trip-still-pairs
+  (let [{:keys [round-trips open-entries]} (rm/pair-round-trips [(fo spy-call "BUY" 1.00 1 0 "oak")
+                                                                 (fo spy-call "SELL" 1.50 1 10 "oak")])
+        rt (first round-trips)]
+    (is (empty? open-entries))
+    (is (= 1 (count round-trips)))
+    (is (= 50.0 (:pnl-dollars rt)))
+    (is (true? (:is-long rt)))))
+
+(deftest carryover-sell-not-a-phantom-short
+  (let [{:keys [round-trips open-entries unmatched-closes]} (rm/pair-round-trips [(fo spy-call "SELL" 2.00)])]
+    (is (empty? round-trips))
+    (is (empty? open-entries))
+    (is (= 1 (count unmatched-closes)))))
+
+(deftest carryover-then-genuine-open
+  (let [{:keys [round-trips open-entries]} (rm/pair-round-trips [(fo spy-put "SELL" 2.00 1 0 "oak")
+                                                                 (fo spy-call "BUY" 1.10 1 1 "oak")])]
+    (is (empty? round-trips))
+    (is (= [spy-call] (mapv :symbol open-entries)))))
+
+(deftest accounts-are-isolated-when-pairing-same-symbol
+  (let [{:keys [round-trips open-entries unmatched-closes]}
+        (rm/pair-round-trips [(fo spy-call "BUY" 1.00 1 0 "oak")
+                              (fo spy-call "SELL" 9.99 1 1 "parrot")
+                              (fo spy-call "SELL" 1.25 1 2 "oak")])
+        rt (first round-trips)]
+    (is (= 1 (count round-trips)))
+    (is (= "oak" (:account rt)))
+    (is (= 25.0 (:pnl-dollars rt)))
+    (is (empty? open-entries))
+    (is (= 1 (count unmatched-closes)))
+    (is (= "parrot" (:account (first unmatched-closes))))))
+
+(deftest duplicate-filled-order-ids-are-rejected
+  (try
+    (rm/pair-round-trips [(assoc (fo spy-call "BUY" 1.00 1 0 "oak")
+                                 :order-id "dup-order")
+                          (assoc (fo spy-call "SELL" 1.25 1 5 "oak")
+                                 :order-id "dup-order")])
+    (is false "duplicate order ids should fail")
+    (catch python/ValueError e
+      (is (not= -1 (.find (str e) "duplicate filled order id"))))))
+
+(deftest boolean-filled-order-numerics-are-rejected
+  (doseq [[field value expected] [[:qty true "boolean integer field"]
+                                  [:filled-avg-price false
+                                   "boolean report metric number"]]]
+    (testing (str field)
+      (try
+        (rm/pair-round-trips [(assoc (fo spy-call "BUY" 1.00 1 0 "oak")
+                                     field value)])
+        (is false "boolean numeric fields should fail")
+        (catch python/ValueError e
+          (is (not= -1 (.find (str e) expected))))))))
+
+(deftest filled-orders-require-complete-identity
+  (let [base (fo spy-call "BUY" 1.00 1 0 "oak")
+        cases [[:account nil "account"]
+               [:account "   " "account"]
+               [:symbol nil "symbol"]
+               [:symbol "" "symbol"]
+               [:order-id nil "id"]
+               [:order-id " " "id"]]]
+    (doseq [[field value expected] cases]
+      (testing (str field "=" (pr-str value))
+        (try
+          (rm/pair-round-trips [(assoc base field value)])
+          (is false "incomplete filled order identity should fail")
+          (catch python/ValueError e
+            (is (not= -1 (.find (str e) expected)))))))))
+
+(deftest partial-close-consumes-only-matched-quantity
+  (let [{:keys [round-trips open-entries unmatched-closes]}
+        (rm/pair-round-trips [(fo spy-call "BUY" 1.00 3 0 "oak")
+                              (fo spy-call "SELL" 1.20 1 5 "oak")])
+        rt (first round-trips)
+        open (first open-entries)]
+    (is (= 1 (count round-trips)))
+    (is (= 1 (:qty rt)))
+    (is (< (abs (- 20.0 (:pnl-dollars rt))) 1e-9))
+    (is (= 1 (count open-entries)))
+    (is (= 2 (:qty open)))
+    (is (= 200.0 (:open-exposure (rm/open-activity open-entries))))
+    (is (empty? unmatched-closes))))
+
+(deftest oversized-option-close-leaves-carryover-residual-not-negative-open
+  (let [{:keys [round-trips open-entries unmatched-closes]}
+        (rm/pair-round-trips [(fo spy-call "BUY" 1.00 1 0 "oak")
+                              (fo spy-call "SELL" 1.50 3 5 "oak")])
+        rt (first round-trips)
+        close (first unmatched-closes)]
+    (is (= 1 (count round-trips)))
+    (is (= 1 (:qty rt)))
+    (is (= 50.0 (:pnl-dollars rt)))
+    (is (empty? open-entries))
+    (is (= 1 (count unmatched-closes)))
+    (is (= 2 (:qty close)))))
+
+(deftest oversized-equity-close-opens-short-residual
+  (let [{:keys [round-trips open-entries unmatched-closes]}
+        (rm/pair-round-trips [(fo "SPY" "BUY" 680.0 10 0 "parrot")
+                              (fo "SPY" "SELL" 681.0 15 5 "parrot")])
+        rt (first round-trips)
+        open (first open-entries)]
+    (is (= 1 (count round-trips)))
+    (is (= 10 (:qty rt)))
+    (is (= 10.0 (:pnl-dollars rt)))
+    (is (empty? unmatched-closes))
+    (is (= 1 (count open-entries)))
+    (is (= "SELL" (:side open)))
+    (is (= 5 (:qty open)))
+    (is (false? (:is-long open)))))
+
+(deftest side-breakdown-splits-market-long-and-short-stats
+  (let [{:keys [round-trips open-entries]} (rm/pair-round-trips
+                                            [(fo spy-call "BUY" 1.00 1 0 "oak")
+                                             (fo spy-call "SELL" 1.40 1 5 "oak")
+                                             (fo spy-put "BUY" 2.00 1 10 "oak")
+                                             (fo spy-put "SELL" 1.70 1 20 "oak")
+                                             (fo spy-put "BUY" 1.50 1 25 "oak")
+                                             (fo spy-put "SELL" 1.75 1 35 "oak")])
+        by-side (:side-breakdown (rm/compute-all-metrics round-trips))]
+    (is (empty? open-entries))
+    (is (= 1 (get-in by-side ["long" :n-trades])))
+    (is (= 1 (get-in by-side ["long" :n-wins])))
+    (is (< (abs (- 40.0 (get-in by-side ["long" :pnl-dollars]))) 1e-9))
+    (is (= 5.0 (get-in by-side ["long" :avg-hold-minutes])))
+    (is (= 2 (get-in by-side ["short" :n-trades])))
+    (is (= 1 (get-in by-side ["short" :n-wins])))
+    (is (= 1 (get-in by-side ["short" :n-losses])))
+    (is (< (abs (+ 5.0 (get-in by-side ["short" :pnl-dollars]))) 1e-9))
+    (is (= 10.0 (get-in by-side ["short" :avg-hold-minutes])))
+    (is (= "09:45" (get-in by-side ["short" :first-open-time])))
+    (is (= "10:10" (get-in by-side ["short" :last-close-time])))))
+
+(deftest open-activity-summary-from-opens
+  (let [opens [{:account "oak" :symbol spy-call :side "BUY" :open-time t0
+                :open-price 1.20 :qty 2 :is-long true :is-option true}
+               {:account "oak" :symbol spy-put :side "BUY" :open-time t0
+                :open-price 0.80 :qty 1 :is-long false :is-option true}]
+        oa (rm/open-activity opens nil {:as-of (+ t0 (datetime/timedelta ** :minutes 30))})]
+    (is (true? (:has-open oa)))
+    (is (= 2 (:n-opened oa)))
+    (is (= 2 (:n-still-open oa)))
+    (is (= 320.0 (:open-exposure oa)))
+    (is (nil? (:open-unrealized oa)))
+    (is (= "09:35" (:first-open-time oa)))
+    (is (= 30.0 (:open-age-minutes oa)))
+    (is (= 60.0 (:open-time-in-market-minutes oa)))
+    (is (< (abs (- (* (/ 60.0 390.0) 100.0) (:open-pct-time-in-market oa))) 1e-9))
+    (is (false? (:open-age-unknown oa)))
+    (is (= (str spy-call ", " spy-put) (:symbols oa)))))
+
+(deftest open-activity-prefers-broker-positions
+  (let [opens [{:account "oak" :symbol spy-call :side "BUY" :open-time t0
+                :open-price 1.20 :qty 1 :is-long true :is-option true}]
+        snap {:account "oak" :n-positions 26 :market-value -15000.0
+              :unrealized-pl 9447.0 :symbols ["x" "x"]}
+        oa (rm/open-activity opens snap)]
+    (is (= 1 (:n-opened oa)))
+    (is (= 26 (:n-still-open oa)))
+    (is (= 15000.0 (:open-exposure oa)))
+    (is (= 9447.0 (:open-unrealized oa)))
+    (is (= (str "x, " spy-call) (:symbols oa)))))
+
+(deftest open-activity-surfaces-unknown-open-age-for-broker-only-positions
+  (let [snap {:account "lynx" :n-positions 1 :market-value 10000.0
+              :unrealized-pl -192.0 :symbols ["SPY"]}
+        oa (rm/open-activity [] snap {:as-of (+ t0 (datetime/timedelta ** :minutes 30))})]
+    (is (true? (:has-open oa)))
+    (is (= 0 (:n-opened oa)))
+    (is (= 1 (:n-still-open oa)))
+    (is (nil? (:open-age-minutes oa)))
+    (is (nil? (:open-time-in-market-minutes oa)))
+    (is (true? (:open-age-unknown oa)))))
+
+(deftest open-activity-rejects-broker-only-positive-count-without-position-evidence
+  (let [snap {:account "lynx" :n-positions 1 :market-value 0.0
+              :unrealized-pl 0.0 :symbols []}]
+    (try
+      (rm/open-activity [] snap)
+      (is false "expected positive empty broker snapshot to fail")
+      (catch python/ValueError e
+        (is (not= -1 (.find (str e) "positive position count without symbols")))))))
+
+(deftest open-activity-rejects-positive-broker-count-without-symbol-identity
+  (let [exposure-only {:account "lynx" :n-positions 1 :market-value 10000.0
+                       :unrealized-pl -192.0 :symbols []}
+        blank-symbol {:account "lynx" :n-positions 1 :market-value 10000.0
+                      :unrealized-pl -192.0 :symbols [" "]}]
+    (doseq [[snap expected] [[exposure-only "positive position count without symbols"]
+                             [blank-symbol "blank position symbol"]]]
+      (try
+        (rm/open-activity [] snap)
+        (is false "expected broker snapshot without usable symbol identity to fail")
+        (catch python/ValueError e
+          (is (not= -1 (.find (str e) expected))))))))
+
+(deftest python-compatible-metric-shape-matches-report-builders
+  (let [{:keys [round-trips open-entries]} (rm/pair-round-trips [(fo spy-call "BUY" 1.00 1 0 "oak")
+                                                                 (fo spy-call "SELL" 1.25 1 5 "oak")
+                                                                 (fo spy-put "BUY" 0.80 1 10 "oak")])
+        m (rm/compute-all-metrics-python round-trips)
+        oa (rm/open-activity-python open-entries nil {:as-of (+ t0 (datetime/timedelta ** :minutes 20))})]
+    (is (= 25.0 (get m "total_pnl_dollars")))
+    (is (= 1 (get m "n_trades")))
+    (is (contains? m "side_breakdown"))
+    (is (contains? (get-in m ["side_breakdown" "long"]) "avg_hold_minutes"))
+    (is (contains? (get-in m ["side_breakdown" "long"]) "pnl_dollars"))
+    (is (= 1 (get oa "n_opened")))
+    (is (= true (get oa "has_open")))
+    (is (contains? oa "open_age_minutes"))
+    (is (contains? oa "open_time_in_market_minutes"))
+    (is (contains? oa "open_pct_time_in_market"))
+    (is (contains? oa "open_age_unknown"))))
+
+(deftest report-metrics-cli-rejects-orders-mixed-with-explicit-paired-data
+  (let [payload (str "{\"orders\":[{\"account\":\"oak\",\"order_id\":\"o1\","
+                     "\"symbol\":\"" spy-call "\",\"side\":\"BUY\","
+                     "\"filled_at\":\"" (.isoformat t0) "\","
+                     "\"filled_avg_price\":1.0,\"qty\":1,"
+                     "\"order_type\":\"market\"}],"
+                     "\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-call "\","
+                     "\"open_time\":\"" (.isoformat t0) "\","
+                     "\"close_time\":\""
+                     (.isoformat (+ t0 (datetime/timedelta ** :minutes 5)))
+                     "\",\"side\":\"BUY\",\"is_long\":true,\"open_price\":1.0,"
+                     "\"close_price\":1.2,\"qty\":1,"
+                     "\"pnl_dollars\":20.0,\"hold_minutes\":5.0}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "mutually exclusive")))))
+
+(deftest report-metrics-cli-rejects-non-finite-order-numerics
+  (let [payload (str "{\"orders\":["
+                     "{\"account\":\"oak\",\"order_id\":\"o1\","
+                     "\"symbol\":\"" spy-call "\",\"side\":\"BUY\","
+                     "\"filled_at\":\"" (.isoformat t0) "\","
+                     "\"filled_avg_price\":\"NaN\",\"qty\":1},"
+                     "{\"account\":\"oak\",\"order_id\":\"o2\","
+                     "\"symbol\":\"" spy-call "\",\"side\":\"SELL\","
+                     "\"filled_at\":\""
+                     (.isoformat (+ t0 (datetime/timedelta ** :minutes 5)))
+                     "\",\"filled_avg_price\":1.2,\"qty\":1}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "non-finite")))))
+
+(deftest report-metrics-cli-rejects-boolean-numerics
+  (let [order-payload (str "{\"orders\":["
+                           "{\"account\":\"oak\",\"order_id\":\"o1\","
+                           "\"symbol\":\"" spy-call "\",\"side\":\"BUY\","
+                           "\"filled_at\":\"" (.isoformat t0) "\","
+                           "\"filled_avg_price\":true,\"qty\":1}]}")
+        position-payload "{\"positions\":{\"n_positions\":true,\"market_value\":0.0,\"unrealized_pl\":0.0,\"symbols\":[]}}"
+        order-result (run-report-metrics-cli order-payload)
+        position-result (run-report-metrics-cli position-payload)]
+    (is (not= 0 (.-returncode order-result)))
+    (is (not= -1 (.find (str (.-stderr order-result) (.-stdout order-result))
+                        "boolean numeric field")))
+    (is (not= 0 (.-returncode position-result)))
+    (is (not= -1 (.find (str (.-stderr position-result)
+                             (.-stdout position-result))
+                        "boolean numeric field")))))
+
+(deftest report-metrics-cli-rejects-invalid-order-side
+  (let [payload (str "{\"orders\":[{\"account\":\"oak\",\"order_id\":\"o1\","
+                     "\"symbol\":\"" spy-call "\",\"side\":\"HOLD\","
+                     "\"filled_at\":\"" (.isoformat t0) "\","
+                     "\"filled_avg_price\":1.0,\"qty\":1}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "invalid side")))))
+
+(deftest report-metrics-cli-rejects-malformed-container-shapes
+  (let [cases [["[]" "object field required: payload"]
+               ["{\"orders\":{\"account\":\"oak\"}}" "array field required: orders"]
+               ["{\"round_trips\":{\"account\":\"oak\"}}" "array field required: round_trips"]
+               ["{\"open_entries\":{\"account\":\"oak\"}}" "array field required: open_entries"]
+               ["{\"positions\":[]}" "object field required: positions"]
+               ["{\"positions\":{\"n_positions\":1,\"market_value\":1.0,\"unrealized_pl\":0.0,\"symbols\":\"SPY\"}}"
+                "array field required: positions.symbols"]
+               ["{\"batches\":[]}" "object field required: batches"]
+               ["{\"batches\":{\"oak\":[]}}" "object field required: payload"]]]
+    (doseq [[payload expected] cases]
+      (let [result (run-report-metrics-cli payload)
+            output (str (.-stderr result) (.-stdout result))]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find output expected)) (str expected " in " output))))))
+
+(deftest report-metrics-cli-fuzz-rejects-scalar-containers
+  (let [scalar-values ["null" "true" "false" "\"SPY\"" "42" "1.5"]
+        array-fields ["orders" "round_trips" "open_entries"]]
+    (doseq [field array-fields
+            scalar scalar-values]
+      (let [payload (str "{\"" field "\":" scalar "}")
+            result (run-report-metrics-cli payload)
+            output (str (.-stderr result) (.-stdout result))]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find output (str "array field required: " field)))
+            (str field "=" scalar " in " output))))))
+
+(deftest report-metrics-cli-rejects-missing-order-identity
+  (let [missing-account (str "{\"orders\":[{\"order_id\":\"o1\","
+                             "\"symbol\":\"" spy-call "\",\"side\":\"BUY\","
+                             "\"filled_at\":\"" (.isoformat t0) "\","
+                             "\"filled_avg_price\":1.0,\"qty\":1}]}")
+        blank-symbol (str "{\"orders\":[{\"account\":\"oak\","
+                          "\"order_id\":\"o1\",\"symbol\":\"   \","
+                          "\"side\":\"BUY\",\"filled_at\":\""
+                          (.isoformat t0)
+                          "\",\"filled_avg_price\":1.0,\"qty\":1}]}")
+        missing-order-id (str "{\"orders\":[{\"account\":\"oak\","
+                              "\"symbol\":\"" spy-call "\",\"side\":\"BUY\","
+                              "\"filled_at\":\"" (.isoformat t0) "\","
+                              "\"filled_avg_price\":1.0,\"qty\":1}]}")
+        cases [[missing-account "orders.account"]
+               [blank-symbol "orders.symbol"]
+               [missing-order-id "orders.order_id"]]]
+    (doseq [[payload expected] cases]
+      (let [result (run-report-metrics-cli payload)]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                            expected)))))))
+
+(deftest report-metrics-cli-rejects-stale-explicit-round-trip
+  (let [payload (str "{\"report_date\":\"2026-07-02\","
+                     "\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-call "\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                     "\"side\":\"BUY\",\"is_long\":true,\"open_price\":1.0,"
+                     "\"close_price\":1.2,\"qty\":1,"
+                     "\"pnl_dollars\":20.0,\"hold_minutes\":5.0}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "outside report_date")))))
+
+(deftest report-metrics-cli-infers-unambiguous-explicit-report-date
+  (let [payload (str "{\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-call "\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                     "\"side\":\"BUY\",\"is_long\":true,\"open_price\":1.0,"
+                     "\"close_price\":1.2,\"qty\":1,"
+                     "\"pnl_dollars\":20.0,\"hold_minutes\":5.0}],"
+                     "\"open_entries\":[{\"account\":\"oak\","
+                     "\"symbol\":\"SPY\",\"side\":\"BUY\","
+                     "\"open_time\":\"2026-06-09T09:45:00-04:00\","
+                     "\"open_price\":100.0,\"qty\":1,"
+                     "\"is_long\":true,\"is_option\":false}]}")
+        result (run-report-metrics-cli payload)
+        data (json/loads (.-stdout result))]
+    (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+    (is (= 1 (get data "round_trips")))
+    (is (= 1 (get data "open_entries")))))
+
+(deftest report-metrics-cli-rejects-ambiguous-explicit-report-date
+  (let [payload (str "{\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-call "\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                     "\"side\":\"BUY\",\"is_long\":true,\"open_price\":1.0,"
+                     "\"close_price\":1.2,\"qty\":1,"
+                     "\"pnl_dollars\":20.0,\"hold_minutes\":5.0}],"
+                     "\"open_entries\":[{\"account\":\"oak\","
+                     "\"symbol\":\"SPY\",\"side\":\"BUY\","
+                     "\"open_time\":\"2026-06-10T09:45:00-04:00\","
+                     "\"open_price\":100.0,\"qty\":1,"
+                     "\"is_long\":true,\"is_option\":false}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "span multiple dates")))))
+
+(deftest report-metrics-cli-allows-multi-day-closed-round-trip-aggregate
+  (let [payload (str "{\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"SPY\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                     "\"side\":\"BUY\",\"is_long\":true,\"open_price\":100.0,"
+                     "\"close_price\":101.0,\"qty\":1,"
+                     "\"pnl_dollars\":1.0,\"hold_minutes\":5.0},"
+                     "{\"account\":\"oak\","
+                     "\"symbol\":\"SPY\","
+                     "\"open_time\":\"2026-06-10T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-10T09:40:00-04:00\","
+                     "\"side\":\"BUY\",\"is_long\":true,\"open_price\":100.0,"
+                     "\"close_price\":102.0,\"qty\":1,"
+                     "\"pnl_dollars\":2.0,\"hold_minutes\":5.0}]}")
+        result (run-report-metrics-cli payload)
+        data (json/loads (.-stdout result))]
+    (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+    (is (= 2 (get data "round_trips")))))
+
+(deftest report-metrics-cli-rejects-explicit-round-trip-pnl-mismatch
+  (let [payload (str "{\"report_date\":\"2026-06-09\","
+                     "\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-call "\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                     "\"side\":\"BUY\",\"is_long\":true,\"open_price\":1.0,"
+                     "\"close_price\":1.2,\"qty\":1,"
+                     "\"pnl_dollars\":999999.0,\"hold_minutes\":5.0}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "pnl_dollars does not match")))))
+
+(deftest report-metrics-cli-reconciles-explicit-long-put-pnl-by-contract-side
+  (let [good-payload (str "{\"report_date\":\"2026-06-09\","
+                          "\"round_trips\":[{\"account\":\"oak\","
+                          "\"symbol\":\"" spy-put "\","
+                          "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                          "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                          "\"side\":\"BUY\",\"is_long\":false,"
+                          "\"open_price\":2.0,\"close_price\":2.5,"
+                          "\"qty\":1,\"pnl_dollars\":50.0,"
+                          "\"hold_minutes\":5.0}]}")
+        bad-payload (str "{\"report_date\":\"2026-06-09\","
+                         "\"round_trips\":[{\"account\":\"oak\","
+                         "\"symbol\":\"" spy-put "\","
+                         "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                         "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                         "\"side\":\"BUY\",\"is_long\":false,"
+                         "\"open_price\":2.0,\"close_price\":2.5,"
+                         "\"qty\":1,\"pnl_dollars\":-50.0,"
+                         "\"hold_minutes\":5.0}]}")
+        good (run-report-metrics-cli good-payload)
+        bad (run-report-metrics-cli bad-payload)
+        data (json/loads (.-stdout good))]
+    (is (= 0 (.-returncode good)))
+    (is (= 50.0 (get-in data ["metrics" "total_pnl_dollars"])))
+    (is (not= 0 (.-returncode bad)))
+    (is (not= -1 (.find (str (.-stderr bad) (.-stdout bad))
+                        "pnl_dollars does not match")))))
+
+(deftest report-metrics-cli-rejects-explicit-round-trip-side-long-contradiction
+  (let [call-payload (str "{\"report_date\":\"2026-06-09\","
+                          "\"round_trips\":[{\"account\":\"oak\","
+                          "\"symbol\":\"" spy-call "\","
+                          "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                          "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                          "\"side\":\"BUY\",\"is_long\":false,"
+                          "\"open_price\":1.0,\"close_price\":1.2,"
+                          "\"qty\":1,\"pnl_dollars\":20.0,"
+                          "\"hold_minutes\":5.0}]}")
+        put-payload (str "{\"report_date\":\"2026-06-09\","
+                         "\"round_trips\":[{\"account\":\"oak\","
+                         "\"symbol\":\"" spy-put "\","
+                         "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                         "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                         "\"side\":\"BUY\",\"is_long\":true,"
+                         "\"open_price\":2.0,\"close_price\":2.5,"
+                         "\"qty\":1,\"pnl_dollars\":50.0,"
+                         "\"hold_minutes\":5.0}]}")
+        call-result (run-report-metrics-cli call-payload)
+        put-result (run-report-metrics-cli put-payload)]
+    (is (not= 0 (.-returncode call-result)))
+    (is (not= -1 (.find (str (.-stderr call-result) (.-stdout call-result))
+                        "is_long does not match")))
+    (is (not= 0 (.-returncode put-result)))
+    (is (not= -1 (.find (str (.-stderr put-result) (.-stdout put-result))
+                        "is_long does not match")))))
+
+(deftest report-metrics-cli-preserves-explicit-option-round-trip-without-side
+  (let [payload (str "{\"report_date\":\"2026-06-09\","
+                     "\"round_trips\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-put "\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                     "\"is_long\":false,\"open_price\":2.0,"
+                     "\"close_price\":2.5,\"qty\":1,"
+                     "\"pnl_dollars\":50.0,\"hold_minutes\":5.0}]}")
+        result (run-report-metrics-cli payload)
+        data (json/loads (.-stdout result))]
+    (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+    (is (= 50.0 (get-in data ["metrics" "total_pnl_dollars"])))
+    (is (= 1 (get data "round_trips")))))
+
+(deftest report-metrics-cli-rejects-explicit-open-entry-side-long-contradiction
+  (let [payload (str "{\"report_date\":\"2026-06-09\","
+                     "\"open_entries\":[{\"account\":\"oak\","
+                     "\"symbol\":\"" spy-put "\",\"side\":\"BUY\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"open_price\":2.0,\"qty\":1,"
+                     "\"is_long\":true,\"is_option\":true}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "is_long does not match")))))
+
+(deftest report-metrics-cli-rejects-explicit-activity-after-as-of
+  (let [round-trip-payload (str "{\"as_of\":\"2026-06-09T09:38:00-04:00\","
+                                "\"round_trips\":[{\"account\":\"oak\","
+                                "\"symbol\":\"" spy-call "\","
+                                "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                                "\"close_time\":\"2026-06-09T09:40:00-04:00\","
+                                "\"side\":\"BUY\",\"is_long\":true,"
+                                "\"open_price\":1.0,\"close_price\":1.2,"
+                                "\"qty\":1,\"pnl_dollars\":20.0,"
+                                "\"hold_minutes\":5.0}]}")
+        open-entry-payload (str "{\"as_of\":\"2026-06-09T09:30:00-04:00\","
+                                "\"open_entries\":[{\"account\":\"oak\","
+                                "\"symbol\":\"SPY\",\"side\":\"BUY\","
+                                "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                                "\"open_price\":100.0,\"qty\":1,"
+                                "\"is_long\":true,\"is_option\":false}]}")
+        round-trip-result (run-report-metrics-cli round-trip-payload)
+        open-entry-result (run-report-metrics-cli open-entry-payload)]
+    (is (not= 0 (.-returncode round-trip-result)))
+    (is (not= -1 (.find (str (.-stderr round-trip-result)
+                             (.-stdout round-trip-result))
+                        "after as_of")))
+    (is (not= 0 (.-returncode open-entry-result)))
+    (is (not= -1 (.find (str (.-stderr open-entry-result)
+                             (.-stdout open-entry-result))
+                        "after as_of")))))
+
+(deftest report-metrics-cli-rejects-malformed-explicit-report-dates
+  (let [entry (str "\"open_entries\":[{\"account\":\"oak\","
+                   "\"symbol\":\"SPY\",\"side\":\"BUY\","
+                   "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                   "\"open_price\":100.0,\"qty\":1,"
+                   "\"is_long\":true,\"is_option\":false}]")
+        cases [(str "{\"report_date\":\"zzzz\"," entry "}")
+               (str "{\"report_date\":\"20260609\"," entry "}")
+               (str "{\"report_date\":\"2026-13-09\"," entry "}")
+               (str "{\"report_date\":true," entry "}")]]
+    (doseq [payload cases]
+      (let [result (run-report-metrics-cli payload)
+            output (str (.-stderr result) (.-stdout result))]
+        (is (not= 0 (.-returncode result))
+            (str "malformed report_date should fail: " payload))
+        (is (not= -1 (.find output "invalid report_date field"))
+            output)))))
+
+(deftest report-metrics-cli-rejects-fractional-quantities
+  (let [payload (str "{\"orders\":["
+                     "{\"account\":\"parrot\",\"order_id\":\"o1\","
+                     "\"symbol\":\"SPY\",\"side\":\"BUY\","
+                     "\"filled_at\":\"" (.isoformat t0) "\","
+                     "\"filled_avg_price\":100.0,\"qty\":1.9},"
+                     "{\"account\":\"parrot\",\"order_id\":\"o2\","
+                     "\"symbol\":\"SPY\",\"side\":\"SELL\","
+                     "\"filled_at\":\""
+                     (.isoformat (+ t0 (datetime/timedelta ** :minutes 5)))
+                     "\",\"filled_avg_price\":101.0,\"qty\":1.9}]}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "fractional integer field")))))
+
+(deftest report-metrics-cli-rejects-negative-broker-position-count
+  (let [payload "{\"positions\":{\"n_positions\":-1,\"market_value\":0.0,\"unrealized_pl\":0.0,\"symbols\":[]}}"
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "negative integer field")))))
+
+(deftest report-metrics-cli-rejects-open-entry-with-flat-broker-snapshot
+  (let [payload (str "{\"report_date\":\"2026-06-09\","
+                     "\"open_entries\":[{\"account\":\"parrot\","
+                     "\"symbol\":\"SPY\",\"side\":\"BUY\","
+                     "\"open_time\":\"2026-06-09T09:35:00-04:00\","
+                     "\"open_price\":100.0,\"qty\":1,"
+                     "\"is_long\":true,\"is_option\":false}],"
+                     "\"positions\":{\"n_positions\":0,\"market_value\":0.0,"
+                     "\"unrealized_pl\":0.0,\"symbols\":[]}}")
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "zero positions with open entries")))))
+
+(deftest report-metrics-cli-rejects-inconsistent-broker-position-snapshot
+  (let [payload "{\"positions\":{\"n_positions\":0,\"market_value\":10000.0,\"unrealized_pl\":123.0,\"symbols\":[\"SPY\"]}}"
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "broker positions are inconsistent")))))
+
+(deftest report-metrics-cli-rejects-positive-empty-broker-position-snapshot
+  (let [payload "{\"positions\":{\"n_positions\":1,\"market_value\":0.0,\"unrealized_pl\":0.0,\"symbols\":[]}}"
+        result (run-report-metrics-cli payload)]
+    (is (not= 0 (.-returncode result)))
+    (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                        "positive position count without symbols")))))
+
+(deftest report-metrics-cli-rejects-positive-broker-position-without-symbol-identity
+  (let [exposure-only "{\"positions\":{\"n_positions\":1,\"market_value\":10000.0,\"unrealized_pl\":-192.0,\"symbols\":[]}}"
+        blank-symbol "{\"positions\":{\"n_positions\":1,\"market_value\":10000.0,\"unrealized_pl\":-192.0,\"symbols\":[\" \"]}}"
+        cases [[exposure-only "positive position count without symbols"]
+               [blank-symbol "blank required field: positions.symbols[]"]]]
+    (doseq [[payload expected] cases]
+      (let [result (run-report-metrics-cli payload)]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                            expected)))))))
+
+(deftest report-metrics-cli-emits-strict-json-with-null-undefined-ratios
+  (let [payload (str "{\"orders\":["
+                     "{\"account\":\"oak\",\"order_id\":\"o1\","
+                     "\"symbol\":\"" spy-call "\",\"side\":\"BUY\","
+                     "\"filled_at\":\"" (.isoformat t0) "\","
+                     "\"filled_avg_price\":1.0,\"qty\":1},"
+                     "{\"account\":\"oak\",\"order_id\":\"o2\","
+                     "\"symbol\":\"" spy-call "\",\"side\":\"SELL\","
+                     "\"filled_at\":\""
+                     (.isoformat (+ t0 (datetime/timedelta ** :minutes 5)))
+                     "\",\"filled_avg_price\":1.2,\"qty\":1}]}")
+        result (run-report-metrics-cli payload)
+        data (json/loads (.-stdout result))]
+    (is (= 0 (.-returncode result)))
+    (is (< (abs (- 20.0 (get-in data ["metrics" "total_pnl_dollars"]))) 1e-9))
+    (is (nil? (get-in data ["metrics" "profit_factor"])))
+    (is (nil? (get-in data ["metrics" "calmar"])))))
+
+(deftest stress-pairs-many-independent-symbols-with-invariants
+  (let [orders (vec
+                (mapcat (fn [i]
+                          (let [sym (str "SPY260610C" (python/format (+ 650000 i) "08d"))
+                                q (inc (mod i 3))
+                                open (+ 1.0 (/ i 100.0))
+                                close (+ open 0.25)]
+                            [(fo sym "BUY" open q (* 2 i) "stress")
+                             (fo sym "SELL" close q (inc (* 2 i)) "stress")]))
+                        (range 1000)))
+        {:keys [round-trips open-entries unmatched-closes]} (rm/pair-round-trips orders)
+        m (rm/compute-all-metrics round-trips)]
+    (is (= 1000 (count round-trips)))
+    (is (empty? open-entries))
+    (is (empty? unmatched-closes))
+    (is (= 1000 (:n-trades m)))
+    (is (= 1000 (:n-wins m)))
+    (is (= 0 (:n-losses m)))
+    (is (= (reduce + (map #(* 0.25 100.0 (inc (mod % 3))) (range 1000)))
+           (:total-pnl-dollars m)))
+    (is (= 100.0 (:pct-time-in-market m)))))
+
+(deftest stress-partial-fifo-pnl-is-sum-of-consumed-lots
+  (let [orders (vec
+                (mapcat (fn [i]
+                          (let [sym (str "SPY260610C" (python/format (+ 700000 i) "08d"))
+                                account (str "acct-" (mod i 7))
+                                open (+ 1.0 (/ (mod i 11) 100.0))
+                                c1 (+ open 0.10)
+                                c2 (+ open 0.25)
+                                q (+ 2 (mod i 5))
+                                q1 (inc (mod i (dec q)))
+                                q2 (- q q1)]
+                            [(fo sym "BUY" open q (* 3 i) account)
+                             (fo sym "SELL" c1 q1 (inc (* 3 i)) account)
+                             (fo sym "SELL" c2 q2 (+ 2 (* 3 i)) account)]))
+                        (range 300)))
+        {:keys [round-trips open-entries unmatched-closes]} (rm/pair-round-trips orders)
+        expected (reduce +
+                         (map (fn [i]
+                                (let [q (+ 2 (mod i 5))
+                                      q1 (inc (mod i (dec q)))
+                                      q2 (- q q1)]
+                                  (+ (* 0.10 100.0 q1)
+                                     (* 0.25 100.0 q2))))
+                              (range 300)))]
+    (is (= 600 (count round-trips)))
+    (is (empty? open-entries))
+    (is (empty? unmatched-closes))
+    (is (< (abs (- expected (:total-pnl-dollars (rm/compute-all-metrics round-trips))))
+           1e-6))))
+
+(defn- lcg
+  [seed]
+  (mod (+ (* 1103515245 seed) 12345) 2147483648))
+
+(defn- fuzz-equity-orders
+  [n]
+  (loop [i 0
+         seed 424242
+         out []]
+    (if (= i n)
+      out
+      (let [seed1 (lcg seed)
+            seed2 (lcg seed1)
+            seed3 (lcg seed2)
+            seed4 (lcg seed3)
+            account (nth ["acct-a" "acct-b" "acct-c"] (mod seed1 3))
+            symbol (nth ["SPY" "QQQ"] (mod seed2 2))
+            side (if (zero? (mod seed3 2)) "BUY" "SELL")
+            qty (inc (mod seed4 5))
+            price (+ 100.0 (/ (mod seed1 1000) 100.0))]
+        (recur (inc i)
+               seed4
+               (conj out (fo symbol side price qty i account)))))))
+
+(defn- oracle-match-one
+  [queue signed-qty price]
+  (loop [remaining signed-qty
+         lots queue
+         pnl 0.0
+         trades 0]
+    (if (or (zero? remaining)
+            (empty? lots)
+            (pos? (* remaining (:signed-qty (first lots)))))
+      {:remaining remaining
+       :lots lots
+       :pnl pnl
+       :trades trades}
+      (let [lot (first lots)
+            lot-qty (:signed-qty lot)
+            matched (min (abs remaining) (abs lot-qty))
+            trade-pnl (if (pos? lot-qty)
+                        (* (- price (:price lot)) matched)
+                        (* (- (:price lot) price) matched))
+            remaining' (+ remaining
+                          (if (pos? remaining) (- matched) matched))
+            lot-qty' (+ lot-qty
+                        (if (pos? lot-qty) (- matched) matched))
+            lots' (if (zero? lot-qty')
+                    (vec (rest lots))
+                    (vec (cons (assoc lot :signed-qty lot-qty') (rest lots))))]
+        (recur remaining'
+               lots'
+               (+ pnl trade-pnl)
+               (inc trades))))))
+
+(defn- oracle-equity
+  [orders]
+  (let [lots-by-key (atom {})
+        total-pnl (atom 0.0)
+        trade-count (atom 0)]
+    (doseq [o (sort-by :filled-at orders)]
+      (let [k [(:account o) (:symbol o)]
+            signed-qty (if (= "BUY" (:side o)) (:qty o) (- (:qty o)))
+            matched (oracle-match-one (vec (get @lots-by-key k []))
+                                      signed-qty
+                                      (:filled-avg-price o))
+            residual (:remaining matched)
+            lots' (cond-> (:lots matched)
+                    (not (zero? residual))
+                    (conj {:signed-qty residual
+                           :price (:filled-avg-price o)}))]
+        (swap! total-pnl + (:pnl matched))
+        (swap! trade-count + (:trades matched))
+        (swap! lots-by-key assoc k lots')))
+    {:total-pnl @total-pnl
+     :trade-count @trade-count
+     :open-qty-by-key (into {}
+                            (map (fn [[k lots]]
+                                   [k (reduce + 0 (map :signed-qty lots))])
+                                 @lots-by-key))}))
+
+(defn- open-qty-by-key
+  [open-entries]
+  (reduce (fn [acc e]
+            (let [k [(:account e) (:symbol e)]
+                  signed-qty (if (= "BUY" (:side e)) (:qty e) (- (:qty e)))]
+              (update acc k (fnil + 0) signed-qty)))
+          {}
+          open-entries))
+
+(deftest deterministic-fuzz-equity-pairing-matches-signed-fifo-oracle
+  (let [orders (fuzz-equity-orders 500)
+        expected (oracle-equity orders)
+        {:keys [round-trips open-entries unmatched-closes]} (rm/pair-round-trips orders)]
+    (is (empty? unmatched-closes))
+    (is (= (:trade-count expected) (count round-trips)))
+    (is (< (abs (- (:total-pnl expected)
+                   (:total-pnl-dollars (rm/compute-all-metrics round-trips))))
+           1e-6))
+    (is (= (:open-qty-by-key expected) (open-qty-by-key open-entries)))
+    (is (every? #(pos? (:qty %)) round-trips))
+    (is (every? #(pos? (:qty %)) open-entries))))

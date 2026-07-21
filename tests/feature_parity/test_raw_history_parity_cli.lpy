@@ -1,0 +1,147 @@
+(ns feature-parity.test-raw-history-parity-cli
+  (:import http.server json os pathlib shutil subprocess sys tempfile threading urllib.parse)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def manifest-script (.joinpath root "scripts" "build_raw_history_request_manifest.lpy"))
+(def executor-script (.joinpath root "scripts" "execute_raw_history_parity.lpy"))
+
+(defn resolve-basilisp []
+  (cond (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+        (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+        (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+        (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+        :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+(def requests (atom []))
+
+(defn jsonable [value]
+  (cond (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+        (or (vector? value) (seq? value)) (python/list (map jsonable value))
+        :else value))
+
+(defn write-json! [handler payload]
+  (let [body (.encode (json/dumps (jsonable payload)) "utf-8")]
+    (.send_response handler 200)
+    (.send_header handler "Content-Type" "application/json")
+    (.send_header handler "Content-Length" (str (count body)))
+    (.end_headers handler)
+    (.write (.-wfile handler) body)))
+
+(defn log-message [& _] nil)
+
+(defn do-get [self]
+  (let [parsed (urllib.parse/urlparse (.-path self)) query (urllib.parse/parse_qs (.-query parsed))
+        path (.-path parsed) venue (first (.get query "venue" []))]
+    (swap! requests conj {"path" path "query" query})
+    (cond
+      (= path "/v3/option/history/quote")
+      ;; Header/response is a real Terminal JSON shape, and includes an extra
+      ;; unselected contract to prove comparison is contract-keyed.
+      (write-json! self {"header" {"format" ["symbol" "expiration" "strike" "right" "timestamp"
+                                             "bid" "ask" "bid_size" "ask_size" "bid_exchange" "ask_exchange"
+                                             "bid_condition" "ask_condition"]}
+                         "response" [["SPY" "2026-07-17" 600.0 "CALL" "2026-07-13T09:31:00.000"
+                                      1.0 1.1 10 11 1 2 3 4]
+                                     ["SPY" "2026-07-17" 600.0 "PUT" "2026-07-13T09:31:00.000"
+                                      2.0 2.1 20 21 5 6 7 8]
+                                     ["SPY" "2026-07-17" 601.0 "CALL" "2026-07-13T09:31:00.000"
+                                      9.0 9.1 1 1 1 1 1 1]]})
+
+      (= path "/v3/stock/history/trade")
+      (write-json! self (case venue
+                          ;; Reverse the two same-millisecond events. The
+                          ;; matcher must treat them as a field multiset, not
+                          ;; assume vendor occurrence order is preserved.
+                          "nqb" [{"timestamp" "2026-07-13T09:31:00.500" "price" 700.75
+                                  "size" 100 "exchange" 11 "condition" 0}
+                                 {"timestamp" "2026-07-13T09:31:00.500" "price" 700.25
+                                  "size" 100 "exchange" 11 "condition" 0}]
+                          "utp_cta" [{"timestamp" "2026-07-13T09:31:00.500" "price" 700.50
+                                      "size" 100 "exchange" 11 "condition" 0}
+                                     {"timestamp" "2026-07-13T09:31:00.500" "price" 700.50
+                                      "size" 100 "exchange" 11 "condition" 0}]
+                          []))
+
+      :else (write-json! self []))))
+
+(def Handler
+  (python/type "RawHistoryParityHandler" (python/tuple [http.server/BaseHTTPRequestHandler])
+               (python/dict {"log_message" log-message "do_GET" do-get})))
+
+(defn run-cli [script & args]
+  (subprocess/run (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+                  ** :cwd (str root) :text true :capture_output true :check false))
+
+(defn event [security req contract body]
+  {"sec_type" security "req_type" req "contract" contract
+   (if (= req "QUOTE") "quote" "trade") body})
+
+(defn json-line [payload] (str (json/dumps (jsonable payload)) "\n"))
+
+(deftest fetch-and-match-batches-options-and-reports-venue-results
+  (let [server (http.server/ThreadingHTTPServer (python/tuple ["127.0.0.1" 0]) Handler)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)
+        tmp (pathlib/Path (tempfile/mkdtemp)) events (.joinpath tmp "events.ndjson")
+        plan (.joinpath tmp "plan.json") receipt (.joinpath tmp "receipt.json") manifest (.joinpath tmp "manifest.json")]
+    (.start thread)
+    (reset! requests [])
+    (try
+      (.write_text events
+                   (str (json-line (event "OPTION" "QUOTE"
+                                          {"root" "SPY" "expiration" "20260717" "strike" "600000" "right" "C"}
+                                          {"date" "20260713" "ms_of_day" 34260000
+                                           "bid" 1.0 "ask" 1.1 "bid_size" 10 "ask_size" 11
+                                           "bid_exchange" 1 "ask_exchange" 2 "bid_condition" 3 "ask_condition" 4}))
+                        (json-line (event "OPTION" "QUOTE"
+                                          {"root" "SPY" "expiration" "20260717" "strike" "600000" "right" "P"}
+                                          {"date" "20260713" "ms_of_day" 34260000
+                                           "bid" 2.0 "ask" 2.1 "bid_size" 20 "ask_size" 21
+                                           "bid_exchange" 5 "ask_exchange" 6 "bid_condition" 7 "ask_condition" 8}))
+                        (json-line (event "STOCK" "TRADE" {"root" "SPY"}
+                                          {"date" "20260713" "ms_of_day" 34260500 "price" 700.25
+                                           "size" 100 "exchange" 11 "condition" 0}))
+                        (json-line (event "STOCK" "TRADE" {"root" "SPY"}
+                                          {"date" "20260713" "ms_of_day" 34260500 "price" 700.75
+                                           "size" 100 "exchange" 11 "condition" 0}))
+                        ;; This later event belongs to the same symbol/class but
+                        ;; falls outside the frozen historical request window.
+                        ;; It must not contaminate the request-scoped comparison.
+                        (json-line (event "STOCK" "TRADE" {"root" "SPY"}
+                                          {"date" "20260713" "ms_of_day" 34261000 "price" 701.0
+                                           "size" 50 "exchange" 11 "condition" 0}))))
+      (.write_text plan (json/dumps (jsonable {"strike_range" 50})))
+      (.write_text receipt (json/dumps (jsonable {"event_path" (str events) "plan_file" (str plan)})))
+      (let [build (run-cli manifest-script "--stream-receipt" (str receipt) "--out" (str manifest))
+            request-manifest (json/loads (.read_text manifest))
+            option-request (first (filter #(= "option-quote" (.get % "class"))
+                                          (.get request-manifest "historical_requests")))]
+        (is (= 0 (.-returncode build)) (.-stderr build))
+        (is (= 2 (count (.get request-manifest "historical_requests"))))
+        (is (= "both" (.get (.get option-request "params") "right")))
+        (is (= 50 (.get (.get option-request "params") "strike_range")))
+        (is (= 2 (count (.get option-request "selected_contracts"))))
+        (let [execute (run-cli executor-script "--request-manifest" (str manifest)
+                               "--base-url" (str "http://127.0.0.1:" (.-server_port server))
+                               "--landing-root" (str tmp) "--jobs" "2")
+              comparison (json/loads (.read_text (pathlib/Path (str manifest ".comparison.json"))))
+              results (.get comparison "results")
+              by-venue (into {} (map (fn [result] [(or (.get result "historical_venue") "canonical")
+                                                     (.get (.get result "comparison") "status")]) results))]
+          (is (= 0 (.-returncode execute)) (.-stderr execute))
+          (is (= 2 (.get (.get comparison "summary") "pass")))
+          (is (= 0 (.get (.get comparison "summary") "fail")))
+          (is (= 0 (.get (.get comparison "summary") "inconclusive")))
+          (is (= "PASS" (.get by-venue "canonical")))
+          (is (= "PASS" (.get by-venue "nqb")))
+          (let [option-call (first (filter #(= "/v3/option/history/quote" (.get % "path")) @requests))]
+            (is (= "both" (first (.get (.get option-call "query") "right"))))
+            (is (= "50" (first (.get (.get option-call "query") "strike_range")))))
+          (is (= #{"nqb"}
+                 (set (keep #(first (.get (.get % "query") "venue"))
+                            (filter #(= "/v3/stock/history/trade" (.get % "path")) @requests)))))))
+      (finally
+        (.shutdown server)
+        (.server_close server)
+        (shutil/rmtree tmp ** :ignore_errors true)))))

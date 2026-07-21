@@ -1,7 +1,6 @@
 # Ops Project
 
-Canonical hosting and deployment material lives here. Top-level `scripts/ops/*`
-files are compatibility wrappers only.
+Canonical hosting and deployment material lives here.
 
 ## Layout
 
@@ -15,7 +14,7 @@ files are compatibility wrappers only.
 Provision dry-run:
 
 ```bash
-python projects/ops/scripts/hetzner_vps.py --env-file ~/ascolais/.env \
+basilisp run projects/ops/scripts/hetzner_vps.lpy -- --env-file ~/ascolais/.env \
   provision stevetrading-live-1 --location ash --dry-run
 ```
 
@@ -23,12 +22,6 @@ Deploy current working tree to an existing VPS release:
 
 ```bash
 projects/ops/scripts/deploy_live_vps.sh bot@<host>
-```
-
-Compatibility path:
-
-```bash
-scripts/ops/deploy_live_vps.sh bot@<host>
 ```
 
 ## ThetaData Lifecycle

@@ -1,0 +1,37 @@
+{
+  "kind": "databento-equities-corpus-observation-v1",
+  "observed_at": "2026-07-21",
+  "source": "Direct read-only GCP object inventory of databento-raw-bucket using the project service account",
+  "dataset": "EQUS.MINI",
+  "asset_class": "stock",
+  "date_range": {
+    "first": "2025-07-21",
+    "last": "2026-07-17"
+  },
+  "symbols": [
+    "AAPL", "AMZN", "AVGO", "GME", "GOOG", "HYG", "LLY", "META", "MSFT", "NFLX",
+    "NVDA", "ORCL", "QQQ", "SPY", "SQQQ", "TLT", "TQQQ", "TSLA", "TSM", "VXX"
+  ],
+  "physical_storage_gib": {
+    "mbp-1": 106.682,
+    "tbbo": 2.069,
+    "trades": 1.674,
+    "ohlcv-1s": 0.535,
+    "ohlcv-1m": 0.084
+  },
+  "known_control_artifact": {
+    "date": "2026-04-03",
+    "description": "Good Friday contains one non-economic MBP-1 reset row per symbol (action R, side N, size 0, null prices). Preserve raw rows, but do not count this reset-only partition as a market session or predictive event."
+  },
+  "prior_local_15_symbol_plan": [
+    "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "AMZN", "META",
+    "GOOGL", "NFLX", "AVGO", "PLTR", "XLF"
+  ],
+  "universe_reconciliation": {
+    "shared": ["AAPL", "AMZN", "AVGO", "META", "MSFT", "NFLX", "NVDA", "QQQ", "SPY", "TSLA"],
+    "missing_from_steve_corpus": ["AMD", "GOOGL", "IWM", "PLTR", "XLF"],
+    "outside_prior_local_plan": ["GME", "GOOG", "HYG", "LLY", "ORCL", "SQQQ", "TLT", "TQQQ", "TSM", "VXX"],
+    "status": "selected-for-schema-study-and-2026-07-21-live-parity-expansion",
+    "automatic_mutation_authorized": false
+  }
+}

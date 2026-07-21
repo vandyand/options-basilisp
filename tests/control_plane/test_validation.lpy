@@ -94,6 +94,18 @@
                     :control-plane/status :control-plane-status/wip))]
       (is (false? (:valid? v))))))
 
+(deftest structural-audit-timestamps-must-be-parseable-and-not-future
+  (testing "top-level generated-at"
+    (doseq [[value expected-code] [["not-a-time" :error/malformed-timestamp]
+                                   ["" :error/missing-field]
+                                   ["2999-01-01T00:00:00Z"
+                                    :error/future-timestamp]]]
+      (let [v (cpp/validate-manifest
+               (assoc (example-manifest) :control-plane/generated-at value))]
+        (is (false? (:valid? v)))
+        (is (contains? (error-codes v) expected-code)
+            (str "expected " expected-code " for " (pr-str value)))))))
+
 (deftest structural-dangling-references
   (testing "route → unknown account"
     (let [v (cpp/validate-manifest
@@ -123,6 +135,27 @@
                        ["strategy/ghost/x/v1"]))]
       (is (false? (:valid? v)))
       (is (contains? (error-codes v) :error/dangling-reference)))))
+
+(deftest structural-process-strategy-membership-mismatch
+  (testing "a strategy cannot point to a process that omits it"
+    (let [v (cpp/validate-manifest
+             (assoc-in (example-manifest)
+                       [:control-plane/processes 0 :process/strategies]
+                       []))]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v)
+                     :error/process-strategy-mismatch))))
+  (testing "a process cannot list a strategy assigned to another process"
+    (let [m (update (example-manifest) :control-plane/processes conj
+                    {:process/id "engine-paper-shadow"
+                     :process/base :base/engine-live
+                     :process/allowed-modes #{:mode/paper}
+                     :process/strategies
+                     ["strategy/spx-credit/spread-entry/v1"]})
+          v (cpp/validate-manifest m)]
+      (is (false? (:valid? v)))
+      (is (contains? (error-codes v)
+                     :error/process-strategy-mismatch)))))
 
 ;; ---------------------------------------------------------------------------
 ;; §9.2 safety rejections
@@ -211,7 +244,21 @@
                      :kill-switch/activated-at nil
                      :kill-switch/actor nil}])
           v (cpp/validate-manifest m)]
-      (is (false? (:valid? v))))))
+      (is (false? (:valid? v)))))
+  (testing "active switch activated-at must be parseable and not future"
+    (doseq [[value expected-code] [["not-a-time" :error/malformed-timestamp]
+                                   ["2999-01-01T00:00:00Z"
+                                    :error/future-timestamp]]]
+      (let [m (assoc (example-manifest) :control-plane/kill-switches
+                     [{:kill-switch/scope :kill-switch-scope/global
+                       :kill-switch/active? true
+                       :kill-switch/reason "halt"
+                       :kill-switch/activated-at value
+                       :kill-switch/actor "ops"}])
+            v (cpp/validate-manifest m)]
+        (is (false? (:valid? v)))
+        (is (contains? (error-codes v) expected-code)
+            (str "expected " expected-code " for " (pr-str value)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; §9.3 policy warnings (never block)

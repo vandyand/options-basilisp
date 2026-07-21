@@ -1,0 +1,103 @@
+(ns feature-parity.test-raw-thetadata-parity-cli
+  (:import http.server json os pathlib shutil subprocess tempfile threading)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "raw_thetadata_parity.lpy"))
+(def basilisp-bin (str (.joinpath root ".venv/bin/basilisp")))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn write-json! [handler payload]
+  (let [body (.encode (json/dumps (jsonable payload)) "utf-8")]
+    (.send_response handler 200)
+    (.send_header handler "Content-Type" "application/json")
+    (.send_header handler "Content-Length" (str (count body)))
+    (.end_headers handler)
+    (.write (.-wfile handler) body)))
+
+(defn log-message [& _] nil)
+
+(defn do-get [self]
+  (cond
+    (.startswith (.-path self) "/v3/option/list/expirations")
+    (write-json! self {"expiration" ["2026-07-17" "2026-07-24"]})
+    (.startswith (.-path self) "/v3/option/snapshot/quote")
+    (write-json! self {"expiration" ["2026-07-17" "2026-07-17"]
+                       "strike" [600.0 600.0] "right" ["CALL" "PUT"]
+                       "timestamp" ["2026-07-13T09:31:00.000" "2026-07-13T09:31:00.000"]
+                       "bid" [1.0 2.0] "ask" [1.1 2.1]
+                       "bid_size" [10 20] "ask_size" [11 21]})
+    (.startswith (.-path self) "/v3/option/at_time/quote")
+    (write-json! self [{"expiration" "2026-07-17" "strike" 600.0 "right" "CALL"
+                        "bid" 1.0 "ask" 1.1 "bid_size" 10 "ask_size" 11}
+                       {"expiration" "2026-07-17" "strike" 600.0 "right" "PUT"
+                        "bid" 2.0 "ask" 2.1 "bid_size" 20 "ask_size" 21}])
+    (.startswith (.-path self) "/v3/option/snapshot/open_interest")
+    (write-json! self [{"expiration" "2026-07-17" "strike" 600.0 "right" "CALL"
+                        "timestamp" "2026-07-13T06:30:00.000" "open_interest" 101}
+                       {"expiration" "2026-07-17" "strike" 600.0 "right" "PUT"
+                        "timestamp" "2026-07-13T06:30:00.000" "open_interest" 202}])
+    (.startswith (.-path self) "/v3/option/history/open_interest")
+    (write-json! self [{"expiration" "2026-07-17" "strike" 600.0 "right" "CALL"
+                        "timestamp" "2026-07-13T06:30:00.000" "open_interest" 101}
+                       {"expiration" "2026-07-17" "strike" 600.0 "right" "PUT"
+                        "timestamp" "2026-07-13T06:30:00.000" "open_interest" 202}])
+    :else (do (.send_response self 404) (.end_headers self))))
+
+(def Handler
+  (python/type "RawParityHandler" (python/tuple [http.server/BaseHTTPRequestHandler])
+               (python/dict {"log_message" log-message "do_GET" do-get})))
+
+(defn run-cli [& args]
+  (subprocess/run (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+                  ** :cwd (str root) :text true :capture_output true :check false))
+
+(deftest raw-parity-persists-paired-payloads-and-passes-identical-options
+  (let [server (http.server/ThreadingHTTPServer (python/tuple ["127.0.0.1" 0]) Handler)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)
+        tmp (pathlib/Path (tempfile/mkdtemp))]
+    (.start thread)
+    (try
+      (let [result (run-cli "--class" "option-nbbo-quote" "--symbol" "SPY"
+                            "--base-url" (str "http://127.0.0.1:" (.-server_port server))
+                            "--landing-root" (str tmp))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (let [output (json/loads (.-stdout result))]
+          (is (= "PASS" (.get output "status")))
+          (is (= 2 (.get output "shared_rows")))
+          (is (.exists (pathlib/Path (.get (.get output "live_receipt") "payload_path"))))
+          (is (.exists (pathlib/Path (.get (.get output "historical_receipt") "payload_path"))))
+          (is (.exists (pathlib/Path (.get output "comparison_path"))))))
+      (finally
+        (.shutdown server)
+        (.server_close server)
+        (shutil/rmtree tmp ** :ignore_errors true)))))
+
+(deftest raw-parity-rejects-incomplete-historical-only-request
+  (let [result (run-cli "--class" "option-nbbo-quote" "--symbol" "SPY" "--historical-only")]
+    (is (= 2 (.-returncode result)))
+    (is (>= (.find (.-stderr result) "--historical-only requires") 0))))
+
+(deftest raw-parity-compares-prior-session-option-open-interest-as-daily-state
+  (let [server (http.server/ThreadingHTTPServer (python/tuple ["127.0.0.1" 0]) Handler)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)
+        tmp (pathlib/Path (tempfile/mkdtemp))]
+    (.start thread)
+    (try
+      (let [result (run-cli "--class" "option-open-interest" "--symbol" "SPY"
+                            "--base-url" (str "http://127.0.0.1:" (.-server_port server))
+                            "--landing-root" (str tmp))
+            output (json/loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "PASS" (.get output "status")))
+        (is (= 2 (.get output "shared_rows")))
+        (is (= "option-open-interest" (.get output "class"))))
+      (finally
+        (.shutdown server)
+        (.server_close server)
+        (shutil/rmtree tmp ** :ignore_errors true)))))

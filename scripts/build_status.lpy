@@ -1,0 +1,77 @@
+;; Basilisp status dashboard builder.
+;;
+;; Usage:
+;;   .venv/bin/basilisp run scripts/build_status.lpy -- [--date YYYY-MM-DD] [--out-dir DIR] [--no-probes]
+(import datetime glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.status.core :as status])
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/build_status.lpy -- "
+                "[--date YYYY-MM-DD] [--out-dir DIR] [--remote SSH_TARGET] [--no-probes]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-date
+  [value arg]
+  (try
+    (datetime.date/fromisoformat value)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid date for " arg ": " value))))))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:root (or (os/getenv "STEVETRADING_BASILISP_ROOT") repo-root)
+              :out-dir (or (os/getenv "STATUS_OUT_DIR")
+                           (os.path/join repo-root "report-viewer" "public" "reports" "status"))}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--date")
+          (recur (nnext remaining)
+                 (assoc out :target-date (parse-date (option-value remaining arg) arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining)
+                 (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--remote")
+          (recur (nnext remaining)
+                 (assoc out :remote (option-value remaining arg)))
+
+          (= arg "--no-probes")
+          (recur (next remaining)
+                 (assoc out :probe-dependencies false))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(try
+  (let [out (status/write-status! (parse-args (vec *command-line-args*)))]
+    (println (str "Wrote " out)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

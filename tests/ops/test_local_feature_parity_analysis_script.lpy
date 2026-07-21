@@ -1,0 +1,30 @@
+(ns ops.test-local-feature-parity-analysis-script
+  (:import os pathlib)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "run_local_feature_parity_analysis.sh"))
+
+(deftest local-parity-analysis-keeps-live-ownership-on-vps
+  (let [text (.read_text script)]
+    (is (str/includes? text "rsync -a --partial --checksum"))
+    (is (str/includes? text "feature-parity-snapshots"))
+    (is (str/includes? text "REF/.venv/bin/basilisp"))
+    (is (str/includes? text "capture checksum changed during transfer"))
+    (is (str/includes? text "ssh -N -L"))
+    (is (str/includes? text "trap cleanup EXIT"))
+    (is (str/includes? text "scripts/replay_captured_feature_cohort.lpy"))
+    (is (str/includes? text "scripts/build_thetadata_historical_feature_cohort.lpy"))
+    (is (str/includes? text "--implementation legacy-python"))
+    (is (str/includes? text "scripts/matched_feature_parity_report.lpy"))
+    (is (str/includes? text "scripts/feature_drift_ledger.lpy"))
+    (is (str/includes? text "--replay-rows N"))
+    (is (str/includes? text "--cohort-window-minutes N"))
+    (is (str/includes? text "--cohort-window-minutes \"$COHORT_WINDOW_MINUTES\""))
+    (is (str/includes? text "--include-option-overlays"))
+    (is (str/includes? text "--tail-rows \"$REPLAY_ROWS\""))
+    (is (str/includes? text "replay_cmd+=(--skip-option-overlays)"))
+    (is (str/includes? text "REPLAY_RC=$?"))
+    (is (str/includes? text "replay did not write evidence JSON"))
+    (is (str/includes? text "Local work never writes the VPS capture"))))

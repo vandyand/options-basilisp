@@ -1,0 +1,153 @@
+;; Windows/Hetzner orchestration for the bounded ThetaData acquisition pilots.
+;; The data collectors are Basilisp; SSH is used only to reach the single
+;; existing remote Theta Terminal. The runner refuses to compete with the VPS
+;; raw-history parity job and is idempotent across Task Scheduler retries.
+(import argparse datetime json os pathlib subprocess time traceback urllib.request)
+
+(def manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+(def progress-path (.joinpath manifest-root "pilots" "thetadata-acquisition-20260720.json"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn atomic-json! [path payload]
+  (let [temp (.with_suffix path (str (.-suffix path) ".tmp"))]
+    (.mkdir (.-parent path) ** :parents true :exist_ok true)
+    (spit (str temp) (str (json/dumps payload ** :indent 2 :sort_keys true :default str) "\n"))
+    (os/replace (str temp) (str path))))
+
+(defn remote-command [remote command]
+  (subprocess/run (python/list ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=10" remote command])
+                  ** :capture_output true :text true :timeout 30))
+
+(defn latest-complete? [folder kind]
+  (if-not (.exists folder)
+    false
+    (boolean
+     (some (fn [path]
+             (try
+               (let [receipt (json/loads (slurp (str path)))]
+                 (case kind
+                   "index" (and (.startswith (str (.get receipt "archive_status")) "historical-response-raw")
+                                ;; A permanently unavailable symbol must not
+                                ;; force every successful index payload to be
+                                ;; downloaded again on each orchestration retry.
+                                (some #(.get % "available") (.get receipt "raw_payloads" (python/list))))
+                   "panel" (= (.get receipt "status") "complete")
+                   false))
+               (catch python/Exception _ false)))
+           (vec (.glob folder "run=*.json"))))))
+
+(defn wait-health! [port seconds]
+  (let [deadline (+ (time/monotonic) seconds)
+        url (str "http://127.0.0.1:" port "/v3/option/list/expirations?symbol=SPY&format=json")]
+    (loop []
+      (let [result (try
+                     (with-open [response (urllib.request/urlopen url ** :timeout 4)]
+                       (if (pos? (len (.read response 1))) true false))
+                     (catch python/Exception error error))]
+        (cond
+          (= result true) true
+          (>= (time/monotonic) deadline)
+          (throw (python/TimeoutError (str "ThetaData tunnel did not become healthy: " result)))
+          :else (do (time/sleep 2.0) (recur)))))))
+
+(defn run-command! [command timeout]
+  (let [completed (subprocess/run (python/list command)
+                                  ** :capture_output true :text true :timeout timeout)]
+    (when-not (= 0 (.-returncode completed))
+      (throw (python/RuntimeError
+              (str "collector failed rc=" (.-returncode completed) "\n"
+                   (.__getitem__ (or (.-stderr completed) "")
+                                  (slice (max 0 (- (len (or (.-stderr completed) "")) 6000)) nil))))))
+    (.-stdout completed)))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--remote" ** :default "stevetrading-vps")
+    (.add_argument parser "--port" ** :type int :default 25503)
+    (.add_argument parser "--date" ** :default "2026-07-17")
+    (.add_argument parser "--basilisp-exe" ** :default ".venv\\Scripts\\basilisp.exe")
+    (.add_argument parser "--collector" ** :default "scripts\\thetadata_event_collection.lpy")
+    (.add_argument parser "--panel-collector" ** :default "scripts\\thetadata_option_quote_panel_pilot.lpy")
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        state (python/dict [#py ("schema_version" 1) #py ("started_at" (now-utc))
+                            #py ("status" "preflight") #py ("date" (.-date args))
+                            #py ("steps" (python/list))])
+        _ (atomic-json! progress-path state)
+        parity (remote-command (.-remote args) "systemctl is-active stevetrading-raw-history-parity.service || true")
+        parity-state (.strip (.-stdout parity))]
+    (when (contains? #{"active" "activating" "deactivating"} parity-state)
+      (.__setitem__ state "status" "deferred-vps-parity-job-active")
+      (.__setitem__ state "finished_at" (now-utc))
+      (atomic-json! progress-path state)
+      (println (json/dumps state ** :indent 2 :sort_keys true))
+      (python/exit 75))
+    ;; Start the one canonical terminal service only if it is not already up.
+    (let [terminal (remote-command (.-remote args) "systemctl is-active theta-terminal.service || true")
+          terminal-was-active (= "active" (.strip (.-stdout terminal)))
+          _ (when-not terminal-was-active
+              (let [started (remote-command (.-remote args) "sudo -n systemctl start theta-terminal.service")]
+                (when-not (= 0 (.-returncode started))
+                  (throw (python/RuntimeError (str "could not start remote Theta Terminal: " (.-stderr started)))))))
+          tunnel (subprocess/Popen
+                  (python/list ["ssh" "-N" "-L" (str (.-port args) ":127.0.0.1:25503")
+                                "-o" "ExitOnForwardFailure=yes" "-o" "ServerAliveInterval=30"
+                                (.-remote args)])
+                  ** :creationflags (if (= (.-name os) "nt") subprocess/CREATE_NO_WINDOW 0))]
+      (try
+        (do
+          (wait-health! (.-port args) 60.0)
+          (let [base-url (str "http://127.0.0.1:" (.-port args))
+                index-folder (.joinpath manifest-root "thetadata" "INDEX" "hard"
+                                            "thetadata-selected-indexes-full-session-pilot"
+                                            (str "trade_date=" (.-date args)))
+                panel-folder (.joinpath manifest-root "thetadata" "OPRA" "hard"
+                                            "thetadata-spy-option-quote-panel-pilot"
+                                            (str "trade_date=" (.-date args)))]
+            (if (latest-complete? index-folder "index")
+              (.append (.get state "steps") {"id" "indexes" "status" "already-complete"})
+              (do
+                (.__setitem__ state "status" "downloading-index-pilot")
+                (atomic-json! progress-path state)
+                (run-command! [(.-basilisp_exe args) "run" (.-collector args)
+                               "--asset-class" "indexes" "--class-id" "thetadata-selected-indexes-full-session-pilot"
+                               "--symbols" "NDX,RUT,RVX,SPX,TNX,VIX,VIXN" "--date" (.-date args)
+                               "--start-time" "09:30:00" "--end-time" "16:00:00"
+                               "--event-classes" "price" "--format" "csv" "--base-url" base-url] 1200)
+                (.append (.get state "steps") {"id" "indexes" "status" "complete"})))
+            (if (latest-complete? panel-folder "panel")
+              (.append (.get state "steps") {"id" "spy-option-quote-panel" "status" "already-complete"})
+              (do
+                (.__setitem__ state "status" "downloading-option-quote-panel-pilot")
+                (atomic-json! progress-path state)
+                (run-command! [(.-basilisp_exe args) "run" (.-panel_collector args)
+                               "--class-id" "thetadata-spy-option-quote-panel-pilot"
+                               "--symbol" "SPY" "--date" (.-date args)
+                               "--start-time" "09:30:00" "--end-time" "09:45:00"
+                               "--max-dte" "45" "--strike-range" "5"
+                               "--max-bytes" "536870912" "--max-wall-seconds" "900"
+                               "--base-url" base-url] 1020)
+                (.append (.get state "steps") {"id" "spy-option-quote-panel" "status" "complete"})))
+            (.__setitem__ state "status" "complete")
+            (.__setitem__ state "finished_at" (now-utc))
+            (atomic-json! progress-path state)
+            state))
+        (finally
+          (when (nil? (.poll tunnel))
+            (.terminate tunnel)
+            (try (.wait tunnel ** :timeout 10)
+                 (catch python/Exception _ (.kill tunnel)))))))))
+
+(try
+  (println (json/dumps (run-main (vec *command-line-args*)) ** :indent 2 :sort_keys true :default str))
+  (python/exit 0)
+  (catch python/SystemExit error (throw error))
+  (catch python/Exception error
+    (let [state {"schema_version" 1 "status" "failed" "finished_at" (now-utc) "error" (str error)}]
+      (atomic-json! progress-path state))
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

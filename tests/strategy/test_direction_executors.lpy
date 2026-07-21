@@ -198,7 +198,7 @@
       ;; marketable limit (2026-06-11 fix): selling a long lot prices at the BID
       (is (= "2.10" (:order-intent/limit-price intent)))
       (is (= "1" (:order-intent/quantity intent)))))
-  (testing "contract no longer two-sided in the chain -> MARKET close"
+  (testing "contract no longer two-sided in the chain -> penny limit close"
     (let [chain-sans (update chain :chain/contracts
                              (fn [cs]
                                (filterv #(not= call-550 (:instrument/id %)) cs)))
@@ -206,10 +206,10 @@
           (plan-option :posture/flatten "1"
                        {:chain* chain-sans :spot "550.20" :view long-call-view})
           [intent] order-intents]
-      (is (= :order-type/market (:order-intent/order-type intent)))
-      (is (nil? (:order-intent/limit-price intent)))
+      (is (= :order-type/limit (:order-intent/order-type intent)))
+      (is (= "0.01" (:order-intent/limit-price intent)))
       (is (= :order-side/sell (:order-intent/side intent)))))
-  (testing "2026-06-22 FIX: forced session-close ALWAYS markets, even with a live two-sided quote (the quote may be STALE on a dead feed and a limit would never fill — 0DTE expiry)"
+  (testing "forced session-close uses market to avoid resting stale limits"
     (let [[intent] (:execution/order-intents
                     (plan-option :posture/flatten "1"
                                  {:chain* chain :spot "550.20"
@@ -218,13 +218,14 @@
       (is (nil? (:order-intent/limit-price intent)))
       (is (= :order-side/sell (:order-intent/side intent)))
       (is (= :position-effect/close (:order-intent/effect intent)))))
-  (testing "2026-06-22 FIX: flatten with open lots but a DEAD feed (no chain) still closes — as MARKET, not skipped"
+  (testing "flatten with open lots but a DEAD feed still closes — as penny limit, not skipped"
     (let [ints (:execution/order-intents
                 (plan-option :posture/flatten "1"
                              {:spot "550.20" :view long-call-view}))
           [intent] ints]
       (is (= 1 (count ints)))
-      (is (= :order-type/market (:order-intent/order-type intent)))
+      (is (= :order-type/limit (:order-intent/order-type intent)))
+      (is (= "0.01" (:order-intent/limit-price intent)))
       (is (= :order-side/sell (:order-intent/side intent)))))
   (testing "flatten with no open option lots plans nothing"
     (is (= [] (:execution/order-intents

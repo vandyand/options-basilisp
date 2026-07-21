@@ -1,0 +1,127 @@
+(import glob os os.path sqlite3 sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[basilisp.edn :as edn])
+(require '[stevetrading.replay.fixture :as fixture])
+
+(def observation-types
+  #{":fact/market-bar-observed"
+    ":fact/quote-observed"
+    ":fact/option-chain-observed"
+    ":fact/calendar-session-observed"})
+
+(def data-keys
+  #{:data/provider :data/provider-ref :data/received-at :data/quality})
+
+(defn- placeholders
+  [n]
+  (apply str (interpose "," (repeat n "?"))))
+
+(defn- read-observation-facts
+  [facts-db start end]
+  (let [conn (sqlite3/connect facts-db)
+        params (atom (vec observation-types))
+        sql (atom (str "SELECT \"offset\", fact_type, instrument_id, occurred_at, record "
+                       "FROM facts WHERE fact_type IN ("
+                       (placeholders (count observation-types))
+                       ")"))]
+    (when start
+      (swap! sql str " AND occurred_at >= ?")
+      (swap! params conj start))
+    (when end
+      (swap! sql str " AND occurred_at <= ?")
+      (swap! params conj end))
+    (swap! sql str " ORDER BY occurred_at ASC, \"offset\" ASC")
+    (try
+      (mapv (fn [row]
+              {:offset (nth row 0)
+               :fact-type (nth row 1)
+               :instrument-id (nth row 2)
+               :occurred-at (nth row 3)
+               :fact (edn/read-string (nth row 4))})
+            (.fetchall (.execute conn @sql (python/tuple @params))))
+      (finally
+        (.close conn)))))
+
+(defn- clean-payload
+  [payload]
+  (apply dissoc payload data-keys))
+
+(defn- input-row
+  [{:keys [instrument-id occurred-at fact]}]
+  (cond-> {:input/at occurred-at
+           :input/type (:record/type fact)
+           :input/payload (clean-payload (:fact/payload fact))}
+    (some? instrument-id)
+    (assoc :input/instrument-id instrument-id)))
+
+(defn fixture-from-facts
+  [{:keys [facts-db fixture-id description start end]}]
+  (let [rows (read-observation-facts facts-db start end)
+        inputs (mapv input-row rows)]
+    {:fixture/id fixture-id
+     :fixture/version fixture/fixture-version
+     :fixture/mode :mode/replay
+     :fixture/description (or description
+                              (str "Replay fixture exported from " facts-db))
+     :fixture/inputs inputs
+     ;; Expected outputs are deliberately empty for exported live windows:
+     ;; different strategy subsets can be replayed against the same market
+     ;; inputs, and the alignment report is the gate.
+     :fixture/expected-outputs []}))
+
+(defn- parse-args
+  [args]
+  (loop [remaining (seq args) acc {}]
+    (if (nil? remaining)
+      acc
+      (let [flag (first remaining)
+            value (second remaining)]
+        (cond
+          (contains? #{"--facts" "--out" "--fixture-id" "--description" "--start" "--end"}
+                     flag)
+          (do
+            (when (or (nil? value)
+                      (.startswith (str value) "--"))
+              (throw (python/ValueError (str "missing value for " flag))))
+            (recur (nnext remaining)
+                   (assoc acc (keyword (subs flag 2)) value)))
+
+          (or (= flag "-h") (= flag "--help"))
+          (recur (next remaining) acc)
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " flag))))))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (println "usage: basilisp run scripts/export_replay_fixture_from_facts.lpy -- --facts <facts.db> --out <fixture.edn> [--fixture-id id] [--description text] [--start iso] [--end iso]")
+    (python/exit 0))
+  (try
+    (let [{:keys [facts out fixture-id description start end]} (parse-args args)]
+      (when (or (nil? facts) (nil? out))
+        (println "usage: basilisp run scripts/export_replay_fixture_from_facts.lpy -- --facts <facts.db> --out <fixture.edn> [--fixture-id id] [--description text] [--start iso] [--end iso]")
+        (python/exit 2))
+      (let [fid (or fixture-id
+                    (str "fixture/replay/exported/"
+                         (.replace (os.path/basename (os.path/dirname facts)) "/" "-")
+                         "/v0.2"))
+            fx (fixture-from-facts {:facts-db facts
+                                    :fixture-id fid
+                                    :description description
+                                    :start start
+                                    :end end})
+            path (fixture/write-fixture out fx)]
+        (println (str "wrote " (count (:fixture/inputs fx))
+                      " replay fixture inputs to " path))
+        fx))
+    (catch python/ValueError e
+      (println (str "ERROR: " e))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

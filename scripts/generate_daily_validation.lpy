@@ -1,0 +1,305 @@
+;; Generate canonical daily report validation JSON.
+;;
+;; Production mode fetches Alpaca paper orders/account state directly through
+;; Alpaca REST. Test/cache mode can read order JSON fixtures with the same
+;; shape as Data-Preprocessor pipeline_data/report_cache/orders_*.json.
+(import datetime glob json math os os.path ssl sys urllib.parse urllib.request zoneinfo)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.report-metrics.core :as rm]
+         '[stevetrading.reporting.core :as reporting])
+
+(def account-slugs ["chestnut" "lynx" "moose" "oak" "parrot" "dolphin"])
+(def account-display {"chestnut" "CHESTNUT" "lynx" "LYNX" "moose" "MOOSE" "oak" "OAK" "parrot" "PARROT" "dolphin" "DOLPHIN"})
+(def divergence-threshold 50.0)
+(def alpaca-paper-base-url "https://paper-api.alpaca.markets")
+
+(defn usage []
+  (println
+   (str "usage: basilisp run scripts/generate_daily_validation.lpy -- "
+        "--daily-dir DIR --date YYYY-MM-DD [--ref-root DIR] "
+        "[--orders-cache-dir DIR] [--state-fixture FILE] [--allow-cache]")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:allow-cache false}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--daily-dir")
+          (recur (nnext remaining) (assoc out :daily-dir (option-value remaining arg)))
+          (= arg "--date")
+          (recur (nnext remaining) (assoc out :date (option-value remaining arg)))
+          (= arg "--ref-root")
+          (recur (nnext remaining) (assoc out :ref-root (option-value remaining arg)))
+          (= arg "--orders-cache-dir")
+          (recur (nnext remaining) (assoc out :orders-cache-dir (option-value remaining arg)))
+          (= arg "--state-fixture")
+          (recur (nnext remaining) (assoc out :state-fixture (option-value remaining arg)))
+          (= arg "--allow-cache")
+          (recur (next remaining) (assoc out :allow-cache true))
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn read-json [path] (json/loads (slurp path)))
+(defn write-json! [path payload]
+  (spit path (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn parse-date [s]
+  (.fromisoformat (.-date datetime) s))
+
+(defn et-zone [] (zoneinfo/ZoneInfo "America/New_York"))
+(defn utc-zone [] (.-utc (.-timezone datetime)))
+
+(defn now-et []
+  (.now (.-datetime datetime) (et-zone)))
+
+(defn parse-dt [s]
+  (when s
+    (let [dt (.fromisoformat (.-datetime datetime) (.replace (str s) "Z" "+00:00"))]
+      (.astimezone dt (et-zone)))))
+
+(defn date-start-end-utc [date-str]
+  (let [d (parse-date date-str)
+        start ((.-datetime datetime) (.-year d) (.-month d) (.-day d) 0 0 0 0 (et-zone))
+        end (+ start ((.-timedelta datetime) ** :days 1))]
+    [(.astimezone start (utc-zone)) (.astimezone end (utc-zone))]))
+
+(defn dotenv-paths [ref-root]
+  (vec (filter some?
+               [(when ref-root (os.path/join ref-root ".env"))
+                (os.path/join (os/getcwd) ".env")
+        (os.path/join (os.path/dirname repo-root) "SteveTrading" "ref" "Data-Preprocessor" ".env")])))
+
+(defn parse-dotenv-file [path]
+  (if (and path (os.path/exists path))
+    (into {}
+          (keep (fn [line]
+                  (let [line (.strip line)]
+                    (when (and (seq line)
+                               (not (.startswith line "#"))
+                               (not= -1 (.find line "=")))
+                      (let [idx (.index line "=")
+                            k (.strip (subs line 0 idx))
+                            raw (.strip (subs line (inc idx)))
+                            v (if (and (>= (count raw) 2)
+                                       (or (and (.startswith raw "\"") (.endswith raw "\""))
+                                           (and (.startswith raw "'") (.endswith raw "'"))))
+                                (subs raw 1 (dec (count raw)))
+                                raw)]
+                        [k v]))))
+                (.splitlines (slurp path))))
+    {}))
+
+(defn env-map [ref-root]
+  (merge (apply merge (map parse-dotenv-file (dotenv-paths ref-root)))
+         (into {} (map (fn [[k v]] [k v]) (.items os/environ)))))
+
+(defn account-creds [env slug]
+  (let [prefix (str "ALPACA_" (.upper slug))]
+    {:key (or (get env (str prefix "_API_KEY"))
+              (get env (str prefix "_PAPER_API_KEY")))
+     :secret (or (get env (str prefix "_API_SECRET"))
+                 (get env (str prefix "_SECRET_KEY"))
+                 (get env (str prefix "_PAPER_SECRET_KEY")))}))
+
+(defn http-json [method url headers]
+  (let [req (urllib.request/Request url ** :method method :headers headers)
+        ctx (ssl/create_default_context)]
+    (with-open [resp (urllib.request/urlopen req ** :timeout 30 :context ctx)]
+      (json/loads (.decode (.read resp) "utf-8")))))
+
+(defn alpaca-headers [creds]
+  (when (or (not (:key creds)) (not (:secret creds)))
+    (throw (python/ValueError "missing Alpaca API credentials")))
+  {"APCA-API-KEY-ID" (:key creds)
+   "APCA-API-SECRET-KEY" (:secret creds)
+   "Accept" "application/json"})
+
+(defn query-url [path params]
+  (str alpaca-paper-base-url path "?" (urllib.parse/urlencode params)))
+
+(defn order-side [side]
+  (let [s (.lower (str side))]
+    (if (= s "buy") "BUY" "SELL")))
+
+(defn order->canonical [slug order]
+  {:account slug
+   :order-id (str (get order "id"))
+   :symbol (str (get order "symbol"))
+   :side (order-side (get order "side"))
+   :filled-at (parse-dt (get order "filled_at"))
+   :filled-avg-price (python/float (get order "filled_avg_price"))
+   :qty (python/int (python/float (or (get order "filled_qty") (get order "qty"))))
+   :order-type (str (get order "order_type"))})
+
+(defn valid-filled-order? [start-utc end-utc order]
+  (let [filled-at (get order "filled_at")
+        qty (python/float (or (get order "filled_qty") 0))]
+    (and filled-at
+         (> qty 0)
+         (some? (get order "filled_avg_price"))
+         (let [dt (.fromisoformat (.-datetime datetime) (.replace (str filled-at) "Z" "+00:00"))]
+           (and (>= (.timestamp dt) (.timestamp start-utc))
+                (< (.timestamp dt) (.timestamp end-utc)))))))
+
+(defn fetch-filled-orders [env slug date-str]
+  (let [creds (account-creds env slug)
+        headers (alpaca-headers creds)
+        [start-utc end-utc] (date-start-end-utc date-str)
+        after (.isoformat start-utc)
+        until0 (.isoformat end-utc)]
+    (loop [until until0
+           out []]
+      (let [url (query-url "/v2/orders" {"status" "all" "after" after "until" until "limit" 500})
+            page (http-json "GET" url headers)
+            filled (vec (keep (fn [order]
+                                (when (valid-filled-order? start-utc end-utc order)
+                                  (order->canonical slug order)))
+                              page))
+            out' (vec (concat out filled))]
+        (if (< (count page) 500)
+          out'
+          (let [submitted (vec (keep #(get % "submitted_at") page))]
+            (if (seq submitted)
+              (recur (first (sort submitted)) out')
+              out')))))))
+
+(defn load-cached-orders [orders-cache-dir slug date-str]
+  (let [path (os.path/join orders-cache-dir (str "orders_" slug "_" date-str ".json"))]
+    (when (os.path/exists path)
+      (let [payload (read-json path)]
+        (mapv (fn [order]
+                {:account (get order "account")
+                 :order-id (get order "order_id")
+                 :symbol (get order "symbol")
+                 :side (get order "side")
+                 :filled-at (parse-dt (get order "filled_at"))
+                 :filled-avg-price (python/float (get order "filled_avg_price"))
+                 :qty (python/int (get order "qty"))
+                 :order-type (get order "order_type")})
+              (get payload "orders" []))))))
+
+(defn fixture-account-state [state-fixture slug]
+  (when state-fixture
+    (get (read-json state-fixture) slug)))
+
+(defn fetch-account-pnl [env state-fixture slug]
+  (if-let [fixture (fixture-account-state state-fixture slug)]
+    (python/float (or (get fixture "equity_day_pnl") 0.0))
+    (let [account (http-json "GET" (str alpaca-paper-base-url "/v2/account")
+                             (alpaca-headers (account-creds env slug)))]
+      (- (python/float (get account "equity"))
+         (python/float (get account "last_equity"))))))
+
+(defn position-instrument-id [symbol asset-class]
+  (if (= "us_equity" (str asset-class))
+    (str "equity/NASDAQ/" symbol)
+    (str "broker/" symbol)))
+
+(defn fetch-positions [env state-fixture slug]
+  (if-let [fixture (fixture-account-state state-fixture slug)]
+    (mapv (fn [p]
+            {"instrument/id" (str (get p "instrument/id"))
+             "position/side" (str (or (get p "position/side") "long"))
+             "position/quantity" (str (get p "position/quantity"))
+             "position/unrealized-pnl" (python/float (or (get p "position/unrealized-pnl") 0.0))})
+          (get fixture "positions" []))
+    (let [positions (http-json "GET" (str alpaca-paper-base-url "/v2/positions")
+                               (alpaca-headers (account-creds env slug)))]
+      (mapv (fn [p]
+              {"instrument/id" (position-instrument-id (get p "symbol") (get p "asset_class"))
+               "position/side" (if (.startswith (str (get p "qty")) "-") "short" "long")
+               "position/quantity" (str (get p "qty"))
+               "position/unrealized-pnl" (python/float (or (get p "unrealized_pl") 0.0))})
+            positions))))
+
+(defn source-orders [env orders-cache-dir allow-cache? slug date-str]
+  (or (when (and allow-cache? orders-cache-dir)
+        (load-cached-orders orders-cache-dir slug date-str))
+      (fetch-filled-orders env slug date-str)))
+
+(defn account-payload [env orders-cache-dir state-fixture allow-cache? date-str slug]
+  (let [orders (source-orders env orders-cache-dir allow-cache? slug date-str)
+        paired (rm/pair-round-trips orders)
+        rts (:round-trips paired)
+        metrics (rm/compute-all-metrics-python rts)
+        realized (python/float (get metrics "total_pnl_dollars"))
+        equity (fetch-account-pnl env state-fixture slug)
+        positions (fetch-positions env state-fixture slug)
+        open-count (count positions)
+        divergence (- equity realized)
+        validation-unrealized (if (or (> open-count 0)
+                                      (>= (math/fabs divergence) divergence-threshold))
+                                divergence
+                                0.0)
+        explanations (if (and (> open-count 0)
+                              (>= (math/fabs divergence) 0.01))
+                       ["explanation/open-position-carryover"]
+                       [])]
+    {"account/id" (str "account/alpaca/" slug "-paper")
+     "account/display" (get account-display slug (.upper slug))
+     "report/date" date-str
+     "trade/closed-count" (python/int (get metrics "n_trades"))
+     "order/count" (count orders)
+     "positions/open-count" open-count
+     "positions/open" positions
+     "pnl/equity-day" equity
+     "pnl/realized" realized
+     "pnl/unrealized" validation-unrealized
+     "pnl/closed-trades" realized
+     "broker/equity-observed?" true
+     "report/explanations" explanations}))
+
+(defn build! [{:keys [daily-dir date ref-root orders-cache-dir state-fixture allow-cache]}]
+  (when-not daily-dir (throw (python/ValueError "--daily-dir is required")))
+  (when-not date (throw (python/ValueError "--date is required")))
+  (when-not (:trading-day? (reporting/market-session date))
+    (throw (python/ValueError (str "not a trading day: " date))))
+  (os/makedirs daily-dir ** :exist_ok true)
+  (let [env (env-map ref-root)
+        payload {"report/date" date
+                 "report/rendered?" true
+                 "accounts" (mapv #(account-payload env orders-cache-dir state-fixture allow-cache date %) account-slugs)}
+        validation (reporting/validate-report-day payload)
+        out (os.path/join daily-dir (str (.replace date "-" "") ".validation.json"))]
+    (write-json! out payload)
+    {:validation-path out
+     :accounts (count (get payload "accounts"))
+     :validation-status (:status validation)
+     :validation-issues (count (:issues validation))}))
+
+(try
+  (let [result (build! (parse-args (vec *command-line-args*)))]
+    (println (json/dumps (python/dict {"validation_path" (:validation-path result)
+                                       "accounts" (:accounts result)
+                                       "validation_status" (str (:validation-status result))
+                                       "validation_issues" (:validation-issues result)})
+                         ** :indent 2 :sort_keys true))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2)))

@@ -1,0 +1,139 @@
+;; Exact multiset comparison for a bounded live DBN capture and its historical DBN replay.
+(import argparse collections datetime json operator pathlib databento)
+
+(def excluded-transport-fields #{"ts_recv" "ts_out" "ts_index" "ts_in_delta"})
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    :else value))
+
+(defn parse-csv [value]
+  (vec (filter #(pos? (count %)) (.split (str value) ","))))
+
+(defn canonical-value [value]
+  ;; DBN-to-DataFrame is deterministic for both payloads. String form avoids
+  ;; Python/NumPy scalar hash differences while preserving every retained field.
+  (if (nil? value) "<nil>" (str value)))
+
+(defn retained-columns [live historical]
+  (vec (sort (remove excluded-transport-fields
+                     (filter (set (.tolist (.-columns historical)))
+                             (.tolist (.-columns live)))))))
+
+(defn filtered-keys [frame columns symbols]
+  (vec
+   (keep (fn [row]
+           (let [symbol (str (.get row "symbol"))]
+             (when (contains? symbols symbol)
+               (python/tuple (map (fn [column] (canonical-value (.get row column))) columns)))))
+         (.to_dict frame ** :orient "records"))))
+
+(defn preview [counter columns limit]
+  (vec (map (fn [[row count]]
+              {"count" (int count)
+               "event" (into {} (map (fn [column value] [column value]) columns row))})
+            (take limit (.items counter)))))
+
+(defn timestamp-range [counter columns]
+  (let [timestamp-index (.index columns "ts_event")
+        values (vec (map #(nth % timestamp-index) (.keys counter)))]
+    (when (seq values) {"first" (apply min values) "last" (apply max values)})))
+
+(defn within? [value bounds]
+  (and bounds
+       (not (neg? (compare value (get bounds "first"))))
+       (not (pos? (compare value (get bounds "last"))))))
+
+(defn interior-residual-count [counter columns shared-bounds]
+  (let [timestamp-index (.index columns "ts_event")]
+    (int (reduce + 0
+                 (map (fn [[row count]]
+                        (if (within? (nth row timestamp-index) shared-bounds) count 0))
+                       (.items counter))))) )
+
+(defn residual-counts-by-symbol [counter columns shared-bounds interior-only?]
+  (let [symbol-index (.index columns "symbol")
+        timestamp-index (.index columns "ts_event")]
+    (reduce (fn [counts [row count]]
+              (if (or (not interior-only?)
+                      (within? (nth row timestamp-index) shared-bounds))
+                (update counts (nth row symbol-index) (fnil + 0) (int count))
+                counts))
+            {}
+            (.items counter))))
+
+(defn compare-schema [live-store historical-store schema symbols]
+  (let [live (.to_df live-store ** :schema schema)
+        historical (.to_df historical-store ** :schema schema)
+        columns (retained-columns live historical)
+        live-counter (collections/Counter (filtered-keys live columns symbols))
+        historical-counter (collections/Counter (filtered-keys historical columns symbols))
+        matched (operator/and_ live-counter historical-counter)
+        live-only (operator/sub live-counter historical-counter)
+        historical-only (operator/sub historical-counter live-counter)
+        shared-bounds (timestamp-range matched columns)]
+    {"schema" schema
+     "retained_fields" columns
+     "live_events" (int (python/sum (.values live-counter)))
+     "historical_events" (int (python/sum (.values historical-counter)))
+     "matched_events" (int (python/sum (.values matched)))
+     "live_only_events" (int (python/sum (.values live-only)))
+     "historical_only_events" (int (python/sum (.values historical-only)))
+     "shared_event_time_range" shared-bounds
+     "live_only_event_time_range" (timestamp-range live-only columns)
+     "historical_only_event_time_range" (timestamp-range historical-only columns)
+     "live_only_inside_shared_time_range" (interior-residual-count live-only columns shared-bounds)
+     "historical_only_inside_shared_time_range" (interior-residual-count historical-only columns shared-bounds)
+     "live_only_by_symbol" (residual-counts-by-symbol live-only columns shared-bounds false)
+     "historical_only_by_symbol" (residual-counts-by-symbol historical-only columns shared-bounds false)
+     "live_only_inside_shared_time_range_by_symbol"
+     (residual-counts-by-symbol live-only columns shared-bounds true)
+     "historical_only_inside_shared_time_range_by_symbol"
+     (residual-counts-by-symbol historical-only columns shared-bounds true)
+     "live_only_examples" (preview live-only columns 5)
+     "historical_only_examples" (preview historical-only columns 5)}))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--live-dbn" ** :required true)
+    (.add_argument parser "--historical-mbp-dbn" ** :required true)
+    (.add_argument parser "--historical-trades-dbn" ** :required true)
+    (.add_argument parser "--symbols" ** :required true)
+    (.add_argument parser "--schemas" ** :default "mbp-1,trades")
+    (.add_argument parser "--out" ** :required true)
+    (.parse_args parser (python/list argv))))
+
+(let [args (parse-args (vec *command-line-args*))
+      symbols (set (parse-csv (.-symbols args)))
+      requested-schemas (parse-csv (.-schemas args))
+      _ (when-not (every? #{"mbp-1" "trades"} requested-schemas)
+          (throw (python/ValueError "--schemas supports only mbp-1,trades")))
+      live (databento/read_dbn (.-live_dbn args))
+      historical-mbp (when (contains? (set requested-schemas) "mbp-1")
+                       (databento/read_dbn (.-historical_mbp_dbn args)))
+      historical-trades (when (contains? (set requested-schemas) "trades")
+                          (databento/read_dbn (.-historical_trades_dbn args)))
+      schemas (vec (map (fn [schema]
+                          (compare-schema live (if (= schema "mbp-1") historical-mbp historical-trades) schema symbols))
+                        requested-schemas))
+      exact? (every? #(and (zero? (get % "live_only_events"))
+                            (zero? (get % "historical_only_events"))) schemas)
+      boundary-only? (every? #(and (zero? (get % "live_only_inside_shared_time_range"))
+                                    (zero? (get % "historical_only_inside_shared_time_range"))) schemas)
+      payload {"kind" "databento-bounded-live-historical-event-parity-v1"
+               "created_at_utc" (.isoformat (datetime.datetime/now datetime.timezone/utc))
+               "verdict" (cond exact? "PASS_EXACT"
+                               boundary-only? "PASS_BOUNDARY_ONLY"
+                               :else "FAIL")
+               "comparison" "exact multiset on every shared DBN market field except transport timestamps"
+               "excluded_transport_fields" (vec (sort excluded-transport-fields))
+               "symbols" (vec (sort symbols))
+               "live_dbn" (.-live_dbn args)
+               "historical" {"mbp-1" (.-historical_mbp_dbn args) "trades" (.-historical_trades_dbn args)}
+               "schemas" schemas}
+      target (.resolve (pathlib/Path (.-out args)))]
+  (.mkdir (.-parent target) ** :parents true :exist_ok true)
+  (spit (str target) (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+  (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true)))

@@ -1,0 +1,350 @@
+;; Audit evidence for neutralized features that still lack formula provenance.
+(import csv datetime glob json numpy os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def default-ref
+  (or (os.environ/get "STEVE_REF_ROOT")
+      (let [vps-ref "/opt/stevetrading/shared/Data-Preprocessor"]
+        (if (os.path/isdir vps-ref)
+          vps-ref
+          (os.path/join (os.path/dirname repo-root) "SteveTrading/ref/Data-Preprocessor")))))
+(def default-plan (os.path/join repo-root "live_runtime/analysis/neutralized_feature_unlock_plan_current.json"))
+(def default-stats (os.path/join (os.path/dirname repo-root) "parity/feature_stats_raw_corrected.npz"))
+(def default-replay (os.path/join (os.path/dirname repo-root) "parity/replay_report.json"))
+(def default-rebucket (os.path/join (os.path/dirname repo-root) "parity/rebucket_report.json"))
+(def default-out (os.path/join repo-root "live_runtime/analysis"))
+(def source-extensions #{".py" ".lpy" ".clj" ".cljs" ".edn"})
+(def excluded-parts #{".git" ".mypy_cache" ".pytest_cache" ".ruff_cache" ".venv"
+                      "__pycache__" "live_runtime" "node_modules" "report-viewer"})
+
+(def greek-suffix-requirements
+  {"dollar_delta" {"required_inputs" "delta, underlying/notional price, contract multiplier, and weighting semantics"
+                   "blocker_detail" "Dollar exposure is not the same as raw delta; the legacy notional and weighting convention is unknown."}
+   "dollar_vega" {"required_inputs" "vega, option/notional price basis, contract multiplier, and weighting semantics"
+                  "blocker_detail" "Dollar vega requires the legacy currency conversion/exposure convention, not just grid vega."}
+   "epsilon_exposure" {"required_inputs" "legacy epsilon definition, exposure weighting, and source grid or contract universe"
+                       "blocker_detail" "Epsilon is not present in the live grid channels, and the training definition is unknown."}
+   "epsilon_mean" {"required_inputs" "legacy epsilon definition and aggregation universe"
+                   "blocker_detail" "Epsilon is not present in the live grid channels, so mean epsilon cannot be reconstructed safely."}
+   "epsilon_times_delta" {"required_inputs" "legacy epsilon definition plus delta alignment and aggregation semantics"
+                          "blocker_detail" "Delta is available, but epsilon provenance is missing."}
+   "lambda_mean" {"required_inputs" "legacy lambda definition and aggregation universe"
+                  "blocker_detail" "Lambda is not present in the live grid channels, and several plausible definitions exist."}
+   "lambda_times_iv" {"required_inputs" "legacy lambda definition plus IV alignment semantics"
+                      "blocker_detail" "IV is available, but lambda provenance is missing."}
+   "lambda_weighted" {"required_inputs" "legacy lambda definition plus weighting basis"
+                      "blocker_detail" "The weighting basis is unknown; guessing would change feature scale and model behavior."}
+   "rho_exposure" {"required_inputs" "rho, exposure weighting/notional basis, and aggregation semantics"
+                   "blocker_detail" "Raw rho is available, but exposure semantics are not proven."}
+   "skew_times_volume" {"required_inputs" "skew definition, option volume source, and contract universe alignment"
+                        "blocker_detail" "Volume exists in option sidecars, but this Greek-namespaced feature may not match option volume-skew formulas."}
+   "theta_exposure_ratio" {"required_inputs" "theta, denominator exposure definition, and ratio guardrail semantics"
+                           "blocker_detail" "Raw theta is available, but the denominator/exposure convention is unknown."}
+   "vega_total_exposure" {"required_inputs" "vega, contract/notional multiplier, and total exposure aggregation semantics"
+                          "blocker_detail" "Total exposure is not equivalent to mean vega; the legacy exposure basis is unknown."}})
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/blocked_feature_provenance_audit.lpy -- "
+                "[--plan-json PATH] [--ref-root DIR] [--feature-names PATH] "
+                "[--feature-stats-npz PATH] [--replay-report PATH] [--rebucket-report PATH] "
+                "[--source-root DIR ...] [--out-dir DIR] [--label LABEL] [--target-date YYYY-MM-DD]")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn valid-target-date [value]
+  (let [s (str value)]
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError "expected YYYY-MM-DD calendar date"))))
+    s))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:plan-json default-plan
+              :ref-root default-ref
+              :feature-stats-npz default-stats
+              :replay-report default-replay
+              :rebucket-report default-rebucket
+              :source-root []
+              :out-dir default-out
+              :label "current"}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--plan-json") (recur (nnext remaining) (assoc out :plan-json (option-value remaining arg)))
+          (= arg "--ref-root") (recur (nnext remaining) (assoc out :ref-root (option-value remaining arg)))
+          (= arg "--feature-names") (recur (nnext remaining) (assoc out :feature-names (option-value remaining arg)))
+          (= arg "--feature-stats-npz") (recur (nnext remaining) (assoc out :feature-stats-npz (option-value remaining arg)))
+          (= arg "--replay-report") (recur (nnext remaining) (assoc out :replay-report (option-value remaining arg)))
+          (= arg "--rebucket-report") (recur (nnext remaining) (assoc out :rebucket-report (option-value remaining arg)))
+          (= arg "--source-root") (recur (nnext remaining) (update out :source-root conj (option-value remaining arg)))
+          (= arg "--out-dir") (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+          (= arg "--label") (recur (nnext remaining) (assoc out :label (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (valid-target-date (option-value remaining arg))))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn load-json-if-exists [path]
+  (if (os.path/exists path) (fp/read-json path) {}))
+
+(defn default-feature-names [ref-root]
+  (os.path/join ref-root "pipeline_data/live_model_chestnut_multihead_corrected/feature_names.json"))
+
+(defn source-files [roots]
+  (let [files (atom #{})]
+    (doseq [root roots]
+      (when (os.path/exists root)
+        (doseq [path (glob/glob (os.path/join root "**" "*") ** :recursive true)]
+          (let [parts (set (.split (str path) (.-sep os)))
+                suffix (second (os.path/splitext path))]
+            (when (and (os.path/isfile path)
+                       (contains? source-extensions suffix)
+                       (empty? (filter excluded-parts parts)))
+              (swap! files conj path))))))
+    (vec (sort @files))))
+
+(defn search-sources [files needles]
+  (let [matches (atom (into {} (map (fn [n] [n []]) needles)))]
+    (doseq [path files]
+      (try
+        (let [text (slurp path)]
+          (doseq [needle needles]
+            (when (not= -1 (.find text needle))
+              (swap! matches update needle conj path))))
+        (catch python/OSError _ nil)))
+    @matches))
+
+(defn parity-row [report feature]
+  (let [row (get-in report ["per_feature" feature])]
+    (if (map? row) row {})))
+
+(defn greek-suffix [feature]
+  (if (not= -1 (.find feature "_greeks_"))
+    (second (.split feature "_greeks_" 1))
+    (second (.split feature "_" 1))))
+
+(defn feature-prefix [feature]
+  (first (.split feature "_" 1)))
+
+(defn suffix-summary [rows]
+  (let [grouped (atom {})]
+    (doseq [row rows]
+      (let [suffix (greek-suffix (get row "feature"))
+            default-info (get greek-suffix-requirements suffix
+                              {"required_inputs" "unknown legacy formula inputs"
+                               "blocker_detail" "No suffix-specific provenance rule is registered."})]
+        (swap! grouped
+               (fn [m]
+                 (let [bucket (get m suffix (merge {"suffix" suffix
+                                                    "count" 0
+                                                    "features" []
+                                                    "prefixes" #{}
+                                                    "model_gain" 0.0
+                                                    "model_split_count" 0
+                                                    "exact_source_hits" 0
+                                                    "suffix_source_hits" 0
+                                                    "formula_provenance_found" 0
+                                                    "nonzero_train_std" 0}
+                                                   default-info))]
+                   (assoc m suffix
+                          (-> bucket
+                              (update "count" inc)
+                              (update "features" conj (get row "feature"))
+                              (update "prefixes" conj (feature-prefix (get row "feature")))
+                              (update "model_gain" + (float (or (get row "model_gain") 0.0)))
+                              (update "model_split_count" + (int (or (get row "model_split_count") 0)))
+                              (update "exact_source_hits" + (int (or (get row "exact_source_hits") 0)))
+                              (update "suffix_source_hits" + (int (or (get row "suffix_source_hits") 0)))
+                              (update "formula_provenance_found" + (if (get row "formula_provenance_found") 1 0))
+                              (update "nonzero_train_std" + (if (and (some? (get row "train_std"))
+                                                                      (> (float (get row "train_std")) 1.0e-12))
+                                                               1
+                                                               0)))))))))
+    (vec (sort-by (fn [row] [(- (float (get row "model_gain"))) (get row "suffix")])
+                  (map (fn [[_ bucket]]
+                         (assoc bucket
+                                "prefixes" (vec (sort (get bucket "prefixes")))
+                                "features" (vec (sort (get bucket "features")))))
+                       @grouped)))))
+
+(defn write-csv [path rows]
+  (let [fields ["feature" "source_note" "family" "model_gain" "train_mean" "train_std"
+                "replay_bucket" "rebucket_bucket" "exact_source_hits"
+                "suffix_source_hits" "formula_provenance_found" "blocker"]]
+    (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+    (with-open [fh (open (str path) ** :mode "w" :newline "")]
+      (let [writer (csv/DictWriter fh ** :fieldnames (python/list fields))]
+        (.writeheader writer)
+        (doseq [row rows]
+          (.writerow writer (python/dict (map (fn [field] (python/tuple [field (get row field "")])) fields))))))))
+
+(defn fmt4 [x]
+  (python/format (float (or x 0.0)) ".4f"))
+
+(defn markdown [summary suffixes rows]
+  (str "# Blocked Feature Provenance Audit\n\n"
+       "This is read-only evidence for neutralized features that still lack a trusted replay formula.\n\n"
+       "- Blocked total: `" (get summary "blocked_total") "`\n"
+       "- Formula provenance found: `" (get summary "formula_provenance_found") "`\n"
+       "- Formula provenance missing: `" (get summary "formula_provenance_missing") "`\n"
+       "- Blocked suffixes: `" (get summary "blocked_suffix_total") "`\n"
+       "- Blocked model gain: `" (fmt4 (get summary "blocked_model_gain")) "`\n"
+       "- Blocked model splits: `" (get summary "blocked_model_split_count") "`\n"
+       "- Feature stats available: `" (get summary "feature_stats_available") "`\n"
+       "- Nonzero training std: `" (get summary "nonzero_train_std") "`\n"
+       "- Source files scanned: `" (get summary "source_file_count") "`\n\n"
+       "## Source Counts\n\n"
+       (fp/md-table (vec (concat [["Source" "Count"]] (map (fn [[k v]] [k v]) (get summary "source_counts"))))) "\n\n"
+       "## Replay Buckets\n\n"
+       (fp/md-table (vec (concat [["Bucket" "Count"]] (map (fn [[k v]] [k v]) (get summary "replay_bucket_counts"))))) "\n\n"
+       "## Blocked Suffixes\n\n"
+       (fp/md-table
+        (vec (concat [["Suffix" "Count" "Splits" "Gain" "Prefixes" "Required Inputs" "Blocker"]]
+                     (map (fn [row]
+                            [(str "`" (get row "suffix") "`")
+                             (get row "count")
+                             (get row "model_split_count")
+                             (fmt4 (get row "model_gain"))
+                             (.join ", " (get row "prefixes"))
+                             (get row "required_inputs")
+                             (get row "blocker_detail")])
+                          suffixes)))) "\n\n"
+       "## Top Blocked Features\n\n"
+       (fp/md-table
+        (vec (concat [["Feature" "Source" "Train Std" "Replay" "Exact Hits" "Suffix Hits"]]
+                     (map (fn [row]
+                            [(str "`" (get row "feature") "`")
+                             (get row "source_note")
+                             (if (nil? (get row "train_std")) "" (python/format (float (get row "train_std")) ".6g"))
+                             (get row "replay_bucket")
+                             (get row "exact_source_hits")
+                             (get row "suffix_source_hits")])
+                          (take 40 rows)))))))
+
+(defn run-main [opts]
+  (let [ref-root (:ref-root opts)
+        plan-path (:plan-json opts)
+        feature-names-path (or (:feature-names opts) (default-feature-names ref-root))
+        plan (load-json-if-exists plan-path)
+        feature-names (vec (fp/read-json feature-names-path))
+        feature-index (into {} (map-indexed (fn [idx name] [name idx]) feature-names))
+        blocked-rows (vec (filter #(not= (get % "unlock_status") "awaiting-market-evidence")
+                                  (get plan "features" [])))
+        stats-path (:feature-stats-npz opts)
+        stats-available (os.path/exists stats-path)
+        stats (when stats-available (numpy/load stats-path ** :allow_pickle true))
+        train-mean (when stats-available (aget stats "mean"))
+        train-std (when stats-available (aget stats "std"))
+        replay-path (:replay-report opts)
+        rebucket-path (:rebucket-report opts)
+        replay-available (os.path/exists replay-path)
+        rebucket-available (os.path/exists rebucket-path)
+        replay (load-json-if-exists replay-path)
+        rebucket (load-json-if-exists rebucket-path)
+        source-roots (if (seq (:source-root opts))
+                       (:source-root opts)
+                       [ref-root
+                        (os.path/join repo-root "components")
+                        (os.path/join repo-root "bases")
+                        (os.path/join repo-root "projects")])
+        ;; Source scanning can be expensive on the reference tree; skip it when
+        ;; the plan has no blocked rows.
+        files (if (seq blocked-rows) (source-files source-roots) [])
+        suffixes (set (map #(greek-suffix (get % "feature")) (filter #(get % "feature") blocked-rows)))
+        exact-features (set (map #(get % "feature") (filter #(get % "feature") blocked-rows)))
+        source-matches (search-sources files (into suffixes exact-features))
+        rows (atom [])]
+    (doseq [row blocked-rows]
+      (let [feature (get row "feature")
+            suffix (greek-suffix feature)
+            idx (get feature-index feature)
+            exact-hits (get source-matches feature [])
+            suffix-hits (get source-matches suffix [])
+            replay-feature (parity-row replay feature)
+            rebucket-feature (parity-row rebucket feature)]
+        (swap! rows conj {"feature" feature
+                          "family" (get row "family")
+                          "source_note" (get row "source_note")
+                          "blocker" (get row "blocker")
+                          "next_evidence" (get row "next_evidence")
+                          "model_gain" (get row "model_gain" 0.0)
+                          "model_split_count" (get row "model_split_count" 0)
+                          "train_mean" (when (and idx train-mean (< idx (count train-mean))) (float (aget train-mean idx)))
+                          "train_std" (when (and idx train-std (< idx (count train-std))) (float (aget train-std idx)))
+                          "replay_bucket" (get replay-feature "bucket")
+                          "replay_nmad_train_sigma" (get replay-feature "nmad_train_sigma")
+                          "rebucket_bucket" (get rebucket-feature "bucket")
+                          "rebucket_nmad_sigma" (get rebucket-feature "nmad_sigma")
+                          "exact_source_hits" (count exact-hits)
+                          "exact_source_paths" (vec (take 10 exact-hits))
+                          "suffix_source_hits" (count suffix-hits)
+                          "suffix_source_paths" (vec (take 10 suffix-hits))
+                          "formula_provenance_found" (boolean (seq exact-hits))})))
+    (let [source-counts (into {} (sort (frequencies (map #(get % "source_note") @rows))))
+          replay-counts (into {} (sort-by (fn [[k _]] (str k)) (frequencies (map #(get % "replay_bucket") @rows))))
+          nonzero-train-std (when stats-available
+                              (count (filter #(and (some? (get % "train_std"))
+                                                   (> (float (get % "train_std")) 1.0e-12))
+                                             @rows)))
+          formula-found (count (filter #(get % "formula_provenance_found") @rows))
+          blocked-gain (float (reduce + (map #(float (or (get % "model_gain") 0.0)) @rows)))
+          blocked-splits (int (reduce + (map #(int (or (get % "model_split_count") 0)) @rows)))
+          by-suffix (suffix-summary @rows)
+          summary {"generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                   "target_date" (:target-date opts)
+                   "plan_json" plan-path
+                   "feature_names" feature-names-path
+                   "feature_stats_npz" stats-path
+                   "feature_stats_available" stats-available
+                   "replay_report" replay-path
+                   "replay_report_available" replay-available
+                   "rebucket_report" rebucket-path
+                   "rebucket_report_available" rebucket-available
+                   "source_roots" source-roots
+                   "source_file_count" (count files)
+                   "blocked_total" (count @rows)
+                   "blocked_model_gain" blocked-gain
+                   "blocked_model_split_count" blocked-splits
+                   "formula_provenance_found" formula-found
+                   "formula_provenance_missing" (- (count @rows) formula-found)
+                   "blocked_suffix_total" (count by-suffix)
+                   "nonzero_train_std" nonzero-train-std
+                   "source_counts" source-counts
+                   "replay_bucket_counts" (into {} (map (fn [[k v]] [(str k) v]) replay-counts))}
+          out-base (os.path/join (:out-dir opts) (str "blocked_feature_provenance_audit_" (:label opts)))
+          json-path (str out-base ".json")
+          csv-path (str out-base ".csv")
+          md-path (str out-base ".md")]
+      (os/makedirs (:out-dir opts) ** :exist_ok true)
+      (fp/clear-artifacts! [json-path csv-path md-path])
+      (spit json-path (str (json/dumps (fp/->jsonable {"summary" summary "suffixes" by-suffix "features" @rows})
+                                       ** :indent 2 :sort_keys true)
+                           "\n"))
+      (write-csv csv-path @rows)
+      (spit md-path (markdown summary by-suffix @rows))
+      (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+      (println (str "wrote " md-path))
+      (println (str "wrote " csv-path))
+      (println (str "wrote " json-path))
+      0)))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

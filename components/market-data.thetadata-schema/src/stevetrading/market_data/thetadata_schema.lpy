@@ -1,0 +1,513 @@
+(ns stevetrading.market-data.thetadata-schema
+  "Balli schemas for raw ThetaData Terminal payloads.
+
+  These schemas validate vendor wire shapes before adapter normalization. They
+  intentionally model ThetaData columnar JSON maps, not our canonical market
+  data facts."
+  (:require [balli.core :as b]
+            [balli.error :as be]
+            [basilisp.string :as bstr])
+  (:import datetime math re))
+
+(def schema-version 1)
+
+(defn numeric-wire?
+  "ThetaData floats are parsed with parse_float=str in the adapter so decimal
+  text survives unchanged. Accept numbers and numeric strings, reject NaN-ish
+  junk by requiring python/float to parse."
+  [x]
+  (try
+    (let [n (cond
+              (string? x) (python/float x)
+              (and (number? x) (not (boolean? x))) (python/float x)
+              :else nil)]
+      (and (some? n) (math/isfinite n)))
+    (catch python/Exception _ false)))
+
+(defn non-empty-string?
+  [x]
+  (and (string? x) (pos? (count x))))
+
+(defn nonblank-string?
+  [x]
+  (and (string? x) (pos? (count (bstr/trim x)))))
+
+(defn option-right?
+  [x]
+  (contains? #{"PUT" "CALL"} x))
+
+(defn date-string?
+  [x]
+  (and (non-empty-string? x)
+       (some? (re/fullmatch #"\d{4}-\d{2}-\d{2}" x))
+       (try
+         (datetime.date/fromisoformat x)
+         true
+         (catch python/Exception _ false))))
+
+(defn local-timestamp-string?
+  [x]
+  (and (non-empty-string? x)
+       (some? (re/fullmatch #"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?" x))
+       (try
+         (datetime.datetime/fromisoformat x)
+         true
+         (catch python/Exception _ false))))
+
+(def numeric-wire
+  [:fn {:error/message "should be a number or numeric string"} numeric-wire?])
+
+(def non-empty-string
+  [:fn {:error/message "should be a non-empty string"} non-empty-string?])
+
+(def option-right
+  [:fn {:error/message "should be PUT or CALL"} option-right?])
+
+(def date-string
+  [:fn {:error/message "should be YYYY-MM-DD date string"} date-string?])
+
+(def nullable-local-timestamp
+  [:maybe [:fn {:error/message "should be an ISO local timestamp"} local-timestamp-string?]])
+
+(defn non-empty-vector
+  [item-schema]
+  [:vector {:min 1} item-schema])
+
+(declare wire->data payload-example-coverage-issues)
+
+(defn- header-fields
+  [header]
+  (cond
+    (map? header)
+    (some identity
+          (map (fn [k]
+                 (let [v (get header k)]
+                   (cond
+                     (vector? v) (mapv str v)
+                     (string? v) (vec (filter pos? (map #(.strip %) (.split v ","))))
+                     :else nil)))
+               ["format" "columns" "fields" "header"]))
+
+    (vector? header)
+    (mapv str header)
+
+    (string? header)
+    (vec (filter pos? (map #(.strip %) (.split header ","))))
+
+    :else []))
+
+(defn- rows->columns
+  [rows fields]
+  (reduce
+   (fn [acc row]
+     (cond
+       (map? row)
+       (reduce (fn [a field]
+                 (update a field conj (get row field)))
+               acc fields)
+
+       (vector? row)
+       (reduce (fn [a i]
+                 (let [field (nth fields i)]
+                   (update a field conj (if (< i (count row))
+                                          (nth row i)
+                                          nil))))
+               acc (range (count fields)))
+
+       :else acc))
+   (into {} (map (fn [field] [field []]) fields))
+   rows))
+
+(defn- row-widths-valid?
+  [rows fields]
+  (every? (fn [row]
+            (cond
+              (vector? row) (= (count row) (count fields))
+              (map? row) (empty? (remove (set fields) (keys row)))
+              :else false))
+          rows))
+
+(defn normalize-table
+  "Normalize common ThetaData JSON table encodings into columnar string-keyed
+  maps. Supports direct columnar maps, {header,response} wrappers, row dicts,
+  and header-backed row vectors. Unknown scalar metadata is intentionally
+  dropped; vendor data columns remain as vectors for schema validation."
+  [payload]
+  (let [payload (wire->data payload)]
+    (cond
+      (map? payload)
+      (if (contains? payload "response")
+        (let [response (get payload "response")
+              fields (header-fields (get payload "header"))]
+          (cond
+            (and (vector? response)
+                 (seq response)
+                 (map? (first response)))
+            (let [fields (or (seq fields)
+                             (vec (sort (set (mapcat keys response)))))]
+              (if (row-widths-valid? response fields)
+                (rows->columns response fields)
+                {"__thetadata_row_width_mismatch" true}))
+
+            (and (vector? response) (seq fields))
+            (if (row-widths-valid? response fields)
+              (rows->columns response fields)
+              {"__thetadata_row_width_mismatch" true})
+
+            :else
+            {}))
+        (into {} (filter (fn [[_ v]] (vector? v)) payload)))
+
+      (and (vector? payload) (seq payload) (map? (first payload)))
+      (rows->columns payload (vec (sort (set (mapcat keys payload)))))
+
+      :else {})))
+
+(defn- required-column-lengths
+  [payload columns]
+  (mapv #(count (get payload % [])) (filter #(contains? payload %) columns)))
+
+(defn equal-column-lengths?
+  [payload columns]
+  (let [lengths (required-column-lengths payload columns)]
+    (or (empty? lengths)
+        (apply = lengths))))
+
+(defn- all-columns-same-length?
+  [payload]
+  (equal-column-lengths? payload (keys payload)))
+
+(defn- non-empty-any-column?
+  [columns]
+  (fn [payload]
+    (boolean
+     (some (fn [col]
+             (let [v (get payload col)]
+               (and (vector? v) (seq v))))
+           columns))))
+
+(def expiration-list-payload
+  [:and
+   [:map {:closed true}
+    ["expiration" (non-empty-vector date-string)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "expiration-list columns must have equal length"}
+    all-columns-same-length?]])
+
+(def quote-snapshot-payload
+  [:and
+   [:map {:closed true}
+    ["strike" (non-empty-vector numeric-wire)]
+    ["right" (non-empty-vector option-right)]
+    ["bid" (non-empty-vector numeric-wire)]
+    ["ask" (non-empty-vector numeric-wire)]
+    ["expiration" (non-empty-vector date-string)]
+    ["bid_size" {:optional true} (non-empty-vector numeric-wire)]
+    ["ask_size" {:optional true} (non-empty-vector numeric-wire)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "quote snapshot columns must have equal length"}
+    all-columns-same-length?]])
+
+(def option-ohlc-payload
+  [:and
+   [:map {:closed true}
+    ["strike" (non-empty-vector numeric-wire)]
+    ["right" (non-empty-vector option-right)]
+    ["open" {:optional true} (non-empty-vector numeric-wire)]
+    ["high" {:optional true} (non-empty-vector numeric-wire)]
+    ["low" {:optional true} (non-empty-vector numeric-wire)]
+    ["close" {:optional true} (non-empty-vector numeric-wire)]
+    ["volume" {:optional true} (non-empty-vector numeric-wire)]
+    ["count" {:optional true} (non-empty-vector numeric-wire)]
+    ["expiration" {:optional true} (non-empty-vector date-string)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "option OHLC columns must have equal length"}
+    all-columns-same-length?]
+   [:fn {:error/message "option OHLC payload must include at least one OHLC/volume/count column"}
+    (non-empty-any-column? ["open" "high" "low" "close" "volume" "count"])]])
+
+(def option-open-interest-payload
+  [:and
+   [:map {:closed true}
+    ["strike" (non-empty-vector numeric-wire)]
+    ["right" (non-empty-vector option-right)]
+    ["open_interest" {:optional true} (non-empty-vector numeric-wire)]
+    ["oi" {:optional true} (non-empty-vector numeric-wire)]
+    ["expiration" {:optional true} (non-empty-vector date-string)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "option open-interest columns must have equal length"}
+    all-columns-same-length?]
+   [:fn {:error/message "option open-interest payload must include open_interest or oi"}
+    (non-empty-any-column? ["open_interest" "oi"])]])
+
+(def option-greeks-payload
+  [:and
+   [:map {:closed true}
+    ["strike" (non-empty-vector numeric-wire)]
+    ["right" (non-empty-vector option-right)]
+    ["implied_vol" {:optional true} (non-empty-vector numeric-wire)]
+    ["iv" {:optional true} (non-empty-vector numeric-wire)]
+    ["delta" {:optional true} (non-empty-vector numeric-wire)]
+    ["vega" {:optional true} (non-empty-vector numeric-wire)]
+    ["theta" {:optional true} (non-empty-vector numeric-wire)]
+    ["rho" {:optional true} (non-empty-vector numeric-wire)]
+    ["gamma" {:optional true} (non-empty-vector numeric-wire)]
+    ["vanna" {:optional true} (non-empty-vector numeric-wire)]
+    ["charm" {:optional true} (non-empty-vector numeric-wire)]
+    ["speed" {:optional true} (non-empty-vector numeric-wire)]
+    ["zomma" {:optional true} (non-empty-vector numeric-wire)]
+    ["color" {:optional true} (non-empty-vector numeric-wire)]
+    ["expiration" {:optional true} (non-empty-vector date-string)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "option greeks columns must have equal length"}
+    all-columns-same-length?]
+   [:fn {:error/message "option greeks payload must include at least one Greek/IV column"}
+    (non-empty-any-column? ["implied_vol" "iv" "delta" "vega" "theta" "rho"
+                            "gamma" "vanna" "charm" "speed" "zomma" "color"])]])
+
+(def market-quote-payload
+  [:and
+   [:map {:closed true}
+    ["bid" {:optional true} (non-empty-vector numeric-wire)]
+    ["ask" {:optional true} (non-empty-vector numeric-wire)]
+    ["bid_size" {:optional true} (non-empty-vector numeric-wire)]
+    ["ask_size" {:optional true} (non-empty-vector numeric-wire)]
+    ["last" {:optional true} (non-empty-vector numeric-wire)]
+    ["price" {:optional true} (non-empty-vector numeric-wire)]
+    ["trade_price" {:optional true} (non-empty-vector numeric-wire)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "market quote columns must have equal length"}
+    all-columns-same-length?]
+   [:fn {:error/message "market quote payload must include bid/ask/last/price/trade_price"}
+    (non-empty-any-column? ["bid" "ask" "last" "price" "trade_price"])]])
+
+(def market-price-payload
+  [:and
+   [:map {:closed true}
+    ["price" {:optional true} (non-empty-vector numeric-wire)]
+    ["last" {:optional true} (non-empty-vector numeric-wire)]
+    ["trade_price" {:optional true} (non-empty-vector numeric-wire)]
+    ["size" {:optional true} (non-empty-vector numeric-wire)]
+    ["volume" {:optional true} (non-empty-vector numeric-wire)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "market price columns must have equal length"}
+    all-columns-same-length?]
+   [:fn {:error/message "market price payload must include price/last/trade_price"}
+    (non-empty-any-column? ["price" "last" "trade_price"])]])
+
+(def market-ohlc-payload
+  [:and
+   [:map {:closed true}
+    ["open" {:optional true} (non-empty-vector numeric-wire)]
+    ["high" {:optional true} (non-empty-vector numeric-wire)]
+    ["low" {:optional true} (non-empty-vector numeric-wire)]
+    ["close" {:optional true} (non-empty-vector numeric-wire)]
+    ["volume" {:optional true} (non-empty-vector numeric-wire)]
+    ["count" {:optional true} (non-empty-vector numeric-wire)]
+    ["timestamp" {:optional true} (non-empty-vector nullable-local-timestamp)]
+    [:balli.core/default [:map-of :string [:vector :any]]]]
+   [:fn {:error/message "market OHLC columns must have equal length"}
+    all-columns-same-length?]
+   [:fn {:error/message "market OHLC payload must include at least one OHLC/volume/count column"}
+    (non-empty-any-column? ["open" "high" "low" "close" "volume" "count"])]])
+
+(def schemas
+  {:thetadata/expiration-list expiration-list-payload
+   :thetadata/quote-snapshot quote-snapshot-payload
+   :thetadata/option-ohlc option-ohlc-payload
+   :thetadata/option-open-interest option-open-interest-payload
+   :thetadata/option-greeks option-greeks-payload
+   :thetadata/market-quote market-quote-payload
+   :thetadata/market-price market-price-payload
+   :thetadata/market-ohlc market-ohlc-payload})
+
+(def probe-schema-kinds
+  {"option.expirations" :thetadata/expiration-list
+   "option.snapshot.quote" :thetadata/quote-snapshot
+   "bulk.option.quote" :thetadata/quote-snapshot
+   "option.snapshot.ohlc" :thetadata/option-ohlc
+   "option.snapshot.open_interest" :thetadata/option-open-interest
+   "bulk.option.open_interest" :thetadata/option-open-interest
+   "option.snapshot.greeks" :thetadata/option-greeks
+   "option.snapshot.greeks_second_order" :thetadata/option-greeks
+   "option.snapshot.greeks_third_order" :thetadata/option-greeks
+   "bulk.option.greeks" :thetadata/option-greeks
+   "index.snapshot.quote" :thetadata/market-quote
+   "index.snapshot.price" :thetadata/market-price
+   "stock.snapshot.quote" :thetadata/market-quote
+   "stock.snapshot.trade" :thetadata/market-price
+   "stock.snapshot.ohlc" :thetadata/market-ohlc})
+
+(def required-payload-example-probes
+  #{"option.expirations" "option.snapshot.quote"})
+
+(defn wire->data
+  "Convert Python json.loads containers into Basilisp data before Balli
+  validation. Adapter code can pass raw vendor JSON maps directly."
+  [x]
+  (cond
+    (map? x) (into {} (map (fn [[k v]] [k (wire->data v)]) x))
+    (isinstance x python/dict) (into {} (map (fn [[k v]] [k (wire->data v)])
+                                            (.items x)))
+    (vector? x) (mapv wire->data x)
+    (isinstance x python/list) (mapv wire->data x)
+    :else x))
+
+(defn schema
+  [kind]
+  (get schemas kind))
+
+(defn explain
+  [kind payload]
+  (b/explain (schema kind) (normalize-table payload)))
+
+(defn validate
+  [kind payload]
+  (true? (b/validate (schema kind) (normalize-table payload))))
+
+(defn humanize
+  [kind payload]
+  (when-let [e (explain kind payload)]
+    (be/humanize e)))
+
+(defn validation-result
+  [kind payload]
+  (if (validate kind payload)
+    {:valid? true}
+    {:valid? false
+     :schema/kind kind
+     :schema/errors (humanize kind payload)
+     :schema/explain (explain kind payload)}))
+
+(defn table-summary
+  [payload]
+  (let [table (normalize-table payload)
+        lengths (into {} (map (fn [[k v]] [k (count v)]) table))]
+    {:shape (cond
+              (empty? table) :thetadata/shape-empty
+              :else :thetadata/shape-columnar)
+     :columns (vec (sort (keys table)))
+     :row-count (if (seq lengths) (apply max (vals lengths)) 0)
+     :equal-lengths? (<= (count (set (vals lengths))) 1)
+     :column-lengths lengths}))
+
+(defn probe-schema-kind
+  [probe-name]
+  (get probe-schema-kinds probe-name))
+
+(defn compact-generated-date
+  [generated-at]
+  (try
+    (when generated-at
+      (let [s (str generated-at)]
+        (cond
+          (= 10 (count s))
+          (do
+            (datetime.date/fromisoformat s)
+            (.replace s "-" ""))
+
+          (and (> (count s) 10) (= "T" (subs s 10 11)))
+          (let [normalized (if (.endswith s "Z")
+                             (str (subs s 0 (- (count s) 1)) "+00:00")
+                             s)
+                dt (datetime.datetime/fromisoformat normalized)]
+            (.strftime dt "%Y%m%d"))
+
+          :else nil)))
+    (catch python/Exception _ nil)))
+
+(defn verify-payload-example
+  "Verify one saved capability-probe payload example map.
+  Expected shape:
+    {\"probe\" \"option.snapshot.quote\" \"payload\" <raw vendor payload> ...}"
+  ([item] (verify-payload-example nil item))
+  ([path item]
+   (let [item (wire->data item)
+         probe (get item "probe")
+         payload (get item "payload")
+         kind (probe-schema-kind probe)
+         generated-at (get item "generated_at")
+         target-date (get item "target_date")
+         usable-meta (get item "usable" nil)
+         generated-date (compact-generated-date generated-at)
+         target-date-compact (compact-generated-date target-date)
+         example-meta {:path path
+                       :probe probe
+                       :example/generated_at generated-at
+                       :example/target_date target-date
+                       :example/generated_date generated-date
+                       :example/target_date_compact target-date-compact}]
+     (cond
+       (not (nonblank-string? probe))
+       (merge example-meta
+              {:status :error
+               :valid? false
+               :reason :thetadata/missing-probe})
+
+       (nil? kind)
+       (merge example-meta
+              {:status :error
+               :valid? false
+               :reason :thetadata/no-schema-for-probe})
+
+       (nil? payload)
+       (merge example-meta
+              {:schema/kind kind
+               :status :error
+               :valid? false
+               :reason :thetadata/missing-payload})
+
+       (and (some? usable-meta) (not (true? usable-meta)))
+       (merge example-meta
+              {:schema/kind kind
+               :status :error
+               :valid? false
+               :reason :thetadata/payload-example-not-marked-usable})
+
+       :else
+       (let [result (validation-result kind payload)
+             summary (table-summary payload)]
+         (merge (assoc example-meta
+                 :schema/kind kind
+                 :summary summary)
+                (if (:valid? result)
+                  {:status :ok
+                   :valid? true}
+                  {:status :error
+                   :valid? false
+                   :schema/errors (:schema/errors result)})))))))
+
+(defn verify-payload-examples
+  [items]
+  (let [results (mapv (fn [item] (verify-payload-example item)) items)
+        checked (filter #(not= :skipped (:status %)) results)
+        invalid (filter #(false? (:valid? %)) results)
+        issues (payload-example-coverage-issues results)]
+    {:valid? (and (empty? invalid) (empty? issues))
+     :status (if (and (empty? invalid) (empty? issues)) :ok :error)
+     :total (count results)
+     :checked (count checked)
+     :skipped (- (count results) (count checked))
+     :invalid (count invalid)
+     :issues issues
+     :results results}))
+
+(defn payload-example-coverage-issues
+  ([results] (payload-example-coverage-issues required-payload-example-probes results))
+  ([required-probes results]
+   (let [ok-probes (set (map :probe (filter #(and (= :ok (:status %))
+                                                  (true? (:valid? %)))
+                                             results)))
+         missing (vec (sort (remove ok-probes required-probes)))]
+     (if (seq missing)
+       [{:severity :bad
+         :code :thetadata/payload-examples-required-probes-missing
+         :missing_probes missing
+         :detail "payload examples are missing required schema-backed ThetaData probes"}]
+       []))))

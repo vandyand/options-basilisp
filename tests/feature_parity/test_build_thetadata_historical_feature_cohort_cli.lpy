@@ -1,0 +1,438 @@
+(ns feature-parity.test-build-thetadata-historical-feature-cohort-cli
+  (:import http.server json os pathlib shutil subprocess sys tempfile threading urllib.parse)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "build_thetadata_historical_feature_cohort.lpy"))
+(def theta-calls (atom []))
+(def theta-fail? (atom false))
+(def theta-fail-option-symbols (atom #{}))
+
+(defn resolve-basilisp
+  []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads-path [path] (json/loads (.read_text path)))
+(defn join-path [parent name] (.joinpath parent name))
+
+(defn query-first
+  [query key]
+  (first (get query key [])))
+
+(defn write-json!
+  [handler payload status]
+  (let [body (.encode (dumps payload) "utf-8")]
+    (.send_response handler status)
+    (.send_header handler "Content-Type" "application/json")
+    (.send_header handler "Content-Length" (str (count body)))
+    (.end_headers handler)
+    (.write (.-wfile handler) body)))
+
+(defn fake-log-message
+  [_self _fmt & _args]
+  nil)
+
+(defn fake-do-get
+  [self]
+  (let [parsed (urllib.parse/urlparse (.-path self))
+        query (urllib.parse/parse_qs (.-query parsed))
+        path (.-path parsed)]
+    (swap! theta-calls conj [path query])
+    (if (or @theta-fail?
+            (and (str/ends-with? path "/v3/option/history/quote")
+                 (contains? @theta-fail-option-symbols (query-first query "symbol"))))
+      (write-json! self {"error" "down"} 500)
+      (cond
+        (str/ends-with? path "/v3/stock/history/ohlc")
+        (write-json! self {"timestamp" ["2026-07-07T09:30:00" "2026-07-07T09:31:00"]
+                           "open" [100 101]
+                           "high" [101 102]
+                           "low" [99 100]
+                           "close" [100 101]}
+                     200)
+
+        (str/ends-with? path "/v3/option/list/expirations")
+        (write-json! self {"expiration" [20260708]} 200)
+
+        :else
+        (write-json! self [] 200)))))
+
+(def ThetaHandler
+  (python/type
+   "ThetaHandler"
+   (python/tuple [http.server/BaseHTTPRequestHandler])
+   (python/dict {"log_message" fake-log-message
+                 "do_GET" fake-do-get})))
+
+(defn with-server
+  ([fail?] (with-server fail? #{}))
+  ([fail? fail-option-symbols]
+   (reset! theta-calls [])
+   (reset! theta-fail? fail?)
+   (reset! theta-fail-option-symbols fail-option-symbols)
+  (let [server (http.server/ThreadingHTTPServer (python/tuple ["127.0.0.1" 0]) ThetaHandler)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)]
+    (.start thread)
+    [server (str "http://127.0.0.1:" (.-server_port server))])))
+
+(defn merged-env
+  []
+  (let [env (.copy os/environ)]
+    (.__setitem__ env "STEVE_REPO_ROOT" (str root))
+    env))
+
+(defn write-fake-ref
+  [ref]
+  (let [bundle (join-path (join-path ref "pipeline_data") "live_model_chestnut_multihead_corrected")]
+    (.mkdir bundle ** :parents true :exist_ok true)
+    (.write_text (join-path bundle "feature_names.json")
+                 (dumps (vec (map #(str "f" %) (range 918)))))
+    bundle))
+
+(defn run-builder
+  [tmp args base-url]
+  (let [ref (join-path tmp "ref")
+        bundle (write-fake-ref ref)
+        out-npz (join-path tmp "historical.npz")
+        out-json (join-path tmp "historical.json")]
+    [(subprocess/run
+      (python/list (concat [basilisp-bin "run" (str script) "--"
+                            "--target-date" "2026-07-07"
+                            "--ref-root" (str ref)
+                            "--bundle" (str bundle)
+                            "--out-npz" (str out-npz)
+                            "--out-json" (str out-json)
+                            ;; These fixtures only exercise ThetaData transport
+                            ;; and use a deliberately minimal bundle. The
+                            ;; production default remains legacy-python.
+                            "--implementation" "native"
+                            "--min-rows" "1"
+                            "--base-url" (or base-url "http://127.0.0.1:9")]
+                           args))
+      ** :cwd (str root)
+         :env (merged-env)
+         :text true
+         :capture_output true
+         :check false)
+     out-npz
+     out-json]))
+
+(deftest build-thetadata-historical-feature-cohort-help-exits-zero
+  (let [result (subprocess/run (python/list [basilisp-bin "run" (str script) "--" "--help"])
+                               ** :cwd (str root)
+                                  :text true
+                                  :capture_output true
+                                  :check false)]
+    (is (= 0 (.-returncode result)))
+    (is (str/includes? (.-stdout result) "--target-date"))
+    (is (str/includes? (.-stdout result) "--stock-start-time"))
+    (is (str/includes? (.-stdout result) "--index-source"))
+    (is (str/includes? (.-stdout result) "--surface-symbols"))
+    (is (str/includes? (.-stdout result) "default matches"))
+    (is (str/includes? (.-stdout result) "launch_steve_six.lpy"))
+    (is (str/includes? (.-stdout result) "--allow-missing-surfaces"))
+    (is (str/includes? (.-stdout result) "--thetadata-cache-dir"))
+    (is (str/includes? (.-stdout result) "--option-observed-offset-seconds"))
+    (is (str/includes? (.-stdout result) "--option-quote-minute-offset"))
+    (is (str/includes? (.-stdout result) "--max-feature-rows"))
+    (is (str/includes? (.-stdout result) "--cohort-window-minutes"))
+    (is (str/includes? (.-stdout result) "--max-grid-contracts"))
+    (is (str/includes? (.-stdout result) "--grid-contracts-only"))
+    (is (str/includes? (.-stdout result) "--implementation"))
+    (is (str/includes? (.-stdout result) "legacy-python"))
+    (is (str/includes? (.-stdout result) "--skip-option-enrichment"))
+    (is (str/includes? (.-stdout result) "--skip-contract-coverage"))
+    (is (str/includes? (.-stdout result) "--grid-input-only"))))
+
+(deftest build-thetadata-historical-feature-cohort-persists-grid-diagnostics
+  (let [source (.read_text script)]
+    (is (str/includes? source ":option_chain_json option-chain-jsons"))
+    (is (str/includes? source ":bar_buffers_json bar-buffers-jsons"))
+    (is (str/includes? source "bar-buffers-jsons (atom [])"))
+    (is (str/includes? source "datetime/datetime"))
+    (is (str/includes? source "incomplete?"))
+    (is (str/includes? source "option-chain-jsons (atom [])"))
+    (is (str/includes? source "(defn padded-grid-history"))
+    (is (str/includes? source "\"grid_summary\" (grid-summary grids)"))
+    (is (str/includes? source "\"contracts_per_minute\""))
+    (is (str/includes? source "\"expiration_counts\""))
+    (is (str/includes? source "\"option_observed_offset_seconds\""))
+    (is (str/includes? source "\"option_quote_minute_offset\""))
+    (is (str/includes? source "\"max_feature_rows\""))
+    (is (str/includes? source "\"cohort_window_minutes\""))
+    (is (str/includes? source "cohort-option-start-time"))
+    (is (str/includes? source "take-last (int max-feature-rows) eligible-keys"))
+    (is (str/includes? source "\"max_grid_contracts\""))
+    (is (str/includes? source "\"grid_contracts_only\""))
+    (is (str/includes? source "\"index_source\""))
+    (is (str/includes? source "\"live-proxy\""))
+    (is (str/includes? source "in-grid-range?"))
+    (is (str/includes? source "option-payloads-to-grid-chain-by-minute"))
+    (is (str/includes? source "fetch-many-option-quote-payloads"))
+    (is (str/includes? source "intraminute quote-update count"))
+    (is (str/includes? source "contract-key"))
+    (is (str/includes? source "\"grid-contracts-only-columnar\""))
+    (is (str/includes? source "(defn limit-chain-contracts"))
+    (is (str/includes? source "\"skip_option_enrichment\""))
+    (is (str/includes? source "\"skip_contract_coverage\""))
+    (is (str/includes? source "\"thetadata_cache\""))
+    (is (str/includes? source "raw-unlock/build-option-greeks-grid-from-payload chain"))
+    (is (str/includes? source "raw-unlock/build-option-greeks-grid-from-payload surface"))
+    ;; The deployed bridge still calls FeatureEngine. The builder defaults to
+    ;; the same implementation, while native remains an explicit migration
+    ;; diagnostic rather than a parity substitute.
+    (is (str/includes? source "--implementation"))
+    (is (str/includes? source "legacy-python"))
+    (is (str/includes? source "load-legacy-feature-engine"))
+    (is (str/includes? source "load-legacy-grid-adapter"))
+    (is (str/includes? source "legacy-grid-from-chain"))
+    (is (str/includes? source "scripts_5yr.live.feature_engine"))
+    (is (str/includes? source "raw-unlock/compute-live-feature-vector names buffers grid-history-list hmm-model dictionary-atoms"))
+    (is (not (str/includes? source "compute-live-feature-vector-deferred")))
+    (is (str/includes? source "concurrent.futures/ThreadPoolExecutor"))
+    (is (str/includes? source "consume futures in the input"))
+    (is (str/includes? source "(defn cache-file-for-url"))
+    (is (str/includes? source "(shifted-observed-at key observed-offset-seconds)"))
+    (is (str/includes? source "(shifted-minute-key quote-key (- (int quote-minute-offset)))"))
+    (is (str/includes? source "\"chain_horizon_days\""))
+    (is (str/includes? source "\"surface_horizon_days\""))
+    (is (str/includes? source "\"row_provenance_summary\""))
+    (is (str/includes? source "\"grid_appended_rows\""))
+    (is (str/includes? source "\"carried_grid_rows\""))
+    (is (str/includes? source "\"grid_input_only\" (.-grid_input_only args)"))
+    (is (str/includes? source "\"grid_input_only\""))
+    (is (str/includes? source "(vec (vals @by-key))"))
+    (is (str/includes? source "(numpy/zeros (count names) ** :dtype numpy/float32)"))
+    (is (str/includes? source "raw-unlock/compute-live-feature-vector"))))
+
+(deftest build-thetadata-historical-feature-cohort-uses-stock-start-time-and-spy-range
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [[server base-url] (with-server false)
+          tmp (pathlib/Path tmp-dir)]
+      (try
+        (let [[result _out-npz out-json]
+              (run-builder tmp ["--start-time" "09:30:00"
+                                "--stock-start-time" "04:00:00"
+                                "--strike-range" "1"
+                                "--spy-strike-range" "25"]
+                           base-url)
+              stock-starts (set (keep (fn [[path query]]
+                                         (when (str/ends-with? path "/v3/stock/history/ohlc")
+                                           (query-first query "start_time")))
+                                       @theta-calls))
+              option-list-symbols (set (keep (fn [[path query]]
+                                                (when (str/ends-with? path "/v3/option/list/expirations")
+                                                  (query-first query "symbol")))
+                                              @theta-calls))
+              index-calls (vec (filter (fn [[path _query]]
+                                         (str/ends-with? path "/v3/index/history/ohlc"))
+                                       @theta-calls))
+              payload (loads-path out-json)]
+          (is (= 1 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+          (is (= #{"04:00:00"} stock-starts))
+          (is (empty? index-calls))
+          (is (every? option-list-symbols ["SPY" "SPXW" "VIXW"]))
+          (is (= false (.get payload "ok")))
+          (is (= "insufficient historical feature rows" (.get payload "reason"))))
+        (finally
+          (.shutdown server)
+          (.server_close server))))))
+
+(deftest build-thetadata-historical-feature-cohort-defaults-match-live-contract-universe
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [[server base-url] (with-server false)
+          tmp (pathlib/Path tmp-dir)]
+      (try
+        (let [[result _out-npz out-json]
+              (run-builder tmp [] base-url)
+              option-quote-calls (vec (keep (fn [[path query]]
+                                               (when (str/ends-with? path "/v3/option/history/quote")
+                                                 [(query-first query "symbol")
+                                                  (query-first query "strike_range")] ))
+                                             @theta-calls))
+              payload (loads-path out-json)
+              details (.get payload "details")]
+          (is (= 1 (.-returncode result)))
+          (is (some #(= ["SPY" "100"] %) option-quote-calls))
+          (is (= 1 (.get details "chain_horizon_days")))
+          (is (= 45 (.get details "surface_horizon_days")))
+          (is (= "100" (.get details "spy_strike_range"))))
+        (finally
+          (.shutdown server)
+          (.server_close server))))))
+
+(deftest build-thetadata-historical-feature-cohort-can-bound-sidecar-surface-symbols
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [[server base-url] (with-server false)
+          tmp (pathlib/Path tmp-dir)]
+      (try
+        (let [[result _out-npz out-json]
+              (run-builder tmp ["--surface-symbols" "SPXW"
+                                "--surface-horizon-days" "1"
+                                "--chain-horizon-days" "1"
+                                "--allow-missing-surfaces"]
+                           base-url)
+              option-list-symbols (vec (keep (fn [[path query]]
+                                                (when (str/ends-with? path "/v3/option/list/expirations")
+                                                  (query-first query "symbol")))
+                                              @theta-calls))
+              quote-symbols (vec (keep (fn [[path query]]
+                                          (when (str/ends-with? path "/v3/option/history/quote")
+                                            (query-first query "symbol")))
+                                        @theta-calls))
+              payload (loads-path out-json)]
+          (is (= 1 (.-returncode result)))
+          (is (= ["SPY" "SPXW"] option-list-symbols))
+          (is (= ["SPY" "SPXW"] quote-symbols))
+          (is (= false (.get payload "ok")))
+          (is (= "insufficient historical feature rows" (.get payload "reason"))))
+        (finally
+          (.shutdown server)
+          (.server_close server))))))
+
+(deftest build-thetadata-historical-feature-cohort-reuses-raw-thetadata-cache
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [[server base-url] (with-server false)
+          tmp (pathlib/Path tmp-dir)
+          cache-dir (join-path tmp "theta-cache")]
+      (try
+        (let [[first-result _first-npz first-json]
+              (run-builder tmp ["--surface-symbols" ""
+                                "--thetadata-cache-dir" (str cache-dir)]
+                           base-url)
+              first-payload (loads-path first-json)
+              first-details (or (.get first-payload "details") {})
+              first-cache (or (.get first-payload "thetadata_cache")
+                              (.get first-details "thetadata_cache"))
+              first-stats (when first-cache (.get first-cache "stats"))
+              first-calls (count @theta-calls)]
+          (is (= 1 (.-returncode first-result)) (str (.-stdout first-result) (.-stderr first-result)))
+          (is (some? first-cache) (str first-payload))
+          (is (> first-calls 0))
+          (is (= 0 (.get first-stats "hits")))
+          (is (> (.get first-stats "misses") 0))
+          (is (= (.get first-stats "misses") (.get first-stats "writes")))
+          (is (> (count (vec (.glob cache-dir "*.json"))) 0)))
+        (finally
+          (.shutdown server)
+          (.server_close server)))
+      (reset! theta-calls [])
+      (let [[second-result _second-npz second-json]
+            (run-builder tmp ["--surface-symbols" ""
+                              "--thetadata-cache-dir" (str cache-dir)]
+                         base-url)
+            second-payload (loads-path second-json)
+            second-details (or (.get second-payload "details") {})
+            second-cache (or (.get second-payload "thetadata_cache")
+                             (.get second-details "thetadata_cache"))
+            second-stats (when second-cache (.get second-cache "stats"))]
+        (is (= 1 (.-returncode second-result)) (str (.-stdout second-result) (.-stderr second-result)))
+        (is (some? second-cache) (str second-payload))
+        (is (= 0 (count @theta-calls)))
+        (is (> (.get second-stats "hits") 0))
+        (is (= 0 (.get second-stats "misses")))
+        (is (= 0 (.get second-stats "writes")))))))
+
+(deftest build-thetadata-historical-feature-cohort-records-missing-sidecar-surfaces
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [[server base-url] (with-server false #{"SPXW"})
+          tmp (pathlib/Path tmp-dir)]
+      (try
+        (let [[result _out-npz out-json]
+              (run-builder tmp ["--surface-symbols" "SPXW"
+                                "--surface-horizon-days" "1"
+                                "--chain-horizon-days" "1"
+                                "--allow-missing-surfaces"]
+                           base-url)
+              payload (loads-path out-json)
+              details (.get payload "details")
+              failures (.get details "surface_fetch_failures")
+              failure (first failures)]
+          (is (= 1 (.-returncode result)))
+          (is (= false (.get payload "ok")))
+          (is (= 1 (count failures)))
+          (is (= "SPXW" (.get failure "symbol")))
+          (is (= "history" (.get failure "stage")))
+          (is (str/includes? (.get failure "error") "ThetaData request failed status=500")))
+        (finally
+          (.shutdown server)
+          (.server_close server))))))
+
+(deftest build-thetadata-historical-feature-cohort-removes-stale-npz-when-bundle-is-missing
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out-npz (join-path tmp "historical.npz")
+          out-json (join-path tmp "historical.json")]
+      (.write_bytes out-npz (.encode "stale" "utf-8"))
+      (let [result (subprocess/run
+                    (python/list [basilisp-bin "run" (str script) "--"
+                                  "--target-date" "2026-07-07"
+                                  "--ref-root" (str (join-path tmp "ref"))
+                                  "--bundle" (str (join-path tmp "missing"))
+                                  "--out-npz" (str out-npz)
+                                  "--out-json" (str out-json)])
+                    ** :cwd (str root)
+                       :text true
+                       :capture_output true
+                       :check false)
+            payload (loads-path out-json)]
+        (is (= 1 (.-returncode result)))
+        (is (not (.exists out-npz)))
+        (is (= false (.get payload "ok")))
+        (is (= "bundle directory missing" (.get payload "reason")))))))
+
+(deftest build-thetadata-historical-feature-cohort-removes-stale-npz-when-transport-fails
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [[server base-url] (with-server true)
+          tmp (pathlib/Path tmp-dir)]
+      (try
+        (let [[result out-npz out-json] (run-builder tmp [] base-url)
+              payload (loads-path out-json)]
+          (is (= 1 (.-returncode result)))
+          (is (not (.exists out-npz)))
+          (is (= false (.get payload "ok")))
+          (is (= "error" (.get payload "error_class")))
+          (is (= "2026-07-07" (.get payload "target_date")))
+          (is (str/includes? (.get payload "reason") "ThetaData request failed status=500"))
+          (is (str/includes? (.get payload "reason") "/v3/stock/history/ohlc")))
+        (finally
+          (.shutdown server)
+          (.server_close server))))))
+
+(deftest build-thetadata-historical-feature-cohort-classifies-unreachable-terminal
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          [result _out-npz out-json] (run-builder tmp ["--request-timeout" "0.25"] "http://127.0.0.1:9")
+          payload (loads-path out-json)]
+      (is (= 1 (.-returncode result)))
+      (is (= false (.get payload "ok")))
+      (is (= "terminal-unreachable" (.get payload "error_class")))
+      (is (= "2026-07-07" (.get payload "target_date")))
+      (is (str/includes? (.get payload "reason") "ThetaData request failed")))))
+
+(deftest build-thetadata-historical-feature-cohort-rejects-decimal-strike-range
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out-json (join-path tmp "historical.json")
+          [result _out-npz _out-json] (run-builder tmp ["--strike-range" "0.03"] nil)
+          payload (loads-path out-json)]
+      (is (= 1 (.-returncode result)))
+      (is (= false (.get payload "ok")))
+      (is (str/includes? (.get payload "reason")
+                         "--strike-range must be a positive integer strike count")))))

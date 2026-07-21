@@ -1,0 +1,53 @@
+(import glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.analysis.core :as analysis])
+
+(def usage
+  "usage: basilisp run scripts/align_behavior.lpy -- --live <live_tape.csv> --replay <replay_tape.csv> --out <alignment_report.md> [--mismatches <mismatches.csv>] [--bucket-seconds 60]")
+
+(def allowed-options
+  #{"--live" "--replay" "--out" "--mismatches" "--bucket-seconds" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (println usage)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [{:keys [live replay out mismatches bucket-seconds]} (analysis/parse-args args)
+          bucket (analysis/parse-int-arg bucket-seconds 60)]
+      (when (or (nil? live) (nil? replay) (nil? out))
+        (println usage)
+        (python/exit 2))
+      (let [summary (analysis/write-behavior-alignment!
+                     {:live-tape live
+                      :replay-tape replay
+                      :out out
+                      :mismatches-out mismatches
+                      :bucket-seconds bucket})
+            alignment (:alignment summary)]
+        (println (str "wrote behavior alignment report to " out))
+        (when mismatches
+          (println (str "wrote " (:mismatch-count alignment)
+                        " mismatch rows to " mismatches)))
+        (println (pr-str (select-keys alignment [:status :mismatch-count])))
+        summary))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

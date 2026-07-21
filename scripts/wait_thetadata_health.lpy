@@ -1,0 +1,132 @@
+;; Wait until a ThetaData health URL returns HTTP 200 with a usable body.
+(import sys time urllib.error urllib.request)
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/wait_thetadata_health.lpy -- "
+                "--url URL [--timeout-seconds N] [--poll-seconds N]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-nonnegative-float
+  [arg value]
+  (let [n (python/float value)]
+    (when (neg? n)
+      (throw (python/ValueError (str "nonnegative number required for " arg ": " value))))
+    n))
+
+(defn parse-positive-float
+  [arg value]
+  (let [n (parse-nonnegative-float arg value)]
+    (when-not (pos? n)
+      (throw (python/ValueError (str "positive number required for " arg ": " value))))
+    n))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:timeout-seconds 300.0
+              :poll-seconds 5.0}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--url")
+          (recur (nnext remaining) (assoc out :url (option-value remaining arg)))
+
+          (= arg "--timeout-seconds")
+          (recur (nnext remaining)
+                 (assoc out :timeout-seconds
+                        (parse-nonnegative-float arg (option-value remaining arg))))
+
+          (= arg "--poll-seconds")
+          (recur (nnext remaining)
+                 (assoc out :poll-seconds
+                        (parse-positive-float arg (option-value remaining arg))))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn fail!
+  [message]
+  (binding [*out* *err*]
+    (println (str "RESULT: FAILED - " message)))
+  (python/exit 2))
+
+(defn response-status
+  [response]
+  (or (.-status response) (.getcode response)))
+
+(defn response-body
+  [response]
+  (try
+    (.decode (.read response) "utf-8" "replace")
+    (catch python/Exception e
+      (str "BODY_READ_ERROR: " e))))
+
+(defn usable-body?
+  [body]
+  (let [text (.strip (str (or body "")))
+        lower (.lower text)]
+    (and (pos? (count text))
+         (= -1 (.find lower "\"error\""))
+         (= -1 (.find lower "error:"))
+         (= -1 (.find lower "failed")))))
+
+(defn health-error
+  [result]
+  (cond
+    (:error result) (:error result)
+    (not= 200 (:status result)) (str "unexpected response status=" (:status result))
+    (not (usable-body? (:body result)))
+    (str "unusable response body: " (subs (str (:body result))
+                                          0
+                                          (min 160 (count (str (:body result))))))
+    :else nil))
+
+(defn wait-healthy!
+  [url timeout-seconds poll-seconds]
+  (let [deadline (+ (time/monotonic) timeout-seconds)]
+    (loop [attempt 1
+           last-error nil]
+      (let [result (try
+                     (with-open [resp (urllib.request/urlopen
+                                       url ** :timeout (min 10.0 (max 1.0 poll-seconds)))]
+                       {:status (response-status resp)
+                        :body (response-body resp)})
+                     (catch urllib.error/URLError e
+                       {:error (str "URLError: " e)})
+                     (catch TimeoutError e
+                       {:error (str "TimeoutError: " e)})
+                     (catch OSError e
+                       {:error (str "OSError: " e)})
+                     (catch python/Exception e
+                       {:error (str (type e) ": " e)}))]
+        (if (and (= 200 (:status result))
+                 (usable-body? (:body result)))
+          (println (str "OK: ThetaData terminal healthy after " attempt
+                        " attempt(s): " url))
+          (let [next-error (health-error result)]
+            (if (>= (time/monotonic) deadline)
+              (fail! (str "ThetaData terminal not healthy after "
+                          (python/int timeout-seconds) "s at " url ": " next-error))
+              (do
+                (time/sleep poll-seconds)
+                (recur (inc attempt) next-error)))))))))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))]
+    (when-not (:url opts)
+      (throw (python/ValueError "missing required --url")))
+    (wait-healthy! (:url opts) (:timeout-seconds opts) (:poll-seconds opts))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2)))

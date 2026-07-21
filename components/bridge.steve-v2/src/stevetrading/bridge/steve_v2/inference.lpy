@@ -1,0 +1,189 @@
+(ns stevetrading.bridge.steve-v2.inference
+  "Basilisp-owned Steve V2 live inference adapter.
+
+  This owns the model-inference contract that the bridge needs: load bundle
+  config/stats, invoke the configured Torch encoder(s), and score the XGBoost
+  heads. It still relies on Torch/XGBoost and the reference encoder architecture
+  modules, but it does not import the legacy Python scripts_5yr live inference
+  wrapper."
+  (:import importlib json numpy os os.path sys))
+
+(defn ensure-ref-paths! [ref-root]
+  (let [spath (.-path sys)
+        repo-root (or (os/getenv "STEVE_REPO_ROOT")
+                      (os/getcwd))]
+    (doseq [p [repo-root ref-root (str ref-root "/src")]]
+      (when-not (.__contains__ spath p)
+        (.insert spath 0 p)))))
+
+(defn- load-json [path]
+  (json/loads (slurp (str path))))
+
+(defn- py-class [module-name class-name]
+  (python/getattr (importlib/import-module module-name) class-name))
+
+(defn- torch-device [torch]
+  (.device torch (if (.is_available (.-cuda torch)) "cuda" "cpu")))
+
+(defn- find-first-existing [model-dir names]
+  (loop [remaining names]
+    (cond
+      (empty? remaining) nil
+      (os.path/exists (os.path/join model-dir (first remaining)))
+      (os.path/join model-dir (first remaining))
+      :else (recur (rest remaining)))))
+
+(defn- load-state! [torch module path device]
+  (.load_state_dict module (.load torch path ** :map_location device))
+  (.eval module)
+  module)
+
+(defn- build-encoder [torch config model-dir device enc-name]
+  (let [in-channels (int (get config "in_channels"))
+        embed-dim (int (get config "embed_dim"))]
+    (cond
+      (= enc-name "convlstm")
+      (let [klass (py-class "models.convlstm" "ConvLSTMEncoder")
+            pt (find-first-existing model-dir ["convlstm_v3.pt" "convlstm.pt"])]
+        (when-not pt
+          (throw (python/FileNotFoundError (str "No ConvLSTM weight found in " model-dir))))
+        (load-state! torch
+                     (.to (klass ** :in_channels in-channels
+                                     :hidden_channels (int (get config "hidden_channels" 32))
+                                     :embed_dim embed-dim)
+                          device)
+                     pt
+                     device))
+
+      (= enc-name "mamba")
+      (let [klass (py-class "models.mamba_encoder" "MambaEncoder")
+            pt (os.path/join model-dir "mamba.pt")]
+        (when-not (os.path/exists pt)
+          (throw (python/FileNotFoundError (str "Missing " pt))))
+        (load-state! torch
+                     (.to (klass ** :in_channels in-channels
+                                     :d_model (int (get config "d_model" 128))
+                                     :embed_dim embed-dim
+                                     :n_layers (int (get config "n_layers" 2))
+                                     :d_state (int (get config "d_state" 64))
+                                     :lookback (int (get config "lookback")))
+                          device)
+                     pt
+                     device))
+
+      (= enc-name "cnn")
+      (let [klass (py-class "models.multitask_cnn" "MultitaskCNN")
+            pt (os.path/join model-dir "cnn.pt")]
+        (when-not (os.path/exists pt)
+          (throw (python/FileNotFoundError (str "Missing " pt))))
+        (load-state! torch
+                     (.to (klass ** :in_channels in-channels
+                                     :embed_dim embed-dim)
+                          device)
+                     pt
+                     device))
+
+      :else
+      (throw (python/ValueError (str "Unknown encoder name in config: " enc-name))))))
+
+(defn- load-booster [xgb path]
+  (let [booster ((.-Booster xgb))]
+    (.load_model booster path)
+    booster))
+
+(defn make-multihead-inference
+  "Load a Steve V2 multihead bundle.
+
+  Supported model types mirror the active Alpaca strategies:
+  `multihead` and `multihead_regime_gated`."
+  [ref-root model-dir]
+  (ensure-ref-paths! ref-root)
+  (let [torch (importlib/import-module "torch")
+        xgb (importlib/import-module "xgboost")
+        config (load-json (os.path/join model-dir "config.json"))
+        model-type (.lower (str (get config "model_type")))
+        _ (when-not (contains? #{"multihead" "multihead_regime_gated"} model-type)
+            (throw (python/ValueError (str "Unsupported model_type " model-type " in "
+                                           model-dir "/config.json"))))
+        device (torch-device torch)
+        encoders-list (vec (get config "encoders"))
+        encoders (into {} (for [enc encoders-list]
+                            [enc (build-encoder torch config model-dir device enc)]))
+        stats (numpy/load (os.path/join model-dir "feature_stats.npz"))
+        n-regimes (int (get config "n_regimes" 2))]
+    {:config config
+     :model-dir model-dir
+     :model-type model-type
+     :torch torch
+     :xgb xgb
+     :device device
+     :n-tabular (int (get config "n_tabular_features"))
+     :lookback (int (get config "lookback"))
+     :in-channels (int (get config "in_channels"))
+     :encoders-list encoders-list
+     :encoders encoders
+     :feature-mean (.__getitem__ stats "mean")
+     :feature-std (.__getitem__ stats "std")
+     :xgb-heads (if (= model-type "multihead")
+                  {"long" (load-booster xgb (os.path/join model-dir "xgb_long.json"))
+                   "gen" (load-booster xgb (os.path/join model-dir "xgb_gen.json"))
+                   "short" (load-booster xgb (os.path/join model-dir "xgb_short.json"))}
+                  (into {} (for [r (range n-regimes)]
+                             [r {"long" (load-booster xgb (os.path/join model-dir (str "xgb_long_regime" r ".json")))
+                                 "gen" (load-booster xgb (os.path/join model-dir (str "xgb_gen_regime" r ".json")))
+                                 "short" (load-booster xgb (os.path/join model-dir (str "xgb_short_regime" r ".json")))}])))
+     :regime-threshold (when (contains? config "regime_threshold")
+                         (float (get config "regime_threshold")))
+     :regime-proxy-feature (get config "regime_proxy_feature" "spy_rv_60m")
+     :last-regime-idx (atom nil)}))
+
+(defn- embed-one [inference enc-name grids-seq]
+  (let [torch (:torch inference)
+        encoder (get (:encoders inference) enc-name)
+        device (:device inference)]
+    (if (= enc-name "cnn")
+      (let [latest (.__getitem__ grids-seq -1)
+            x (.to (.float (.unsqueeze (.from_numpy torch latest) 0)) device)
+            out (encoder x ** :return_embedding true)]
+        (.flatten (.numpy (.cpu (.detach out)))))
+      (let [lookback (:lookback inference)
+            seq-len (first (.-shape grids-seq))
+            seq (if (< seq-len lookback)
+                  (let [pad-shape (python/tuple (concat [(- lookback seq-len)]
+                                                   (rest (python/list (.-shape grids-seq)))))
+                        pad (numpy/zeros pad-shape ** :dtype numpy/float32)]
+                    (numpy/concatenate (python/list [pad grids-seq]) ** :axis 0))
+                  (.__getitem__ grids-seq (slice (- seq-len lookback) seq-len)))
+            x (.to (.float (.unsqueeze (.from_numpy torch seq) 0)) device)
+            out (encoder x ** :return_embedding true)]
+        (.flatten (.numpy (.cpu (.detach out))))))))
+
+(defn- select-regime [inference regime-value]
+  (if (or (nil? regime-value) (not (numpy/isfinite regime-value)))
+    0
+    (if (= 2 (count (:xgb-heads inference)))
+      (if (< (float regime-value) (:regime-threshold inference)) 0 1)
+      (int (numpy/digitize regime-value (python/list [(:regime-threshold inference)]))))))
+
+(defn predict
+  "Return [p-long p-gen p-short] for raw tabular features and greeks-grid window."
+  ([inference tabular-features greeks-grids-seq]
+   (predict inference tabular-features greeks-grids-seq nil))
+  ([inference tabular-features greeks-grids-seq regime-value]
+   (let [x-tab (.astype (numpy/nan_to_num (/ (- tabular-features (:feature-mean inference))
+                                             (:feature-std inference))
+                                          ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+                        numpy/float32)
+         embeds (python/list (for [enc-name (:encoders-list inference)]
+                               (embed-one inference enc-name greeks-grids-seq)))
+         x-full (.astype (numpy/concatenate (python/list (concat [x-tab] embeds)))
+                         numpy/float32)
+         dmat ((.-DMatrix (:xgb inference)) (.reshape x-full 1 -1))
+         heads (if (= "multihead_regime_gated" (:model-type inference))
+                 (let [idx (select-regime inference regime-value)]
+                   (reset! (:last-regime-idx inference) idx)
+                   (get (:xgb-heads inference) idx))
+                 (:xgb-heads inference))]
+     [(float (.__getitem__ (.predict (get heads "long") dmat) 0))
+      (float (.__getitem__ (.predict (get heads "gen") dmat) 0))
+      (float (.__getitem__ (.predict (get heads "short") dmat) 0))])))

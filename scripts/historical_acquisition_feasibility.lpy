@@ -1,0 +1,24 @@
+;; Receipt-only evaluator for the two-years-in-24-hours acquisition gate.
+(import argparse glob os os.path sys)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.analysis.acquisition-feasibility :as feasibility])
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--plan" ** :required true)
+    (.add_argument parser "--out" ** :required true)
+    (.parse_args parser (python/list argv))))
+
+(try
+  (let [args (parse-args (vec *command-line-args*))]
+    (println (feasibility/json-text
+              (feasibility/write-evaluation! (.-plan args) (.-out args))))
+    (python/exit 0))
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error)))
+    (python/exit 2)))

@@ -51,6 +51,7 @@
             [stevetrading.feature.core :as feature]
             [stevetrading.inference.core :as inference]
             [stevetrading.risk.core :as risk]
+            [stevetrading.strategy.declaration-schema :as decl-schema]
             [stevetrading.signal.core :as signal]))
 
 ;; ---------------------------------------------------------------------------
@@ -66,6 +67,18 @@
 (defn- check
   [errors pred code path message]
   (if pred errors (conj errors (err code path message))))
+
+(defn- kw-name
+  [x]
+  (when (keyword? x)
+    (name x)))
+
+(defn- strategy-id-parts-match?
+  [decl]
+  (when-let [parsed (identifiers/parse-strategy-id (:strategy/id decl))]
+    (and (= (:strategy/family parsed) (kw-name (:strategy/family decl)))
+         (= (:strategy/name parsed) (kw-name (:strategy/name decl)))
+         (= (:strategy/major parsed) (:strategy/version decl)))))
 
 (def bridge-bots
   "The six bridged steve-v2 bot keys (bridge.steve-v2 `signals` map
@@ -90,11 +103,15 @@
   inference checks (those stages are replaced by the bridge) and instead
   require a known :bot plus the :signal/steve-v2-bridge signal fn."
   [decl]
-  (let [errors
+  (let [shape-errors (decl-schema/structural-errors decl)
+        legacy-errors
         (-> []
             (check (identifiers/valid-strategy-id? (:strategy/id decl))
                    :error/invalid-strategy-id [:strategy/id]
                    "must be a strategy/<family>/<name>/v<major> id string")
+            (check (strategy-id-parts-match? decl)
+                   :error/strategy-id-metadata-mismatch [:strategy/id]
+                   "strategy/id must match :strategy/family, :strategy/name, and :strategy/version")
             (check (keyword? (:strategy/family decl))
                    :error/missing-key [:strategy/family] "must be a keyword")
             (check (keyword? (:strategy/name decl))
@@ -123,7 +140,8 @@
                         (seq (:strategy/instruments decl))
                         (every? string? (:strategy/instruments decl)))
                    :error/missing-key [:strategy/instruments]
-                   "must be a non-empty vector of instrument-id strings"))]
+                   "must be a non-empty vector of instrument-id strings"))
+        errors (into (vec shape-errors) legacy-errors)]
     (if (bridge-strategy? decl)
       (-> errors
           (check (keyword? (get-in decl [:strategy/bridge :bot]))
@@ -371,7 +389,17 @@
                                                 :risk/reason-codes
                                                 :risk/approved-quantity])
                                   :decision/id decision-id))
-            base-facts [signal-fact risk-fact]]
+            base-facts [signal-fact risk-fact]
+            ;; Bridge strategies skip feature artifacts, so multi-leg bridge
+            ;; executors must carry their leg configuration directly on the
+            ;; strategy declaration's execution params.
+            condor-ctx (when-let [cp (get-in strategy
+                                             [:strategy/execution
+                                              :params :condor])]
+                         {:condor/put-spread (instruments/vertical-spread-context
+                                              (:put-spread cp))
+                          :condor/call-spread (instruments/vertical-spread-context
+                                               (:call-spread cp))})]
         (if (not= :risk/allow (:risk/decision risk-result))
           {:facts base-facts
            :strategy-local-state' state'}
@@ -389,7 +417,8 @@
                   ;; orders, no dependence on the chain feed. 2026-06-22: with
                   ;; the feed dead, the option flatten priced limits off STALE
                   ;; quotes that never filled and 0DTE positions expired.
-                  :execution/force-flatten? force-flatten?}
+                  :execution/force-flatten? force-flatten?
+                  :execution/condor condor-ctx}
                  account-id)]
             (if (empty? order-intents)
               {:facts base-facts

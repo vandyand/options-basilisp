@@ -1,0 +1,83 @@
+(ns stevetrading.strategy.declaration-schema
+  "Balli structural schemas for strategy declarations.
+
+  This namespace validates the stable data shape. strategy.registry still owns
+  semantic compatibility checks: artifact refs, bridge signal semantics, and
+  registry-level duplicate ids."
+  (:require [balli.core :as b]
+            [stevetrading.domain.enums :as enums]))
+
+(def schema-version 1)
+
+(defn- err
+  [code path message]
+  {:error/code code
+   :error/path (vec path)
+   :error/message message})
+
+(def non-empty-string
+  [:string {:min 1}])
+
+(def non-empty-string-vector
+  [:vector {:min 1} non-empty-string])
+
+(def mode-policy
+  [:set {:min 1} (into [:enum] enums/modes)])
+
+(def params-map
+  [:map-of :keyword :any])
+
+(def strategy-declaration
+  [:map
+   [:strategy/id non-empty-string]
+   [:strategy/family :keyword]
+   [:strategy/name :keyword]
+   [:strategy/version [:int {:min 0}]]
+   [:strategy/mode-policy mode-policy]
+   [:strategy/schedule [:map [:session :keyword]]]
+   [:strategy/warmup [:map [:required-bars [:int {:min 0}]]]]
+   [:strategy/instruments non-empty-string-vector]
+   [:strategy/features {:optional true}
+    [:map [:manifest-ref non-empty-string]]]
+   [:strategy/inference {:optional true}
+    [:map [:artifact-ref non-empty-string]]]
+   [:strategy/bridge {:optional true}
+    [:map [:bot :keyword]]]
+   [:strategy/signal
+    [:map [:fn-id :keyword]
+     [:params {:optional true} params-map]]]
+   [:strategy/risk
+    [:map [:policy-id :keyword]
+     [:params {:optional true} params-map]]]
+   [:strategy/execution
+    [:map [:policy-id :keyword]
+     [:params {:optional true} params-map]]]])
+
+(defn explain
+  [decl]
+  (b/explain strategy-declaration decl))
+
+(defn valid?
+  [decl]
+  (true? (b/validate strategy-declaration decl)))
+
+(defn explain-error->registry-error
+  [e]
+  (let [path (vec (:in e))]
+    (err :error/invalid-strategy-decl-shape
+         path
+         (str "strategy declaration shape invalid at "
+              (if (seq path) (pr-str path) "root")))))
+
+(defn structural-errors
+  [decl]
+  (if-let [e (explain decl)]
+    (mapv explain-error->registry-error (:errors e))
+    []))
+
+(defn validation-result
+  [decl]
+  (let [errors (structural-errors decl)]
+    (if (seq errors)
+      {:valid? false :errors errors}
+      {:valid? true})))

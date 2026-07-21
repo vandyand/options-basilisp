@@ -1,0 +1,47 @@
+(import os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(def analysis-src (os.path/join repo-root "components" "analysis.core" "src"))
+(when-not (contains? (set (python/list (.-path sys))) analysis-src)
+  (.insert (.-path sys) 0 analysis-src))
+
+(require '[basilisp.edn :as edn])
+(require '[stevetrading.analysis.core :as analysis])
+
+(defn usage!
+  []
+  (println
+   "usage: basilisp run scripts/verify_same_pop_manifest.lpy -- --manifest <manifest.edn> [--out <verification.edn>]"))
+
+(def allowed-options
+  #{"--manifest" "--out" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (usage!)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [{:keys [manifest out]} (analysis/parse-args args)]
+      (when (nil? manifest)
+        (usage!)
+        (python/exit 2))
+      (let [result (analysis/verify-same-pop-manifest-file manifest)]
+        (when out
+          (spit out (str (edn/write-string result) "\n")))
+        (println (edn/write-string result))
+        (python/exit (if (:valid? result) 0 1))))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

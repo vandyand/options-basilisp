@@ -1,0 +1,315 @@
+(ns feature-parity.test-greek-promotion-gate-cli
+  (:import json os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def basilisp-bin
+  (str (or (os.environ/get "BASILISP_BIN")
+           (os.path/join (str root) ".venv/bin/basilisp"))))
+(def script (pathlib/Path (os.path/join (str root) "scripts/greek_reconstruction_promotion_gate.lpy")))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads-path [path] (json/loads (.read_text path)))
+(defn path [parent name] (.joinpath parent name))
+
+(defn write-json
+  [path payload]
+  (.write_text path (dumps payload)))
+
+(defn write-raw
+  [path]
+  (write-json
+   path
+   {"summary" {"target_date" "2026-07-07"
+               "guarded_greek_reconstruction_count" 2}
+    "features" [{"feature" "SPY_greeks_dollar_delta"
+                 "source_note" "greek_reconstruction_candidate_formula"
+                 "recomputed_status" "SANE"
+                 "model_gain" 10.0
+                 "model_split_count" 5
+                 "z_mean" 0.2
+                 "z_std" 1.1
+                 "zero_frac" 0.0}
+                {"feature" "SPY_greeks_lambda_mean"
+                 "source_note" "greek_reconstruction_candidate_formula"
+                 "recomputed_status" "WILD_SCALE"
+                 "model_gain" 9.0
+                 "model_split_count" 5
+                 "z_mean" 0.2
+                 "z_std" 9.1
+                 "zero_frac" 0.0}
+                {"feature" "SPY_opt_contract_count"
+                 "source_note" "option_chain_quote_formula"
+                 "recomputed_status" "SANE"
+                 "model_gain" 1.0
+                 "model_split_count" 5
+                 "z_mean" 0.0
+                 "z_std" 1.0
+                 "zero_frac" 0.0}]}))
+
+(defn write-extra-raw
+  [path feature gain]
+  (write-json
+   path
+   {"summary" {"target_date" "2026-07-07"
+               "guarded_greek_reconstruction_count" 1}
+    "features" [{"feature" feature
+                 "source_note" "greek_reconstruction_candidate_formula"
+                 "recomputed_status" "SANE"
+                 "model_gain" gain
+                 "model_split_count" 5
+                 "z_mean" 0.1
+                 "z_std" 1.0
+                 "zero_frac" 0.0}]}))
+
+(defn write-capture-check
+  ([path] (write-capture-check path true))
+  ([path ok?]
+   (write-json
+    path
+    {"target_date" "2026-07-07"
+     "ok" ok?
+     "capture_version" (if ok? 2 1)
+     "issues" (if ok? [] ["bad capture"])
+     "sidecar_useful_rows" {"bar_buffers_json" (if ok? 120 0)
+                            "option_chain_json" (if ok? 120 0)
+                            "option_surfaces_json" (if ok? 120 0)}
+     "sidecar_total_contracts" {"option_chain_json" (if ok? 2400 0)
+                                "option_surfaces_json" (if ok? 2400 0)}})))
+
+(defn run-gate-with-args
+  [tmp raw capture extra]
+  (subprocess/run
+   (python/list
+    (concat [basilisp-bin "run" (str script) "--"
+             "--target-date" "2026-07-07"
+             "--raw-audit-json" (str raw)
+             "--capture-check-json" (str capture)
+             "--out-dir" (str (path tmp "out"))
+             "--label" "test"]
+            extra))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn run-gate
+  [tmp raw capture]
+  (run-gate-with-args tmp raw capture ["--min-evaluated-count" "2"]))
+
+(defn output-payload
+  [tmp]
+  (loads-path (path (path tmp "out") "greek_reconstruction_promotion_gate_test.json")))
+
+(defn feature-row
+  [payload feature]
+  (first (filter (fn [row] (= feature (.get row "feature")))
+                 (.get payload "features"))))
+
+(defn some-contains?
+  [xs needle]
+  (some (fn [x] (not= -1 (.find (str x) needle))) xs))
+
+(deftest greek-reconstruction-promotion-gate-emits-only-strict-candidates
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture)
+      (let [result (run-gate tmp raw capture)
+            payload (output-payload tmp)
+            summary (.get payload "summary")
+            dollar (feature-row payload "SPY_greeks_dollar_delta")
+            lambda-row (feature-row payload "SPY_greeks_lambda_mean")]
+        (is (= 0 (.-returncode result)))
+        (is (= true (.get summary "capture_ok")))
+        (is (= true (.get summary "coverage_ok")))
+        (is (= 2 (.get summary "evaluated_count")))
+        (is (= 1 (.get summary "candidate_count")))
+        (is (= "SPY_greeks_dollar_delta" (first (.get summary "candidate_features"))))
+        (is (= true (.get dollar "candidate")))
+        (is (= false (.get lambda-row "candidate")))
+        (is (not= -1 (.find (.get lambda-row "reasons") "recomputed_status is not SANE")))))))
+
+(deftest greek-reconstruction-promotion-gate-combines-extra-raw-audits
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          extra-a (path tmp "extra-a.json")
+          extra-b (path tmp "extra-b.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-extra-raw extra-a "SPY_greeks_theta_delta_ratio" 12.0)
+      (write-extra-raw extra-b "SPY_greeks_vega_delta_ratio" 11.0)
+      (write-capture-check capture)
+      (let [result (run-gate-with-args tmp raw capture ["--extra-raw-audit-json" (str extra-a)
+                                                        "--extra-raw-audit-json" (str extra-b)
+                                                        "--min-evaluated-count" "4"])
+            payload (output-payload tmp)
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get summary "coverage_ok")))
+        (is (= 4 (.get summary "evaluated_count")))
+        (is (= 3 (.get summary "candidate_count")))
+        (is (= ["SPY_greeks_theta_delta_ratio"
+                "SPY_greeks_vega_delta_ratio"
+                "SPY_greeks_dollar_delta"]
+               (vec (.get summary "candidate_features"))))))))
+
+(deftest greek-reconstruction-promotion-gate-fails-closed-on-bad-capture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture false)
+      (let [result (run-gate tmp raw capture)
+            payload (output-payload tmp)
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)))
+        (is (= false (.get summary "capture_ok")))
+        (is (= 0 (.get summary "candidate_count")))
+        (is (pos? (count (.get summary "capture_reasons"))))
+        (doseq [row (.get payload "features")]
+          (is (= false (.get row "candidate"))))))))
+
+(deftest greek-reconstruction-promotion-gate-fails-closed-on-incomplete-coverage
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture)
+      (let [result (run-gate-with-args tmp raw capture ["--min-evaluated-count" "3"])
+            payload (output-payload tmp)
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)))
+        (is (= false (.get summary "coverage_ok")))
+        (is (= 0 (.get summary "candidate_count")))
+        (is (some-contains? (.get summary "coverage_reasons") "evaluated rows 2 below minimum 3"))
+        (doseq [row (.get payload "features")]
+          (is (= false (.get row "candidate"))))))))
+
+(deftest greek-reconstruction-promotion-gate-writes-explicit-unavailable-artifact
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out (path tmp "out")]
+      (let [result (subprocess/run
+                    (python/list [basilisp-bin "run" (str script) "--"
+                                  "--target-date" "2026-07-09"
+                                  "--out-dir" (str out)
+                                  "--label" "20260709"
+                                  "--write-unavailable"
+                                  "--unavailable-reason" "raw unlock missing"])
+                    ** :cwd (str root)
+                       :text true
+                       :capture_output true
+                       :check false)
+            json-path (path out "greek_reconstruction_promotion_gate_20260709.json")
+            csv-path (path out "greek_reconstruction_promotion_gate_20260709.csv")
+            md-path (path out "greek_reconstruction_promotion_gate_20260709.md")
+            payload (loads-path json-path)
+            summary (.get payload "summary")]
+        (is (= 1 (.-returncode result)))
+        (is (.exists json-path))
+        (is (.exists csv-path))
+        (is (.exists md-path))
+        (is (= "unavailable" (.get summary "status")))
+        (is (= false (.get summary "available")))
+        (is (= false (.get summary "capture_ok")))
+        (is (= false (.get summary "coverage_ok")))
+        (is (= 0 (.get summary "evaluated_count")))
+        (is (= 0 (.get summary "candidate_count")))
+        (is (= [] (vec (.get summary "candidate_features"))))
+        (is (= "raw unlock missing" (.get summary "unavailable_reason")))
+        (is (not= -1 (.find (.read_text md-path) "raw unlock missing")))))))
+
+(deftest greek-reconstruction-promotion-gate-flags-raw-summary-count-mismatch
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture)
+      (let [payload (loads-path raw)]
+        (.__setitem__ (.get payload "summary") "guarded_greek_reconstruction_count" 3)
+        (.write_text raw (json/dumps payload)))
+      (let [result (run-gate tmp raw capture)
+            payload (output-payload tmp)
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)))
+        (is (= false (.get summary "coverage_ok")))
+        (is (= 0 (.get summary "candidate_count")))
+        (is (some-contains? (.get summary "coverage_reasons") "does not match evaluated rows 2"))))))
+
+(deftest greek-reconstruction-promotion-gate-rejects-duplicate-raw-json-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture)
+      (.write_text raw (.replace (.read_text raw)
+                                 "\"target_date\": \"2026-07-07\""
+                                 "\"target_date\": \"2026-07-07\", \"target_date\": \"2026-07-06\""
+                                 1))
+      (let [result (run-gate tmp raw capture)]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find (.-stderr result) "duplicate JSON key: target_date")))
+        (is (false? (.exists (path (path tmp "out") "greek_reconstruction_promotion_gate_test.json"))))))))
+
+(deftest greek-reconstruction-promotion-gate-fails-closed-on-boolean-capture-counts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture)
+      (let [payload (loads-path capture)]
+        (.__setitem__ (.get payload "sidecar_useful_rows") "option_chain_json" true)
+        (.write_text capture (json/dumps payload)))
+      (let [result (run-gate tmp raw capture)
+            payload (output-payload tmp)
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)))
+        (is (= false (.get summary "capture_ok")))
+        (is (= 0 (.get summary "candidate_count")))
+        (is (some-contains? (.get summary "capture_reasons")
+                            "capture check sidecar_useful_rows.option_chain_json must be a nonnegative integer"))))))
+
+(deftest greek-reconstruction-promotion-gate-fails-closed-on-boolean-raw-guarded-count
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          raw (path tmp "raw.json")
+          capture (path tmp "capture.json")]
+      (write-raw raw)
+      (write-capture-check capture)
+      (let [payload (loads-path raw)]
+        (.__setitem__ (.get payload "summary") "guarded_greek_reconstruction_count" true)
+        (.write_text raw (json/dumps payload)))
+      (let [result (run-gate tmp raw capture)
+            payload (output-payload tmp)
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)))
+        (is (= false (.get summary "coverage_ok")))
+        (is (= 0 (.get summary "candidate_count")))
+        (is (some-contains? (.get summary "coverage_reasons")
+                            "raw guarded_greek_reconstruction_count must be a nonnegative integer"))))))
+
+(deftest greek-reconstruction-promotion-gate-reports-missing-artifact-without-traceback
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture (path tmp "capture.json")]
+      (write-capture-check capture)
+      (let [result (run-gate tmp (path tmp "missing_raw.json") capture)]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find (.-stderr result) "required JSON artifact is missing")))
+        (is (= -1 (.find (.-stderr result) "Traceback")))))))

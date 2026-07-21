@@ -1,0 +1,37 @@
+(ns feature-parity.test-native-feature-migration-report-cli
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "native_feature_migration_report.lpy"))
+(def basilisp-bin (str (.joinpath root ".venv/bin/basilisp")))
+
+(deftest native-feature-migration-report-aligns-by-timestamp-and-classifies-drift
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          legacy (.joinpath tmp "legacy.npz")
+          native (.joinpath tmp "native.npz")
+          names (.joinpath tmp "names.json")
+          out (.joinpath tmp "out")]
+      (numpy/savez_compressed legacy
+                              ** :times (numpy/asarray ["2026-07-10T14:00:00Z" "2026-07-10T14:01:00Z"])
+                                 :replay (numpy/asarray #py [[1.0 2.0] [3.0 4.0]] ** :dtype numpy/float32))
+      ;; Reverse timestamps to prove the report aligns content, not row index.
+      (numpy/savez_compressed native
+                              ** :times (numpy/asarray ["2026-07-10T14:01:00Z" "2026-07-10T14:00:00Z"])
+                                 :replay (numpy/asarray #py [[3.0 9.0] [1.0 2.0]] ** :dtype numpy/float32))
+      (.write_text names (json/dumps (python/list ["stable" "drifted"])))
+      (let [result (subprocess/run
+                    (python/list [basilisp-bin "run" (str script) "--"
+                                  "--target-date" "2026-07-10"
+                                  "--legacy-npz" (str legacy)
+                                  "--native-npz" (str native)
+                                  "--feature-names" (str names)
+                                  "--out-dir" (str out)])
+                    ** :cwd (str root) :capture_output true :text true)]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (let [payload (json/loads (.read_text (.joinpath out "native_feature_migration_20260710.json")))]
+          (is (= 2 (.get (.get payload "summary") "matched_rows")))
+          (is (= 1 (.get (.get payload "summary") "exact_match_count")))
+          (is (= 1 (.get (.get payload "summary") "diverged_feature_count")))
+          (is (= "drifted" (.get (first (.get payload "worst_features")) "feature"))))))))

@@ -1,0 +1,278 @@
+(ns feature-parity.test-thetadata-payload-verifier-cli
+  (:import json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "verify_thetadata_payload_examples.lpy"))
+
+(defn resolve-basilisp
+  []
+  (cond
+    (os.environ/get "BASILISP_BIN")
+    (pathlib/Path (os.environ/get "BASILISP_BIN"))
+
+    (.exists (.joinpath root ".venv/bin/basilisp"))
+    (.joinpath root ".venv/bin/basilisp")
+
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp"))
+    (.with_name (pathlib/Path sys/executable) "basilisp")
+
+    (shutil/which "basilisp")
+    (pathlib/Path (shutil/which "basilisp"))
+
+    :else
+    (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads [s] (json/loads s))
+(defn join-path [parent name] (.joinpath parent name))
+
+(defn merged-env
+  [extra]
+  (let [env (.copy os/environ)]
+    (doseq [[k v] (or extra {})]
+      (.__setitem__ env k v))
+    env))
+
+(defn run-verifier
+  ([args] (run-verifier args root nil))
+  ([args cwd env]
+   (subprocess/run
+    (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+    ** :cwd (str cwd)
+       :env (merged-env env)
+       :text true
+       :capture_output true
+       :check false)))
+
+(defn write-valid-examples
+  [tmp]
+  (let [payload-dir (join-path (join-path tmp "examples") "20260705")
+        quote (join-path payload-dir "quote.json")
+        expirations (join-path payload-dir "expirations.json")]
+    (.mkdir payload-dir ** :parents true)
+    (.write_text quote
+                 (dumps {"probe" "option.snapshot.quote"
+                         "generated_at" "2026-07-05T14:01:00Z"
+                         "payload" {"strike" ["550.0"]
+                                    "right" ["PUT"]
+                                    "bid" ["1.0"]
+                                    "ask" ["1.1"]
+                                    "expiration" ["2026-06-12"]
+                                    "timestamp" ["2026-06-10T15:30:00"]}}))
+    (.write_text expirations
+                 (dumps {"probe" "option.expirations"
+                         "generated_at" "2026-07-05T14:01:00Z"
+                         "payload" {"expiration" ["2026-06-12" "2026-06-19"]}}))
+    (join-path tmp "examples")))
+
+(defn invalid-results
+  [payload]
+  (vec (filter #(= false (.get % "valid?")) (.get payload "results"))))
+
+(defn issue-codes
+  [payload]
+  (set (map #(.get % "code") (.get payload "issues"))))
+
+(deftest thetadata-payload-verifier-rejects-missing-cli-values
+  (let [result (run-verifier ["--target-date"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "missing value for --target-date"))))
+
+(deftest thetadata-payload-verifier-rejects-option-value-that-is-another-flag
+  (let [result (run-verifier ["--payload-dir" "--target-date" "2026-07-05"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "missing value for --payload-dir"))))
+
+(deftest thetadata-payload-verifier-rejects-unknown-arguments
+  (let [result (run-verifier ["--target-date" "2026-07-05" "--payload-dri" "typo"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "unknown argument: --payload-dri"))))
+
+(deftest thetadata-payload-verifier-rejects-malformed-target-dates
+  (doseq [target-date ["20260705" "2026-02-31" "2026-07-05T14:00:00Z"]]
+    (let [result (run-verifier ["--target-date" target-date])]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? (.-stderr result) "invalid --target-date"))
+      (is (str/includes? (.-stderr result) target-date)))))
+
+(deftest thetadata-payload-verifier-help-documents-cli
+  (let [result (run-verifier ["--help"])]
+    (is (= 0 (.-returncode result)))
+    (is (str/includes? (.-stdout result) "--payload-dir DIR"))
+    (is (str/includes? (.-stdout result) "--target-date YYYY-MM-DD"))))
+
+(deftest thetadata-payload-verifier-runs-from-non-repo-cwd-and-writes-basename-output
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (write-valid-examples tmp)
+          result (run-verifier ["--payload-dir" (str payload-dir)
+                                "--target-date" "2026-07-05"
+                                "--out" "payload-verification.json"]
+                               tmp
+                               {"STEVE_REPO_ROOT" (str root)})
+          stdout-payload (loads (.-stdout result))
+          file-payload (loads (.read_text (join-path tmp "payload-verification.json")))]
+      (is (= 0 (.-returncode result)) (.-stderr result))
+      (is (= true (.get stdout-payload "valid?")))
+      (is (= true (.get file-payload "valid?")))
+      (is (= 2 (.get file-payload "checked")))
+      (is (= 0 (count (.get file-payload "issues"))))
+      (is (= {"20260705" 2} (into {} (.items (.get file-payload "example_generated_date_counts")))))
+      (is (= {"missing" 2} (into {} (.items (.get file-payload "example_target_date_counts")))))
+      (is (= {"20260705" 2} (into {} (.items (.get file-payload "example_path_date_counts"))))))))
+
+(deftest thetadata-payload-verifier-allows-after-close-generated-examples
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (write-valid-examples tmp)
+          quote (join-path (join-path payload-dir "20260705") "quote.json")
+          expirations (join-path (join-path payload-dir "20260705") "expirations.json")]
+      (doseq [p [quote expirations]]
+        (let [payload (loads (.read_text p))]
+          (aset payload "generated_at" "2026-07-06T01:05:00Z")
+          (aset payload "target_date" "2026-07-05")
+          (.write_text p (dumps payload))))
+      (let [result (run-verifier ["--payload-dir" (str payload-dir)
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "valid?")))
+        (is (= {"20260706" 2} (into {} (.items (.get payload "example_generated_date_counts")))))
+        (is (= {"20260705" 2} (into {} (.items (.get payload "example_target_date_counts")))))
+        (is (= {"20260705" 2} (into {} (.items (.get payload "example_path_date_counts")))))))))
+
+(deftest thetadata-payload-verifier-rejects-missing-required-probe-coverage
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (join-path (join-path tmp "examples") "20260705")]
+      (.mkdir payload-dir ** :parents true)
+      (.write_text (join-path payload-dir "quote.json")
+                   (dumps {"probe" "option.snapshot.quote"
+                           "generated_at" "2026-07-05T14:01:00Z"
+                           "payload" {"strike" ["550.0"]
+                                      "right" ["PUT"]
+                                      "bid" ["1.0"]
+                                      "ask" ["1.1"]
+                                      "expiration" ["2026-06-12"]}}))
+      (let [result (run-verifier ["--payload-dir" (str (join-path tmp "examples"))
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))
+            issue (first (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "valid?")))
+        (is (= "payload-examples-required-probes-missing" (.get issue "code")))
+        (is (= ["option.expirations"] (vec (.get issue "missing_probes"))))))))
+
+(deftest thetadata-payload-verifier-rejects-symlink-escape
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (write-valid-examples tmp)
+          escaped (join-path tmp "escaped")
+          outside-quote (join-path escaped "quote.json")
+          quote (join-path (join-path payload-dir "20260705") "quote.json")]
+      (.mkdir escaped)
+      (.write_text outside-quote (.read_text quote))
+      (.unlink quote)
+      (.symlink_to quote outside-quote)
+      (let [result (run-verifier ["--payload-dir" (str payload-dir)
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (contains? (issue-codes payload) "payload-example-path-outside-payload-dir"))
+        (is (= false (.get payload "valid?")))))))
+
+(deftest thetadata-payload-verifier-rejects-invalid-date-directories
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (write-valid-examples tmp)
+          invalid-dir (join-path payload-dir "20261301")]
+      (.mkdir invalid-dir)
+      (.write_text (join-path invalid-dir "quote.json")
+                   (.read_text (join-path (join-path payload-dir "20260705") "quote.json")))
+      (let [result (run-verifier ["--payload-dir" (str payload-dir)
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))
+            path-counts (.get payload "example_path_date_counts")]
+        (is (= 1 (.-returncode result)))
+        (is (contains? (issue-codes payload) "payload-examples-invalid-date-directory"))
+        (is (contains? (issue-codes payload) "payload-examples-outside-target-date-directory"))
+        (is (= 1 (.get path-counts "invalid")))
+        (is (= false (.get payload "valid?")))))))
+
+(deftest thetadata-payload-verifier-rejects-examples-not-marked-usable
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (join-path (join-path tmp "examples") "20260705")]
+      (.mkdir payload-dir ** :parents true)
+      (.write_text (join-path payload-dir "quote.json")
+                   (dumps {"probe" "option.snapshot.quote"
+                           "usable" false
+                           "generated_at" "2026-07-05T14:01:00Z"
+                           "payload" {"strike" ["550.0"]
+                                      "right" ["PUT"]
+                                      "bid" ["1.0"]
+                                      "ask" ["1.1"]
+                                      "expiration" ["2026-06-12"]}}))
+      (.write_text (join-path payload-dir "expirations.json")
+                   (dumps {"probe" "option.expirations"
+                           "generated_at" "2026-07-05T14:01:00Z"
+                           "payload" {"expiration" ["2026-06-12"]}}))
+      (let [result (run-verifier ["--payload-dir" (str (join-path tmp "examples"))
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))
+            invalid (invalid-results payload)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "valid?")))
+        (is (= 1 (.get payload "invalid")))
+        (is (= "payload-example-not-marked-usable" (.get (first invalid) "reason")))))))
+
+(deftest thetadata-payload-verifier-rejects-unsupported-saved-probe-examples
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (write-valid-examples tmp)]
+      (.write_text (join-path (join-path payload-dir "20260705") "unknown.json")
+                   (dumps {"probe" "unsupported.snapshot.example"
+                           "generated_at" "2026-07-05T14:01:00Z"
+                           "payload" {"value" ["1.0"]}}))
+      (let [result (run-verifier ["--payload-dir" (str payload-dir)
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))
+            invalid (invalid-results payload)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "valid?")))
+        (is (= 3 (.get payload "checked")))
+        (is (= 0 (.get payload "skipped")))
+        (is (= 1 (.get payload "invalid")))
+        (is (= "no-schema-for-probe" (.get (first invalid) "reason")))))))
+
+(deftest thetadata-payload-verifier-rejects-duplicate-payload-json-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          payload-dir (write-valid-examples tmp)
+          quote (join-path (join-path payload-dir "20260705") "quote.json")]
+      (.write_text quote
+                   (str "{\n"
+                        "  \"probe\": \"option.snapshot.quote\",\n"
+                        "  \"generated_at\": \"2026-07-05T14:01:00Z\",\n"
+                        "  \"payload\": {\"strike\": [\"550.0\"]},\n"
+                        "  \"payload\": {\"strike\": [\"999.0\"]}\n"
+                        "}\n"))
+      (let [result (run-verifier ["--payload-dir" (str payload-dir)
+                                  "--target-date" "2026-07-05"])
+            payload (loads (.-stdout result))
+            invalid (invalid-results payload)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "valid?")))
+        (is (= 1 (.get payload "invalid")))
+        (is (= "unreadable-payload-example" (.get (first invalid) "reason")))))))

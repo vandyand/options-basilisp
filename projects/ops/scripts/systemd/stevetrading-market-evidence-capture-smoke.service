@@ -1,0 +1,14 @@
+[Unit]
+Description=Smoke-check SteveTrading capture-v2 sidecars after market open
+Wants=network-online.target theta-terminal.service
+After=network-online.target theta-terminal.service stevetrading-six.service
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+Environment=MARKET_EVIDENCE_MODE=capture-smoke
+ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_market_evidence.sh
+StandardOutput=append:/var/log/stevetrading/market-evidence-systemd.log
+StandardError=append:/var/log/stevetrading/market-evidence-systemd.log

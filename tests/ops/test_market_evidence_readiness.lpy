@@ -1,0 +1,744 @@
+(ns ops.test-market-evidence-readiness
+  (:import json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/market_evidence_readiness.lpy"))
+(def stamp "20260705")
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn write-json! [p x] (.write_text p (str (dumps x) "\n")))
+(defn read-json [p] (json/loads (.read_text p)))
+(defn path [parent child] (.joinpath parent child))
+
+(defn merged-env [m]
+  (let [env (.copy os/environ)]
+    (.update env (jsonable (or m {})))
+    env))
+
+(defn run-readiness [& opts]
+  (let [opts-map (into {} (map vec (partition 2 opts)))
+        args (get opts-map :args [])
+        cwd (get opts-map :cwd root)
+        env (get opts-map :env {})]
+    (subprocess/run
+     (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+     ** :cwd (str cwd)
+        :env (merged-env env)
+        :text true
+        :capture_output true
+        :check false)))
+
+(defn stdout-payload [stdout]
+  (json/loads (first (str/split stdout #"\nwrote " 2))))
+
+(defn write-readiness-bundle [base]
+  (.mkdir base ** :parents true :exist_ok true)
+  (let [baseline (path base (str "live_feature_parity_baseline_" stamp ".json"))
+        probe (path base (str "thetadata_capability_probe_" stamp ".json"))
+        verification (path base (str "thetadata_payload_verification_" stamp ".json"))
+        neutralization (path base (str "neutralization_audit_" stamp ".json"))
+        capture-check (path base (str "capture_v2_sidecar_check_" stamp ".json"))
+        option-surface-sidecar-check (path base (str "option_surface_sidecar_check_" stamp ".json"))
+        legacy-search (path base (str "legacy_greek_formula_search_" stamp ".json"))
+        greek-promotion (path base (str "greek_reconstruction_promotion_gate_" stamp ".json"))
+        historical-cohort (path base (str "historical_feature_cohort_" stamp ".json"))
+        raw-unlock (path base (str "raw_feature_unlock_audit_" stamp ".json"))
+        v3-unlock (path base (str "v3_grid_unlock_audit_" stamp ".json"))
+        matched-parity (path base (str "matched_feature_parity_" stamp ".json"))
+        payload-dir (path base "payloads")
+        expirations-payload (path payload-dir "expirations.json")
+        quote-payload (path payload-dir "quote.json")]
+    (.mkdir payload-dir ** :parents true :exist_ok true)
+    (write-json! baseline
+                 {"target_date" "2026-07-05"
+                  "summary" {"generated_at" "2026-07-05T15:00:00Z"
+                             "rows" 120
+                             "captures" {"files" ["live_features_20260705.npz"]
+                                         "rows_by_file" {"live_features_20260705.npz" 120}
+                                         "skipped_files" {}
+                                         "required_raw_replay_arrays" ["bar_buffers_json" "option_chain_json" "option_surfaces_json"]
+                                         "raw_replay_missing_by_file" {}}
+                             "per_capture" [{"date" "20260705"
+                                             "path" "live_features_20260705.npz"
+                                             "rows" 120
+                                             "raw_replay_ready" true
+                                             "raw_replay_missing" []}]
+                             "capture_file_count" 1
+                             "active_problem_count" 0}})
+    (write-json! probe
+                 {"target_date" "2026-07-05"
+                  "generated_at" "2026-07-05T15:00:00Z"
+                  "summary" {"total" 2 "ok" 2 "usable" 2 "failed" 0 "payload_examples" 2 "error_classes" {}}
+                  "results" [{"name" "option.expirations"
+                              "ok" true
+                              "usable" true
+                              "summary" {"required_ok" true "row_width_valid" true}
+                              "payload_example" (str expirations-payload)}
+                             {"name" "option.snapshot.quote"
+                              "ok" true
+                              "usable" true
+                              "summary" {"required_ok" true "row_width_valid" true}
+                              "payload_example" (str quote-payload)}]})
+    (write-json! verification
+                 {"target_date" stamp
+                  "generated_at" "2026-07-05T15:00:00Z"
+                  "status" "ok"
+                  "valid?" true
+                  "total" 2
+                  "checked" 2
+                  "skipped" 0
+                  "invalid" 0
+                  "example_generated_date_counts" {stamp 2}
+                  "example_path_date_counts" {stamp 2}
+                  "results" [{"probe" "option.expirations" "status" "ok" "valid?" true "path" (str expirations-payload)}
+                             {"probe" "option.snapshot.quote" "status" "ok" "valid?" true "path" (str quote-payload)}]})
+    (write-json! neutralization
+                 {"target_date" "2026-07-05"
+                  "summary" {"generated_at" "2026-07-05T15:00:00Z"
+                             "candidate_now" 0
+                             "review_count" 0
+                             "blocked_count" 0
+                             "neutralized_features" 826
+                             "baseline_csv" (str (path base (str "live_feature_parity_baseline_" stamp ".csv")))
+                             "usage_csv" (str (path base (str "live_feature_model_usage_" stamp ".csv")))}})
+    (write-json! capture-check
+                 {"target_date" "2026-07-05"
+                  "generated_at" "2026-07-05T15:00:00Z"
+                  "ok" true
+                  "status" "ok"
+                  "capture_version" 2
+                  "row_count" 120
+                  "unique_time_count" 120
+                  "duplicate_time_count" 0
+                  "sidecar_useful_rows" {"bar_buffers_json" 120
+                                         "grid_history_json" 120
+                                         "option_chain_json" 120
+                                         "option_surfaces_json" 120}
+                  "sidecar_total_contracts" {"option_chain_json" 24000
+                                             "option_surfaces_json" 36000}
+                  "sidecar_malformed_contracts" {"option_chain_json" 0
+                                                 "option_surfaces_json" 0}
+                  "required_option_surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                  "option_surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                  "option_surface_contracts_by_prefix" {"SPX" 9000 "SPXW" 9000 "VIX" 9000 "VIXW" 9000}
+                  "option_surface_malformed_contracts_by_prefix" {"SPX" 0 "SPXW" 0 "VIX" 0 "VIXW" 0}
+                  "issues" []
+                  "warnings" []})
+    (write-json! option-surface-sidecar-check
+                 {"target_date" "2026-07-05"
+                  "generated_at" "2026-07-05T15:00:00Z"
+                  "ok" true
+                  "row_count" 4
+                  "useful_row_count" 4
+                  "required_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                  "prefixes_present" ["SPX" "SPXW" "VIX" "VIXW"]
+                  "contracts_by_prefix" {"SPX" 1200 "SPXW" 1200 "VIX" 458 "VIXW" 255}
+                  "malformed_by_prefix" {"SPX" 0 "SPXW" 0 "VIX" 0 "VIXW" 0}
+                  "issues" []})
+    (write-json! legacy-search
+                 {"summary" {"target_date" "2026-07-05"
+                             "generated_at" "2026-07-05T15:00:00Z"
+                             "candidate_formula_hits" 0
+                             "legacy_formula_provenance_hits" 0
+                             "candidate_reconstruction_hits" 28
+                             "manifest_reference_count" 60
+                             "manifest_impl_classes_missing" 60
+                             "hit_count" 108}
+                  "manifest_references" []
+                  "hits" []})
+    (write-json! greek-promotion
+                 {"summary" {"target_date" "2026-07-05"
+                             "generated_at" "2026-07-05T15:00:00Z"
+                             "capture_ok" true
+                             "capture_reasons" []
+                             "coverage_ok" true
+                             "coverage_reasons" []
+                             "evaluated_count" 60
+                             "min_evaluated_count" 60
+                             "raw_guarded_greek_reconstruction_count" 60
+                             "candidate_count" 0
+                             "candidate_features" []}
+                  "features" []})
+    (write-json! historical-cohort
+                 {"target_date" "2026-07-05"
+                  "generated_at" "2026-07-05T15:00:00Z"
+                  "status" "ok"
+                  "ok" true
+                  "alignment" "thetadata"
+                  "matched_rows" 120
+                  "features" 918})
+    (write-json! raw-unlock
+                 {"summary" {"target_date" "2026-07-05"
+                             "generated_at" "2026-07-05T15:00:00Z"
+                             "capture_rows" 120
+                             "replayed_rows" 120
+                             "neutralized_total" 703
+                             "supported_neutralized" 181
+                             "unsupported_neutralized" 522
+                             "candidate_count" 0
+                             "guarded_greek_reconstruction_count" 60
+                             "source_counts" {"bar_buffer_replay" 113}
+                             "status_counts" {}}})
+    (write-json! v3-unlock
+                 {"summary" {"target_date" "2026-07-05"
+                             "generated_at" "2026-07-05T15:00:00Z"
+                             "neutralized_v3_features" 131
+                             "recomputed_candidate_now" 0
+                             "recomputed_non_degenerate" 0
+                             "prediction_delta_status" "skipped-no-candidates"
+                             "prediction_delta_p95_abs_seed_z" 0.0
+                             "prediction_delta_max_abs_seed_z" 0.0
+                             "status_counts" {}}})
+    (write-json! matched-parity
+                 {"summary" {"target_date" "2026-07-05"
+                             "generated_at" "2026-07-05T15:00:00Z"
+                             "matched_rows" 120
+                             "matched_start" "2026-07-05T13:30:00Z"
+                             "matched_end" "2026-07-05T19:59:00Z"
+                             "feature_count" 2
+                             "neutralized_count" 0
+                             "problem_feature_count" 0
+                             "active_problem_count" 0
+                             "neutralized_problem_count" 0
+                             "status_counts" {"MATCH" 2}
+                             "max_abs_deviation" 0.0
+                             "min_correlation" 1.0}
+                  "features" [{"feature" "SPY_close" "status" "MATCH" "neutralized" false "active_problem" false}
+                              {"feature" "vix_proxy" "status" "MATCH" "neutralized" false "active_problem" false}]})
+    {"baseline" baseline
+     "probe" probe
+     "verification" verification
+     "neutralization" neutralization
+     "capture_check" capture-check
+     "option_surface_sidecar_check" option-surface-sidecar-check
+     "legacy_search" legacy-search
+     "greek_promotion" greek-promotion
+     "historical_cohort" historical-cohort
+     "raw_unlock" raw-unlock
+     "v3_unlock" v3-unlock
+     "matched_parity" matched-parity}))
+
+(defn bundle-args [analysis artifacts out-dir]
+  ["--target-date" "2026-07-05"
+   "--analysis-dir" (str analysis)
+   "--out-dir" (str out-dir)
+   "--baseline-json" (str (get artifacts "baseline"))
+   "--probe-json" (str (get artifacts "probe"))
+   "--payload-verification-json" (str (get artifacts "verification"))
+   "--neutralization-json" (str (get artifacts "neutralization"))
+   "--capture-check-json" (str (get artifacts "capture_check"))
+   "--option-surface-sidecar-check-json" (str (get artifacts "option_surface_sidecar_check"))
+   "--legacy-greek-search-json" (str (get artifacts "legacy_search"))
+   "--greek-promotion-json" (str (get artifacts "greek_promotion"))
+   "--historical-cohort-json" (str (get artifacts "historical_cohort"))
+   "--raw-unlock-json" (str (get artifacts "raw_unlock"))
+   "--v3-unlock-json" (str (get artifacts "v3_unlock"))
+   "--matched-parity-json" (str (get artifacts "matched_parity"))])
+
+(defn run-bundle [analysis artifacts out-dir]
+  (run-readiness :args (bundle-args analysis artifacts out-dir)))
+
+(defn reasons [payload] (str/join "\n" (.get payload "reasons")))
+
+(defn update-json! [p f]
+  (let [payload (read-json p)]
+    (write-json! p (f payload))
+    payload))
+
+(deftest market-evidence-readiness-rejects-cli-errors
+  (let [missing (run-readiness :args ["--target-date"])
+        flag-value (run-readiness :args ["--target-date" "--analysis-dir" "x"])
+        unknown (run-readiness :args ["--target-date" "2026-07-05" "--probe-jsno" "typo"])
+        help (run-readiness :args ["--help"])]
+    (is (= 2 (.-returncode missing)))
+    (is (str/includes? (.-stderr missing) "missing value for --target-date"))
+    (is (= 2 (.-returncode flag-value)))
+    (is (str/includes? (.-stderr flag-value) "missing value for --target-date"))
+    (is (= 2 (.-returncode unknown)))
+    (is (str/includes? (.-stderr unknown) "unknown argument: --probe-jsno"))
+    (doseq [target-date ["20260705" "2026-02-31" "2026-07-05T14:00:00Z"]]
+      (let [result (run-readiness :args ["--target-date" target-date])]
+        (is (= 2 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "invalid --target-date"))
+        (is (str/includes? (.-stderr result) target-date))))
+    (doseq [value ["many" "0" "-1" "1.5"]]
+      (let [result (run-readiness :args ["--target-date" "2026-07-05" "--min-capture-rows" value])]
+        (is (= 2 (.-returncode result)))
+        (is (str/includes? (.-stderr result) (str "invalid positive integer for --min-capture-rows: " value)))))
+    (is (= 0 (.-returncode help)))
+    (doseq [text ["--target-date YYYY-MM-DD"
+                  "--payload-verification-json PATH"
+                  "--capture-check-json PATH"
+                  "--option-surface-sidecar-check-json PATH"
+                  "--legacy-greek-search-json PATH"
+                  "--greek-promotion-json PATH"
+                  "--historical-cohort-json PATH"
+                  "--raw-unlock-json PATH"
+                  "--v3-unlock-json PATH"
+                  "--matched-parity-json PATH"]]
+      (is (str/includes? (.-stdout help) text)))))
+
+(deftest market-evidence-readiness-passes-from-non-repo-cwd
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)
+          out-dir (path tmp "out")
+          args (vec (drop-last 2 (bundle-args analysis artifacts out-dir)))
+          result (run-readiness :args args :cwd tmp :env {"STEVE_REPO_ROOT" (str root)})
+          payload (stdout-payload (.-stdout result))]
+      (is (= 0 (.-returncode result)) (.-stderr result))
+      (is (= "PASS" (.get payload "verdict")))
+      (is (= true (.get (.get payload "capture_v2_sidecars") "ok")))
+      (is (= true (.get (.get payload "option_surface_sidecar") "ok")))
+      (is (= 4 (.get (.get payload "option_surface_sidecar") "useful_row_count")))
+      (is (= [] (vec (.get (.get payload "option_surface_sidecar") "missing_prefixes"))))
+      (is (= true (.get (.get payload "historical_feature_cohort") "ok")))
+      (is (= 181 (.get (.get payload "raw_feature_unlock") "supported_neutralized")))
+      (is (= 131 (.get (.get payload "v3_grid_unlock") "neutralized_v3_features")))
+      (is (= [] (vec (.get (.get payload "capture_v2_sidecars") "missing_option_surface_prefixes"))))
+      (is (= 120 (.get (.get payload "matched_feature_parity") "matched_rows")))
+      (is (= 0 (.get (.get payload "matched_feature_parity") "problem_feature_count")))
+      (is (= 0.0 (.get (.get payload "matched_feature_parity") "max_abs_deviation")))
+      (is (= 1.0 (.get (.get payload "matched_feature_parity") "min_correlation")))
+      (is (= "2026-07-05T13:30:00Z" (.get (.get payload "matched_feature_parity") "matched_start")))
+      (is (= "2026-07-05T19:59:00Z" (.get (.get payload "matched_feature_parity") "matched_end")))
+      (is (= 0 (.get (.get payload "legacy_greek_formula_search") "candidate_formula_hits")))
+      (is (= 0 (.get (.get payload "legacy_greek_formula_search") "legacy_formula_provenance_hits")))
+      (is (= 28 (.get (.get payload "legacy_greek_formula_search") "candidate_reconstruction_hits")))
+      (is (= 0 (.get (.get payload "greek_reconstruction_promotion") "candidate_count")))
+      (is (= true (.get (.get payload "greek_reconstruction_promotion") "coverage_ok")))
+      (is (.exists (path out-dir (str "market_evidence_readiness_" stamp ".json"))))
+      (is (.exists (path out-dir (str "market_evidence_readiness_" stamp ".md")))))))
+
+(deftest market-evidence-readiness-rejects-duplicate-json
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)
+          baseline (get artifacts "baseline")]
+      (.write_text baseline
+                   (.replace (.read_text baseline)
+                             "\"target_date\": \"2026-07-05\""
+                             "\"target_date\": \"2026-07-05\", \"target_date\": \"2026-07-04\""
+                             1))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))]
+        (is (= 2 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "duplicate JSON key: target_date"))
+        (is (not (.exists (path (path tmp "out") (str "market_evidence_readiness_" stamp ".json")))))))))
+
+(deftest market-evidence-readiness-accepts-verified-payload-examples-without-probe-paths
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "probe")
+                    (fn [probe]
+                      (aset (.get probe "summary") "payload_examples" 0)
+                      (doseq [row (.get probe "results")]
+                        (aset row "payload_example" ""))
+                      probe))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "PASS" (.get payload "verdict")))
+        (is (not (str/includes? (reasons payload) "ThetaData probe saved no payload examples")))
+        (is (not (str/includes? (reasons payload) "checked unexpected probe identities")))))))
+
+(deftest market-evidence-readiness-fails-explicit-terminal-unreachable-probe
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "probe")
+                    (fn [probe]
+                      (aset probe "summary"
+                            (jsonable {"total" 2
+                                       "ok" 0
+                                       "usable" 0
+                                       "failed" 2
+                                       "payload_examples" 0
+                                       "error_classes" {"terminal-unreachable" 2}}))
+                      (aset probe "results"
+                            (jsonable [{"name" "option.expirations"
+                                        "symbol" "SPY"
+                                        "ok" false
+                                        "usable" false
+                                        "error_class" "terminal-unreachable"}
+                                       {"name" "option.snapshot.quote"
+                                        "symbol" "SPY"
+                                        "ok" false
+                                        "usable" false
+                                        "error_class" "terminal-unreachable"}]))
+                      probe))
+      (update-json! (get artifacts "verification")
+                    (fn [verification]
+                      (aset verification "status" "error")
+                      (aset verification "valid?" false)
+                      (aset verification "total" 0)
+                      (aset verification "checked" 0)
+                      (aset verification "skipped" 0)
+                      (aset verification "invalid" 0)
+                      (aset verification "example_generated_date_counts" (jsonable {}))
+                      (aset verification "example_path_date_counts" (jsonable {}))
+                      (aset verification "results" (python/list []))
+                      verification))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))
+            text (reasons payload)]
+        (is (= 1 (.-returncode result)))
+        (is (= "FAIL" (.get payload "verdict")))
+        (is (not (str/includes? text "ThetaData capability probe missing")))
+        (is (str/includes? text "ThetaData terminal unreachable for all usable surfaces"))
+        (is (str/includes? text "ThetaData probe found no usable surfaces"))
+        (is (str/includes? text "ThetaData probe saved no payload examples"))
+        (is (str/includes? text "ThetaData payload verification checked no supported examples"))
+        (is (= 2 (.get (.get payload "thetadata_probe") "failed")))
+        (is (= 2 (.get (.get (.get payload "thetadata_probe") "error_classes") "terminal-unreachable")))))))
+
+(deftest market-evidence-readiness-fails-bad-or-sparse-capture-sidecars
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)
+          capture (get artifacts "capture_check")]
+      (update-json! capture (fn [p]
+                              (aset p "ok" false)
+                              (aset p "status" "error")
+                              (aset p "issues" (python/list ["missing option surfaces"]))
+                              (aset (.get p "sidecar_useful_rows") "option_surfaces_json" 0)
+                              p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))
+            text (reasons payload)]
+        (is (= 1 (.-returncode result)))
+        (is (= "FAIL" (.get payload "verdict")))
+        (is (str/includes? text "capture-v2 sidecar check did not pass"))
+        (is (str/includes? text "capture-v2 sidecar check has issues"))
+        (is (str/includes? text "capture-v2 option surface sidecars below minimum useful rows")))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)
+          capture (get artifacts "capture_check")]
+      (update-json! capture (fn [p] (aset (.get p "sidecar_useful_rows") "grid_history_json" 59) p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload) "capture-v2 grid history sidecars below minimum useful rows"))
+        (is (= 59 (.get (.get (.get payload "capture_v2_sidecars") "sidecar_useful_rows") "grid_history_json")))))))
+
+(deftest market-evidence-readiness-fails-bad-option-surface-sidecar-check
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)
+          option-surface-check (get artifacts "option_surface_sidecar_check")]
+      (update-json! option-surface-check
+                    (fn [p]
+                      (aset p "ok" false)
+                      (aset p "prefixes_present" (python/list ["SPX" "SPXW" "VIX"]))
+                      (aset p "contracts_by_prefix" (jsonable {"SPX" 1200 "SPXW" 1200 "VIX" 458}))
+                      (aset p "issues" (python/list ["missing required surface prefix: VIXW"]))
+                      p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))
+            text (reasons payload)]
+        (is (= 1 (.-returncode result)))
+        (is (= "FAIL" (.get payload "verdict")))
+        (is (str/includes? text "option-surface sidecar check did not pass"))
+        (is (str/includes? text "option-surface sidecar check has issues"))
+        (is (str/includes? text "option-surface sidecar check missing required prefixes: VIXW"))
+        (is (= false (.get (.get payload "option_surface_sidecar") "ok")))
+        (is (= ["VIXW"] (vec (.get (.get payload "option_surface_sidecar") "missing_prefixes"))))))))
+
+(deftest market-evidence-readiness-fails-capture-integrity-problems
+  (doseq [[mutate expected check]
+          [(python/tuple [(fn [p]
+                            (aset p "row_count" 120)
+                            (aset p "unique_time_count" 119)
+                            (aset p "duplicate_time_count" 1)
+                            (aset p "duplicate_times" (python/list ["2026-07-05T10:01:00"]))
+                            p)
+                          "capture-v2 sidecar check contains duplicate timestamp rows"
+                          (fn [payload] (is (= 1 (.get (.get payload "capture_v2_sidecars") "duplicate_time_count"))))])
+           (python/tuple [(fn [p]
+                            (aset p "sidecar_malformed_contracts" (jsonable {"option_chain_json" 1 "option_surfaces_json" 2}))
+                            (aset p "option_surface_malformed_contracts_by_prefix" (jsonable {"SPX" 1 "VIXW" 1}))
+                            p)
+                          "capture-v2 option sidecars contain malformed non-object contract entries"
+                          (fn [payload] (is (= {"option_chain_json" 1 "option_surfaces_json" 2}
+                                                (into {} (.items (.get (.get payload "capture_v2_sidecars") "sidecar_malformed_contracts"))))))])
+           (python/tuple [(fn [p]
+                            (aset p "option_surface_prefixes" (python/list ["SPXW"]))
+                            (aset p "option_surface_contracts_by_prefix" (jsonable {"SPXW" 12000}))
+                            p)
+                          "capture-v2 option surface sidecars missing required prefixes: SPX, VIX, VIXW"
+                          (fn [payload] (is (= ["SPX" "VIX" "VIXW"]
+                                                (vec (.get (.get payload "capture_v2_sidecars") "missing_option_surface_prefixes")))))])]]
+    (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+      (let [tmp (pathlib/Path tmp-dir)
+            analysis (path tmp "analysis")
+            artifacts (write-readiness-bundle analysis)
+            capture (get artifacts "capture_check")]
+        (update-json! capture mutate)
+        (let [result (run-bundle analysis artifacts (path tmp "out"))
+              payload (stdout-payload (.-stdout result))]
+          (is (= 1 (.-returncode result)))
+          (is (= "FAIL" (.get payload "verdict")))
+          (is (str/includes? (reasons payload) expected))
+          (check payload))))))
+
+(deftest market-evidence-readiness-fails-missing-or-explicit-artifacts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (.unlink (get artifacts "matched_parity"))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload) "matched live-vs-historical feature parity report missing"))
+        (is (= false (.get (.get payload "matched_feature_parity") "available"))))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)
+          out-dir (path tmp "out")]
+      (.unlink (get artifacts "baseline"))
+      (let [result (run-bundle analysis artifacts out-dir)
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload) "baseline artifact missing"))
+        (is (.exists (path out-dir (str "market_evidence_readiness_" stamp ".json"))))
+        (is (= "FAIL" (.get (read-json (path out-dir (str "market_evidence_readiness_" stamp ".json"))) "verdict"))))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "baseline")
+                    (fn [m]
+                      (aset (.get m "summary") "status" "unavailable")
+                      (aset (.get m "summary") "unavailable_reason" "capture missing")
+                      m))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload)
+                           "baseline artifact unavailable: capture missing")))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "neutralization")
+                    (fn [m]
+                      (aset (.get m "summary") "status" "unavailable")
+                      (aset (.get m "summary") "unavailable_reason" "model usage missing")
+                      m))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload)
+                           "neutralization audit unavailable: model usage missing"))))))
+
+(deftest market-evidence-readiness-surfaces-optional-diagnostic-artifact-failures
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "historical_cohort")
+                    (fn [m]
+                      (aset m "status" "error")
+                      (aset m "ok" false)
+                      (aset m "reason" "date map does not contain target date 2026-07-05")
+                      m))
+      (update-json! (get artifacts "raw_unlock")
+                    (fn [m]
+                      (aset (.get m "summary") "status" "unavailable")
+                      (aset (.get m "summary") "unavailable_reason" "capture-v2 sidecar check failed")
+                      m))
+      (update-json! (get artifacts "v3_unlock")
+                    (fn [m]
+                      (aset (.get m "summary") "status" "unavailable")
+                      (aset (.get m "summary") "unavailable_reason" "baseline missing")
+                      m))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))
+            text (reasons payload)]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? text "historical feature cohort unavailable: date map does not contain target date 2026-07-05"))
+        (is (str/includes? text "raw feature unlock audit unavailable: capture-v2 sidecar check failed"))
+        (is (str/includes? text "V3 grid unlock audit unavailable: baseline missing"))
+        (is (= false (.get (.get payload "historical_feature_cohort") "ok")))
+        (is (= "unavailable" (.get (.get payload "raw_feature_unlock") "status")))
+        (is (= "unavailable" (.get (.get payload "v3_grid_unlock") "status")))))))
+
+(deftest market-evidence-readiness-fails-matched-feature-parity-problems
+  (doseq [[mutate expected]
+          [(python/tuple [(fn [m]
+                            (aset (.get m "summary") "problem_feature_count" 1)
+                            (aset (.get m "summary") "active_problem_count" 1)
+                            (aset (.get m "summary") "neutralized_count" 0)
+                            (aset (.get m "summary") "neutralized_problem_count" 0)
+                            (.append (.get m "features") (jsonable {"feature" "bad_feature" "status" "DIVERGED" "neutralized" false "active_problem" true}))
+                            (aset (.get m "summary") "feature_count" (len (.get m "features")))
+                            m)
+                          "matched live-vs-historical feature parity has problem features"])
+           (python/tuple [(fn [m] (aset (.get m "summary") "matched_rows" 59) m)
+                          "matched live-vs-historical feature parity rows below minimum 60"])
+           (python/tuple [(fn [m] (aset (.get m "summary") "feature_count" 99) m)
+                          "matched live-vs-historical feature parity feature_count does not match feature rows"])
+           (python/tuple [(fn [m] (aset (.get m "summary") "problem_feature_count" 0)
+                            (aset (.__getitem__ (.get m "features") 0) "status" "DIVERGED")
+                            m)
+                          "matched live-vs-historical feature parity problem_feature_count does not match feature rows"])
+           (python/tuple [(fn [m] (aset (.get m "summary") "status_counts" (jsonable {"MATCH" 1 "DIVERGED" 1})) m)
+                          "matched live-vs-historical feature parity status_counts does not match feature rows"])]]
+    (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+      (let [tmp (pathlib/Path tmp-dir)
+            analysis (path tmp "analysis")
+            artifacts (write-readiness-bundle analysis)]
+        (update-json! (get artifacts "matched_parity") mutate)
+        (let [result (run-bundle analysis artifacts (path tmp "out"))
+              payload (stdout-payload (.-stdout result))]
+          (is (= 1 (.-returncode result)))
+          (is (= "FAIL" (.get payload "verdict")))
+          (is (str/includes? (reasons payload) expected)))))))
+
+(deftest market-evidence-readiness-watches-legacy-and-greek-candidates
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "legacy_search")
+                    (fn [p] (aset (.get p "summary") "candidate_formula_hits" 2)
+                      (aset (.get p "summary") "legacy_formula_provenance_hits" 2)
+                      p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 0 (.-returncode result)))
+        (is (= "WATCH" (.get payload "verdict")))
+        (is (= 2 (.get (.get payload "legacy_greek_formula_search") "candidate_formula_hits")))
+        (is (str/includes? (reasons payload) "legacy Greek formula search found legacy formula provenance contexts")))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 0 (.-returncode result)))
+        (is (= "PASS" (.get payload "verdict")))
+        (is (= 28 (.get (.get payload "legacy_greek_formula_search") "candidate_reconstruction_hits"))))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "greek_promotion")
+                    (fn [p] (aset (.get p "summary") "candidate_count" 1)
+                      (aset (.get p "summary") "candidate_features" (python/list ["SPY_greeks_dollar_delta"]))
+                      p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 0 (.-returncode result)))
+        (is (= "WATCH" (.get payload "verdict")))
+        (is (= 1 (.get (.get payload "greek_reconstruction_promotion") "candidate_count")))
+        (is (str/includes? (reasons payload) "Greek reconstruction promotion gate produced candidate features"))))))
+
+(deftest market-evidence-readiness-fails-greek-promotion-integrity
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "greek_promotion")
+                    (fn [p] (aset (.get p "summary") "coverage_ok" false)
+                      (aset (.get p "summary") "coverage_reasons" (python/list ["evaluated rows 45 below minimum 60"]))
+                      (aset (.get p "summary") "evaluated_count" 45)
+                      p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get (.get payload "greek_reconstruction_promotion") "coverage_ok")))
+        (is (str/includes? (reasons payload) "Greek reconstruction promotion gate coverage is incomplete"))
+        (is (str/includes? (reasons payload) "Greek reconstruction promotion gate has coverage reasons")))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "greek_promotion")
+                    (fn [p] (aset (.get p "summary") "candidate_count" 2)
+                      (aset (.get p "summary") "candidate_features" (python/list ["SPY_greeks_dollar_delta"]))
+                      p))
+      (let [result (run-bundle analysis artifacts (path tmp "out"))
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload) "Greek reconstruction promotion gate candidate_count does not match candidate_features"))))))
+
+(deftest market-evidence-readiness-fails-without-raw-replay-metadata
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "baseline")
+                    (fn [p] (let [summary (.get p "summary")
+                                  captures (.get summary "captures")
+                                  per-capture (.__getitem__ (.get summary "per_capture") 0)]
+                              (.pop captures "required_raw_replay_arrays")
+                              (.pop captures "raw_replay_missing_by_file")
+                              (.pop per-capture "raw_replay_ready")
+                              (.pop per-capture "raw_replay_missing")
+                              p)))
+      (let [result (run-readiness :args ["--target-date" "2026-07-05"
+                                         "--analysis-dir" (str analysis)
+                                         "--out-dir" (str (path tmp "out"))
+                                         "--baseline-json" (str (get artifacts "baseline"))
+                                         "--probe-json" (str (get artifacts "probe"))
+                                         "--payload-verification-json" (str (get artifacts "verification"))
+                                         "--neutralization-json" (str (get artifacts "neutralization"))])
+            payload (stdout-payload (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? (reasons payload) "baseline missing raw replay sidecar metadata")))))
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          artifacts (write-readiness-bundle analysis)]
+      (update-json! (get artifacts "baseline")
+                    (fn [p] (let [summary (.get p "summary")
+                                  captures (.get summary "captures")
+                                  per-capture (.__getitem__ (.get summary "per_capture") 0)]
+                              (aset captures "raw_replay_missing_by_file"
+                                    (jsonable {"live_features_20260705.npz" ["bar_buffers_json" "option_chain_json" "option_surfaces_json"]}))
+                              (aset per-capture "raw_replay_ready" false)
+                              (aset per-capture "raw_replay_missing"
+                                    (python/list ["bar_buffers_json" "option_chain_json" "option_surfaces_json"]))
+                              p)))
+      (let [result (run-readiness :args ["--target-date" "2026-07-05"
+                                         "--analysis-dir" (str analysis)
+                                         "--out-dir" (str (path tmp "out"))
+                                         "--baseline-json" (str (get artifacts "baseline"))
+                                         "--probe-json" (str (get artifacts "probe"))
+                                         "--payload-verification-json" (str (get artifacts "verification"))
+                                         "--neutralization-json" (str (get artifacts "neutralization"))])
+            payload (stdout-payload (.-stdout result))
+            text (reasons payload)]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? text "target-date capture missing raw replay sidecars"))
+        (is (str/includes? text "target-date per_capture row is not raw replay ready"))))))

@@ -1,0 +1,13 @@
+[Unit]
+Description=Build SteveTrading status dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_status_dashboard.sh
+StandardOutput=append:/var/log/stevetrading/status-dashboard.log
+StandardError=append:/var/log/stevetrading/status-dashboard.log

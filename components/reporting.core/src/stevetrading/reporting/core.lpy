@@ -1,0 +1,777 @@
+(ns stevetrading.reporting.core
+  "Canonical report-day validation.
+
+  This component is intentionally independent of HTML rendering. Renderers and
+  external report builders should first project their raw facts into these
+  account/report maps, then validate the maps before publishing or comparing
+  performance."
+  (:import datetime math)
+  (:require [stevetrading.reporting.schema :as reporting-schema]))
+
+(def material-pnl-threshold 0.01)
+
+(def regular-open-time (datetime/time 9 30))
+(def regular-close-time (datetime/time 16 0))
+(def equity-early-close-time (datetime/time 13 0))
+
+(def official-nyse-session-overrides
+  "NYSE-published full-day holidays and 1 p.m. equity early closes.
+  Covers the currently published 2026-2028 calendar. Rule-based fallback below
+  protects later years but these official dates take precedence."
+  {"2026-01-01" {:closed? true :reason "New Year's Day"}
+   "2026-01-19" {:closed? true :reason "Martin Luther King, Jr. Day"}
+   "2026-02-16" {:closed? true :reason "Washington's Birthday"}
+   "2026-04-03" {:closed? true :reason "Good Friday"}
+   "2026-05-25" {:closed? true :reason "Memorial Day"}
+   "2026-06-19" {:closed? true :reason "Juneteenth National Independence Day"}
+   "2026-07-03" {:closed? true :reason "Independence Day observed"}
+   "2026-09-07" {:closed? true :reason "Labor Day"}
+   "2026-11-26" {:closed? true :reason "Thanksgiving Day"}
+   "2026-11-27" {:early-close? true :reason "Day after Thanksgiving"}
+   "2026-12-24" {:early-close? true :reason "Christmas Eve"}
+   "2026-12-25" {:closed? true :reason "Christmas Day"}
+
+   "2027-01-01" {:closed? true :reason "New Year's Day"}
+   "2027-01-18" {:closed? true :reason "Martin Luther King, Jr. Day"}
+   "2027-02-15" {:closed? true :reason "Washington's Birthday"}
+   "2027-03-26" {:closed? true :reason "Good Friday"}
+   "2027-05-31" {:closed? true :reason "Memorial Day"}
+   "2027-06-18" {:closed? true :reason "Juneteenth National Independence Day observed"}
+   "2027-07-05" {:closed? true :reason "Independence Day observed"}
+   "2027-09-06" {:closed? true :reason "Labor Day"}
+   "2027-11-25" {:closed? true :reason "Thanksgiving Day"}
+   "2027-11-26" {:early-close? true :reason "Day after Thanksgiving"}
+   "2027-12-24" {:closed? true :reason "Christmas Day observed"}
+
+   "2028-01-17" {:closed? true :reason "Martin Luther King, Jr. Day"}
+   "2028-02-21" {:closed? true :reason "Washington's Birthday"}
+   "2028-04-14" {:closed? true :reason "Good Friday"}
+   "2028-05-29" {:closed? true :reason "Memorial Day"}
+   "2028-06-19" {:closed? true :reason "Juneteenth National Independence Day"}
+   "2028-07-03" {:early-close? true :reason "Day before Independence Day"}
+   "2028-07-04" {:closed? true :reason "Independence Day"}
+   "2028-09-04" {:closed? true :reason "Labor Day"}
+   "2028-11-23" {:closed? true :reason "Thanksgiving Day"}
+   "2028-11-24" {:early-close? true :reason "Day after Thanksgiving"}
+   "2028-12-25" {:closed? true :reason "Christmas Day"}})
+
+(defn- iso-date
+  [d]
+  (cond
+    (string? d) d
+    (some? d) (.isoformat d)
+    :else nil))
+
+(defn- date-from-iso
+  [s]
+  (try
+    (let [date-cls (.-date datetime)]
+      (.fromisoformat date-cls s))
+    (catch python/Exception _ nil)))
+
+(defn- nth-weekday
+  [year month weekday n]
+  (let [first-day (datetime/date year month 1)
+        offset (mod (- weekday (.weekday first-day)) 7)]
+    (+ first-day (datetime/timedelta ** :days (+ offset (* 7 (dec n)))))))
+
+(defn- last-weekday
+  [year month weekday]
+  (let [next-month (if (= month 12)
+                     (datetime/date (inc year) 1 1)
+                     (datetime/date year (inc month) 1))
+        last-day (- next-month (datetime/timedelta ** :days 1))
+        offset (mod (- (.weekday last-day) weekday) 7)]
+    (- last-day (datetime/timedelta ** :days offset))))
+
+(defn- observed-fixed-date
+  [year month day]
+  (let [d (datetime/date year month day)]
+    (cond
+      (= 5 (.weekday d)) (- d (datetime/timedelta ** :days 1))
+      (= 6 (.weekday d)) (+ d (datetime/timedelta ** :days 1))
+      :else d)))
+
+(defn- easter-date
+  [year]
+  (let [a (mod year 19)
+        b (quot year 100)
+        c (mod year 100)
+        d (quot b 4)
+        e (mod b 4)
+        f (quot (+ b 8) 25)
+        g (quot (+ (- b f) 1) 3)
+        h (mod (+ (* 19 a) b (- d) (- g) 15) 30)
+        i (quot c 4)
+        k (mod c 4)
+        l (mod (+ 32 (* 2 e) (* 2 i) (- h) (- k)) 7)
+        m (quot (+ a (* 11 h) (* 22 l)) 451)
+        month (quot (+ h l (- (* 7 m)) 114) 31)
+        day (inc (mod (+ h l (- (* 7 m)) 114) 31))]
+    (datetime/date year month day)))
+
+(defn- good-friday
+  [year]
+  (- (easter-date year) (datetime/timedelta ** :days 2)))
+
+(defn- generated-market-holidays
+  [year]
+  (into {}
+        (map (fn [[d reason]]
+               [(.isoformat d) {:closed? true :reason reason}])
+             [[(observed-fixed-date year 1 1) "New Year's Day"]
+              [(nth-weekday year 1 0 3) "Martin Luther King, Jr. Day"]
+              [(nth-weekday year 2 0 3) "Washington's Birthday"]
+              [(good-friday year) "Good Friday"]
+              [(last-weekday year 5 0) "Memorial Day"]
+              [(observed-fixed-date year 6 19) "Juneteenth National Independence Day"]
+              [(observed-fixed-date year 7 4) "Independence Day"]
+              [(nth-weekday year 9 0 1) "Labor Day"]
+              [(nth-weekday year 11 3 4) "Thanksgiving Day"]
+              [(observed-fixed-date year 12 25) "Christmas Day"]])))
+
+(defn- generated-early-closes
+  [year holidays]
+  (let [thanksgiving (nth-weekday year 11 3 4)
+        black-friday (+ thanksgiving (datetime/timedelta ** :days 1))
+        christmas-eve (datetime/date year 12 24)
+        day-before-independence (datetime/date year 7 3)
+        candidates [[black-friday "Day after Thanksgiving"]
+                    [christmas-eve "Christmas Eve"]
+                    [day-before-independence "Day before Independence Day"]]]
+    (into {}
+          (keep (fn [[d reason]]
+                  (let [s (.isoformat d)]
+                    (when (and (< (.weekday d) 5)
+                               (not (contains? holidays s)))
+                      [s {:early-close? true :reason reason}]))))
+          candidates)))
+
+(defn- generated-market-session-overrides
+  [year]
+  (let [holidays (generated-market-holidays year)]
+    (merge holidays (generated-early-closes year holidays))))
+
+(defn market-session
+  "Return the canonical NYSE equity regular-session calendar for date d.
+  d may be an ISO yyyy-mm-dd string or a Python datetime.date."
+  [d]
+  (let [s (iso-date d)
+        dt (when s (date-from-iso s))
+        weekend? (when dt (>= (.weekday dt) 5))
+        year (when dt (.-year dt))
+        override (when year
+                   (or (get official-nyse-session-overrides s)
+                       (get (generated-market-session-overrides year) s)))]
+    (cond
+      (nil? dt)
+      {:market/date s
+       :trading-day? false
+       :market/session :invalid
+       :market/reason "invalid or missing date"
+       :market/open-time regular-open-time
+       :market/close-time regular-close-time}
+
+      weekend?
+      {:market/date s
+       :trading-day? false
+       :market/session :closed
+       :market/reason "weekend"
+       :market/open-time regular-open-time
+       :market/close-time regular-close-time}
+
+      (:closed? override)
+      {:market/date s
+       :trading-day? false
+       :market/session :closed
+       :market/reason (:reason override)
+       :market/open-time regular-open-time
+       :market/close-time regular-close-time}
+
+      (:early-close? override)
+      {:market/date s
+       :trading-day? true
+       :market/session :early-close
+       :market/reason (:reason override)
+       :market/open-time regular-open-time
+       :market/close-time equity-early-close-time}
+
+      :else
+      {:market/date s
+       :trading-day? true
+       :market/session :regular
+       :market/reason nil
+       :market/open-time regular-open-time
+       :market/close-time regular-close-time})))
+
+(defn- external-key->kw
+  [k]
+  (cond
+    (keyword? k) k
+    (string? k) (keyword (if (.startswith k ":") (subs k 1) k))
+    :else k))
+
+(defn- external-value->kw
+  [v]
+  (cond
+    (keyword? v) v
+    (string? v) (keyword (if (.startswith v ":") (subs v 1) v))
+    :else v))
+
+(defn- normalize-explanations
+  [xs]
+  (set (map external-value->kw (or xs #{}))))
+
+(defn external->canonical
+  "Normalize JSON/string-keyed external report projections into canonical
+  keyword-keyed Basilisp maps. Accepts either EDN-shaped maps or Python
+  json.loads output with keys such as \"report/date\" and \"pnl/equity-day\"."
+  [x]
+  (cond
+    (map? x)
+    (into {} (map (fn [[k v]]
+                    [(external-key->kw k) (external->canonical v)])
+                  x))
+
+    (python/isinstance x python/dict)
+    (into {} (map (fn [kv]
+                    [(external-key->kw (first kv))
+                     (external->canonical (second kv))])
+                  (.items x)))
+
+    (or (python/isinstance x python/list)
+        (vector? x)
+        (seq? x))
+    (mapv external->canonical x)
+
+    :else x))
+
+(defn trading-day?
+  "True when d is an NYSE equity trading day.
+  d may be an ISO yyyy-mm-dd string or a Python datetime.date."
+  [d]
+  (true? (:trading-day? (market-session d))))
+
+(defn- ->float
+  [x]
+  (cond
+    (nil? x) 0.0
+    (string? x) (float x)
+    :else (float x)))
+
+(defn- finite-float
+  [x]
+  (try
+    (when-not (boolean? x)
+      (let [n (->float x)]
+        (when (math/isfinite n) n)))
+    (catch python/Exception _ nil)))
+
+(defn- material?
+  [x]
+  (> (math/fabs (->float x)) material-pnl-threshold))
+
+(defn- issue
+  [severity code message]
+  {:severity severity
+   :code code
+   :message message})
+
+(defn- with-account
+  [account-id issue]
+  (if (some? account-id)
+    (assoc issue :account/id account-id)
+    issue))
+
+(defn- schema-issue
+  [kind result]
+  (issue :error
+         (case kind
+           :reporting/account-day :report/invalid-account-day-shape
+           :reporting/report-day :report/invalid-report-day-shape
+           :report/invalid-shape)
+         (str "Report projection failed " kind " structural validation: "
+              (pr-str (:schema/errors result)))))
+
+(defn- count-value
+  [x]
+  (cond
+    (nil? x) 0
+    (string? x) (python/int x)
+    :else (python/int x)))
+
+(defn- sum-account-pnl
+  [accounts k]
+  (reduce + 0.0 (map #(->float (get % k)) accounts)))
+
+(defn- malformed-pnl-values
+  [rows k]
+  (vec
+   (keep (fn [row]
+           (when (nil? (finite-float (get row k)))
+             (or (:account/id row) :report)))
+         rows)))
+
+(defn- present-key?
+  [m k]
+  (or (contains? m k)
+      (and (python/isinstance m python/dict) (contains? (set (.keys m)) k))))
+
+(defn- report-pnl-total-issues
+  [report accounts]
+  (vec
+   (keep identity
+         (map (fn [[k code label]]
+                (when (present-key? report k)
+                  (let [malformed (malformed-pnl-values (cons report accounts) k)]
+                    (if (seq malformed)
+                      (issue :error
+                             :pnl/report-total-unparseable
+                             (str "Report-level " label
+                                  " reconciliation contains malformed numeric values: "
+                                  (pr-str malformed)))
+                      (let [reported (->float (get report k))
+                            account-sum (sum-account-pnl accounts k)]
+                        (when (material? (- reported account-sum))
+                          (issue :error
+                                 code
+                                 (str "Report-level " label
+                                      " does not equal the sum of account values."))))))))
+              [[:pnl/equity-day :pnl/report-equity-total-mismatch "equity day P&L"]
+               [:pnl/realized :pnl/report-realized-total-mismatch "realized P&L"]
+               [:pnl/unrealized :pnl/report-unrealized-total-mismatch "unrealized P&L"]
+               [:pnl/closed-trades :pnl/report-closed-trades-total-mismatch "closed-trade P&L"]]))))
+
+(defn- blank-string?
+  [x]
+  (empty? (.strip (str (or x "")))))
+
+(defn- normalize-position-side
+  [side]
+  (let [s (.lower (.strip (str (or side ""))))]
+    (cond
+      (empty? s) nil
+      (contains? #{"long" ":long" "buy" ":buy" ":order-side/buy"
+                   "position-side/long" ":position-side/long"}
+                 s)
+      :long
+      (contains? #{"short" ":short" "sell" ":sell" ":order-side/sell"
+                   "position-side/short" ":position-side/short"}
+                 s)
+      :short
+      :else :unknown)))
+
+(defn- open-position-detail-issues
+  [positions]
+  (vec
+   (mapcat
+    (fn [idx position]
+      (let [instrument-id (:instrument/id position)
+            quantity (:position/quantity position)
+            q (finite-float quantity)
+            side (when (present-key? position :position/side)
+                   (normalize-position-side (:position/side position)))]
+        (keep identity
+              [(when (blank-string? instrument-id)
+                 (issue :error
+                        :positions/open-position-missing-instrument
+                        (str "Open position " idx
+                             " is missing :instrument/id.")))
+               (when (or (nil? q)
+                         (not (material? q)))
+                 (issue :error
+                        :positions/open-position-invalid-quantity
+                        (str "Open position " idx
+                             " is missing a non-zero numeric :position/quantity.")))
+               (when (= :unknown side)
+                 (issue :error
+                        :positions/open-position-invalid-side
+                        (str "Open position " idx
+                             " has an unknown :position/side.")))
+               (when (and (some? q)
+                          (= :long side)
+                          (< q 0.0))
+                 (issue :error
+                        :positions/open-position-side-quantity-conflict
+                        (str "Open position " idx
+                             " is marked long but has negative quantity.")))
+               (when (and (some? q)
+                          (= :short side)
+                          (> q 0.0))
+                 (issue :error
+                        :positions/open-position-side-quantity-conflict
+                        (str "Open position " idx
+                             " is marked short but has positive quantity.")))])))
+    (range)
+    positions)))
+
+(defn- open-position-unrealized-issues
+  [account positions]
+  (let [account-unrealized (:pnl/unrealized account)
+        material-unrealized? (material? account-unrealized)]
+    (if-not material-unrealized?
+      []
+      (let [missing (vec
+                     (keep-indexed
+                      (fn [idx position]
+                        (when-not (present-key? position :position/unrealized-pnl)
+                          idx))
+                      positions))
+            malformed (vec
+                       (keep-indexed
+                        (fn [idx position]
+                          (when (and (present-key? position
+                                                   :position/unrealized-pnl)
+                                     (nil? (finite-float
+                                            (:position/unrealized-pnl
+                                             position))))
+                            idx))
+                        positions))
+            position-sum (reduce + 0.0
+                                 (map #(->float
+                                        (:position/unrealized-pnl %))
+                                      positions))
+            mismatch? (and (empty? missing)
+                           (empty? malformed)
+                           (material? (- (->float account-unrealized)
+                                         position-sum)))]
+        (vec
+         (keep identity
+               [(when (seq missing)
+                  (issue :error
+                         :positions/open-unrealized-missing
+                         (str "Material unrealized P&L requires per-position "
+                              ":position/unrealized-pnl detail for open positions: "
+                              (pr-str missing))))
+                (when (seq malformed)
+                  (issue :error
+                         :positions/open-unrealized-unparseable
+                         (str "Open position unrealized P&L contains malformed numeric values: "
+                              (pr-str malformed))))
+                (when mismatch?
+                  (issue :error
+                         :positions/open-unrealized-total-mismatch
+                         "Account unrealized P&L does not equal the sum of open-position unrealized P&L."))]))))))
+
+(defn- duplicate-account-issues
+  [account-results]
+  (let [ids (filter some? (map #(get-in % [:account :account/id]) account-results))
+        counts (frequencies ids)]
+    (vec
+     (map (fn [[account-id _]]
+            (with-account
+             account-id
+             (issue :error
+                    :report/duplicate-account-id
+                    "Report-day contains duplicate account projections.")))
+          (filter (fn [[_ n]] (> n 1)) counts)))))
+
+(defn account-day
+  "Build a canonical account-day projection with safe defaults.
+
+  Required in practice:
+  - :account/id
+  - :report/date
+
+  Important economics:
+  - :pnl/equity-day is broker equity day P&L.
+  - :pnl/realized is realized P&L.
+  - :pnl/unrealized is open-position/carry-over P&L.
+  - :trade/closed-count and :order/count describe actual activity.
+  - :positions/open-count must be non-zero when unrealized/carry-over P&L is
+    attributed to open exposure.
+  - :report/explanations is an explicit set of accepted explanation keywords,
+    e.g. :explanation/open-position-carryover, :explanation/broker-mark-to-market,
+    or :explanation/manual-adjustment."
+  [m]
+  (let [m (update (external->canonical m)
+                  :report/explanations normalize-explanations)
+        date (:report/date m)]
+    (merge {:report/rendered? true
+            :report/date date
+            :trading-day? (trading-day? date)
+            :trade/closed-count 0
+            :order/count 0
+            :positions/open-count 0
+            :positions/open []
+            :pnl/realized 0.0
+            :pnl/unrealized 0.0
+            :pnl/equity-day 0.0
+            :pnl/closed-trades 0.0
+            :broker/equity-observed? nil
+            :report/explanations #{}}
+           m)))
+
+(defn- has-explanation?
+  [account explanation]
+  (contains? (:report/explanations account) explanation))
+
+(defn- activity-pnl-explained?
+  [account]
+  (or (has-explanation? account :explanation/broker-mark-to-market)
+      (has-explanation? account :explanation/manual-adjustment)))
+
+(defn- equity-gap-explained?
+  [account]
+  (or (has-explanation? account :explanation/broker-mark-to-market)
+      (has-explanation? account :explanation/manual-adjustment)))
+
+(defn- closed-pnl-explained?
+  [account]
+  (has-explanation? account :explanation/manual-adjustment))
+
+(def ^:private allowed-explanations
+  #{:explanation/open-position-carryover
+    :explanation/broker-mark-to-market
+    :explanation/manual-adjustment})
+
+(def ^:private required-economic-account-keys
+  [:trade/closed-count
+   :order/count
+   :positions/open-count
+   :positions/open
+   :pnl/equity-day
+   :pnl/realized
+   :pnl/unrealized
+   :pnl/closed-trades
+   :broker/equity-observed?])
+
+(defn validate-account-day
+  "Validate one canonical account-day map.
+  Returns {:valid? boolean :status :ok/:warn/:error :issues [...] :account account}."
+  [input]
+  (let [raw-account (external->canonical input)
+        account (account-day raw-account)
+        shape-result (reporting-schema/validation-result
+                      :reporting/account-day account)
+        account-id (:account/id account)
+        date (:report/date account)
+        trading? (trading-day? date)
+        shape-errors (when-not (:valid? shape-result)
+                       [(schema-issue :reporting/account-day shape-result)])
+        closed-trades (when (:valid? shape-result)
+                        (count-value (:trade/closed-count account)))
+        orders (when (:valid? shape-result)
+                 (count-value (:order/count account)))
+        open-count (when (:valid? shape-result)
+                     (count-value (:positions/open-count account)))
+        open-positions (:positions/open account)
+        equity-pnl (:pnl/equity-day account)
+        realized (:pnl/realized account)
+        unrealized (:pnl/unrealized account)
+        closed-pnl (:pnl/closed-trades account)
+        expected-equity (when (:valid? shape-result)
+                          (+ (->float realized) (->float unrealized)))
+        equity-gap (when (:valid? shape-result)
+                     (- (->float equity-pnl) expected-equity))
+        closed-pnl-gap (when (:valid? shape-result)
+                         (- (->float realized) (->float closed-pnl)))
+        active? (when (:valid? shape-result)
+                  (or (> closed-trades 0)
+                      (> orders 0)
+                      (> open-count 0)))
+        unknown-explanations (when (:valid? shape-result)
+                               (vec (remove allowed-explanations
+                                            (:report/explanations account))))
+        missing-economic-keys (when (:valid? shape-result)
+                                (vec (filter #(not (present-key? raw-account %))
+                                             required-economic-account-keys)))
+        broker-observed (:broker/equity-observed? account)
+        broker-observed-present? (present-key? raw-account
+                                               :broker/equity-observed?)
+        malformed-broker-observed? (and broker-observed-present?
+                                        (not (or (true? broker-observed)
+                                                 (false? broker-observed))))
+        open-position-issues (when (:valid? shape-result)
+                               (open-position-detail-issues open-positions))
+        open-position-unrealized-issues (when (:valid? shape-result)
+                                          (open-position-unrealized-issues
+                                           account open-positions))
+        issues (vec
+                (keep identity
+                      (concat
+                       shape-errors
+                       [(when-not (some? account-id)
+                         (issue :error
+                                :report/missing-account-id
+                                "Account-day is missing :account/id."))
+                       (when-not (some? date)
+                         (issue :error
+                                :report/missing-date
+                                "Account-day is missing :report/date."))
+                       (when (and (:valid? shape-result)
+                                  trading?
+                                  (seq missing-economic-keys))
+                         (issue :error
+                                :report/missing-economic-fields
+                                (str "Trading-day account report is missing required economic fields: "
+                                     (pr-str missing-economic-keys))))
+                       (when (and (:valid? shape-result)
+                                  (seq unknown-explanations))
+                         (issue :error
+                                :report/unknown-explanation
+                                (str "Account-day contains unknown report explanations: "
+                                     (pr-str unknown-explanations))))
+                       (when (and (:valid? shape-result)
+                                  malformed-broker-observed?)
+                         (issue :error
+                                :broker/equity-observed-malformed
+                                ":broker/equity-observed? must be literal true or false when present."))
+                       (when (and (false? trading?)
+                                  (:report/rendered? account))
+                         (issue :error
+                                :report/non-trading-day-rendered
+                                "Daily account report was rendered for a non-trading day."))
+                       (when (and (:valid? shape-result)
+                                  (material? equity-pnl)
+                                  (not active?)
+                                  (not (activity-pnl-explained? account)))
+                         (issue :error
+                                :pnl/material-pnl-without-activity
+                                "Material equity P&L has no trades, orders, open positions, or explicit explanation."))
+                       (when (and (:valid? shape-result)
+                                  (material? unrealized)
+                                  (= 0 open-count)
+                                  (not (activity-pnl-explained? account)))
+                         (issue :error
+                                :pnl/unrealized-without-open-position
+                                "Unrealized/carry-over P&L is present but no open position is represented."))
+                       (when (and (:valid? shape-result)
+                                  (pos? open-count)
+                                  (empty? open-positions))
+                         (issue :error
+                                :positions/open-count-without-position-detail
+                                "Any open position count requires explicit open position detail."))
+                       (when (and (:valid? shape-result)
+                                  (seq open-positions)
+                                  (not= open-count (count open-positions)))
+                         (issue :error
+                                :positions/open-count-detail-mismatch
+                                "Open-position count does not match listed open position detail."))
+                       (when (and (:valid? shape-result)
+                                  (material? equity-gap)
+                                  (not (equity-gap-explained? account)))
+                         (issue :warn
+                                :pnl/equity-realized-unrealized-gap
+                                "Equity day P&L does not equal realized plus unrealized P&L."))
+                       (when (and (:valid? shape-result)
+                                  (zero? closed-trades)
+                                  (material? realized)
+                                  (not (closed-pnl-explained? account)))
+                         (issue :error
+                                :pnl/realized-without-closed-trades
+                                "Realized P&L is material but the report has zero closed trades."))
+                       (when (and (:valid? shape-result)
+                                  (zero? orders)
+                                  (pos? closed-trades)
+                                  (not (closed-pnl-explained? account)))
+                         (issue :error
+                                :trade/closed-trades-without-orders
+                                "Closed trades are present but the report has zero orders/fills."))
+                       (when (and (:valid? shape-result)
+                                  (zero? closed-trades)
+                                  (material? closed-pnl)
+                                  (not (closed-pnl-explained? account)))
+                         (issue :error
+                                :pnl/closed-pnl-without-closed-trades
+                                "Closed-trade P&L is material but the report has zero closed trades."))
+                       (when (and (:valid? shape-result)
+                                  (pos? closed-trades)
+                                  (material? closed-pnl-gap)
+                                  (not (closed-pnl-explained? account)))
+                         (issue :error
+                                :pnl/realized-closed-trades-gap
+                                "Realized P&L does not equal closed-trade P&L."))
+                       (when (and (:valid? shape-result)
+                                  trading?
+                                  (not (true? broker-observed)))
+                         (issue :warn
+                                :broker/missing-equity-observation
+                                "Trading-day account report is missing a broker equity observation."))]
+                       open-position-issues
+                       open-position-unrealized-issues)))
+        issues (mapv #(with-account account-id %) issues)
+        has-error? (boolean (some #(= :error (:severity %)) issues))
+        has-warn? (boolean (some #(= :warn (:severity %)) issues))]
+    {:valid? (not has-error?)
+     :status (cond has-error? :error
+                   has-warn? :warn
+                   :else :ok)
+     :issues issues
+     :account account}))
+
+(defn validate-report-day
+  "Validate a full report-day projection:
+    {:report/date \"2026-07-02\"
+     :report/rendered? true
+     :accounts [(account-day {...}) ...]}"
+  [report]
+  (let [report (external->canonical report)
+        shape-result (reporting-schema/validation-result
+                      :reporting/report-day report)
+        date (:report/date report)
+        trading? (trading-day? date)
+        accounts (:accounts report)
+        account-inputs (if (or (vector? accounts)
+                               (seq? accounts)
+                               (python/isinstance accounts python/list))
+                         accounts
+                         [])
+        report-issues (vec
+                       (keep identity
+                             (concat
+                              (when-not (:valid? shape-result)
+                                [(schema-issue :reporting/report-day
+                                               shape-result)])
+                              [(when-not (some? date)
+                                (issue :error
+                                       :report/missing-date
+                                       "Report-day is missing :report/date."))
+                              (when (and (:valid? shape-result)
+                                         (empty? accounts))
+                                (issue :error
+                                       :report/no-accounts
+                                       "Report-day contains no account projections."))
+                              (when (and (false? trading?)
+                                         (:report/rendered? report true))
+                                (issue :error
+                                       :report/non-trading-day-rendered
+                                       "Daily report was rendered for a non-trading day."))])))
+        account-results (mapv #(validate-account-day
+                                (merge {:report/date date
+                                        :report/rendered?
+                                        (:report/rendered? report true)}
+                                       %))
+                              account-inputs)
+        account-date-issues (vec
+                             (keep identity
+                                   (map (fn [account-result]
+                                          (let [account (:account account-result)
+                                                account-date (:report/date account)]
+                                            (when (and (some? date)
+                                                       (some? account-date)
+                                                       (not= date account-date))
+                                              (with-account
+                                               (:account/id account)
+                                               (issue :error
+                                                      :report/account-date-mismatch
+                                                      "Account projection date does not match report date.")))))
+                                        account-results)))
+        duplicate-account-issues (duplicate-account-issues account-results)
+        report-total-issues (when (:valid? shape-result)
+                              (report-pnl-total-issues report
+                                                       (mapv :account account-results)))
+        issues (vec (concat report-issues
+                            account-date-issues
+                            duplicate-account-issues
+                            report-total-issues
+                            (mapcat :issues account-results)))
+        has-error? (boolean (some #(= :error (:severity %)) issues))
+        has-warn? (boolean (some #(= :warn (:severity %)) issues))]
+    {:valid? (not has-error?)
+     :status (cond has-error? :error
+                   has-warn? :warn
+                   :else :ok)
+     :trading-day? trading?
+     :issues issues
+     :account-results account-results}))

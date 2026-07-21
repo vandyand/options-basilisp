@@ -70,6 +70,26 @@
 
 (def default-artifact-root "resources/artifacts")
 
+(defn- parse-positive-int-option
+  [label value]
+  (when (some? value)
+    (try
+      (when (boolean? value)
+        (throw (python/ValueError
+                (str label " must be a positive integer, not boolean"))))
+      (let [s (str value)
+            n (int s)]
+        (when-not (= s (str n))
+          (throw (python/ValueError
+                  (str label " must be an integer literal: " s))))
+        (when-not (pos? n)
+          (throw (python/ValueError
+                  (str label " must be positive: " s))))
+        n)
+      (catch python/Exception e
+        (throw (python/ValueError
+                (str "invalid " label ": " value " (" e ")")))))))
+
 (defn describe-base
   []
   {:base/id base-id
@@ -122,10 +142,19 @@
                     (default [resources/strategies/simple-direction-sma-cross-v1.edn])
     :artifact-root  artifact store root (default resources/artifacts)
     :account-id     sim account route (default account/sim/main)
+    :account-routes optional {strategy-id account-id}; per-strategy replay
+                    account route. When present, strategy entries carry
+                    :account-id and the loop uses that over :account-id.
     :snapshot-every snapshot cadence in appended facts (default 50)
     :max-facts      stop at the first cycle boundary where this run's
                     appended count reaches this (no final snapshot —
                     simulated crash) (optional)
+    :bridge-ctx     optional {strategy-id {:signals-fn fn}} for bridge
+                    strategies. This mirrors engine-live and lets replay
+                    exercise bridged strategy declarations through the same
+                    engine loop, broker, ledger, and fact store.
+    :on-observation optional caller hook (fn [obs new?]) composed after the
+                    replay base updates deterministic market clock and marks.
     :resume?        override resume auto-detection (optional)
     :crash-after-fact / :crash-before-fact
                     engine.loop crash-injection predicates (test only;
@@ -141,11 +170,15 @@
      :resumed? bool :engine/state state :ledger ledger-state
      :skipped-ledger-fills [..]}"
   [{:keys [fixture-path out-dir strategy-paths artifact-root account-id
+           account-routes
            snapshot-every max-facts resume? crash-after-fact
-           crash-before-fact]}]
+           crash-before-fact bridge-ctx on-observation]}]
   (let [strategy-paths (or strategy-paths default-strategy-paths)
         artifact-root (or artifact-root default-artifact-root)
         account-id (or account-id default-account-id)
+        snapshot-every (parse-positive-int-option ":snapshot-every"
+                                                  snapshot-every)
+        max-facts (parse-positive-int-option ":max-facts" max-facts)
         ;; 1. wire adapters
         fixture* (fixture/load-fixture fixture-path)
         source (replay/make-replay-source fixture*)
@@ -160,8 +193,17 @@
                                      :clock (fn [] @market-clock)
                                      :position-seed (fn [] @position-seed)})
         ;; 2. strategies + engine state (fresh or recovered)
-        strategies (mapv #(eloop/load-strategy artifact-store run-mode %)
-                         strategy-paths)
+        strategies0 (mapv #(eloop/load-strategy artifact-store run-mode %)
+                          strategy-paths)
+        strategies (mapv (fn [entry]
+                           (let [sid (get-in entry [:decl :strategy/id])]
+                             (cond-> entry
+                               (get account-routes sid)
+                               (assoc :account-id (get account-routes sid))
+
+                               (get bridge-ctx sid)
+                               (assoc :bridge (get bridge-ctx sid)))))
+                         strategies0)
         _ (reg/build-registry (mapv :decl strategies))
         run-id (identifiers/new-record-id)
         run-info {:run/id run-id
@@ -239,7 +281,9 @@
               (when (or (nil? seed-wm)
                         (>= (compare (:fact/occurred-at obs) seed-wm) 0))
                 (swap! marks eloop/apply-payload-marks (:record/type obs)
-                       (:record/instrument-id obs) (:fact/payload obs))))})
+                       (:record/instrument-id obs) (:fact/payload obs)))
+              (when on-observation
+                (on-observation obs new?)))})
           (catch python/Exception e
             (if (eloop/crash-ex? e)
               {:crashed? true :crash (ex-data e)}
@@ -290,8 +334,9 @@
                    :strategy-paths (when strategies
                                      (vec (.split strategies ",")))
                    :artifact-root artifact-root
-                   :snapshot-every (when snapshot-every
-                                     (int snapshot-every))})]
+                   :snapshot-every (parse-positive-int-option
+                                    "--snapshot-every"
+                                    snapshot-every)})]
       (println (pr-str (dissoc result :engine/state :ledger)))
       result)))
 

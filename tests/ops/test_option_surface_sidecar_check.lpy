@@ -1,0 +1,106 @@
+(ns ops.test-option-surface-sidecar-check
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "option_surface_sidecar_check.lpy"))
+(def basilisp-bin (or (os.environ/get "BASILISP_BIN")
+                      (str (.joinpath root ".venv/bin/basilisp"))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads [s] (json/loads s))
+(defn read-json [p] (loads (.read_text p)))
+
+(defn surface [symbol strike]
+  {"symbol" symbol
+   "observed_at" "2026-07-10T15:30:00Z"
+   "underlying" strike
+   "contracts" [{"strike" strike
+                 "right" "CALL"
+                 "bid" 1.0
+                 "ask" 1.2
+                 "expiration" "20260717"}]})
+
+(defn surface-row []
+  (dumps {"SPXW" (dumps (surface "SPXW" 7550.0))
+          "VIXW" (dumps (surface "VIXW" 15.5))
+          "SPX" (dumps (surface "SPX" 7550.0))
+          "VIX" (dumps (surface "VIX" 15.5))}))
+
+(defn write-sidecar! [path rows]
+  (.mkdir (.-parent path) ** :parents true :exist_ok true)
+  (numpy/savez
+   path
+   ** :times (numpy/array (python/list (for [i (range rows)]
+                                         (str "2026-07-10T15:3" i ":00Z")))
+                          ** :dtype object)
+      :grids (numpy/zeros (python/tuple [rows 6 21 8]) ** :dtype numpy/float64)
+      :bar_buffers_json (numpy/array (python/list (repeat rows "")) ** :dtype object)
+      :option_chain_json (numpy/array (python/list (repeat rows "")) ** :dtype object)
+      :option_surfaces_json (numpy/array (python/list (repeat rows (surface-row))) ** :dtype object)))
+
+(defn write-bad-sidecar! [path]
+  (.mkdir (.-parent path) ** :parents true :exist_ok true)
+  (let [bad-contract {"strike" 7550.0
+                      "right" "CALL"
+                      "bid" 1.0
+                      "expiration" "20260717"}
+        bad-surface (dumps {"contracts" [bad-contract]})
+        bad-row (dumps {"SPXW" bad-surface})]
+    (numpy/savez
+     path
+     ** :times (numpy/array (python/list ["2026-07-10T15:30:00Z"]) ** :dtype object)
+        :grids (numpy/zeros (python/tuple [1 6 21 8]) ** :dtype numpy/float64)
+        :bar_buffers_json (numpy/array (python/list [""]) ** :dtype object)
+        :option_chain_json (numpy/array (python/list [""]) ** :dtype object)
+        :option_surfaces_json (numpy/array (python/list [bad-row]) ** :dtype object))))
+
+(defn run-check [args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(deftest option-surface-sidecar-check-accepts-valid-sidecar
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          sidecar (.joinpath tmp "option_surface_sidecar_20260710.npz")
+          out (.joinpath tmp "check.json")]
+      (write-sidecar! sidecar 2)
+      (let [result (run-check ["--sidecar" (str sidecar)
+                               "--target-date" "2026-07-10"
+                               "--min-rows" "2"
+                               "--out-json" (str out)])
+            payload (read-json out)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "ok")))
+        (is (= 2 (.get payload "row_count")))
+        (is (= 2 (.get payload "useful_row_count")))
+        (is (= ["SPX" "SPXW" "VIX" "VIXW"] (vec (.get payload "prefixes_present"))))
+        (is (= {"SPX" 2 "SPXW" 2 "VIX" 2 "VIXW" 2}
+               (into {} (.items (.get payload "contracts_by_prefix")))))
+        (is (= [] (vec (.get payload "issues"))))))))
+
+(deftest option-surface-sidecar-check-rejects-missing-prefix-and-malformed-contract
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          sidecar (.joinpath tmp "bad_sidecar.npz")]
+      (write-bad-sidecar! sidecar)
+      (let [result (run-check ["--sidecar" (str sidecar)
+                               "--target-date" "2026-07-10"
+                               "--required-prefixes" "SPXW,VIXW"])
+            payload (loads (.-stdout result))
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (str/includes? issues "missing required surface prefix: VIXW"))
+        (is (str/includes? issues "SPXW malformed contracts: 1"))))))

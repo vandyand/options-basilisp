@@ -1,0 +1,55 @@
+;; Audit published status dashboard artifacts and fail closed.
+(import glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.status.core :as status])
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/audit_status_publication.lpy -- "
+                "[--out-dir DIR]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:out-dir (or (os/getenv "STATUS_OUT_DIR")
+                           (os.path/join repo-root "report-viewer" "public" "reports" "status"))}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(try
+  (let [{:keys [out-dir]} (parse-args (vec *command-line-args*))
+        result (status/audit-status-publication out-dir)]
+    (println (json/dumps (status/->jsonable result) ** :indent 2 :sort_keys true))
+    (python/exit (if (:valid? result) 0 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

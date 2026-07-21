@@ -1,0 +1,389 @@
+;; Join neutralized-feature plan rows with current market-evidence outcomes.
+(import argparse csv datetime glob json os os.path sys)
+(require '[clojure.string :as str])
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def csv-fields
+  ["feature"
+   "family"
+   "unlock_status"
+   "source_note"
+   "current_evidence_status"
+   "current_reason"
+   "missing_evidence_reasons"
+   "required_evidence"
+   "next_evidence"
+   "model_gain"
+   "model_split_count"
+   "baseline_status"
+   "recomputed_status"
+   "live_mean"
+   "live_std"
+   "z_mean"
+   "z_std"
+   "zero_frac"])
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--plan-json" ** :required true)
+    (.add_argument parser "--out-dir" ** :default (os.path/join repo-root "live_runtime/analysis"))
+    (.add_argument parser "--target-date" ** :required true)
+    (.add_argument parser "--raw-unlock-json" ** :default nil :action "append")
+    (.add_argument parser "--v3-unlock-json" ** :default nil)
+    (.add_argument parser "--grid-input-parity-json" ** :default nil)
+    (.add_argument parser "--readiness-json" ** :default nil)
+    (.add_argument parser "--capture-check-json" ** :default nil)
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn attr [obj name] (python/getattr obj name))
+
+(defn compact-date [value]
+  (.replace (str value) "-" ""))
+
+(defn load-json [path]
+  (when (and path (os.path/exists path))
+    (fp/read-json path)))
+
+(defn int-value [x]
+  (try (int x) (catch python/Exception _ 0)))
+
+(defn raw-json-paths [values]
+  (vec
+   (filter seq
+           (map str/trim
+                (mapcat #(str/split (str %) #",")
+                        (or values []))))))
+
+(defn better-raw-row [existing candidate]
+  (cond
+    (nil? existing) candidate
+    (= true (get candidate "candidate")) candidate
+    (= true (get existing "candidate")) existing
+    :else candidate))
+
+(defn merge-raw-payloads [payloads]
+  (let [features-by-name
+        (reduce
+         (fn [acc payload]
+           (reduce
+            (fn [inner row]
+              (let [feature (get row "feature")]
+                (if feature
+                  (assoc inner feature (better-raw-row (get inner feature) row))
+                  inner)))
+            acc
+            (get payload "features" [])))
+         {}
+         payloads)
+        summaries (vec (map #(get % "summary" {}) payloads))
+        neutralized-total (reduce max 0 (map #(int-value (get % "neutralized_total" 0)) summaries))
+        covered-sources (vec (sort (set (mapcat #(keys (or (get % "source_counts") {})) summaries))))
+        supported-count (count features-by-name)]
+    {"summary" {"supported_neutralized" supported-count
+                "unsupported_neutralized" (if (pos? neutralized-total)
+                                            (max 0 (- neutralized-total supported-count))
+                                            (if (seq summaries)
+                                              (reduce min (map #(int-value (get % "unsupported_neutralized" 0)) summaries))
+                                              0))
+                "neutralized_total" neutralized-total
+                "covered_sources" covered-sources
+                "raw_unlock_json_count" (count payloads)
+                "candidate_count" (count (filter #(= true (get % "candidate")) (vals features-by-name)))}
+     "features" (vec (vals features-by-name))}))
+
+(defn by-feature [payload]
+  (into {}
+        (for [row (get payload "features" [])
+              :let [feature (get row "feature")]
+              :when feature]
+          [feature row])))
+
+(defn evidence-reasons [readiness capture-check]
+  (let [readiness-reasons (get readiness "reasons" [])
+        capture-issues (get capture-check "issues" [])
+        capture-warnings (get capture-check "warnings" [])]
+    (vec (concat readiness-reasons capture-issues capture-warnings))))
+
+(defn concise-global-reason [source-note readiness capture-check]
+  (let [rows (get-in readiness ["baseline" "target_date_rows"] (get-in readiness ["baseline" "rows"] 0))
+        min-rows (get-in readiness ["baseline" "min_rows"] 60)
+        missing-prefixes (get-in readiness ["capture_v2_sidecars" "missing_option_surface_prefixes"] [])
+        hist-reason (get-in readiness ["historical_feature_cohort" "reason"])
+        hist-error-class (get-in readiness ["historical_feature_cohort" "error_class"])
+        theta-usable (get-in readiness ["thetadata_probe" "usable"])
+        capture-ok (get capture-check "ok")
+        candidate-parts [(when (< (int-value rows) (int-value min-rows))
+                           (str "only " rows " target-date capture rows; need >= " min-rows))
+                         (when (= false capture-ok)
+                           "capture-v2 sidecar check is not clean")
+                         (when (seq missing-prefixes)
+                           (str "missing option surface prefixes: " (str/join ", " missing-prefixes)))
+                         (when (or hist-error-class hist-reason)
+                           (str "historical cohort unavailable: " (or hist-error-class hist-reason)))
+                         (when (= 0 (int-value theta-usable))
+                           "ThetaData probe has no usable surfaces")]
+        parts (vec (filter identity candidate-parts))]
+    (if (seq parts)
+      (str/join "; " parts)
+      (case source-note
+        "v3_grid_unlock_audit" "awaiting V3 grid unlock audit evidence"
+        "greek_reconstruction_candidate_formula" "awaiting Greek reconstruction promotion evidence"
+        "option_surface_formula" "awaiting same-day option surface evidence"
+        "option_surface_greek_grid_formula" "awaiting same-day option surface Greek-grid evidence"
+        "option_chain_quote_formula" "awaiting same-day option-chain quote evidence"
+        "bar_buffer_replay" "awaiting same-day bar-buffer replay evidence"
+        "v2_grid_formula" "awaiting same-day grid input parity evidence"
+	        "v2_engine_replay" "awaiting same-day V2 replay evidence"
+	        "awaiting required market evidence"))))
+
+(defn missing-market-evidence?
+  [readiness capture-check]
+  (let [rows (get-in readiness ["baseline" "target_date_rows"] (get-in readiness ["baseline" "rows"] 0))
+        min-rows (get-in readiness ["baseline" "min_rows"] 60)
+        missing-prefixes (get-in readiness ["capture_v2_sidecars" "missing_option_surface_prefixes"] [])
+        hist-reason (get-in readiness ["historical_feature_cohort" "reason"])
+        hist-error-class (get-in readiness ["historical_feature_cohort" "error_class"])
+        theta-usable (get-in readiness ["thetadata_probe" "usable"])
+        capture-ok (get capture-check "ok")]
+    (or (< (int-value rows) (int-value min-rows))
+        (= false capture-ok)
+        (seq missing-prefixes)
+        (or (some? hist-reason) (some? hist-error-class))
+        (= 0 (int-value theta-usable)))))
+
+(defn missing-market-evidence-tags
+  [readiness capture-check]
+  (let [rows (get-in readiness ["baseline" "target_date_rows"] (get-in readiness ["baseline" "rows"] 0))
+        min-rows (get-in readiness ["baseline" "min_rows"] 60)
+        missing-prefixes (get-in readiness ["capture_v2_sidecars" "missing_option_surface_prefixes"] [])
+        hist-reason (get-in readiness ["historical_feature_cohort" "reason"])
+        hist-error-class (get-in readiness ["historical_feature_cohort" "error_class"])
+        theta-usable (get-in readiness ["thetadata_probe" "usable"])
+        capture-ok (get capture-check "ok")]
+    (vec (concat
+          (if (< (int-value rows) (int-value min-rows))
+            [(str "capture-rows-below-min:" rows "/" min-rows)]
+            [])
+          (if (= false capture-ok)
+            ["capture-v2-sidecar-check-failed"]
+            [])
+          (map #(str "missing-option-surface-prefix:" %) missing-prefixes)
+          (if (or hist-error-class hist-reason)
+            [(str "historical-cohort-unavailable:" (or hist-error-class hist-reason))]
+            [])
+          (if (= 0 (int-value theta-usable))
+            ["thetadata-probe-no-usable-surfaces"]
+            [])))))
+
+(defn grid-alignment-reason [grid]
+  (let [diagnosis (get grid "alignment_diagnosis" {})
+        category (get diagnosis "category")
+        reason (get diagnosis "reason")
+        carried (get diagnosis "historical_carried_grid_rows")
+        best-lag (get-in grid ["best_sequence_lag" "lag_minutes"])
+        min-corr (get grid "min_correlation")]
+    (when (seq (str category))
+      (str "grid input parity blocker=" category
+           (when (some? carried) (str ", historical_carried_grid_rows=" carried))
+           (when (some? best-lag) (str ", best_sequence_lag_minutes=" best-lag))
+           (when (some? min-corr) (str ", min_correlation=" min-corr))
+           (when (seq (str reason)) (str "; " reason))))))
+
+(defn feature-current-row [plan-row raw-by-feature v3-by-feature raw-covered-sources readiness capture-check grid]
+  (let [feature (get plan-row "feature")
+        source-note (get plan-row "source_note")
+        raw-row (get raw-by-feature feature)
+        v3-row (get v3-by-feature feature)
+        evidence-row (or raw-row v3-row)
+        candidate? (= true (get evidence-row "candidate"))
+        source-covered? (contains? raw-covered-sources source-note)
+        missing-market-evidence? (missing-market-evidence? readiness capture-check)
+        missing-tags (when (and (not evidence-row) missing-market-evidence?)
+                       (missing-market-evidence-tags readiness capture-check))
+        recomputed-status (get evidence-row "recomputed_status")
+        baseline-status (get evidence-row "baseline_status")
+        grid-reason (when (or (= source-note "v3_grid_unlock_audit")
+                              (= source-note "v2_grid_formula")
+                              (= (get plan-row "family") "v3-grid"))
+                      (grid-alignment-reason grid))
+        current-status (cond
+                         candidate? "candidate"
+                         evidence-row "blocked-by-current-evidence"
+                         source-covered? "blocked-by-current-evidence"
+                         missing-market-evidence? "blocked-by-missing-market-evidence"
+                         :else "awaiting-current-evidence")
+        current-reason (cond
+	                         candidate? "current audit marks this feature as an unmask candidate"
+	                         evidence-row (str "current audit recomputed_status=" recomputed-status
+	                                           ", baseline_status=" baseline-status
+	                                           ", rows still insufficient or distribution not sane"
+	                                           (when grid-reason (str "; " grid-reason)))
+                         source-covered? (str "current audit covered source " source-note
+                                              " but did not produce a finite replay value for this feature")
+                         grid-reason grid-reason
+	                         :else (concise-global-reason source-note readiness capture-check))]
+    {"feature" feature
+     "family" (get plan-row "family")
+     "unlock_status" (get plan-row "unlock_status")
+     "source_note" source-note
+     "current_evidence_status" current-status
+     "current_reason" current-reason
+     "missing_evidence_reasons" (when missing-tags (str/join "; " missing-tags))
+     "required_evidence" (get plan-row "requirement")
+     "next_evidence" (get plan-row "next_evidence")
+     "model_gain" (get plan-row "model_gain" 0.0)
+     "model_split_count" (get plan-row "model_split_count" 0)
+     "baseline_status" baseline-status
+     "recomputed_status" recomputed-status
+     "live_mean" (get evidence-row "live_mean")
+     "live_std" (get evidence-row "live_std")
+     "z_mean" (get evidence-row "z_mean")
+     "z_std" (get evidence-row "z_std")
+     "zero_frac" (get evidence-row "zero_frac")}))
+
+(defn nested-status-counts
+  [rows group-key]
+  (into {}
+        (for [[group group-rows] (group-by #(get % group-key "unknown") rows)]
+          [group (frequencies (map #(get % "current_evidence_status") group-rows))])))
+
+(defn filtered-counts
+  [rows row-pred group-key]
+  (frequencies (map #(get % group-key "unknown") (filter row-pred rows))))
+
+(defn missing-reason-counts
+  [rows]
+  (frequencies
+   (mapcat (fn [row]
+             (let [reasons (get row "missing_evidence_reasons")]
+               (if (seq (str reasons))
+                 (str/split reasons #"; ")
+                 [])))
+           rows)))
+
+(defn summarize [rows plan raw v3 readiness grid]
+  (let [status-counts (frequencies (map #(get % "current_evidence_status") rows))
+        source-counts (frequencies (map #(get % "source_note") rows))
+        family-counts (frequencies (map #(get % "family") rows))
+        missing-row? #(= "blocked-by-missing-market-evidence"
+                         (get % "current_evidence_status"))
+        current-evidenced? #(contains? #{"candidate" "blocked-by-current-evidence"}
+                                       (get % "current_evidence_status"))
+        current-evidenced (count (filter current-evidenced? rows))]
+    {"target_date" (get-in plan ["summary" "target_date"])
+     "generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc)
+                               "%Y-%m-%dT%H:%M:%SZ")
+     "neutralized_total" (count rows)
+     "current_evidenced_neutralized" current-evidenced
+     "current_unevidenced_neutralized" (- (count rows) current-evidenced)
+     "current_status_counts" status-counts
+     "current_status_by_source" (nested-status-counts rows "source_note")
+     "current_status_by_family" (nested-status-counts rows "family")
+     "missing_market_evidence_by_source" (filtered-counts rows missing-row? "source_note")
+     "missing_market_evidence_by_family" (filtered-counts rows missing-row? "family")
+     "missing_market_evidence_reason_counts" (missing-reason-counts rows)
+     "source_counts" source-counts
+     "family_counts" family-counts
+	     "raw_supported_neutralized" (get-in raw ["summary" "supported_neutralized"] 0)
+	     "raw_unsupported_neutralized" (get-in raw ["summary" "unsupported_neutralized"] 0)
+	     "raw_covered_sources" (get-in raw ["summary" "covered_sources"] [])
+	     "v3_neutralized_features" (get-in v3 ["summary" "neutralized_v3_features"] 0)
+	     "grid_alignment_diagnosis" (get grid "alignment_diagnosis" {})
+     "readiness_verdict" (get readiness "verdict")
+     "readiness_reason_count" (count (get readiness "reasons" []))}))
+
+(defn write-csv [path rows]
+  (with-open [fh (open path ** :mode "w" :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list csv-fields))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer (python/dict
+                           (map (fn [field] (python/tuple [field (get row field "")]))
+                                csv-fields)))))))
+
+(defn markdown [summary rows]
+  (let [top (vec (take 30 rows))
+        status-rows (vec (concat [["Status" "Count"]]
+                                 (map (fn [[k v]] [k v])
+                                      (get summary "current_status_counts" {}))))
+        source-missing-rows (vec (concat [["Source" "Missing Evidence Blockers"]]
+                                         (map (fn [[k v]] [k v])
+                                              (get summary "missing_market_evidence_by_source" {}))))
+        reason-rows (vec (concat [["Missing Evidence Reason" "Feature Count"]]
+                                 (map (fn [[k v]] [k v])
+                                      (get summary "missing_market_evidence_reason_counts" {}))))]
+    (str "# Neutralized Feature Evidence Report\n\n"
+         "- Neutralized features: `" (get summary "neutralized_total") "`\n"
+         "- Readiness verdict: `" (get summary "readiness_verdict") "`\n"
+         "- Readiness reasons: `" (get summary "readiness_reason_count") "`\n"
+         "- Current evidenced neutralized: `" (get summary "current_evidenced_neutralized") "`\n"
+         "- Current unevidenced neutralized: `" (get summary "current_unevidenced_neutralized") "`\n"
+         "- Raw supported neutralized: `" (get summary "raw_supported_neutralized") "`\n"
+         "- Raw unsupported neutralized: `" (get summary "raw_unsupported_neutralized") "`\n"
+         "- V3 neutralized features: `" (get summary "v3_neutralized_features") "`\n\n"
+         "## Current Evidence Status\n\n"
+         (fp/md-table status-rows) "\n\n"
+         "## Missing Market Evidence By Source\n\n"
+         (fp/md-table source-missing-rows) "\n\n"
+         "## Missing Market Evidence Reasons\n\n"
+         (fp/md-table reason-rows) "\n\n"
+         "## Highest-Gain Current Blockers\n\n"
+         (fp/md-table
+          (vec (concat [["Feature" "Source" "Current Status" "Current Reason"]]
+                       (map (fn [row]
+                              [(str "`" (get row "feature") "`")
+                               (get row "source_note")
+                               (get row "current_evidence_status")
+                               (get row "current_reason")])
+                            top)))) "\n")))
+
+(defn run-main [args]
+  (let [target-date (attr args "target_date")
+        stamp (compact-date target-date)
+        out-dir (attr args "out_dir")
+        out-base (os.path/join out-dir (str "neutralized_feature_evidence_report_" stamp))
+        plan (load-json (attr args "plan_json"))
+        raw-paths (raw-json-paths (attr args "raw_unlock_json"))
+        raw (merge-raw-payloads (vec (filter identity (map load-json raw-paths))))
+        v3 (or (load-json (attr args "v3_unlock_json")) {})
+        grid (or (load-json (attr args "grid_input_parity_json")) {})
+        readiness (or (load-json (attr args "readiness_json")) {})
+        capture-check (or (load-json (attr args "capture_check_json")) {})
+        raw-by-feature (by-feature raw)
+        v3-by-feature (by-feature v3)
+        raw-covered-sources (set (get-in raw ["summary" "covered_sources"] []))
+        rows (vec (map #(feature-current-row % raw-by-feature v3-by-feature raw-covered-sources readiness capture-check grid)
+                       (get plan "features" [])))
+        summary (assoc (summarize rows plan raw v3 readiness grid)
+                       "target_date" target-date
+                       "plan_json" (attr args "plan_json")
+                       "raw_unlock_json" raw-paths
+                       "v3_unlock_json" (attr args "v3_unlock_json")
+                       "grid_input_parity_json" (attr args "grid_input_parity_json")
+                       "readiness_json" (attr args "readiness_json")
+                       "capture_check_json" (attr args "capture_check_json"))
+        json-path (str out-base ".json")
+        csv-path (str out-base ".csv")
+        md-path (str out-base ".md")]
+    (os/makedirs out-dir ** :exist_ok true)
+    (spit json-path (str (json/dumps (fp/->jsonable {"summary" summary "features" rows})
+                                     ** :indent 2 :sort_keys true) "\n"))
+    (write-csv csv-path rows)
+    (spit md-path (markdown summary rows))
+    (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote " json-path))
+    (println (str "wrote " csv-path))
+    (println (str "wrote " md-path))
+    0))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

@@ -1,0 +1,172 @@
+;; Build bounded, batch historical requests from an immutable live stream receipt.
+(import argparse json os os.path sys)
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn py-dict? [value] (python/isinstance value python/dict))
+
+(defn clock [ms]
+  (let [n (int ms) h (quot n 3600000) m (quot (mod n 3600000) 60000)
+        s (quot (mod n 60000) 1000) milli (mod n 1000)]
+    (format "%02d:%02d:%02d.%03d" h m s milli)))
+
+(defn compact-date [value] (.replace (str value) "-" ""))
+(defn canonical-right [value]
+  (if (contains? #{"C" "CALL"} (.upper (str value))) "C" "P"))
+
+(defn read-events [path]
+  (vec (keep (fn [line]
+               (try (json/loads line) (catch python/Exception _ nil)))
+             (.splitlines (slurp path)))))
+
+(defn read-json-if-present [path]
+  (when (and path (os.path/exists path))
+    (try (json/loads (slurp path)) (catch python/Exception _ nil))))
+
+(defn plan-strike-range [receipt]
+  (let [plan (read-json-if-present (.get receipt "plan_file"))
+        value (when plan (.get plan "strike_range"))]
+    (when (and value (pos? (int value))) (int value))))
+
+(defn quote-or-trade [payload] (or (.get payload "quote") (.get payload "trade")))
+
+(defn stream-key [payload]
+  ;; Historical query identity is the subscribed stream contract/type, not an
+  ;; individual intraminute tick. Retaining one representative event per
+  ;; stream keeps manifest construction bounded on high-volume market opens.
+  (let [header (.get payload "header")
+        contract (.get payload "contract")
+        security (or (.get payload "sec_type")
+                     (when (py-dict? contract) (.get contract "security_type")))
+        req (or (.get payload "req_type")
+                (when (py-dict? header) (.get header "type")))]
+    (when (and security req (py-dict? contract))
+      (str security "|" req "|" (.get contract "root") "|"
+           (.get contract "expiration") "|" (.get contract "strike") "|"
+           (.get contract "right")))))
+
+(defn first-event-per-stream [events]
+  (vals (reduce (fn [acc payload]
+                  (let [key (stream-key payload)]
+                    (if (or (nil? key) (contains? acc key))
+                      acc
+                      (assoc acc key payload))))
+                {} events)))
+
+(defn selected-contract [contract]
+  {"root" (str (.get contract "root"))
+   "expiration" (compact-date (.get contract "expiration"))
+   "strike" (str (.get contract "strike"))
+   "right" (canonical-right (.get contract "right"))})
+
+(defn event-request [payload strike-range]
+  (let [header (.get payload "header")
+        contract (.get payload "contract")
+        ;; ThetaData's current socket frames identify the stream in the nested
+        ;; header/contract objects; keep top-level fields for older captures.
+        security (or (.get payload "sec_type")
+                     (when (py-dict? contract) (.get contract "security_type")))
+        req (or (.get payload "req_type")
+                (when (py-dict? header) (.get header "type")))
+        body (quote-or-trade payload)]
+    (when (and contract body (.get body "date") (.get body "ms_of_day"))
+      (let [date (.get body "date") ms (.get body "ms_of_day")
+            common {"start_time_et" (clock ms) "end_time_et" (clock ms)
+                    "live_event_count" 1}]
+        (cond
+          (= security "OPTION")
+          (merge common
+                 {"class" (str "option-" (.lower req))
+                  "endpoint" (str "/v3/option/history/" (.lower req))
+                  ;; A stream plan is created from this same bounded snapshot.
+                  ;; Request both rights in one call; the matcher still filters to
+                  ;; the exact frozen contract set before asserting parity.
+                  "params" (cond-> {"symbol" (.get contract "root")
+                                     "expiration" (compact-date (.get contract "expiration"))
+                                     "date" date "interval" "tick" "right" "both"
+                                     "format" "json"}
+                              strike-range (assoc "strike_range" strike-range)
+                              (nil? strike-range) (assoc "strike" "*"))
+                  "selected_contracts" [(selected-contract contract)]})
+
+          (= security "INDEX")
+          (merge common
+                 {"class" "index-price" "endpoint" "/v3/index/history/price"
+                  "params" {"symbol" (.get contract "root") "date" date
+                            "interval" "tick" "format" "json"}})
+
+          (= security "STOCK")
+          (merge common
+                 {"class" (str "stock-" (.lower req))
+                  "endpoint" (str "/v3/stock/history/" (.lower req))
+                  "params" {"symbol" (.get contract "root") "date" date
+                            "interval" "tick" "format" "json"}
+                  ;; Direct live parity is against the current-session Nasdaq
+                  ;; Basic feed. The v3 terminal can resolve prior-session
+                  ;; `venue=nqb` history to the same UTP/CTA corpus, so this
+                  ;; request is evidence only while the captured session is
+                  ;; still current; UTP/CTA remains separate long-horizon data.
+                  "historical_venues" ["nqb"]}))))))
+
+(defn key-for [request]
+  ;; selected contracts and observed times are aggregation metadata, not query identity.
+  (str (get request "endpoint") "|"
+       (json/dumps (jsonable (get request "params")) ** :sort_keys true)))
+
+(defn merge-contracts [left right]
+  (vec (sort-by #(json/dumps (jsonable %) ** :sort_keys true)
+                (set (concat (or (get left "selected_contracts") [])
+                             (or (get right "selected_contracts") []))))))
+
+(defn merge-request [left right]
+  (-> left
+      (assoc "start_time_et" (min (get left "start_time_et") (get right "start_time_et"))
+             "end_time_et" (max (get left "end_time_et") (get right "end_time_et"))
+             "live_event_count" (+ (get left "live_event_count" 0)
+                                   (get right "live_event_count" 0)))
+      (cond-> (or (get left "selected_contracts") (get right "selected_contracts"))
+        (assoc "selected_contracts" (merge-contracts left right)))))
+
+(defn consolidate-request-group [requests]
+  ;; Do one set union and sort for a query group. Repeatedly calling
+  ;; merge-request for every tick/contract is quadratic at a busy open.
+  (let [first-request (first requests)
+        selected (vec (sort-by #(json/dumps (jsonable %) ** :sort_keys true)
+                               (set (mapcat #(or (get % "selected_contracts") []) requests))))]
+    (cond->
+      (assoc first-request
+             "start_time_et" (apply min (map #(get % "start_time_et") requests))
+             "end_time_et" (apply max (map #(get % "end_time_et") requests))
+             "live_event_count" (reduce + 0 (map #(get % "live_event_count" 0) requests)))
+      (seq selected) (assoc "selected_contracts" selected))))
+
+(defn parse-args [argv]
+  (let [p (argparse/ArgumentParser)]
+    (.add_argument p "--stream-receipt" ** :required true)
+    (.add_argument p "--out" ** :required true)
+    (.parse_args p (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv) receipt (json/loads (slurp (.-stream_receipt args)))
+        events (read-events (.get receipt "event_path")) strike-range (plan-strike-range receipt)
+        representative-events (first-event-per-stream events)
+        requests (vec (keep #(event-request % strike-range) representative-events))
+        merged (vec (map consolidate-request-group (vals (group-by key-for requests))))
+        payload {"schema_version" 2 "stream_receipt" (os.path/abspath (.-stream_receipt args))
+                 "event_path" (.get receipt "event_path") "live_events_parsed" (count events)
+                 "representative_stream_events" (count representative-events)
+                 "stream_plan_file" (.get receipt "plan_file") "stream_plan_strike_range" strike-range
+                 "historical_requests" (vec (sort-by key-for merged))}]
+    (os/makedirs (os.path/dirname (.-out args)) ** :exist_ok true)
+    (spit (.-out args) (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+    (println (json/dumps (jsonable {"requests" (count merged) "events" (count events)
+                                    "representative_stream_events" (count representative-events)
+                                    "out" (.-out args)}) ** :sort_keys true))
+    0))
+
+(try (python/exit (run-main (vec *command-line-args*)))
+     (catch python/Exception e (binding [*out* *err*] (println (str e))) (python/exit 2)))

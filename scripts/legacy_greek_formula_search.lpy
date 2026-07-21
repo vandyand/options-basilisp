@@ -1,0 +1,375 @@
+;; Search archived files for formula provenance of blocked Greek features.
+(import csv datetime glob json os os.path re sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def default-blocked (os.path/join repo-root "live_runtime/analysis/blocked_feature_provenance_audit_current.json"))
+(def default-out (os.path/join repo-root "live_runtime/analysis"))
+(def default-roots [repo-root
+                    (os.path/dirname repo-root)
+                    (os.path/join (os.path/dirname repo-root) "SteveTrading/ref/Data-Preprocessor")])
+
+(def include-suffixes #{".py" ".lpy" ".clj" ".cljs" ".edn" ".md" ".txt" ".json" ".yaml" ".yml" ".ipynb"})
+(def excluded-parts #{".git" ".mypy_cache" ".pytest_cache" ".ruff_cache" ".venv"
+                      "__pycache__" "node_modules" "report-viewer"
+                      "stevetrading_basilisp.egg-info" "live_runtime"
+                      "pipeline_data" "tests"})
+(def source-like-suffixes #{".py" ".lpy" ".clj" ".cljs"})
+
+(def formula-hint-re
+  (re/compile "(def |defn |lambda|epsilon|delta|vega|theta|rho|volume|exposure|weighted|mean|sum|np\\.|numpy|pandas|=|\\*|/|\\+|-)"))
+(def artifact-hint-re
+  (re/compile "(feature_names|neutralize_features|report|replay|rebucket|summary|model_dump|json)"))
+(def reconstruction-context-re
+  (re/compile "(feature\\(|features\\[|candidate_formula)"))
+(def class-re (re/compile "^\\s*class\\s+([A-Za-z_][A-Za-z0-9_]*)\\b"))
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/legacy_greek_formula_search.lpy -- "
+                "[--blocked-json PATH] [--root DIR ...] [--out-dir DIR] "
+                "[--label LABEL] [--target-date YYYY-MM-DD] [--max-bytes N] "
+                "[--context-lines N] [--max-hits-per-needle N]")))
+
+(defn option-value [remaining flag]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith value "--"))
+      (throw (python/ValueError (str "missing value for " flag))))
+    value))
+
+(defn parse-int [value flag]
+  (try
+    (python/int value)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid integer for " flag ": " value))))))
+
+(defn parse-args [args]
+  (loop [remaining args
+         out {:blocked-json default-blocked
+              :root []
+              :out-dir default-out
+              :label "current"
+              :target-date nil
+              :max-bytes 3000000
+              :context-lines 2
+              :max-hits-per-needle 25}]
+    (if (empty? remaining)
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--blocked-json") (recur (nnext remaining) (assoc out :blocked-json (option-value remaining arg)))
+          (= arg "--root") (recur (nnext remaining) (update out :root conj (option-value remaining arg)))
+          (= arg "--out-dir") (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+          (= arg "--label") (recur (nnext remaining) (assoc out :label (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+          (= arg "--max-bytes") (recur (nnext remaining) (assoc out :max-bytes (parse-int (option-value remaining arg) arg)))
+          (= arg "--context-lines") (recur (nnext remaining) (assoc out :context-lines (parse-int (option-value remaining arg) arg)))
+          (= arg "--max-hits-per-needle") (recur (nnext remaining) (assoc out :max-hits-per-needle (parse-int (option-value remaining arg) arg)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn load-blocked [path]
+  (let [payload (fp/read-json path)
+        suffixes (sort (set (for [row (get payload "suffixes" [])
+                                  :let [suffix (get row "suffix")]
+                                  :when suffix]
+                              suffix)))
+        features (sort (set (for [row (get payload "features" [])
+                                  :let [feature (get row "feature")]
+                                  :when feature]
+                              feature)))
+        derived (sort (set (for [feature features
+                                  :when (not= -1 (.find feature "_greeks_"))]
+                              (second (.split feature "_greeks_" 1)))))]
+    [(if (seq suffixes) suffixes derived) features]))
+
+(defn lower-suffix [path]
+  (.lower (second (os.path/splitext (str path)))))
+
+(defn path-parts [path]
+  (set (.split (str path) (.-sep os))))
+
+(defn excluded? [path excluded]
+  (boolean (some #(contains? excluded %) (path-parts path))))
+
+(defn file-size-ok? [path max-bytes]
+  (try
+    (<= (.-st_size (os/stat path)) max-bytes)
+    (catch python/OSError _ false)))
+
+(defn candidate-files [roots max-bytes]
+  (let [files (atom #{})]
+    (doseq [root roots]
+      (when (os.path/exists root)
+        (doseq [path (glob/glob (os.path/join root "**" "*") ** :recursive true)]
+          (when (and (os.path/isfile path)
+                     (contains? include-suffixes (lower-suffix path))
+                     (not (excluded? path excluded-parts))
+                     (file-size-ok? path max-bytes))
+            (swap! files conj path)))))
+    (vec (sort @files))))
+
+(defn manifest-files [roots]
+  (let [files (atom #{})
+        manifest-excluded (disj excluded-parts "pipeline_data")]
+    (doseq [root roots]
+      (when (os.path/exists root)
+        (doseq [path (glob/glob (os.path/join root "**" "feature_manifest.yaml") ** :recursive true)]
+          (when (and (os.path/isfile path)
+                     (not (excluded? path manifest-excluded)))
+            (swap! files conj path)))))
+    (vec (sort @files))))
+
+(defn read-lines [path]
+  (try
+    (.splitlines (slurp path))
+    (catch python/OSError _ nil)))
+
+(defn parse-feature-manifest [path blocked-features]
+  (let [lines (read-lines path)]
+    (if (nil? lines)
+      []
+      (let [rows (atom [])
+            current (atom {})]
+        (doseq [line lines]
+          (let [stripped (.strip line)]
+            (cond
+              (.startswith stripped "- name:")
+              (do
+                (when (contains? blocked-features (get @current "name"))
+                  (swap! rows conj (assoc @current "manifest_path" (str path))))
+                (reset! current {"name" (.strip (second (.split stripped ":" 1)))}))
+
+              (and (not (empty? @current)) (not= -1 (.find stripped ":")))
+              (let [[k v] (.split stripped ":" 1)]
+                (when (contains? #{"version" "module" "impl_class"} k)
+                  (swap! current assoc k (.strip v)))))))
+        (when (contains? blocked-features (get @current "name"))
+          (swap! rows conj (assoc @current "manifest_path" (str path))))
+        @rows))))
+
+(defn source-class-index [files]
+  (let [idx (atom {})]
+    (doseq [path files]
+      (when (= ".py" (lower-suffix path))
+        (when-let [lines (read-lines path)]
+          (doseq [[lineno line] (map-indexed vector lines)]
+            (when-let [match (.match class-re line)]
+              (swap! idx update (.group match 1) (fnil conj []) (str path ":" (inc lineno))))))))
+    @idx))
+
+(defn manifest-references [roots source-files features]
+  (let [blocked (set features)
+        class-index (source-class-index source-files)]
+    (vec
+      (sort-by (fn [row] [(str (get row "name")) (str (get row "manifest_path"))])
+               (for [manifest (manifest-files roots)
+                     row (parse-feature-manifest manifest blocked)
+                     :let [impl (str (get row "impl_class" ""))
+                           locations (get class-index impl [])]]
+                 (assoc row
+                        "impl_class_found" (boolean (seq locations))
+                        "impl_class_locations" (vec (take 10 locations))))))))
+
+(defn line-context [lines idx context-lines]
+  (let [start (max 0 (- idx context-lines))
+        end (min (count lines) (+ idx context-lines 1))]
+    (.join "\n" (map #(.rstrip % "\n") (subvec (vec lines) start end)))))
+
+(defn regex-search? [pattern text]
+  (boolean (.search pattern text)))
+
+(defn classify-hit [path context exact?]
+  (let [lowered-path (.join "/" (map #(.lower (str %)) (path-parts path)))
+        lowered-context (.lower context)
+        suffix (lower-suffix path)
+        formula? (regex-search? formula-hint-re context)
+        artifact-path? (regex-search? artifact-hint-re lowered-path)
+        artifact-context? (regex-search? artifact-hint-re lowered-context)
+        reconstruction? (and (regex-search? reconstruction-context-re lowered-context)
+                             (= -1 (.find lowered-context "candidate_formula\": \"\"")))]
+    (cond
+      (and exact?
+           (contains? source-like-suffixes suffix)
+           formula?
+           (not artifact-path?))
+      "candidate_formula_context"
+
+      (and (not exact?)
+           (contains? source-like-suffixes suffix)
+           formula?
+           reconstruction?
+           (not artifact-path?))
+      "candidate_reconstruction_context"
+
+      (or (some #(not= -1 (.find lowered-path %))
+                ["feature_manifest" "feature_names" "neutralize" "report" "parity" "analysis" "pipeline_data"])
+          (and artifact-context? (not formula?)))
+      "artifact_or_report_reference"
+
+      formula?
+      "weak_formula_context"
+
+      :else
+      "name_reference")))
+
+(defn scan-file [path needles context-lines max-hits-per-needle]
+  (try
+    (let [text (slurp path)
+          present (vec (filter #(not= -1 (.find text %)) needles))]
+      (if (empty? present)
+        []
+        (let [lines (vec (.splitlines text))
+              counts (atom (into {} (map (fn [n] [n 0]) present)))
+              hits (atom [])]
+          (doseq [[idx line] (map-indexed vector lines)]
+            (doseq [needle present]
+              (when (and (not= -1 (.find line needle))
+                         (< (get @counts needle 0) max-hits-per-needle))
+                (let [context (line-context lines idx context-lines)
+                      exact? (not= -1 (.find needle "_greeks_"))]
+                  (swap! hits conj {"needle" needle
+                                    "path" (str path)
+                                    "line" (inc idx)
+                                    "exact_feature" exact?
+                                    "classification" (classify-hit path context exact?)
+                                    "context" context})
+                  (swap! counts update needle inc)))))
+          @hits)))
+    (catch python/OSError _ [])))
+
+(defn summarize [hits suffixes features manifest-refs]
+  (let [classification-counts (frequencies (map #(get % "classification") hits))
+        suffix-hit-counts (atom (into {} (map (fn [s] [s 0]) suffixes)))
+        feature-hit-counts (atom (into {} (map (fn [f] [f 0]) features)))
+        candidate-formula-hits (count (filter #(= "candidate_formula_context" (get % "classification")) hits))
+        candidate-reconstruction-hits (count (filter #(= "candidate_reconstruction_context" (get % "classification")) hits))]
+    (doseq [hit hits]
+      (let [needle (get hit "needle")]
+        (when (contains? @suffix-hit-counts needle)
+          (swap! suffix-hit-counts update needle inc))
+        (when (contains? @feature-hit-counts needle)
+          (swap! feature-hit-counts update needle inc))))
+    {"blocked_suffix_count" (count suffixes)
+     "blocked_feature_count" (count features)
+     "hit_count" (count hits)
+     "candidate_formula_hits" candidate-formula-hits
+     "candidate_reconstruction_hits" candidate-reconstruction-hits
+     "legacy_formula_provenance_hits" candidate-formula-hits
+     "suffixes_with_hits" (count (filter pos? (vals @suffix-hit-counts)))
+     "features_with_hits" (count (filter pos? (vals @feature-hit-counts)))
+     "classification_counts" (into {} (sort classification-counts))
+     "suffix_hit_counts" (into {} (sort @suffix-hit-counts))
+     "feature_hit_counts" (into {} (sort (filter (fn [[_ v]] (pos? v)) @feature-hit-counts)))
+     "manifest_reference_count" (count manifest-refs)
+     "manifest_impl_classes_found" (count (filter #(get % "impl_class_found") manifest-refs))
+     "manifest_impl_classes_missing" (count (filter #(not (get % "impl_class_found")) manifest-refs))}))
+
+(defn write-csv [path hits]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (with-open [fh (python/open path "w" ** :newline "")]
+    (let [fields ["needle" "path" "line" "exact_feature" "classification" "context"]
+          writer (csv/DictWriter fh fields)]
+      (.writeheader writer)
+      (doseq [hit hits]
+        (.writerow writer (into {} (map (fn [field] [field (get hit field "")]) fields)))))))
+
+(defn md-table [headers rows]
+  (str "| " (.join " | " headers) " |\n"
+       "| " (.join " | " (repeat (count headers) "---")) " |\n"
+       (.join "" (for [row rows]
+                   (str "| " (.join " | " (map str row)) " |\n")))))
+
+(defn write-md [path payload]
+  (let [summary (get payload "summary")
+        hits (get payload "hits")
+        manifest-refs (get payload "manifest_references")
+        top-hits (take 40 hits)]
+    (spit path
+          (str "# Legacy Greek Formula Search\n\n"
+               "Read-only bounded search for formula provenance of blocked Greek features.\n\n"
+               "- Blocked suffixes: `" (get summary "blocked_suffix_count") "`\n"
+               "- Blocked features: `" (get summary "blocked_feature_count") "`\n"
+               "- Hits: `" (get summary "hit_count") "`\n"
+               "- Candidate formula hits: `" (get summary "candidate_formula_hits") "`\n"
+               "- Suffixes with hits: `" (get summary "suffixes_with_hits") "`\n"
+               "- Features with hits: `" (get summary "features_with_hits") "`\n\n"
+               "- Manifest references: `" (get summary "manifest_reference_count") "`\n"
+               "- Manifest implementation classes found: `" (get summary "manifest_impl_classes_found") "`\n"
+               "- Manifest implementation classes missing: `" (get summary "manifest_impl_classes_missing") "`\n\n"
+               "## Classification Counts\n\n"
+               (md-table ["Classification" "Count"] (for [[k v] (get summary "classification_counts")] [k v]))
+               "\n## Suffix Hit Counts\n\n"
+               (md-table ["Suffix" "Hits"] (for [[k v] (get summary "suffix_hit_counts")] [k v]))
+               "\n## Top Hits\n\n"
+               (md-table ["Needle" "Class" "Path" "Line"]
+                         (for [hit top-hits]
+                           [(str "`" (get hit "needle") "`")
+                            (get hit "classification")
+                            (get hit "path")
+                            (get hit "line")]))
+               "\n## Manifest References\n\n"
+               (md-table ["Feature" "Module" "Impl Class" "Class Found"]
+                         (for [row (take 80 manifest-refs)]
+                           [(str "`" (get row "name") "`")
+                            (get row "module" "")
+                            (get row "impl_class" "")
+                            (get row "impl_class_found" false)]))))))
+
+(defn run-main [opts]
+  (let [blocked-path (:blocked-json opts)
+        [suffixes features] (load-blocked blocked-path)
+        roots (if (seq (:root opts))
+                (mapv os.path/abspath (:root opts))
+                (mapv os.path/abspath default-roots))
+        needles (set (concat suffixes features))
+        ;; When the blocked-provenance audit has no blocked rows, there are no
+        ;; needles to search. Avoid crawling the full archive/reference tree.
+        files (if (seq needles) (candidate-files roots (:max-bytes opts)) [])
+        manifest-refs (if (seq needles) (manifest-references roots files features) [])
+        hits (if (seq needles)
+               (vec (sort-by (fn [hit]
+                                [(not= "candidate_formula_context" (get hit "classification"))
+                                 (str (get hit "needle"))
+                                 (str (get hit "path"))
+                                 (int (get hit "line"))])
+                              (mapcat #(scan-file % needles (:context-lines opts) (:max-hits-per-needle opts)) files)))
+               [])
+        summary (assoc (summarize hits suffixes features manifest-refs)
+                       "generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                       "target_date" (:target-date opts)
+                       "blocked_json" (str blocked-path)
+                       "roots" roots
+                       "file_count" (count files)
+                       "max_bytes" (:max-bytes opts))
+        payload {"summary" summary
+                 "manifest_references" manifest-refs
+                 "hits" hits}
+        out-base (os.path/join (:out-dir opts) (str "legacy_greek_formula_search_" (:label opts)))
+        json-path (str out-base ".json")
+        csv-path (str out-base ".csv")
+        md-path (str out-base ".md")]
+    (os/makedirs (:out-dir opts) ** :exist_ok true)
+    (fp/clear-artifacts! [json-path csv-path md-path])
+    (spit json-path (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+    (write-csv csv-path hits)
+    (write-md md-path payload)
+    (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote " md-path))
+    (println (str "wrote " csv-path))
+    (println (str "wrote " json-path))
+    0))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

@@ -1,0 +1,287 @@
+(ns stevetrading.analysis.databento-schema-study
+  "Inventory and canonical nested views for Databento Trades, TBBO, and MBP-1.
+
+   The three model inputs are information-set ablations, not three independent
+   raw corpora.  A retained MBP-1 stream is the canonical source because it
+   contains trades, the BBO carried on those trades, and every intervening BBO
+   update.  Native Trades and TBBO payloads are retained only where needed to
+   validate the projections and measure vendor delivery/storage costs."
+  (:import datetime json pathlib
+           databento
+           pyarrow.parquet)
+  (:require [clojure.string :as str]))
+
+(def schema-order ["trades" "tbbo" "mbp-1"])
+(def schema-rank {"trades" 1 "tbbo" 2 "mbp-1" 3})
+
+(def trade-columns
+  ["ts_event" "publisher_id" "instrument_id" "action" "side" "price"
+   "size" "flags" "ts_in_delta" "sequence" "symbol"])
+
+(def bbo-columns
+  ["bid_px_00" "ask_px_00" "bid_sz_00" "ask_sz_00"
+   "bid_ct_00" "ask_ct_00"])
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]]
+                                     (python/tuple [(str k) (jsonable v)]))
+                                   value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true :default str) "\n"))
+
+(defn normalize-schema [value]
+  (let [candidate (-> (str value) str/lower-case (str/replace "_" "-"))]
+    (cond
+      (or (= candidate "trades") (= candidate "trade")) "trades"
+      (= candidate "tbbo") "tbbo"
+      (contains? #{"mbp-1" "mbp1"} candidate) "mbp-1"
+      :else nil)))
+
+(defn schema-from-path [path]
+  (let [candidate (-> (str path) str/lower-case (str/replace "_" "-"))]
+    (first (filter #(not= -1 (.find candidate %)) ["mbp-1" "tbbo" "trades"]))))
+
+(defn parquet-partition [path]
+  "Parse Steve's GCP layout:
+   EQUS.MINI/stock/{schema}/{symbol}/{YYYYMMDD}.parquet."
+  (let [parts (vec (map str (.-parts (pathlib/Path (str path)))))
+        schema-index (first
+                      (keep-indexed (fn [index part]
+                                      (when (normalize-schema part) index))
+                                    parts))]
+    (when (some? schema-index)
+      (let [schema (normalize-schema (nth parts schema-index))
+            symbol (when (< (inc schema-index) (count parts))
+                     (nth parts (inc schema-index)))
+            date-name (when (< (+ schema-index 2) (count parts))
+                        (.-stem (pathlib/Path (nth parts (+ schema-index 2)))))
+            dataset (first (filter #(not= -1 (.find % ".")) (take schema-index parts)))]
+        {"dataset" dataset "schema" schema "symbol" symbol "date" date-name}))))
+
+(defn nested-view-specs
+  "Machine-readable, leakage-safe information sets used by later ablations."
+  []
+  [{"view_id" "trades"
+    "information_rank" 1
+    "canonical_source_schema" "mbp-1"
+    "row_selector" {"column" "action" "equals" "T"}
+    "columns" trade-columns
+    "native_validation_schema" "trades"
+    "meaning" "Every trade, without BBO state."}
+   {"view_id" "tbbo"
+    "information_rank" 2
+    "canonical_source_schema" "mbp-1"
+    "row_selector" {"column" "action" "equals" "T"}
+    "columns" (vec (concat trade-columns bbo-columns))
+    "native_validation_schema" "tbbo"
+    "meaning" "Every trade plus the contemporaneous best bid and offer."}
+   {"view_id" "mbp-1"
+    "information_rank" 3
+    "canonical_source_schema" "mbp-1"
+    "row_selector" nil
+    "columns" (vec (concat trade-columns ["depth"] bbo-columns))
+    "native_validation_schema" "mbp-1"
+    "meaning" "Every trade and every top-of-book-changing event."}])
+
+(defn view-spec [view-id]
+  (or (first (filter #(= (get % "view_id") (normalize-schema view-id))
+                     (nested-view-specs)))
+      (throw (python/ValueError (str "unknown nested Databento view: " view-id)))))
+
+(defn project-frame
+  "Project a decoded MBP-1 DataFrame into one nested information set.
+
+   No aggregate is calculated here.  The result preserves vendor event order
+   and timestamps, so a later feature encoder can remain causal."
+  [frame view-id]
+  (let [spec (view-spec view-id)
+        selector (get spec "row_selector")
+        available (set (vec (.tolist (.-columns frame))))
+        required (if selector
+                   (conj (set (get spec "columns")) (get selector "column"))
+                   (set (get spec "columns")))
+        ;; Symbol mappings are optional in instrument-id archives.  Publisher,
+        ;; flags, and exchange sequence metadata can also vary by dataset.
+        required-core (set (filter #(contains? #{"ts_event" "instrument_id" "action"
+                                                 "side" "price" "size" "bid_px_00"
+                                                 "ask_px_00" "bid_sz_00" "ask_sz_00"}
+                                               %)
+                                   required))
+        missing (vec (sort (remove available required-core)))]
+    (when (seq missing)
+      (throw (python/ValueError (str "MBP-1 frame lacks required columns: " missing))))
+    (let [rows (if selector
+                 (.__getitem__ frame (.eq (.get frame (get selector "column"))
+                                          (get selector "equals")))
+                 frame)
+          columns (vec (filter available (get spec "columns")))]
+      (.__getitem__ rows (python/list columns)))))
+
+(defn read-view
+  "Decode one MBP-1 DBN payload and return a nested view DataFrame."
+  [dbn-path view-id]
+  (let [store (databento/read_dbn (str dbn-path))
+        declared (normalize-schema (.-schema (.-metadata store)))]
+    (when-not (= declared "mbp-1")
+      (throw (python/ValueError
+              (str "canonical nested views require an mbp-1 DBN, got " declared))))
+    (project-frame (.to_df store ** :schema "mbp-1") view-id)))
+
+(defn compare-native-frame
+  "Check a native Trades/TBBO sample against its MBP-1 projection.
+
+   The comparison is ordered and exact over shared declared columns.  It is a
+   projection-validation check, not an alpha result."
+  [mbp-frame native-frame view-id]
+  (let [schema (normalize-schema view-id)
+        _ (when-not (contains? #{"trades" "tbbo"} schema)
+            (throw (python/ValueError "native comparison supports trades or tbbo")))
+        projected (project-frame mbp-frame schema)
+        native-columns (set (vec (.tolist (.-columns native-frame))))
+        shared (vec (filter native-columns (get (view-spec schema) "columns")))
+        left (.reset_index (.__getitem__ projected (python/list shared)) ** :drop true)
+        right (.reset_index (.__getitem__ native-frame (python/list shared)) ** :drop true)]
+    {"schema" schema
+     "projected_events" (int (python/len left))
+     "native_events" (int (python/len right))
+     "shared_columns" shared
+     "ordered_field_exact" (python/bool (.equals left right))}))
+
+(defn supported-path? [path]
+  (let [name (str/lower-case (str path))]
+    (or (.endswith name ".dbn") (.endswith name ".dbn.zst")
+        (.endswith name ".zst") (.endswith name ".parquet"))))
+
+(defn- dbn-descriptor [path exact-counts?]
+  (let [store (databento/read_dbn (str path))
+        metadata (.-metadata store)
+        schema (normalize-schema (.-schema metadata))]
+    (when schema
+      {"path" (str path)
+       "format" "dbn"
+       "dataset" (str (.-dataset metadata))
+       "schema" schema
+       "bytes" (int (.-st_size (.stat path)))
+       "events" (when exact-counts? (int (python/len (.to_ndarray store))))
+       "start_ns" (when (some? (.-start metadata)) (int (.-start metadata)))
+       "end_ns" (when (some? (.-end metadata)) (int (.-end metadata)))
+       "symbols" (vec (map str (.-symbols metadata)))})))
+
+(defn- parquet-descriptor [path exact-counts?]
+  (let [partition (parquet-partition path)
+        schema (or (get partition "schema") (schema-from-path path))]
+    (when schema
+      (let [parquet-file (pyarrow.parquet/ParquetFile (str path))]
+        {"path" (str path)
+         "format" "parquet"
+         "dataset" (get partition "dataset")
+         "schema" schema
+         "bytes" (int (.-st_size (.stat path)))
+         ;; Row count is footer metadata and therefore cheap and exact.
+         "events" (when exact-counts? (int (.-num_rows (.-metadata parquet-file))))
+         "start_ns" nil
+         "end_ns" nil
+         "symbols" (if-let [symbol (get partition "symbol")] [symbol] [])
+         "partition_date" (get partition "date")}))))
+
+(defn file-descriptor [path exact-counts?]
+  (let [source (.resolve (pathlib/Path (str path)))
+        name (str/lower-case (str source))]
+    (cond
+      (.endswith name ".parquet") (parquet-descriptor source exact-counts?)
+      (supported-path? source) (dbn-descriptor source exact-counts?)
+      :else nil)))
+
+(defn- safe-ratio [numerator denominator]
+  (when (and (some? numerator) (some? denominator) (pos? denominator))
+    (/ (float numerator) denominator)))
+
+(defn summarize-descriptors
+  "Aggregate physical storage and event counts without materializing new data."
+  [root descriptors ignored-files errors count-mode]
+  (let [grouped (group-by #(get % "schema") descriptors)
+        groups (vec
+                (map (fn [schema]
+                       (let [rows (vec (get grouped schema []))
+                             bytes (sum (map #(get % "bytes") rows))
+                             events-values (vec (keep #(get % "events") rows))
+                             events (when (= (count rows) (count events-values))
+                                      (sum events-values))]
+                         {"schema" schema
+                          "information_rank" (get schema-rank schema)
+                          "files" (count rows)
+                          "bytes" bytes
+                          "events" events
+                          "bytes_per_event" (safe-ratio bytes events)}))
+                     schema-order))
+        by-schema (into {} (map (fn [row] [(get row "schema") row]) groups))
+        trade-bytes (get (get by-schema "trades") "bytes")
+        observed-symbols (vec (sort (set (mapcat #(get % "symbols" []) descriptors))))]
+    {"kind" "databento-nested-schema-inventory-v1"
+     "created_at_utc" (now-utc)
+     "root" (str root)
+     "count_mode" count-mode
+     "files_scanned" (+ (count descriptors) ignored-files (count errors))
+     "files_profiled" (count descriptors)
+     "files_ignored" ignored-files
+     "observed_symbols" observed-symbols
+     "errors" errors
+     "schemas" (vec (map #(assoc % "storage_vs_trades"
+                                  (safe-ratio (get % "bytes") trade-bytes))
+                          groups))
+     "files" descriptors
+     "nested_ablation_views" (nested-view-specs)
+     "retention_contract"
+     {"canonical_bulk_schema" "mbp-1"
+      "native_validation_schemas" ["trades" "tbbo"]
+      "rule" "Do not create duplicate bulk Trades or TBBO copies when the same symbol/time coverage is retained as MBP-1. Keep bounded native samples for projection validation and measured cost comparisons."
+      "deletion_authorized" false}
+     "limitations"
+     ["This inventory measures storage and event counts; it does not estimate alpha."
+      "Ratios are meaningful only after confirming equivalent symbol and time coverage."
+      "Parquet schema is inferred from its path because generic Parquet footers do not identify the Databento schema."]}))
+
+(defn reconcile-universe
+  "Compare the observed corpus with an explicit intended universe.  A mismatch
+   is reported, never silently repaired or deleted."
+  [observed expected]
+  (let [observed-set (set (map #(str/upper-case (str %)) observed))
+        expected-set (set (map #(str/upper-case (str %)) expected))
+        missing (vec (sort (remove observed-set expected-set)))
+        unexpected (vec (sort (remove expected-set observed-set)))]
+    {"status" (if (and (empty? missing) (empty? unexpected)) "exact" "mismatch")
+     "observed" (vec (sort observed-set))
+     "expected" (vec (sort expected-set))
+     "missing_from_corpus" missing
+     "outside_expected_universe" unexpected
+     "automatic_mutation_authorized" false}))
+
+(defn inventory-root
+  "Recursively inventory supported files.  Exact DBN counts decode each file;
+   `metadata` mode records bytes immediately and leaves DBN event counts null."
+  [root count-mode progress-fn]
+  (let [base (.resolve (pathlib/Path (str root)))
+        exact-counts? (= count-mode "exact")]
+    (when-not (.is_dir base)
+      (throw (python/ValueError (str "inventory root does not exist: " base))))
+    (let [paths (vec (sort-by str (filter #(and (.is_file %) (supported-path? %))
+                                          (iterator-seq (.rglob base "*")))))
+          descriptors (atom [])
+          ignored (atom 0)
+          errors (atom [])]
+      (doseq [[index path] (map-indexed vector paths)]
+        (when progress-fn (progress-fn (inc index) (count paths) path))
+        (try
+          (if-let [descriptor (file-descriptor path exact-counts?)]
+            (swap! descriptors conj descriptor)
+            (swap! ignored inc))
+          (catch python/Exception error
+            (swap! errors conj {"path" (str path) "error" (str error)}))))
+      (summarize-descriptors base @descriptors @ignored @errors count-mode))))

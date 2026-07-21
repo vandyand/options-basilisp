@@ -2,6 +2,8 @@
 Description=Build SteveTrading reports
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=2h
+StartLimitBurst=8
 
 [Service]
 Type=oneshot
@@ -10,5 +12,7 @@ WorkingDirectory=/opt/stevetrading/current
 EnvironmentFile=/etc/stevetrading/env
 Environment=REPORTS_MODE=incremental
 ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_reports.sh
+Restart=on-failure
+RestartSec=5min
 StandardOutput=append:/var/log/stevetrading/reports-systemd.log
 StandardError=append:/var/log/stevetrading/reports-systemd.log

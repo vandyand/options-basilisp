@@ -317,6 +317,44 @@
          (or (empty? required)
              (contains? (set required) input-kind)))))
 
+(defn- session-flags
+  "Wall-clock session flags for live launchers. nil means replay/offline mode."
+  [session-clock]
+  (when session-clock
+    (let [now (utc-now-str)
+          {:keys [entry-cutoff flatten-at]} session-clock]
+      {:entries-allowed?
+       (or (nil? entry-cutoff)
+           (neg? (compare now entry-cutoff)))
+       :force-flatten?
+       (and (some? flatten-at)
+            (>= (compare now flatten-at) 0))})))
+
+(defn- strategy-exposure?
+  "True when this strategy still has exposure that must be cleaned up:
+  settled lots/net positions or unresolved orders."
+  [state strategy-id]
+  (let [sview (get-in state [:engine/portfolio :portfolio/by-strategy
+                             strategy-id])
+        in-flight (some (fn [[_ entry]]
+                          (and (= strategy-id (:order/strategy-id entry))
+                               (not (:order/resolved? entry))))
+                        (:engine/unresolved-orders state))]
+    (boolean
+     (or in-flight
+         (seq (:view/open-lots sview))
+         (some (fn [[_ q]]
+                 (not (zero? (python/float (str q)))))
+               (:view/net-positions sview))))))
+
+(defn- force-flatten-trigger?
+  "After flatten-at, strategy exposure is itself a pipeline trigger. This makes
+  EOD flatten a safety invariant instead of depending on the next observation
+  being relevant to that strategy."
+  [session state strategy-id]
+  (and (:force-flatten? session)
+       (strategy-exposure? state strategy-id)))
+
 ;; ---------------------------------------------------------------------------
 ;; Ledger integration (derive → append → fold; never fold raw fills)
 ;; ---------------------------------------------------------------------------
@@ -559,6 +597,43 @@
                         (:appended-count ledger-res))
      :skipped-fills (:skipped-fills ledger-res)}))
 
+(defn- run-force-flatten-sweep!
+  "Run one force-flatten pass for every active strategy that still has exposure,
+  independent of the current market observation. Used at source exhaustion as
+  an EOD safety net; normal cycles also bypass observation relevance while
+  :force-flatten? is true."
+  [{:keys [append! broker state ledger strategies account-id run-id run-mode
+           broker-route session]}]
+  (if-not (:force-flatten? session)
+    {:state state :ledger ledger :appended-count 0 :skipped-fills []}
+    (reduce
+     (fn [acc strategy]
+       (let [sid (get-in strategy [:decl :strategy/id])
+             lifecycle (:strategy/lifecycle
+                        (st/strategy-state (:state acc) sid))]
+         (if (and (= :active lifecycle)
+                  (force-flatten-trigger? session (:state acc) sid))
+           (let [res (run-strategy-cycle!
+                      {:append! append!
+                       :broker broker
+                       :state (:state acc)
+                       :ledger (:ledger acc)
+                       :strategy strategy
+                       :account-id account-id
+                       :run-id run-id
+                       :run-mode run-mode
+                       :broker-route broker-route
+                       :session session})]
+             {:state (:state res)
+              :ledger (:ledger res)
+              :appended-count (+ (:appended-count acc)
+                                 (:appended-count res))
+              :skipped-fills (into (:skipped-fills acc)
+                                   (:skipped-fills res))})
+           acc)))
+     {:state state :ledger ledger :appended-count 0 :skipped-fills []}
+     strategies)))
+
 ;; ---------------------------------------------------------------------------
 ;; Snapshots
 ;; ---------------------------------------------------------------------------
@@ -689,8 +764,45 @@
       (let [{:keys [observations] next-cursor :cursor}
             (mdp/next-observations source cursor 1)]
         (if (empty? observations)
-          ;; finish: final snapshot
-          (do
+          ;; finish: final force-flatten safety sweep + snapshot
+          (let [session (session-flags session-clock)
+                cancel-res (if (some? stale-order-seconds)
+                             (cancel-stale-orders!
+                              {:append! append! :broker broker :state state
+                               :strategies strategies
+                               :account-id account-id
+                               :run-mode run-mode
+                               :session session
+                               :stale-seconds stale-order-seconds
+                               :pending cancel-pending})
+                             {:state state :appended-count 0
+                              :pending cancel-pending})
+                state (:state cancel-res)
+                sweep-res (run-force-flatten-sweep!
+                           {:append! append! :broker broker
+                            :state state :ledger ledger
+                            :strategies strategies
+                            :account-id account-id
+                            :run-id run-id
+                            :run-mode run-mode
+                            :broker-route broker-route
+                            :session session})
+                state (:state sweep-res)
+                ledger (:ledger sweep-res)
+                poll-res (poll-broker-fills!
+                          {:append! append! :broker broker :state state
+                           :ledger ledger :account-ids poll-account-ids
+                           :since (get-in state [:engine/run
+                                                :run/started-at])})
+                state (:state poll-res)
+                ledger (:ledger poll-res)
+                appended (+ appended
+                            (:appended-count cancel-res)
+                            (:appended-count sweep-res)
+                            (:appended-count poll-res))
+                skipped-fills (into skipped-fills
+                                    (concat (:skipped-fills sweep-res)
+                                            (:skipped-fills poll-res)))]
             (write-snapshot!* snapshot-store fact-store state run-id
                               snapshot-scope)
             {:state state :ledger ledger :cursor cursor :appended appended
@@ -715,25 +827,19 @@
                 ;; session clock: wall-clock UTC vs the configured
                 ;; cutoffs, once per cycle (ISO-8601 Z strings compare
                 ;; lexicographically). nil when no clock is configured.
-                session (when session-clock
-                          (let [now (utc-now-str)
-                                {:keys [entry-cutoff flatten-at]} session-clock]
-                            {:entries-allowed?
-                             (or (nil? entry-cutoff)
-                                 (neg? (compare now entry-cutoff)))
-                             :force-flatten?
-                             (and (some? flatten-at)
-                                  (>= (compare now flatten-at) 0))}))
+                session (session-flags session-clock)
                 ;; §6 steps 4-10 per active + relevant strategy
                 cycle-res
                 (reduce
                  (fn [acc strategy]
-                     (let [sid (get-in strategy [:decl :strategy/id])
-                           lifecycle (:strategy/lifecycle
+                   (let [sid (get-in strategy [:decl :strategy/id])
+                         lifecycle (:strategy/lifecycle
                                     (st/strategy-state (:state acc) sid))]
                      (if (and tradeable-observation?
                               (= :active lifecycle)
-                              (observation-relevant? obs strategy))
+                              (or (observation-relevant? obs strategy)
+                                  (force-flatten-trigger?
+                                   session (:state acc) sid)))
                        (let [res (run-strategy-cycle!
                                   {:append! append!
                                    :broker broker

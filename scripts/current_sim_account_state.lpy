@@ -1,4 +1,4 @@
-;; Print one durable sim broker account-state as TSV for scripts/current_pnl.py.
+;; Print one durable sim broker account-state as TSV for scripts/current_pnl.lpy.
 ;;
 ;; Keep the broker accounting in Basilisp so Python does not need to reimplement
 ;; option multipliers, lot signs, marks, or unrealized P&L semantics.

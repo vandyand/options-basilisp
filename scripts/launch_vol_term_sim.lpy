@@ -11,21 +11,22 @@
 ;;     straddle term-slope CHANGE z-score (HAWK_TERM sign convention:
 ;;     widening -> long calendar). Rule v1 — the model-driven bridge
 ;;     (61-feature XGB) replaces the signal later; executor stays.
-;;   strategy/sim-direction/sma-cross/v1 SMA(3/5) SPY equity baseline to
+;;   strategy/simple-direction/sma-cross/v1 SMA(3/5) SPY equity baseline to
 ;;     exercise the single-leg equity path in the sim broker.
 ;;
 ;; Everything price-dependent (condor strikes, calendar candidates,
 ;; expirations) resolves at LAUNCH; dated artifacts + manifest land
 ;; under live_runtime/generated-sim/.
 ;;
-;; Run under the REF venv (the HAWK_TERM bridge loads xgboost + the V2
-;; legacy term predictor):
+;; Run under the REF venv. The explicit legacy wrappers load xgboost + the V2
+;; Data-Preprocessor predictors only when V2 model bridges are enabled.
 ;;   PYTHONPATH=$(cat .nrepl-pythonpath) REF/.venv/bin/basilisp run scripts/launch_vol_term_sim.lpy
 ;; Env: SIM_DRY_RUN=1 -> resolve + activate + print, skip run-live.
 (import datetime json os os.path re urllib.request zoneinfo)
 (require '[basilisp.edn :as edn]
          '[stevetrading.base.engine-live :as live]
-         '[stevetrading.bridge.v2-term :as v2t]
+         '[stevetrading.bridge.v2-term.legacy :as v2t-legacy]
+         '[stevetrading.bridge.v2-vol.legacy :as v2v-legacy]
          '[stevetrading.control-plane.file-store :as cpfs]
          '[stevetrading.market-data.alpaca :as mda]
          '[stevetrading.market-data.composite :as mdc]
@@ -39,7 +40,16 @@
 (def vertical-threshold (or (os/getenv "SIM_VERTICAL_THRESHOLD") "0.05"))
 (def enter-sigma (python/float (or (os/getenv "SIM_ENTER_SIGMA") "2.0")))
 (def min-samples (python/int (or (os/getenv "SIM_MIN_SAMPLES") "20")))
+(def enable-core? (not= "0" (os/getenv "SIM_ENABLE_CORE")))
 (def enable-sma? (not= "0" (os/getenv "SIM_ENABLE_SMA")))
+(def enable-variants? (not= "0" (os/getenv "SIM_ENABLE_VARIANTS")))
+(def enable-v2-term? (not= "0" (os/getenv "SIM_ENABLE_V2_TERM")))
+(def enable-v2-vol? (not= "0" (os/getenv "SIM_ENABLE_V2_VOL")))
+(def enable-v2-term-spxw? (and enable-v2-term?
+                                (not= "0" (os/getenv "SIM_ENABLE_V2_TERM_SPXW"))))
+(def enable-v2-otter? (= "1" (os/getenv "SIM_ENABLE_V2_OTTER")))
+(def front-exp-override (os/getenv "SIM_FRONT_EXP"))
+(def back-exp-override (os/getenv "SIM_BACK_EXP"))
 (def sim-equity-qty (or (os/getenv "SIM_EQUITY_QTY") "50"))
 (def sim-option-qty (or (os/getenv "SIM_OPTION_QTY") "1"))
 (def sim-spread-qty (or (os/getenv "SIM_SPREAD_QTY") sim-option-qty))
@@ -67,6 +77,9 @@
 (def session-date
   (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
 (def out-dir (str "live_runtime/sim-vt-session-" session-date out-suffix))
+(def account-id (or (os/getenv "SIM_ACCOUNT_ID") "account/sim/vol-term"))
+(def process-id (or (os/getenv "SIM_PROCESS_ID") "engine-sim-vol-term"))
+(def cp-root (or (os/getenv "SIM_CP_ROOT") "live_runtime/cp-sim-vt"))
 (def compact-date (.replace session-date "-" ""))
 
 (defn- et->utc-str [hh mm]
@@ -89,18 +102,20 @@
     (python/float (get-in data ["trade" "p"]))))
 
 (def front-exp
-  (let [e (td/nearest-expiration {:transport @#'td/default-transport
-                                  :symbol "SPY"} session-date)]
-    (when (:error e) (println "FATAL front expiration:" e) (python/exit 1))
-    e))
+  (or front-exp-override
+      (let [e (td/nearest-expiration {:transport @#'td/default-transport
+                                      :symbol "SPY"} session-date)]
+        (when (:error e) (println "FATAL front expiration:" e) (python/exit 1))
+        e)))
 (def back-exp
-  (let [date-cls (.-date datetime)
-        day-after (let [d (.fromisoformat date-cls front-exp)]
-                    (str (.fromordinal date-cls (inc (.toordinal d)))))
-        e (td/nearest-expiration {:transport @#'td/default-transport
-                                  :symbol "SPY"} day-after)]
-    (when (:error e) (println "FATAL back expiration:" e) (python/exit 1))
-    e))
+  (or back-exp-override
+      (let [date-cls (.-date datetime)
+            day-after (let [d (.fromisoformat date-cls front-exp)]
+                        (str (.fromordinal date-cls (inc (.toordinal d)))))
+            e (td/nearest-expiration {:transport @#'td/default-transport
+                                      :symbol "SPY"} day-after)]
+        (when (:error e) (println "FATAL back expiration:" e) (python/exit 1))
+        e)))
 
 (def atm (python/int (python/round spy-price)))
 (defn- k [n] (str n ".000"))
@@ -108,20 +123,273 @@
 ;; --- generated artifacts + declarations --------------------------------------
 (def gen-root "live_runtime/generated-sim")
 (def artifact-root (str gen-root "/artifacts"))
-(def condor-feature-ref (str "feature/sim-vol/condor-" compact-date))
-(def condor-model-ref (str "model/sim-vol/condor-" compact-date))
-(def calendar-feature-ref (str "feature/sim-term/calendar-" compact-date))
-(def calendar-model-ref (str "model/sim-term/calendar-" compact-date))
-(def vertical-feature-ref (str "feature/sim-vol/vertical-" compact-date))
-(def vertical-model-ref (str "model/sim-vol/vertical-" compact-date))
+(def condor-feature-ref (str "feature/sim-vol/condor/" compact-date "/v1"))
+(def condor-model-ref (str "model/sim-vol/condor/" compact-date "/v1"))
+(def calendar-feature-ref (str "feature/sim-term/calendar/" compact-date "/v1"))
+(def calendar-model-ref (str "model/sim-term/calendar/" compact-date "/v1"))
+(def vertical-feature-ref (str "feature/sim-vol/vertical/" compact-date "/v1"))
+(def vertical-model-ref (str "model/sim-vol/vertical/" compact-date "/v1"))
 (def condor-sid "strategy/sim-vol/condor-rv/v1")
 (def calendar-sid "strategy/sim-term/calendar-slope/v1")
 (def vertical-sid "strategy/sim-vol/put-credit-spread/v1")
-(def sma-sid "strategy/sim-direction/sma-cross/v1")
+(def sma-sid "strategy/simple-direction/sma-cross/v1")
 
 (defn- write-edn! [path value]
   (os/makedirs (os.path/dirname path) ** :exist_ok true)
   (spit path (edn/write-string value)))
+
+(defn- generated-ref [kind family name]
+  (str kind "/" family "/" name "/" compact-date "/v1"))
+
+(defn- generated-sid [family name]
+  (str "strategy/" family "/" name "/v1"))
+
+(defn- generated-strategy-path [family name]
+  (str gen-root "/strategies/" family "-" name ".edn"))
+
+(defn- write-condor-variant!
+  [{:keys [name put-near put-far call-near call-far threshold]}]
+  (let [family "sim-vol"
+        sid (generated-sid family name)
+        fref (generated-ref "feature" family name)
+        mref (generated-ref "model" family name)
+        spath (generated-strategy-path family name)]
+    (write-edn! (str artifact-root "/" fref ".edn")
+                {:feature-manifest/id fref
+                 :feature-manifest/version 1
+                 :feature-manifest/features [:feature/condor-mid-credit
+                                             :feature/realized-vol]
+                 :feature-manifest/params
+                 {:realized-vol {:window 20}
+                  :condor {:put-spread {:venue "OPRA" :underlying-symbol "SPY"
+                                        :expiry front-exp
+                                        :right :option-right/put
+                                        :near-strike (k (- atm put-near))
+                                        :far-strike (k (- atm put-far))}
+                           :call-spread {:venue "OPRA" :underlying-symbol "SPY"
+                                         :expiry front-exp
+                                         :right :option-right/call
+                                         :near-strike (k (+ atm call-near))
+                                         :far-strike (k (+ atm call-far))}}}
+                 :feature-manifest/required-inputs [:input/option-chain]
+                 :feature-manifest/compatibility
+                 {:strategy-family :strategy-family/sim-vol
+                  :prediction-schema-version 1}})
+    (write-edn! (str artifact-root "/" mref ".edn")
+                {:model/id mref
+                 :model/version 1
+                 :model/type :model.type/threshold
+                 :model/params {:feature :feature/condor-mid-credit
+                                :threshold threshold}
+                 :model/feature-manifest-ref fref
+                 :model/prediction-schema-version 1})
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family :strategy-family/sim-vol
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 1
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 25}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/features {:manifest-ref fref}
+                 :strategy/inference {:artifact-ref mref}
+                 :strategy/signal {:fn-id :signal/credit-threshold-v1}
+                 :strategy/risk {:policy-id :risk/single-structure :params {}}
+                 :strategy/execution {:policy-id :execution/iron-condor-v1
+                                      :params {:quantity sim-spread-qty}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath
+     :plan {:kind :condor :name name :threshold threshold
+            :puts [(k (- atm put-near)) (k (- atm put-far))]
+            :calls [(k (+ atm call-near)) (k (+ atm call-far))]}}))
+
+(defn- write-vertical-variant!
+  [{:keys [name right near far threshold]}]
+  (let [family "sim-vol"
+        sid (generated-sid family name)
+        fref (generated-ref "feature" family name)
+        mref (generated-ref "model" family name)
+        spath (generated-strategy-path family name)
+        near-strike (k (if (= :option-right/put right)
+                         (- atm near)
+                         (+ atm near)))
+        far-strike (k (if (= :option-right/put right)
+                        (- atm far)
+                        (+ atm far)))]
+    (write-edn! (str artifact-root "/" fref ".edn")
+                {:feature-manifest/id fref
+                 :feature-manifest/version 1
+                 :feature-manifest/features [:feature/chain-mid-width]
+                 :feature-manifest/params
+                 {:spread {:venue "OPRA"
+                           :underlying-symbol "SPY"
+                           :expiry front-exp
+                           :right right
+                           :near-strike near-strike
+                           :far-strike far-strike}}
+                 :feature-manifest/required-inputs [:input/option-chain]
+                 :feature-manifest/compatibility
+                 {:strategy-family :strategy-family/sim-vol
+                  :prediction-schema-version 1}})
+    (write-edn! (str artifact-root "/" mref ".edn")
+                {:model/id mref
+                 :model/version 1
+                 :model/type :model.type/threshold
+                 :model/params {:feature :feature/chain-mid-width
+                                :threshold threshold}
+                 :model/feature-manifest-ref fref
+                 :model/prediction-schema-version 1})
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family :strategy-family/sim-vol
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 1
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 1}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/features {:manifest-ref fref}
+                 :strategy/inference {:artifact-ref mref}
+                 :strategy/signal {:fn-id :signal/credit-threshold-v1}
+                 :strategy/risk {:policy-id :risk/defined-risk-spread
+                                 :params {:max-spreads 1 :max-risk "6.00"}}
+                 :strategy/execution {:policy-id :execution/vertical-credit-spread-v1
+                                      :params {:quantity sim-spread-qty}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath
+     :plan {:kind :vertical :name name :right right :threshold threshold
+            :strikes [near-strike far-strike]}}))
+
+(defn- write-calendar-variant!
+  [{:keys [name right horizon window enter exit min-samples* strike-width]}]
+  (let [family "sim-term"
+        sid (generated-sid family name)
+        fref (generated-ref "feature" family name)
+        mref (generated-ref "model" family name)
+        spath (generated-strategy-path family name)
+        width (or strike-width 3)]
+    (write-edn! (str artifact-root "/" fref ".edn")
+                {:feature-manifest/id fref
+                 :feature-manifest/version 1
+                 :feature-manifest/features [:feature/calendar-straddle-slope]
+                 :feature-manifest/params
+                 {:calendar {:venue "OPRA" :underlying-symbol "SPY"
+                             :front-expiry front-exp
+                             :back-expiry back-exp
+                             :strikes (mapv k (range (- atm width)
+                                                      (+ atm width 1)))}}
+                 :feature-manifest/required-inputs [:input/option-chain]
+                 :feature-manifest/compatibility
+                 {:strategy-family :strategy-family/sim-term
+                  :prediction-schema-version 1}})
+    (write-edn! (str artifact-root "/" mref ".edn")
+                {:model/id mref
+                 :model/version 1
+                 :model/type :model.type/passthrough
+                 :model/params {:feature :feature/calendar-straddle-slope}
+                 :model/feature-manifest-ref fref
+                 :model/prediction-schema-version 1})
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family :strategy-family/sim-term
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 1
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 1}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/features {:manifest-ref fref}
+                 :strategy/inference {:artifact-ref mref}
+                 :strategy/signal {:fn-id :signal/zscore-hysteresis-v1
+                                   :params {:delta-horizon horizon
+                                            :stats-window window
+                                            :enter-sigma enter
+                                            :exit-sigma exit
+                                            :min-samples min-samples*}}
+                 :strategy/risk {:policy-id :risk/single-structure :params {}}
+                 :strategy/execution {:policy-id :execution/calendar-spread-v1
+                                      :params {:quantity sim-option-qty
+                                               :right right
+                                               :allow-short? true}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath
+     :plan {:kind :calendar :name name :right right :horizon horizon
+            :window window :enter enter :exit exit
+            :min-samples min-samples* :strike-width width}}))
+
+(defn- condor-params
+  [put-near put-far call-near call-far]
+  {:put-spread {:venue "OPRA" :underlying-symbol "SPY"
+                :expiry front-exp
+                :right :option-right/put
+                :near-strike (k (- atm put-near))
+                :far-strike (k (- atm put-far))}
+   :call-spread {:venue "OPRA" :underlying-symbol "SPY"
+                 :expiry front-exp
+                 :right :option-right/call
+                 :near-strike (k (+ atm call-near))
+                 :far-strike (k (+ atm call-far))}})
+
+(defn- write-v2-vol-bridge!
+  [{:keys [name bot put-near put-far call-near call-far]}]
+  (let [family "v2-vol"
+        sid (str "strategy/" family "/" name "/v2")
+        fref (str "feature/" family "/bridge/v2")
+        mref (str "model/" family "/bridge/v2")
+        spath (str gen-root "/strategies/" name ".edn")
+        condor (condor-params put-near put-far call-near call-far)]
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family :strategy-family/v2-vol
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 2
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 1}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/bridge {:bot bot}
+                 :strategy/signal {:fn-id :signal/steve-v2-bridge}
+                 :strategy/risk {:policy-id :risk/single-structure :params {}}
+                 :strategy/execution {:policy-id :execution/iron-condor-v1
+                                      :params {:quantity sim-spread-qty
+                                               :condor condor}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath
+     :bridge-kind :v2-vol
+     :bot bot
+     :plan {:kind :v2-vol-condor
+            :name name
+            :bot bot
+            :puts [(get-in condor [:put-spread :near-strike])
+                   (get-in condor [:put-spread :far-strike])]
+            :calls [(get-in condor [:call-spread :near-strike])
+                    (get-in condor [:call-spread :far-strike])]}}))
+
+(defn- write-v2-term-bridge!
+  [{:keys [name bot right]}]
+  (let [family "v2-term"
+        sid (str "strategy/" family "/" name "/v2")
+        fref (str "feature/" family "/bridge/v2")
+        mref (str "model/" family "/bridge/v2")
+        spath (str gen-root "/strategies/" name ".edn")]
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family :strategy-family/v2-term
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 2
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 1}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/bridge {:bot bot}
+                 :strategy/signal {:fn-id :signal/steve-v2-bridge}
+                 :strategy/risk {:policy-id :risk/single-structure :params {}}
+                 :strategy/execution {:policy-id :execution/calendar-spread-v1
+                                      :params {:quantity sim-option-qty
+                                               :right (or right :option-right/call)
+                                               :allow-short? true}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath
+     :bridge-kind :v2-term
+     :bot bot
+     :plan {:kind :v2-term-calendar :name name :bot bot
+            :right (or right :option-right/call)}}))
 
 (write-edn! (str artifact-root "/" condor-feature-ref ".edn")
             {:feature-manifest/id condor-feature-ref
@@ -308,33 +576,129 @@
 	                                           :allow-short? true}}})
 
 (def v2-bridge
-  (when-not dry-run?
-    (println "loading HAWK_TERM_SPY_V2 bridge (xgboost + legacy term predictor)...")
-    (v2t/make-v2-term-bridge
+  (when (and enable-v2-term? (not dry-run?))
+    (println "loading HAWK_TERM legacy bridge (xgboost + legacy term predictors)...")
+    (v2t-legacy/make-legacy-v2-term-bridge
      {:ref-root ref-root
       :state-dir "live_runtime/v2-term-state"
       :alpaca-key key-id
       :alpaca-secret secret
-      :strategies {:hawk-term-spy {:enter-sigma 2.5 :exit-sigma 0.5}}})))
+      :strategies (cond-> {:hawk-term-spy {:enter-sigma 2.5 :exit-sigma 0.5}}
+                    enable-v2-term-spxw?
+                    (assoc :hawk-term-spxw {:enter-sigma 2.5
+                                            :exit-sigma 0.5}))})))
+
+(def v2-vol-bridge
+  (when (and enable-v2-vol? (not dry-run?))
+    (println "loading V2 VOL legacy bridge (FOX/WOLF model-driven condors)...")
+    (v2v-legacy/make-legacy-v2-vol-bridge
+     {:ref-root ref-root
+      :state-dir "live_runtime/v2-vol-state"
+      :alpaca-key key-id
+      :alpaca-secret secret
+      :strategies (cond-> {:fox-vol {:enter-sigma 2.0 :exit-sigma 0.5}
+                           :fox-vol-1dte {:enter-sigma 2.0 :exit-sigma 0.5}
+                           :wolf-vol {:enter-sigma 2.0 :exit-sigma 0.5}}
+                    enable-v2-otter?
+                    (assoc :otter-vol {:enter-sigma 2.0
+                                       :exit-sigma 0.5}))})))
+
+(def variant-rows
+  (if (and enable-core? enable-variants?)
+    (vec
+     (concat
+      (map write-condor-variant!
+           [{:name "condor-w4-8-t035"
+             :put-near 4 :put-far 8 :call-near 4 :call-far 8
+             :threshold "0.35"}
+            {:name "condor-w8-12-t065"
+             :put-near 8 :put-far 12 :call-near 8 :call-far 12
+             :threshold "0.65"}])
+      (map write-vertical-variant!
+           [{:name "put-credit-w2-7-t003"
+             :right :option-right/put :near 2 :far 7 :threshold "0.03"}
+            {:name "put-credit-w5-10-t008"
+             :right :option-right/put :near 5 :far 10 :threshold "0.08"}
+            {:name "call-credit-w3-8-t005"
+             :right :option-right/call :near 3 :far 8 :threshold "0.05"}
+            {:name "call-credit-w5-10-t008"
+             :right :option-right/call :near 5 :far 10 :threshold "0.08"}])
+      (map write-calendar-variant!
+           [{:name "calendar-call-h5-w30-e15"
+             :right :option-right/call :horizon 5 :window 30
+             :enter 1.5 :exit 0.5 :min-samples* 12 :strike-width 3}
+            {:name "calendar-call-h15-w90-e25"
+             :right :option-right/call :horizon 15 :window 90
+             :enter 2.5 :exit 0.7 :min-samples* 30 :strike-width 4}
+            {:name "calendar-put-h10-w60-e20"
+             :right :option-right/put :horizon 10 :window 60
+             :enter 2.0 :exit 0.5 :min-samples* 20 :strike-width 3}])))
+    []))
+
+(def v2-vol-rows
+  (if enable-v2-vol?
+    (vec
+     (map write-v2-vol-bridge!
+          (cond-> [{:name "fox-vol-spy-condor"
+                    :bot :fox-vol
+                    :put-near 6 :put-far 10
+                    :call-near 6 :call-far 10}
+                   {:name "fox-vol-1dte-spy-condor"
+                    :bot :fox-vol-1dte
+                    :put-near 6 :put-far 10
+                    :call-near 6 :call-far 10}
+                   {:name "wolf-vol-spxw-signal-spy-condor"
+                    :bot :wolf-vol
+                    :put-near 6 :put-far 10
+                    :call-near 6 :call-far 10}]
+            enable-v2-otter?
+            (conj {:name "otter-vol-qqq-signal-spy-condor"
+                   :bot :otter-vol
+                   :put-near 6 :put-far 10
+                   :call-near 6 :call-far 10}))))
+    []))
+
+(def v2-term-extra-rows
+  (if enable-v2-term-spxw?
+    [(write-v2-term-bridge! {:name "hawk-term-spxw"
+                             :bot :hawk-term-spxw
+                             :right :option-right/call})]
+    []))
 
 ;; --- manifest -----------------------------------------------------------------
 (def revision (str "cp-sim-vt-" compact-date "-"
                    (.strftime (datetime.datetime/now (.-utc datetime/timezone))
                               "%H%M%S")))
+(def variant-artifact-rows
+  (mapv (fn [{:keys [sid feature-ref model-ref]}]
+          [sid feature-ref model-ref])
+        variant-rows))
+(def bridge-artifact-rows
+  (mapv (fn [{:keys [sid feature-ref model-ref]}]
+          [sid feature-ref model-ref])
+        (concat v2-vol-rows v2-term-extra-rows)))
 (def strategy-artifact-rows
-  (vec (concat [[condor-sid condor-feature-ref condor-model-ref]
-                [calendar-sid calendar-feature-ref calendar-model-ref]
-                [vertical-sid vertical-feature-ref vertical-model-ref]]
-               (when enable-sma?
+  (vec (concat (when enable-core?
+                 [[condor-sid condor-feature-ref condor-model-ref]
+                  [calendar-sid calendar-feature-ref calendar-model-ref]
+                  [vertical-sid vertical-feature-ref vertical-model-ref]])
+               (when (and enable-core? enable-sma?)
                  [[sma-sid "feature/simple-direction/v1"
                    "model/simple-direction/v1"]])
-               [[hawk-sid "feature/v2-term/bridge/v2"
-                 "model/v2-term/bridge/v2"]])))
+               (when enable-v2-term?
+                 [[hawk-sid "feature/v2-term/bridge/v2"
+                   "model/v2-term/bridge/v2"]])
+               variant-artifact-rows
+               bridge-artifact-rows)))
 (def process-strategy-ids (mapv first strategy-artifact-rows))
 (def strategy-paths
-  (vec (concat [condor-decl-path calendar-decl-path vertical-decl-path]
-               (when enable-sma? [sma-decl-path])
-               [hawk-decl-path])))
+  (vec (concat (when enable-core?
+                 [condor-decl-path calendar-decl-path vertical-decl-path])
+               (when (and enable-core? enable-sma?) [sma-decl-path])
+               (when enable-v2-term? [hawk-decl-path])
+               (mapv :path variant-rows)
+               (mapv :path v2-vol-rows)
+               (mapv :path v2-term-extra-rows))))
 (def manifest
   {:control-plane/revision revision
    :control-plane/generated-at (td/utc-now-str)
@@ -344,19 +708,19 @@
           {:strategy/id sid
            :strategy/enabled? true
            :strategy/mode :mode/sim
-           :strategy/process "engine-sim-vol-term"
+	           :strategy/process process-id
            :strategy/account-route (str "route/" sid)
            :strategy/artifacts {:model-ref model-ref
                                 :feature-manifest-ref feature-ref}
            :strategy/schedule {:session :session/us-equities-regular}}))
    :control-plane/accounts
-   [{:account/id "account/sim/vol-term"
+	   [{:account/id account-id
      :account/broker :broker/sim
      :account/environment :environment/sim
      :account/allowed-modes #{:mode/sim}
      :account/live-enabled? false}]
    :control-plane/processes
-   [{:process/id "engine-sim-vol-term"
+   [{:process/id process-id
      :process/base :base/engine-live
      :process/allowed-modes #{:mode/sim}
      :process/strategies process-strategy-ids}]
@@ -364,7 +728,7 @@
    (vec (for [sid process-strategy-ids]
           {:route/id (str "route/" sid)
            :route/strategy-id sid
-           :route/account-id "account/sim/vol-term"
+           :route/account-id account-id
            :route/broker :broker/sim}))
    :control-plane/kill-switches
    [{:kill-switch/scope :kill-switch-scope/global
@@ -373,7 +737,7 @@
    :control-plane/policies
    {:policy/default-degradation :degradation-policy/default-paper}})
 
-(def cp-store (cpfs/make-file-control-plane-store "live_runtime/cp-sim-vt"))
+(def cp-store (cpfs/make-file-control-plane-store cp-root))
 (def activation (cpfs/activate! cp-store manifest {:activation/actor "vol-term-sim-launcher"}))
 (when-not (:activated? activation)
   (println "FATAL: activation failed:" activation) (python/exit 1))
@@ -392,6 +756,16 @@
 	      :sizing {:equity sim-equity-qty
 	               :option sim-option-qty
 	               :spread sim-spread-qty}
+              :enabled {:core enable-core?
+                        :variants enable-variants?
+                        :v2-term enable-v2-term?}
+              :strategy-count (count process-strategy-ids)
+              :variants (mapv :plan variant-rows)
+              :v2-vol {:enabled enable-v2-vol?
+                       :otter-enabled enable-v2-otter?
+                       :strategies (mapv :plan v2-vol-rows)}
+              :v2-term-extra {:spxw-enabled enable-v2-term-spxw?
+                              :strategies (mapv :plan v2-term-extra-rows)}
 	      :session-clock {:entry-cutoff entry-cutoff
 	                      :flatten-at flatten-at}
 	      :revision revision :until until})
@@ -414,8 +788,8 @@
                 {:sources [bars-src chains-src]
                  :poll-seconds 2 :until until})
         result (live/run-live
-                {:control-plane-root "live_runtime/cp-sim-vt"
-                 :process-id "engine-sim-vol-term"
+	                {:control-plane-root cp-root
+	                 :process-id process-id
                  :out-dir out-dir
                  :source source
                  :mode :mode/sim
@@ -423,11 +797,21 @@
                  :sim-store-path (str out-dir "/sim-broker.db")
 	                 :sim-fill-policy sim-fill-policy
 	                 :suppress-pre-run-trading? true
-	                 :session-clock {:entry-cutoff entry-cutoff
-	                                 :flatten-at flatten-at}
-	                 :strategy-paths strategy-paths
+                 :session-clock {:entry-cutoff entry-cutoff
+                                 :flatten-at flatten-at}
+                 :strategy-paths strategy-paths
                  :artifact-root artifact-root
-                 :bridge-ctx {hawk-sid {:signals-fn (:signals-fn v2-bridge)}}})]
+	                 :bridge-ctx (into (cond-> {}
+                                           enable-v2-term?
+                                           (assoc hawk-sid
+                                                  {:signals-fn (:signals-fn v2-bridge)}))
+	                                   (concat
+                                    (map (fn [{:keys [sid]}]
+                                           [sid {:signals-fn (:signals-fn v2-vol-bridge)}])
+                                         v2-vol-rows)
+                                    (map (fn [{:keys [sid]}]
+                                           [sid {:signals-fn (:signals-fn v2-bridge)}])
+                                         v2-term-extra-rows)))})]
     (println "=== SESSION RESULT ===")
     (prn (select-keys result [:live/started? :live/refusal :run/id
                               :facts-appended :orders]))

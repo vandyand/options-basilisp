@@ -1,0 +1,254 @@
+(ns stevetrading.analysis.schema
+  "Balli schemas for canonical analysis artifacts.
+
+  These schemas validate artifact boundaries. They intentionally stay structural:
+  analysis.core owns cohort semantics, alignment math, and episode economics."
+  (:require [balli.core :as b]
+            [balli.error :as be])
+  (:import math re))
+
+(def schema-version 1)
+
+(defn- non-empty-string?
+  [x]
+  (and (string? x) (pos? (count x))))
+
+(defn- optional-non-empty-string?
+  [x]
+  (or (nil? x) (non-empty-string? x)))
+
+(defn- finite-number?
+  [x]
+  (try
+    (let [n (cond
+              (and (number? x) (not (boolean? x))) (python/float x)
+              :else nil)]
+      (and (some? n) (math/isfinite n)))
+    (catch python/Exception _ false)))
+
+(defn- nonnegative-number?
+  [x]
+  (and (finite-number? x) (>= (python/float x) 0.0)))
+
+(defn- boolean-wire?
+  [x]
+  (or (boolean? x)
+      (= "true" x)
+      (= "false" x)))
+
+(defn- sha256-string?
+  [x]
+  (and (string? x)
+       (some? (re/fullmatch #"[0-9a-f]{64}" x))))
+
+(def non-empty-string
+  [:fn {:error/message "should be a non-empty string"} non-empty-string?])
+
+(def optional-non-empty-string
+  [:fn {:error/message "should be nil or a non-empty string"}
+   optional-non-empty-string?])
+
+(def finite-number
+  [:fn {:error/message "should be a finite number"} finite-number?])
+
+(def nonnegative-number
+  [:fn {:error/message "should be a non-negative finite number"}
+   nonnegative-number?])
+
+(def boolean-wire
+  [:fn {:error/message "should be boolean or boolean text"} boolean-wire?])
+
+(def sha256-string
+  [:fn {:error/message "should be a lowercase 64-character SHA-256 hex string"}
+   sha256-string?])
+
+(def tape-event-type
+  [:enum "signal" "intent" "fill" "broker_ack" "broker_reject"
+   "broker_status" "cancel_ack" "cancel_reject" "cancel_intent"
+   "command_dispatched" "unknown"])
+
+(def tape-row
+  [:map
+   [:event-type tape-event-type]
+   [:occurred-at non-empty-string]
+   [:account-id {:optional true} optional-non-empty-string]
+   [:strategy-id {:optional true} optional-non-empty-string]
+   [:decision-id {:optional true} optional-non-empty-string]
+   [:order-intent-id {:optional true} optional-non-empty-string]
+   [:broker-order-id {:optional true} optional-non-empty-string]
+   [:instrument-id {:optional true} optional-non-empty-string]
+   [:direction {:optional true} optional-non-empty-string]
+   [:posture {:optional true} :any]
+   [:role {:optional true} :any]
+   [:intent-role {:optional true} :any]
+   [:effect {:optional true} :any]
+   [:side {:optional true} :any]
+   [:quantity {:optional true} optional-non-empty-string]
+   [:limit-price {:optional true} optional-non-empty-string]
+   [:fill-price {:optional true} optional-non-empty-string]
+   [:fill-quantity {:optional true} optional-non-empty-string]
+   [:correlation-id {:optional true} optional-non-empty-string]
+   [:reason-codes {:optional true} :any]
+   [:order-type {:optional true} :any]
+   [:broker-status {:optional true} :any]
+   [:fill-id {:optional true} optional-non-empty-string]
+   [:leg-count {:optional true} :any]
+   [:leg-instruments {:optional true} :any]
+   [:source-system {:optional true} :any]
+   [:record-id {:optional true} optional-non-empty-string]
+   [:bot {:optional true} :any]
+   [:bridge-kind {:optional true} :any]])
+
+(def episode-row
+  [:map
+   [:episode-id non-empty-string]
+   [:strategy-id non-empty-string]
+   [:account-id non-empty-string]
+   [:direction {:optional true} optional-non-empty-string]
+   [:instrument-group {:optional true} optional-non-empty-string]
+   [:entry-time non-empty-string]
+   [:entry-price {:optional true} optional-non-empty-string]
+   [:entry-quantity {:optional true} optional-non-empty-string]
+   [:exit-time {:optional true} optional-non-empty-string]
+   [:exit-price {:optional true} optional-non-empty-string]
+   [:exit-quantity {:optional true} optional-non-empty-string]
+   [:holding-minutes {:optional true} :any]
+   [:gross-pnl {:optional true} optional-non-empty-string]
+   [:net-pnl {:optional true} optional-non-empty-string]
+   [:return-on-risk {:optional true} :any]
+   [:max-favorable-excursion {:optional true} :any]
+   [:max-adverse-excursion {:optional true} :any]
+   [:exit-reason {:optional true} :any]
+   [:forced-flatten boolean-wire]
+   [:data-quality-flags :any]
+   [:order-intent-id {:optional true} optional-non-empty-string]
+   [:closing-order-intent-id {:optional true} optional-non-empty-string]
+   [:instrument-id {:optional true} optional-non-empty-string]
+   [:lot-id {:optional true} optional-non-empty-string]])
+
+(def calibration-summary
+  [:map
+   [:n [:int {:min 0}]]
+   [:mean-improvement {:optional true} [:maybe finite-number]]
+   [:median-improvement {:optional true} [:maybe finite-number]]
+   [:p25-improvement {:optional true} [:maybe finite-number]]
+   [:p10-improvement {:optional true} [:maybe finite-number]]
+   [:positive-rate {:optional true} [:maybe finite-number]]
+   [:mean-spread {:optional true} [:maybe finite-number]]
+   [:median-spread {:optional true} [:maybe finite-number]]
+   [:median-lag-seconds {:optional true} [:maybe finite-number]]
+   [:conservative-price-improvement nonnegative-number]])
+
+(def calibration-bucket
+  [:map
+   [:bucket/key [:map
+                 [:side :keyword]
+                 [:spread-bucket :keyword]]]
+   [:n [:int {:min 0}]]
+   [:raw-conservative-price-improvement nonnegative-number]
+   [:shrunk-conservative-price-improvement nonnegative-number]])
+
+(def artifact-ref
+  [:map
+   [:path non-empty-string]
+   [:sha256 sha256-string]])
+
+(def calibration-artifact
+  [:map
+   [:calibration/version [:int {:min 1}]]
+   [:calibration/kind :keyword]
+   [:calibration/generated-at non-empty-string]
+   [:source/facts-dbs [:vector non-empty-string]]
+   [:source/facts-fingerprints [:vector artifact-ref]]
+   [:matching/max-lag-seconds nonnegative-number]
+   [:estimator/prior-strength nonnegative-number]
+   [:input/option-fills [:int {:min 0}]]
+   [:input/matched-fills [:int {:min 0}]]
+   [:global calibration-summary]
+   [:buckets [:vector calibration-bucket]]])
+
+(def same-pop-manifest
+  [:map
+   [:manifest/version [:int {:min 1}]]
+   [:manifest/kind [:enum :same-population/performance-v1]]
+   [:manifest/generated-at non-empty-string]
+   [:code/revision non-empty-string]
+   [:artifacts [:map
+                [:live-tape artifact-ref]
+                [:replay-tape artifact-ref]
+                [:live-episodes artifact-ref]
+                [:replay-episodes artifact-ref]
+                [:calibration artifact-ref]
+                [:report {:optional true} artifact-ref]]]
+   [:cohort [:map
+             [:accounts [:vector non-empty-string]]
+             [:strategies [:vector non-empty-string]]
+             [:start non-empty-string]
+             [:end non-empty-string]
+             [:event-counts :map]
+             [:account-strategies :any]]]
+   [:gates [:map
+            [:readiness-status [:enum :same-pop/ready-for-stat-tests]]
+            [:alignment-status [:enum :alignment/pass-exact]]
+            [:mismatch-count [:int {:min 0}]
+            ]
+            [:calibration-matched-fills [:maybe [:int {:min 0}]]]]]
+   [:parameters [:map
+                 [:bucket-seconds [:int {:min 1}]]
+                 [:bootstrap-reps [:int {:min 1}]]
+                 [:permutation-reps [:int {:min 1}]]
+                 [:min-samples [:int {:min 1}]]
+                 [:practical-mean-threshold nonnegative-number]]]])
+
+(def schemas
+  {:analysis/tape-row tape-row
+   :analysis/episode-row episode-row
+   :analysis/calibration-artifact calibration-artifact
+   :analysis/same-pop-manifest same-pop-manifest})
+
+(defn schema
+  [kind]
+  (get schemas kind))
+
+(defn explain
+  [kind row]
+  (b/explain (schema kind) row))
+
+(defn valid?
+  [kind row]
+  (true? (b/validate (schema kind) row)))
+
+(defn humanize
+  [kind row]
+  (when-let [e (explain kind row)]
+    (be/humanize e)))
+
+(defn row-errors
+  [kind row]
+  (if-let [e (explain kind row)]
+    (mapv (fn [err]
+            {:schema/kind kind
+             :error/path (vec (:in err))
+             :error/message (or (:message err)
+                                (str "invalid " kind " row"))})
+          (:errors e))
+    []))
+
+(defn validation-result
+  [kind row]
+  (let [errors (row-errors kind row)]
+    (if (seq errors)
+      {:valid? false :errors errors}
+      {:valid? true})))
+
+(defn rows-validation-result
+  [kind rows]
+  (let [errors (vec
+                (mapcat
+                 (fn [[idx row]]
+                   (map #(assoc % :row-index idx)
+                        (row-errors kind row)))
+                 (map-indexed vector rows)))]
+    (if (seq errors)
+      {:valid? false :errors errors}
+      {:valid? true :rows (count rows)})))

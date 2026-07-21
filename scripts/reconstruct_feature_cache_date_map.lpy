@@ -1,0 +1,118 @@
+;; Reconstruct a day_id -> YYYY-MM-DD map for calendar-day feature caches.
+;;
+;; The legacy Steve v3 cache stores day_ids but not timestamps. This script
+;; makes the fixed rows-per-calendar-day assumption explicit and validates it.
+(import argparse datetime json numpy os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--feature-cache" ** :required true)
+    (.add_argument parser "--end-date" ** :required true :help "Calendar date for max day_id, YYYY-MM-DD")
+    (.add_argument parser "--rows-per-day" ** :type int :default 390)
+    (.add_argument parser "--out-json" ** :required true)
+    (.add_argument parser "--report-json" ** :default nil)
+    (let [args (.parse_args parser (python/list *command-line-args*))]
+      (when (<= (python/getattr args "rows_per_day") 0)
+        (.error parser "--rows-per-day must be positive"))
+      args)))
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn write-json [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn reject [reason out-json & [details]]
+  (let [payload {"ok" false
+                 "status" "error"
+                 "reason" reason
+                 "details" (or details {})}]
+    (when out-json
+      (write-json out-json payload))
+    (println (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+    1))
+
+(defn run-main [args]
+  (let [feature-cache (attr args "feature_cache")
+        out-json (attr args "out_json")
+        report-json (attr args "report_json")
+        rows-per-day (attr args "rows_per_day")
+        end-date (try
+                   (datetime.date/fromisoformat (attr args "end_date"))
+                   (catch python/ValueError _
+                     (throw (python/SystemExit "--end-date must be YYYY-MM-DD"))))]
+    (if-not (os.path/exists feature-cache)
+      (reject "feature cache missing" report-json {"feature_cache" feature-cache})
+      (try
+        (let [cache (numpy/load feature-cache ** :allow_pickle true)
+              files (set (map str (.-files cache)))]
+          (if-not (contains? files "day_ids")
+            (reject "feature cache missing day_ids" report-json {"arrays" (vec (.-files cache))})
+            (let [day-ids (numpy/asarray (.__getitem__ cache "day_ids"))]
+              (cond
+                (or (not= (.-ndim day-ids) 1) (= (.-size day-ids) 0))
+                (reject "day_ids must be a non-empty 1D array" report-json)
+
+                :else
+                (let [[unique counts] (numpy/unique day-ids ** :return_counts true)
+                      first-id (int (.__getitem__ unique 0))
+                      last-id (int (.__getitem__ unique (dec (len unique))))]
+                  (cond
+                    (not= first-id 0)
+                    (reject "day_ids must start at 0" report-json {"min_day_id" first-id})
+
+                    :else
+                    (let [expected (numpy/arange (inc last-id) ** :dtype (.-dtype unique))]
+                      (if (or (not= (.-shape unique) (.-shape expected))
+                              (not (numpy/array_equal unique expected)))
+                        (reject "day_ids must be contiguous" report-json)
+                        (let [bad-counts (into {}
+                                               (for [i (range (len unique))
+                                                     :let [day (int (.__getitem__ unique i))
+                                                           cnt (int (.__getitem__ counts i))]
+                                                     :when (not= cnt rows-per-day)]
+                                                 [(str day) cnt]))]
+                          (if (seq bad-counts)
+                            (reject "day_ids do not have the expected row count"
+                                    report-json
+                                    {"rows_per_day" rows-per-day "bad_counts" bad-counts})
+                            (let [start-date (- end-date (datetime/timedelta ** :days last-id))
+                                  date-map (into {}
+                                                 (for [i (range (len unique))
+                                                       :let [day (int (.__getitem__ unique i))]]
+                                                   [(str day) (.isoformat (+ start-date (datetime/timedelta ** :days day)))]))
+                                  report {"ok" true
+                                          "status" "ok"
+                                          "feature_cache" feature-cache
+                                          "out_json" out-json
+                                          "rows" (int (.-size day-ids))
+                                          "unique_days" (int (.-size unique))
+                                          "rows_per_day" rows-per-day
+                                          "start_date" (.isoformat start-date)
+                                          "end_date" (.isoformat end-date)}]
+                              (write-json out-json date-map)
+                              (when report-json
+                                (write-json report-json report))
+                              (println (json/dumps (fp/->jsonable report) ** :indent 2 :sort_keys true))
+                              0)))))))))))
+        (catch python/Exception e
+          (reject (str "date-map reconstruction failed: " e) report-json))))))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/SystemExit e
+    (let [code (or (python/getattr e "code" 1) 1)]
+      (if (int? code)
+        (python/exit code)
+        (do
+          (binding [*out* *err*] (println (str code)))
+          (python/exit 2)))))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

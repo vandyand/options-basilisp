@@ -1,0 +1,147 @@
+;; Read-only market-open evidence readiness gate.
+(import datetime glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def default-analysis-dir "live_runtime/analysis")
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/market_evidence_readiness.lpy -- "
+                "[--analysis-dir DIR] [--out-dir DIR] --target-date YYYY-MM-DD "
+                "[--baseline-json PATH] [--probe-json PATH] "
+                "[--payload-verification-json PATH] [--neutralization-json PATH] "
+                "[--capture-check-json PATH] [--legacy-greek-search-json PATH] "
+                "[--option-surface-sidecar-check-json PATH] "
+                "[--greek-promotion-json PATH] "
+                "[--historical-cohort-json PATH] [--raw-unlock-json PATH] "
+                "[--v3-unlock-json PATH] "
+                "[--matched-parity-json PATH] "
+                "[--min-capture-rows N]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(defn parse-int
+  [x arg]
+  (try
+    (let [s (str x)
+          n (int s)]
+      (when-not (= s (str n))
+        (throw (python/ValueError
+                (str "integer literal required for " arg ": " x))))
+      (when-not (pos? n)
+        (throw (python/ValueError
+                (str "positive integer required for " arg ": " x))))
+      n)
+    (catch python/Exception e
+      (throw (python/ValueError
+              (str "invalid positive integer for " arg ": " x
+                   " (" e ")"))))))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:analysis-dir (os.path/join repo-root default-analysis-dir)
+              :out-dir (os.path/join repo-root default-analysis-dir)}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--analysis-dir")
+          (recur (nnext remaining) (assoc out :analysis-dir (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining)
+                 (assoc out :target-date
+                        (cli-target-date (option-value remaining arg))))
+
+          (= arg "--baseline-json")
+          (recur (nnext remaining) (assoc out :baseline-json (option-value remaining arg)))
+
+          (= arg "--probe-json")
+          (recur (nnext remaining) (assoc out :probe-json (option-value remaining arg)))
+
+          (= arg "--neutralization-json")
+          (recur (nnext remaining) (assoc out :neutralization-json (option-value remaining arg)))
+
+          (= arg "--payload-verification-json")
+          (recur (nnext remaining) (assoc out :payload-verification-json (option-value remaining arg)))
+
+          (= arg "--capture-check-json")
+          (recur (nnext remaining) (assoc out :capture-check-json (option-value remaining arg)))
+
+          (= arg "--option-surface-sidecar-check-json")
+          (recur (nnext remaining) (assoc out :option-surface-sidecar-check-json (option-value remaining arg)))
+
+          (= arg "--legacy-greek-search-json")
+          (recur (nnext remaining) (assoc out :legacy-greek-search-json (option-value remaining arg)))
+
+          (= arg "--greek-promotion-json")
+          (recur (nnext remaining) (assoc out :greek-promotion-json (option-value remaining arg)))
+
+          (= arg "--historical-cohort-json")
+          (recur (nnext remaining) (assoc out :historical-cohort-json (option-value remaining arg)))
+
+          (= arg "--raw-unlock-json")
+          (recur (nnext remaining) (assoc out :raw-unlock-json (option-value remaining arg)))
+
+          (= arg "--v3-unlock-json")
+          (recur (nnext remaining) (assoc out :v3-unlock-json (option-value remaining arg)))
+
+          (= arg "--matched-parity-json")
+          (recur (nnext remaining) (assoc out :matched-parity-json (option-value remaining arg)))
+
+          (= arg "--min-capture-rows")
+          (recur (nnext remaining)
+                 (assoc out :min-capture-rows (parse-int (option-value remaining arg) arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(try
+  (let [{:keys [payload markdown-path json-path]}
+        (fp/write-evidence-readiness! (parse-args (vec *command-line-args*)))]
+    (println (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+    (println (str "wrote " markdown-path))
+    (println (str "wrote " json-path))
+    (python/exit (if (= "FAIL" (get payload "verdict")) 1 0)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

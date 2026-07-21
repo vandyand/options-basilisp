@@ -1,0 +1,244 @@
+;; Render per-account report pages from canonical daily validation JSON.
+;; These pages are artifact-backed and avoid broker refetches during publication.
+(import datetime glob json math os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.reporting.core :as reporting])
+
+(def account-slugs
+  {"CHESTNUT" "chestnut"
+   "LYNX" "lynx"
+   "MOOSE" "moose"
+   "OAK" "oak"
+   "PARROT" "parrot"
+   "DOLPHIN" "dolphin"})
+
+(def account-order ["CHESTNUT" "LYNX" "MOOSE" "OAK" "PARROT" "DOLPHIN"])
+
+(defn usage []
+  (println
+   "usage: basilisp run scripts/render_account_reports.lpy -- --daily-dir DIR --accounts-dir DIR [--account SLUG|DISPLAY]"))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--daily-dir")
+          (recur (nnext remaining) (assoc out :daily-dir (option-value remaining arg)))
+          (= arg "--accounts-dir")
+          (recur (nnext remaining) (assoc out :accounts-dir (option-value remaining arg)))
+          (= arg "--account")
+          (recur (nnext remaining) (assoc out :account (option-value remaining arg)))
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn read-json [path] (json/loads (slurp path)))
+
+(defn escape-html [s]
+  (-> (str s)
+      (.replace "&" "&amp;")
+      (.replace "<" "&lt;")
+      (.replace ">" "&gt;")
+      (.replace "\"" "&quot;")))
+
+(defn ->float [x]
+  (cond
+    (nil? x) 0.0
+    (string? x) (python/float x)
+    :else (python/float x)))
+
+(defn ->int [x]
+  (cond
+    (nil? x) 0
+    (string? x) (python/int (python/float x))
+    :else (python/int x)))
+
+(defn money [x]
+  (let [n (->float x)
+        body (.format "${:,.2f}" (math/fabs n))]
+    (if (neg? n) (str "-" body) body)))
+
+(defn pnl-class [x]
+  (let [n (->float x)]
+    (cond
+      (pos? n) "positive"
+      (neg? n) "negative"
+      :else "neutral")))
+
+(defn status-label [status]
+  (let [s (if (nil? status) "unknown" (str status))]
+    (if (.startswith s ":") (subs s 1) s)))
+
+(defn account-display [account]
+  (or (.get account "account/display")
+      (last (.split (str (.get account "account/id" "ACCOUNT")) "/"))
+      "ACCOUNT"))
+
+(defn account-slug [display]
+  (let [upper (.upper (str display))
+        lower (.lower (str display))]
+    (or (get account-slugs upper) lower)))
+
+(defn validation-artifact [path]
+  (let [payload (read-json path)
+        validation (reporting/validate-report-day payload)]
+    {:date (.get payload "report/date")
+     :path path
+     :payload payload
+     :validation validation
+     :publishable? (:valid? validation)}))
+
+(defn daily-artifacts [daily-dir]
+  (vec
+   (sort-by :date
+            (filter :publishable?
+                    (map validation-artifact
+                         (glob/glob (os.path/join daily-dir "*.validation.json")))))))
+
+(defn account-records [artifacts]
+  (vec
+   (mapcat
+    (fn [artifact]
+      (map (fn [account]
+             {:date (:date artifact)
+              :artifact artifact
+              :account account
+              :display (account-display account)
+              :slug (account-slug (account-display account))
+              :equity (->float (.get account "pnl/equity-day" 0.0))
+              :realized (->float (.get account "pnl/realized" 0.0))
+              :unrealized (->float (.get account "pnl/unrealized" 0.0))
+              :closed (->float (.get account "pnl/closed-trades" 0.0))
+              :trades (->int (.get account "trade/closed-count" 0))
+              :orders (->int (.get account "order/count" 0))
+              :open-count (->int (.get account "positions/open-count" 0))})
+           (.get (:payload artifact) "accounts" [])))
+    artifacts)))
+
+(defn issue-row [record issue]
+  (str "<tr><td>" (escape-html (:date record)) "</td>"
+       "<td>" (escape-html (status-label (:severity issue))) "</td>"
+       "<td>" (escape-html (status-label (:code issue))) "</td>"
+       "<td>" (escape-html (:message issue)) "</td></tr>"))
+
+(defn daily-row [record]
+  (str "<tr>"
+       "<td><a href=\"/reports/daily/" (.replace (:date record) "-" "") ".html\">" (escape-html (:date record)) "</a></td>"
+       "<td class=\"" (pnl-class (:equity record)) "\">" (money (:equity record)) "</td>"
+       "<td>" (money (:realized record)) "</td>"
+       "<td>" (money (:unrealized record)) "</td>"
+       "<td>" (money (:closed record)) "</td>"
+       "<td>" (:trades record) "</td>"
+       "<td>" (:orders record) "</td>"
+       "<td>" (:open-count record) "</td>"
+       "</tr>"))
+
+(def css
+  "body{margin:0;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif}.site-header{border-bottom:1px solid #30363d;background:#161b22}.site-header-inner{max-width:1180px;margin:0 auto;padding:18px 24px;display:flex;justify-content:space-between;gap:20px;align-items:center}.brand a{color:#e6edf3;text-decoration:none}.brand h1{margin:0;font-size:24px}.updated,.muted{color:#8b949e;font-size:12px}.site-nav{display:flex;gap:10px;flex-wrap:wrap}.site-nav a{color:#c9d1d9;text-decoration:none;border:1px solid #30363d;border-radius:999px;padding:7px 10px}.site-nav a:hover{border-color:#58a6ff;color:#fff}.container{max-width:1180px;margin:0 auto;padding:28px 24px}.hero{background:#161b22;border:1px solid #30363d;border-radius:16px;padding:20px;margin-bottom:18px}.hero-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.stat{background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:12px}.stat span{display:block;color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.stat strong{display:block;margin-top:6px;font-size:22px}.positive{color:#3fb950}.negative{color:#f85149}.neutral{color:#8b949e}table{width:100%;border-collapse:collapse;margin-top:10px}td,th{border-bottom:1px solid #30363d;padding:9px;text-align:left}th{color:#8b949e;font-size:12px;text-transform:uppercase}@media(max-width:720px){.site-header-inner{display:block}.site-nav{margin-top:14px}}")
+
+(defn render-html [display slug records]
+  (let [total-equity (reduce + 0.0 (map :equity records))
+        total-realized (reduce + 0.0 (map :realized records))
+        total-unrealized (reduce + 0.0 (map :unrealized records))
+        total-trades (reduce + 0 (map :trades records))
+        total-orders (reduce + 0 (map :orders records))
+        issues (vec
+                (mapcat
+                 (fn [record]
+                   (let [account-id (.get (:account record) "account/id")]
+                     (map #(issue-row record %)
+                          (filter #(= account-id (:account/id %))
+                                  (:issues (:validation (:artifact record)))))))
+                 records))
+        rendered-at (.strftime (datetime.datetime/now) "%Y-%m-%d %H:%M:%S")]
+    (str "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+         "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"
+         "<title>" (escape-html display) " Account Report</title><style>" css "</style></head><body>"
+         "<header class=\"site-header\"><div class=\"site-header-inner\"><div class=\"brand\">"
+         "<a href=\"/reports/index.html\"><h1>" (escape-html display) " Account Report</h1></a>"
+         "<div class=\"updated\">Rendered by Basilisp from daily validation JSON: " (escape-html rendered-at) "</div>"
+         "<div class=\"muted\">Canonical validation-backed period: " (count records) " day" (if (= 1 (count records)) "" "s") "</div></div>"
+         "<nav class=\"site-nav\"><a href=\"/reports/index.html\">Overview</a>"
+         "<a href=\"/reports/daily/index.html\">Daily</a><a href=\"/reports/weekly/index.html\">Weekly</a>"
+         "<a href=\"/reports/accounts/index.html\">Accounts</a><a href=\"/reports/status/index.html\">System</a>"
+         "<a href=\"/index.html\" class=\"back\">All Reports</a></nav></div></header>"
+         "<main class=\"container\"><section class=\"hero\"><h2>Canonical Account Summary</h2><div class=\"hero-grid\">"
+         "<div class=\"stat\"><span>Broker equity P&amp;L</span><strong class=\"" (pnl-class total-equity) "\">" (money total-equity) "</strong></div>"
+         "<div class=\"stat\"><span>Realized</span><strong>" (money total-realized) "</strong></div>"
+         "<div class=\"stat\"><span>Unrealized / carry-over</span><strong>" (money total-unrealized) "</strong></div>"
+         "<div class=\"stat\"><span>Closed trades</span><strong>" total-trades "</strong></div>"
+         "<div class=\"stat\"><span>Orders/fills</span><strong>" total-orders "</strong></div>"
+         "<div class=\"stat\"><span>Validation issues</span><strong>" (count issues) "</strong></div>"
+         "</div></section>"
+         "<section class=\"hero\"><h2>Daily Breakdown</h2><table><thead><tr><th>Date</th><th>Broker equity</th><th>Realized</th><th>Unrealized</th><th>Closed P&amp;L</th><th>Trades</th><th>Orders</th><th>Open pos</th></tr></thead><tbody>"
+         (apply str (map daily-row records))
+         "</tbody></table></section>"
+         (when (seq issues)
+           (str "<section class=\"hero\"><h2>Validation Issues</h2><table><thead><tr><th>Date</th><th>Severity</th><th>Code</th><th>Message</th></tr></thead><tbody>"
+                (apply str issues)
+                "</tbody></table></section>"))
+         "</main></body></html>")))
+
+(defn selected-displays [account]
+  (if account
+    (let [s (.upper (str account))]
+      (vec (filter #(or (= s %) (= (.lower s) (get account-slugs %))) account-order)))
+    account-order))
+
+(defn build! [{:keys [daily-dir accounts-dir account]}]
+  (doseq [[label value] [["--daily-dir" daily-dir] ["--accounts-dir" accounts-dir]]]
+    (when-not value (throw (python/ValueError (str label " is required")))))
+  (when-not (os.path/isdir daily-dir) (throw (python/FileNotFoundError daily-dir)))
+  (os/makedirs accounts-dir ** :exist_ok true)
+  (let [records (account-records (daily-artifacts daily-dir))
+        by-display (group-by :display records)
+        displays (selected-displays account)]
+    (when-not (seq displays)
+      (throw (python/ValueError (str "unknown account: " account))))
+    (let [outputs
+          (vec
+           (for [display displays
+                 :let [account-records (vec (get by-display display []))]
+                 :when (seq account-records)]
+             (let [slug (account-slug display)
+                   html-path (os.path/join accounts-dir (str slug ".html"))]
+               (spit html-path (render-html display slug account-records))
+               html-path)))]
+      (when-not (seq outputs)
+        (throw (python/ValueError "no account records found in daily validations")))
+      {:outputs outputs
+       :accounts (count outputs)
+       :records (count records)})))
+
+(try
+  (let [result (build! (parse-args (vec *command-line-args*)))]
+    (println (json/dumps (python/dict {"accounts" (:accounts result)
+                                       "records" (:records result)
+                                       "outputs" (python/list (:outputs result))})
+                         ** :indent 2 :sort_keys true))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/FileNotFoundError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2)))

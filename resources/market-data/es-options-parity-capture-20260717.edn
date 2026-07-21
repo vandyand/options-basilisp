@@ -1,0 +1,40 @@
+;; Frozen intraday evidence schedule for the GLBX futures-options admission
+;; study. Every capture writes its vendor receipt beside the immutable DBN.
+{:schema-version 1
+ :id :glbx-es-options-parity-20260717
+ :status :completed-and-qualified
+ :dataset "GLBX.MDP3"
+ :selector {:symbol "ES.OPT" :stype-in :parent}
+ :schemas [:definition :mbp-1 :trades]
+ :duration-seconds 300
+ :storage-root "D:\\SteveTradingData\\raw\\v1\\databento-live-validation"
+ :capture-windows
+ [{:label :early-session
+   :started-at "2026-07-17T14:38:41.142450Z"
+   :ended-at "2026-07-17T14:43:41.785827Z"
+   :status :completed}
+  {:label :midday
+   :started-at "2026-07-17T16:29:50.464875Z"
+   :ended-at "2026-07-17T16:34:50.959085Z"
+   :status :completed}
+  {:label :afternoon
+   :started-at "2026-07-17T17:30:15.089646Z"
+   :ended-at "2026-07-17T17:35:20.754993Z"
+   :status :completed}
+  {:label :closing-window
+   :started-at "2026-07-17T19:30:07.219535Z"
+   :ended-at "2026-07-17T19:35:07.684910Z"
+   :status :completed}]
+ :post-finalization-policy
+ {:select-concrete-contract-panel true
+  :strata [:right :expiry-band :log-moneyness-band :live-event-rate-band]
+  :compare-representation :market-event
+  :exclude-transport-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+  :historical-request-policy :cost-and-byte-gated
+  :admission :qualified-hard
+  :result {:mbp-1 {:matched-interior-events 48222
+                    :live-only-interior-events 0
+                    :historical-only-interior-events 0}
+           :ordinary-option-trades {:matched-events 108
+                                     :live-only-events 0
+                                     :historical-only-events 0}}}}

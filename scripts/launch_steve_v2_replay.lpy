@@ -1,0 +1,260 @@
+(import datetime glob math os os.path re sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[basilisp.edn :as edn])
+(require '[stevetrading.base.engine-replay :as replay])
+(require '[stevetrading.bridge.steve-v2 :as bridge])
+(require '[stevetrading.domain.instruments :as ins])
+
+(def default-ref-root
+  "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
+
+(def bots [:chestnut :lynx :moose :parrot :oak :dolphin])
+
+(def stock-syms #{"SPY" "HYG" "TLT" "VXX"})
+
+(def strategy-paths
+  ["resources/strategies/steve/chestnut-h3-v2.edn"
+   "resources/strategies/steve/lynx-h3-v2.edn"
+   "resources/strategies/steve/moose-h3-v2.edn"
+   "resources/strategies/steve/parrot-v2.edn"
+   "resources/strategies/steve/oak-v2.edn"
+   "resources/strategies/steve/dolphin-v2.edn"])
+
+(defn strategy-id
+  [bot]
+  (str "strategy/steve-v2/" (name bot) "/v1"))
+
+(defn account-id
+  [bot]
+  (str "account/alpaca/" (name bot) "-paper"))
+
+(defn- parse-args
+  [args]
+  (loop [remaining (seq args) acc {}]
+    (if (nil? remaining)
+      acc
+      (let [flag (first remaining)
+            value (second remaining)]
+        (cond
+          (contains? #{"--fixture" "--out" "--ref-root" "--bundle-variant"
+                       "--capture-dir" "--bridge-seed" "--mult2-scale" "--max-facts"}
+                     flag)
+          (do
+            (when (or (nil? value)
+                      (.startswith (str value) "--"))
+              (throw (python/ValueError (str "missing value for " flag))))
+            (recur (nnext remaining)
+                   (assoc acc (keyword (subs flag 2)) value)))
+
+          (or (= flag "-h") (= flag "--help"))
+          (recur (next remaining) acc)
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " flag))))))))
+
+(defn- parse-positive-int
+  [label value]
+  (when (some? value)
+    (try
+      (let [s (str value)
+            n (int s)]
+        (when-not (= s (str n))
+          (throw (python/ValueError
+                  (str label " must be an integer literal: " s))))
+        (when-not (pos? n)
+          (throw (python/ValueError
+                  (str label " must be positive: " s))))
+        n)
+      (catch python/Exception e
+        (throw (python/ValueError
+                (str "invalid " label ": " value " (" e ")")))))))
+
+(defn- parse-positive-double
+  [label value default]
+  (if (some? value)
+    (try
+      (let [n (double value)]
+        (when-not (and (math/isfinite n) (pos? n))
+          (throw (python/ValueError
+                  (str label " must be finite and positive: " value))))
+        n)
+      (catch python/Exception e
+        (throw (python/ValueError
+                (str "invalid " label ": " value " (" e ")")))))
+    default))
+
+(defn- parse-bundle-variant
+  [value]
+  (let [variant (or value "corrected")]
+    (when-not (contains? #{"corrected" "identity"} variant)
+      (throw (python/ValueError
+              (str "invalid bundle-variant: " variant
+                   " (expected corrected or identity)"))))
+    variant))
+
+(defn- bridge-config
+  [{:keys [ref-root bundle-variant capture-dir mult2-scale]}]
+  (let [ref-root (or ref-root default-ref-root)
+        suffix (if (= "identity" bundle-variant) "" "_corrected")]
+    {:ref-root ref-root
+     :bundle-dirs {:chestnut (str ref-root "/pipeline_data/live_model_chestnut_multihead" suffix)
+                   :lynx (str ref-root "/pipeline_data/live_model_lynx_multihead" suffix)
+                   :moose (str ref-root "/pipeline_data/live_model_moose_multihead" suffix)}
+     :calibrations {:chestnut (str ref-root "/pipeline_data/calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
+                    :lynx (str ref-root "/pipeline_data/calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
+                    :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}
+     :capture-dir capture-dir
+     :mult2-scale mult2-scale}))
+
+(defn- dt
+  [iso]
+  (.fromisoformat (.-datetime datetime) (.replace iso "Z" "+00:00")))
+
+(defn- seed-bar
+  [bar]
+  (assoc bar :time (dt (:time bar))))
+
+(defn- seed-chain
+  [snap]
+  (assoc snap :observed-at (dt (:observed-at snap))))
+
+(defn- prime-bridge-from-seed!
+  [br seed-path]
+  (when seed-path
+    (let [seed (edn/read-string (slurp seed-path))
+          bars (into {}
+                     (map (fn [[sym rows]]
+                            [sym (mapv seed-bar rows)])
+                          (:seed/bars seed)))
+          chains (mapv seed-chain (:seed/chains seed))]
+      (println (str "priming replay bridge from seed: " seed-path))
+      (bridge/prime! br bars chains))))
+
+(defn- bar-observation->bridge!
+  [br obs payload]
+  (let [iid (:record/instrument-id obs)
+        sym (last (.split iid "/"))]
+    (when (contains? stock-syms sym)
+      (bridge/on-bar! br {:symbol sym
+                          :time (dt (:bar/time payload))
+                          :open (python/float (:bar/open payload))
+                          :high (python/float (:bar/high payload))
+                          :low (python/float (:bar/low payload))
+                          :close (python/float (:bar/close payload))
+                          :volume (python/float (:bar/volume payload))
+                          :vwap (python/float (:bar/close payload))
+                          :trade-count 0}))))
+
+(defn- right-code
+  [right]
+  (case right
+    :option-right/put "PUT"
+    :option-right/call "CALL"
+    nil))
+
+(defn- chain-contract->bridge
+  [contract]
+  (let [ref (ins/parse-instrument-id (:instrument/id contract))
+        bid (:quote/bid contract)
+        ask (:quote/ask contract)]
+    (when (and (= :asset-class/option (:instrument/asset-class ref))
+               (some? bid)
+               (some? ask))
+      {:strike (python/float (:instrument/strike ref))
+       :right (right-code (:instrument/right ref))
+       :bid (python/float bid)
+       :ask (python/float ask)
+       :bid_size (when (some? (:quote/bid-size contract))
+                   (python/float (:quote/bid-size contract)))
+       :ask_size (when (some? (:quote/ask-size contract))
+                   (python/float (:quote/ask-size contract)))
+       :volume (when (some? (:ohlc/volume contract))
+                 (python/float (:ohlc/volume contract)))
+       :count (when (some? (:ohlc/count contract))
+                (python/float (:ohlc/count contract)))
+       :open_interest (when (some? (:open-interest/open-interest contract))
+                        (python/float (:open-interest/open-interest contract)))
+       :expiration (:instrument/expiry ref)})))
+
+(defn- chain-observation->bridge!
+  [br obs payload]
+  (when (bridge/spy-price br)
+    (let [contracts (vec (keep chain-contract->bridge
+                               (:chain/contracts payload)))]
+      (when (seq contracts)
+        (try
+          (bridge/on-chain! br {:observed-at (dt (:fact/occurred-at obs))
+                                :contracts contracts})
+          (catch python/Exception e
+            (println "WARN replay bridge chain ingestion failed:" (str e))))))))
+
+(defn make-observation-hook
+  [br]
+  (fn [obs new?]
+    (when new?
+      (let [payload (:fact/payload obs)]
+        (case (:record/type obs)
+          :fact/market-bar-observed
+          (bar-observation->bridge! br obs payload)
+
+          :fact/option-chain-observed
+          (chain-observation->bridge! br obs payload)
+
+          nil)))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (println "usage: basilisp run scripts/launch_steve_v2_replay.lpy -- --fixture <fixture.edn> --out <dir> [--ref-root <Data-Preprocessor>] [--bundle-variant corrected|identity] [--capture-dir <dir>] [--bridge-seed <bridge_seed.edn>] [--mult2-scale 1.5] [--max-facts n]")
+    (python/exit 0))
+  (try
+    (let [{:keys [fixture out ref-root bundle-variant capture-dir bridge-seed
+                  mult2-scale max-facts]} (parse-args args)]
+      (when (or (nil? fixture) (nil? out))
+        (println "usage: basilisp run scripts/launch_steve_v2_replay.lpy -- --fixture <fixture.edn> --out <dir> [--ref-root <Data-Preprocessor>] [--bundle-variant corrected|identity] [--capture-dir <dir>] [--bridge-seed <bridge_seed.edn>] [--mult2-scale 1.5] [--max-facts n]")
+        (python/exit 2))
+      (let [bundle-variant (parse-bundle-variant bundle-variant)
+            mult2-scale (parse-positive-double "--mult2-scale"
+                                               mult2-scale
+                                               1.5)
+            max-facts (parse-positive-int "--max-facts" max-facts)]
+        (println "loading Steve V2 bridge for deterministic replay...")
+        (let [br (bridge/make-bridge
+              (bridge-config {:ref-root ref-root
+                              :bundle-variant bundle-variant
+                              :capture-dir capture-dir
+                              :mult2-scale mult2-scale}))
+              _ (prime-bridge-from-seed! br bridge-seed)
+              bridge-ctx (into {}
+                               (map (fn [bot]
+                                      [(strategy-id bot)
+                                       {:signals-fn
+                                        (fn []
+                                          (select-keys (bridge/signals br) bots))}])
+                                    bots))
+              account-routes (into {}
+                                   (map (fn [bot]
+                                          [(strategy-id bot) (account-id bot)])
+                                        bots))
+              result (replay/run-replay
+                      {:fixture-path fixture
+                       :out-dir out
+                       :strategy-paths strategy-paths
+                       :account-id "account/alpaca/chestnut-paper"
+                       :account-routes account-routes
+                       :bridge-ctx bridge-ctx
+                       :on-observation (make-observation-hook br)
+                                       :snapshot-every 50
+                                       :max-facts max-facts})]
+          (println (pr-str (dissoc result :engine/state :ledger)))
+          result)))
+    (catch python/ValueError e
+      (println (str "ERROR: " e))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

@@ -72,8 +72,8 @@
 ;; --- generate dated artifacts + declaration + manifest ----------------------
 (def gen-root "live_runtime/generated")
 (def artifact-root (str gen-root "/artifacts"))
-(def feature-ref (str "feature/simple-vol/open-" compact-date))
-(def model-ref (str "model/simple-vol/open-" compact-date))
+(def feature-ref (str "feature/simple-vol/open/" compact-date "/v1"))
+(def model-ref (str "model/simple-vol/open/" compact-date "/v1"))
 (def spread-strategy-id "strategy/simple-vol/credit-spread-open/v1")
 
 (defn- write-edn! [path value]

@@ -1,0 +1,362 @@
+;; Local-only SPY equity sim fleet.
+;;
+;; Purpose: run a larger set of independent strategy IDs against the durable
+;; sim broker without touching Alpaca broker routes or the Hetzner live stack.
+;;
+;; Data path: Alpaca market-data bars only, using the chestnut data credentials
+;; from the REF .env. Broker path: :broker/sim only.
+;;
+;; Env:
+;;   SIM_OUT_SUFFIX=-dev        append to live_runtime/sim-local-fleet-<date>
+;;   SIM_EQUITY_QTY=50         per-strategy share quantity
+;;   SIM_CANARY_QTY=25         always-long broker canary share quantity
+;;   SIM_ENABLE_EXTRA_SMA=1    include restored slower SMA variants
+;;   SIM_ENABLE_ZCLOSE=1       include z-score close-delta variants
+;;   SIM_UNTIL_HHMM=1555       ET session stop time
+;;   SIM_DRY_RUN=1             generate artifacts/manifest only
+(import datetime os os.path re zoneinfo)
+(require '[basilisp.edn :as edn]
+         '[stevetrading.base.engine-live :as live]
+         '[stevetrading.control-plane.file-store :as cpfs]
+         '[stevetrading.market-data.alpaca :as mda])
+
+(def ref-root (or (os/getenv "STEVE_REF_ROOT")
+                  "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"))
+(def dry-run? (= "1" (os/getenv "SIM_DRY_RUN")))
+(def sim-equity-qty (or (os/getenv "SIM_EQUITY_QTY") "50"))
+(def sim-canary-qty (or (os/getenv "SIM_CANARY_QTY") "25"))
+(def enable-extra-sma? (not= "0" (os/getenv "SIM_ENABLE_EXTRA_SMA")))
+(def enable-zclose? (not= "0" (os/getenv "SIM_ENABLE_ZCLOSE")))
+(def out-suffix (or (os/getenv "SIM_OUT_SUFFIX") ""))
+(def until-hhmm (or (os/getenv "SIM_UNTIL_HHMM") "1555"))
+(def account-id (or (os/getenv "SIM_ACCOUNT_ID") "account/sim/local-fleet"))
+(def process-id "engine-sim-local-fleet")
+(def cp-root "live_runtime/cp-sim-local-fleet")
+(def gen-root "live_runtime/generated-local-sim")
+(def artifact-root (str gen-root "/artifacts"))
+(def strategy-root (str gen-root "/strategies"))
+
+(def env-text (slurp (str ref-root "/.env")))
+(defn- env-val [k]
+  (second (re-find (re-pattern (str "(?m)^" k "=(.+)$")) env-text)))
+(def key-id (.strip (env-val "ALPACA_CHESTNUT_API_KEY")))
+(def secret (.strip (env-val "ALPACA_CHESTNUT_API_SECRET")))
+
+(def session-date
+  (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
+(def compact-date (.replace session-date "-" ""))
+(def out-dir (str "live_runtime/sim-local-fleet-" session-date out-suffix))
+
+(defn- et->utc-str [hh mm]
+  (let [et-now (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York"))
+        at (.replace et-now ** :hour hh :minute mm :second 0 :microsecond 0)]
+    (.strftime (.astimezone at (.-utc datetime/timezone))
+               "%Y-%m-%dT%H:%M:%SZ")))
+
+(defn- until-str []
+  (let [hh (python/int (subs until-hhmm 0 2))
+        mm (python/int (subs until-hhmm 2 4))]
+    (et->utc-str hh mm)))
+
+(def entry-cutoff (et->utc-str 15 30))
+(def flatten-at (et->utc-str 15 45))
+(def until (until-str))
+
+(defn- write-edn! [path value]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (edn/write-string value)))
+
+(def base-sma-variants
+  [{:name "sma-02-05" :fast 2 :slow 5 :qty sim-equity-qty}
+   {:name "sma-03-08" :fast 3 :slow 8 :qty sim-equity-qty}
+   {:name "sma-05-13" :fast 5 :slow 13 :qty sim-equity-qty}
+   {:name "sma-08-16" :fast 8 :slow 16 :qty sim-equity-qty}
+   {:name "sma-10-20" :fast 10 :slow 20 :qty sim-equity-qty}
+   {:name "sma-12-24" :fast 12 :slow 24 :qty sim-equity-qty}
+   {:name "sma-04-18" :fast 4 :slow 18 :qty sim-equity-qty}
+   {:name "sma-06-22" :fast 6 :slow 22 :qty sim-equity-qty}
+   {:name "sma-02-10" :fast 2 :slow 10 :qty sim-equity-qty}
+   {:name "sma-03-12" :fast 3 :slow 12 :qty sim-equity-qty}
+   {:name "sma-06-18" :fast 6 :slow 18 :qty sim-equity-qty}
+   {:name "sma-09-24" :fast 9 :slow 24 :qty sim-equity-qty}])
+
+(def extra-sma-variants
+  [{:name "sma-04-20" :fast 4 :slow 20 :qty sim-equity-qty}
+   {:name "sma-08-21" :fast 8 :slow 21 :qty sim-equity-qty}
+   {:name "sma-10-30" :fast 10 :slow 30 :qty sim-equity-qty}
+   {:name "sma-13-34" :fast 13 :slow 34 :qty sim-equity-qty}
+   {:name "sma-21-55" :fast 21 :slow 55 :qty sim-equity-qty}])
+
+(def sma-variants
+  (vec (concat base-sma-variants
+               (when enable-extra-sma? extra-sma-variants))))
+
+(def zscore-variants
+  [{:name "zclose-h1-w08" :horizon 1 :window 8 :enter 1.20 :exit 0.35
+    :min-samples 5 :qty sim-equity-qty}
+   {:name "zclose-h2-w12" :horizon 2 :window 12 :enter 1.35 :exit 0.40
+    :min-samples 6 :qty sim-equity-qty}
+   {:name "zclose-h3-w16" :horizon 3 :window 16 :enter 1.50 :exit 0.50
+    :min-samples 8 :qty sim-equity-qty}
+   {:name "zclose-h5-w24" :horizon 5 :window 24 :enter 1.75 :exit 0.60
+    :min-samples 10 :qty sim-equity-qty}])
+
+(def canary-variants
+  [{:name "long-canary-a" :qty sim-canary-qty}
+   {:name "long-canary-b" :qty sim-canary-qty}
+   {:name "long-canary-c" :qty sim-canary-qty}
+   {:name "long-canary-d" :qty sim-canary-qty}])
+
+(defn- feature-ref [family name]
+  (str "feature/sim-local-" family "/" name "/v" compact-date))
+
+(defn- model-ref [family name]
+  (str "model/sim-local-" family "/" name "/v" compact-date))
+
+(defn- strategy-id [family name]
+  (str "strategy/sim-local-" family "/" name "/v1"))
+
+(defn- strategy-family-kw [family]
+  (keyword (str "strategy-family/sim-local-" family)))
+
+(defn- strategy-path [family name]
+  (str strategy-root "/" family "-" name ".edn"))
+
+(defn- write-sma! [{:keys [name fast slow qty]}]
+  (let [sid (strategy-id "sma" name)
+        fref (feature-ref "sma" name)
+        mref (model-ref "sma" name)
+        spath (strategy-path "sma" name)]
+    (write-edn! (str artifact-root "/" fref ".edn")
+                {:feature-manifest/id fref
+                 :feature-manifest/version 1
+                 :feature-manifest/features [:feature/sma-fast
+                                             :feature/sma-slow
+                                             :feature/last-close]
+                 :feature-manifest/params {:sma-fast {:window fast}
+                                           :sma-slow {:window slow}}
+                 :feature-manifest/required-inputs [:input/bar-1m]
+                 :feature-manifest/compatibility
+                 {:strategy-family :strategy-family/sim-local
+                  :prediction-schema-version 1}})
+    (write-edn! (str artifact-root "/" mref ".edn")
+                {:model/id mref
+                 :model/version 1
+                 :model/type :model.type/sma-crossover
+                 :model/params {:fast fast :slow slow}
+                 :model/feature-manifest-ref fref
+                 :model/prediction-schema-version 1})
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family (strategy-family-kw "sma")
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 1
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars slow}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/features {:manifest-ref fref}
+                 :strategy/inference {:artifact-ref mref}
+                 :strategy/signal {:fn-id :signal/sma-crossover-v1}
+                 :strategy/risk {:policy-id :risk/steve-v2-default
+                                 :params {:max-positions 1}}
+                 :strategy/execution {:policy-id :execution/market-equity-v1
+                                      :params {:quantity qty}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath}))
+
+(defn- write-zscore! [{:keys [name horizon window enter exit min-samples qty]}]
+  (let [sid (strategy-id "zclose" name)
+        fref (feature-ref "zclose" name)
+        mref (model-ref "zclose" name)
+        spath (strategy-path "zclose" name)]
+    (write-edn! (str artifact-root "/" fref ".edn")
+                {:feature-manifest/id fref
+                 :feature-manifest/version 1
+                 :feature-manifest/features [:feature/last-close]
+                 :feature-manifest/params {}
+                 :feature-manifest/required-inputs [:input/bar-1m]
+                 :feature-manifest/compatibility
+                 {:strategy-family :strategy-family/sim-local
+                  :prediction-schema-version 1}})
+    (write-edn! (str artifact-root "/" mref ".edn")
+                {:model/id mref
+                 :model/version 1
+                 :model/type :model.type/passthrough
+                 :model/params {:feature :feature/last-close}
+                 :model/feature-manifest-ref fref
+                 :model/prediction-schema-version 1})
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family (strategy-family-kw "zclose")
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 1
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 1}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/features {:manifest-ref fref}
+                 :strategy/inference {:artifact-ref mref}
+                 :strategy/signal {:fn-id :signal/zscore-hysteresis-v1
+                                   :params {:delta-horizon horizon
+                                            :stats-window window
+                                            :enter-sigma enter
+                                            :exit-sigma exit
+                                            :min-samples min-samples}}
+                 :strategy/risk {:policy-id :risk/steve-v2-default
+                                 :params {:max-positions 1}}
+                 :strategy/execution {:policy-id :execution/equity-direction-v1
+                                      :params {:quantity qty
+                                               :allow-short? true}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath}))
+
+(defn- write-canary! [{:keys [name qty]}]
+  (let [sid (strategy-id "canary" name)
+        fref (feature-ref "canary" name)
+        mref (model-ref "canary" name)
+        spath (strategy-path "canary" name)]
+    (write-edn! (str artifact-root "/" fref ".edn")
+                {:feature-manifest/id fref
+                 :feature-manifest/version 1
+                 :feature-manifest/features [:feature/last-close]
+                 :feature-manifest/params {}
+                 :feature-manifest/required-inputs [:input/bar-1m]
+                 :feature-manifest/compatibility
+                 {:strategy-family :strategy-family/sim-local
+                  :prediction-schema-version 1}})
+    (write-edn! (str artifact-root "/" mref ".edn")
+                {:model/id mref
+                 :model/version 1
+                 :model/type :model.type/threshold
+                 :model/params {:feature :feature/last-close
+                                :threshold "0"}
+                 :model/feature-manifest-ref fref
+                 :model/prediction-schema-version 1})
+    (write-edn! spath
+                {:strategy/id sid
+                 :strategy/family (strategy-family-kw "canary")
+                 :strategy/name (keyword (str "strategy-name/" name))
+                 :strategy/version 1
+                 :strategy/mode-policy #{:mode/sim}
+                 :strategy/schedule {:session :session/us-equities-regular}
+                 :strategy/warmup {:required-bars 1}
+                 :strategy/instruments ["equity/NASDAQ/SPY"]
+                 :strategy/features {:manifest-ref fref}
+                 :strategy/inference {:artifact-ref mref}
+                 :strategy/signal {:fn-id :signal/credit-threshold-v1}
+                 :strategy/risk {:policy-id :risk/steve-v2-default
+                                 :params {:max-positions 1}}
+                 :strategy/execution {:policy-id :execution/market-equity-v1
+                                      :params {:quantity qty}}})
+    {:sid sid :feature-ref fref :model-ref mref :path spath}))
+
+(def strategy-rows
+  (vec (concat (map write-sma! sma-variants)
+               (when enable-zclose?
+                 (map write-zscore! zscore-variants))
+               (map write-canary! canary-variants))))
+(def process-strategy-ids (mapv :sid strategy-rows))
+(def strategy-paths (mapv :path strategy-rows))
+
+(def revision
+  (str "cp-sim-local-fleet-" compact-date "-"
+       (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%H%M%S")))
+
+(def manifest
+  {:control-plane/revision revision
+   :control-plane/generated-at
+   (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+              "%Y-%m-%dT%H:%M:%SZ")
+   :control-plane/status :control-plane-status/proposed
+   :control-plane/strategies
+   (vec (for [{:keys [sid feature-ref model-ref]} strategy-rows]
+          {:strategy/id sid
+           :strategy/enabled? true
+           :strategy/mode :mode/sim
+           :strategy/process process-id
+           :strategy/account-route (str "route/" sid)
+           :strategy/artifacts {:model-ref model-ref
+                                :feature-manifest-ref feature-ref}
+           :strategy/schedule {:session :session/us-equities-regular}}))
+   :control-plane/accounts
+   [{:account/id account-id
+     :account/broker :broker/sim
+     :account/environment :environment/sim
+     :account/allowed-modes #{:mode/sim}
+     :account/live-enabled? false}]
+   :control-plane/processes
+   [{:process/id process-id
+     :process/base :base/engine-live
+     :process/allowed-modes #{:mode/sim}
+     :process/strategies process-strategy-ids}]
+   :control-plane/routes
+   (vec (for [sid process-strategy-ids]
+          {:route/id (str "route/" sid)
+           :route/strategy-id sid
+           :route/account-id account-id
+           :route/broker :broker/sim}))
+   :control-plane/kill-switches
+   [{:kill-switch/scope :kill-switch-scope/global
+     :kill-switch/active? false
+     :kill-switch/reason nil
+     :kill-switch/activated-at nil
+     :kill-switch/actor nil}]
+   :control-plane/policies
+   {:policy/default-degradation :degradation-policy/default-paper}})
+
+(def cp-store (cpfs/make-file-control-plane-store cp-root))
+(def activation
+  (cpfs/activate! cp-store manifest
+                  {:activation/actor "local-sim-fleet-launcher"}))
+(when-not (:activated? activation)
+  (println "FATAL: activation failed:" activation)
+  (python/exit 1))
+
+(println "=== LOCAL SIM FLEET PLAN ===")
+(prn {:revision revision
+      :account account-id
+      :out-dir out-dir
+      :strategy-count (count process-strategy-ids)
+      :strategies process-strategy-ids
+      :session-clock {:entry-cutoff entry-cutoff
+                      :flatten-at flatten-at
+                      :until until}
+      :sizing {:equity sim-equity-qty}
+      :enabled {:extra-sma enable-extra-sma?
+                :zclose enable-zclose?}
+      :variant-counts {:sma (count sma-variants)
+                       :zclose (if enable-zclose? (count zscore-variants) 0)
+                       :canary (count canary-variants)}
+      :canary-sizing {:equity sim-canary-qty}})
+
+(if dry-run?
+  (println "DRY RUN - stopping before run-live.")
+  (let [source (mda/make-alpaca-bars-source
+                {:symbol "SPY"
+                 :instrument-id "equity/NASDAQ/SPY"
+                 :key-id key-id
+                 :secret secret
+                 :warmup-bars 80
+                 :block? true
+                 :poll-seconds 10
+                 :until until
+                 :run-mode :mode/sim})
+        result (live/run-live
+                {:control-plane-root cp-root
+                 :process-id process-id
+                 :out-dir out-dir
+                 :source source
+                 :mode :mode/sim
+                 :snapshot-every 50
+                 :sim-store-path (str out-dir "/sim-broker.db")
+                 :sim-fill-policy {:mode :immediate
+                                   :price-source :mark
+                                   :slippage "0.00"}
+                 :suppress-pre-run-trading? true
+                 :session-clock {:entry-cutoff entry-cutoff
+                                 :flatten-at flatten-at}
+                 :strategy-paths strategy-paths
+                 :artifact-root artifact-root})]
+    (println "=== SESSION RESULT ===")
+    (prn (select-keys result [:live/started? :live/refusal :run/id
+                              :facts-appended :orders]))
+    (prn (:portfolio result))))

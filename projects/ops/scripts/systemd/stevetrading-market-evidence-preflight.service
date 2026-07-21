@@ -1,0 +1,15 @@
+[Unit]
+Description=Preflight SteveTrading market evidence capture
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+Environment=MARKET_EVIDENCE_MODE=preflight
+Environment=HISTORICAL_FEATURE_JOBS=4
+ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_market_evidence.sh
+StandardOutput=append:/var/log/stevetrading/market-evidence-systemd.log
+StandardError=append:/var/log/stevetrading/market-evidence-systemd.log

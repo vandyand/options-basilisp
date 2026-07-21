@@ -1,0 +1,42 @@
+(ns feature-parity.test-feature-drift-ledger-cli
+  (:import csv json os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "feature_drift_ledger.lpy"))
+(def basilisp-bin (str (.joinpath root ".venv/bin/basilisp")))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn write-json! [path value] (.write_text path (json/dumps (jsonable value))))
+(defn load-json [path] (json/loads (.read_text path)))
+
+(deftest feature-drift-ledger-persists-and-archives-prior-session-evidence
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          replay (.joinpath tmp "replay.json")
+          matched (.joinpath tmp "matched.csv")
+          out (.joinpath tmp "out")]
+      (write-json! replay {"feature_rows" [{"feature" "SPY_price_close" "feature_index" 0 "status" "EXACT_MATCH" "max_abs_deviation" 0.0 "mean_abs_deviation" 0.0 "live_nonfinite_count" 0 "replay_nonfinite_count" 0 "finite_mismatch_count" 0 "live_zero_frac" 0.0 "replay_zero_frac" 0.0}
+                                            {"feature" "bad_feature" "feature_index" 1 "status" "DRIFT" "max_abs_deviation" 2.0 "mean_abs_deviation" 1.0 "live_nonfinite_count" 0 "replay_nonfinite_count" 0 "finite_mismatch_count" 0 "live_zero_frac" 0.0 "replay_zero_frac" 0.0}]})
+      (with-open [fh (python/open matched "w" ** :newline "")]
+        (let [writer (csv/DictWriter fh ** :fieldnames ["feature" "status" "correlation" "max_abs_deviation" "live_zero_frac" "historical_zero_frac"])]
+          (.writeheader writer)
+          (.writerow writer {"feature" "SPY_price_close" "status" "EXACT_MATCH" "correlation" "1.0" "max_abs_deviation" "0.0" "live_zero_frac" "0.0" "historical_zero_frac" "0.0"})
+          (.writerow writer {"feature" "bad_feature" "status" "DIVERGED" "correlation" "0.2" "max_abs_deviation" "2.0" "live_zero_frac" "0.0" "historical_zero_frac" "0.0"})))
+      (let [args [basilisp-bin "run" (str script) "--" "--target-date" "2026-07-10" "--replay-json" (str replay) "--matched-csv" (str matched) "--out-dir" (str out)]
+            result (subprocess/run (python/list args) ** :cwd (str root) :capture_output true :text true)]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (let [ledger-json (.joinpath out "feature_drift_ledger_20260710.json")]
+          (is (.exists ledger-json) (str "ledger JSON should be written: args=" (repr (.-args result)) " stdout=" (.-stdout result) " stderr=" (.-stderr result)))
+          (when (.exists ledger-json)
+            (let [payload (load-json ledger-json)]
+              (is (= 2 (.get (.get payload "summary") "feature_count")))
+              (is (= 1 (.get (.get payload "summary") "blocked_feature_count"))))))
+        (is (= 0 (.-returncode (subprocess/run (python/list args) ** :cwd (str root) :capture_output true :text true))))
+        (let [archived (vec (.rglob out "feature_drift_ledger_history/*/*/feature_drift_ledger_20260710.json"))]
+          (is (= 1 (count archived))))))))

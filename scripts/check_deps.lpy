@@ -1,0 +1,103 @@
+;; Enforce dependency direction across workspace components.
+(import glob os os.path re sys)
+(require '[basilisp.string :as bstr])
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+
+(def pure-prefixes
+  ["stevetrading.domain."
+   "stevetrading.engine."
+   "stevetrading.ledger."
+   "stevetrading.portfolio."
+   "stevetrading.strategy."
+   "stevetrading.feature."
+   "stevetrading.inference."
+   "stevetrading.signal."
+   "stevetrading.risk."
+   "stevetrading.execution."])
+
+(def forbidden-prefixes
+  ["stevetrading.broker.alpaca"
+   "stevetrading.broker.router"
+   "stevetrading.broker.sim"
+   "stevetrading.market-data.replay"
+   "stevetrading.market-data.polygon"
+   "stevetrading.persistence.fact-store"
+   "stevetrading.persistence.snapshot-store"
+   "stevetrading.observability.structured-log"
+   "stevetrading.control-plane.file-store"
+   "stevetrading.artifact.file-store"
+   "stevetrading.base."])
+
+(def require-open-re (re/compile "\\((?::require\\b|require\\b)"))
+(def ns-token-re (re/compile "stevetrading[\\w.\\-]*"))
+
+(defn component-files
+  []
+  (sort (glob/glob (os.path/join repo-root "components" "*" "src" "**" "*.lpy")
+                   ** :recursive true)))
+
+(defn file-namespace
+  [path]
+  (let [parts (.split path (.-sep os))
+        src-idx (.index parts "src")
+        rel (python/list (drop (+ src-idx 1) parts))
+        mod (subs (.join "." rel) 0 (- (count (.join "." rel)) (count ".lpy")))]
+    (.replace mod "_" "-")))
+
+(defn strip-comments
+  [text]
+  (re/sub ";[^\n]*" "" text))
+
+(defn require-blocks
+  [text]
+  (let [blocks (atom [])]
+    (doseq [m (python/list (.finditer require-open-re text))]
+      (let [start (.start m)]
+        (loop [i start
+               depth 0]
+          (when (< i (count text))
+            (let [ch (nth text i)
+                  depth' (cond
+                           (= ch "(") (inc depth)
+                           (= ch ")") (dec depth)
+                           :else depth)]
+              (if (zero? depth')
+                (swap! blocks conj (subs text start (inc i)))
+                (recur (inc i) depth')))))))
+    @blocks))
+
+(defn required-namespaces
+  [text]
+  (set
+   (mapcat (fn [block]
+             (map #(.group % 0) (python/list (.finditer ns-token-re block))))
+           (require-blocks (strip-comments text)))))
+
+(defn starts-with-any?
+  [s prefixes]
+  (boolean (some #(.startswith s %) prefixes)))
+
+(defn eprintln
+  [& xs]
+  (python/print (apply str xs) ** :file (.-stderr sys)))
+
+(defn main
+  []
+  (let [violations (atom [])
+        files (component-files)]
+    (doseq [path files]
+      (let [own-ns (file-namespace path)]
+        (when (starts-with-any? own-ns pure-prefixes)
+          (doseq [req (sort (required-namespaces (slurp path)))]
+            (when (starts-with-any? req forbidden-prefixes)
+              (swap! violations conj [own-ns req path]))))))
+    (if (seq @violations)
+      (do
+        (eprintln "check_deps: dependency direction violations:")
+        (doseq [[own-ns req path] @violations]
+          (eprintln "  " own-ns " requires " req "  (" path ")"))
+        (python/exit 1))
+      (println (str "check_deps: " (count files) " component files OK")))))
+
+(main)

@@ -1,0 +1,566 @@
+(ns ops.test-market-evidence-manifest-smoke
+  (:import json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/market_evidence_manifest.lpy"))
+(def stamp "20260705")
+
+(def required-artifacts
+  {"thetadata_capability_probe" [".json" ".md"]
+   "thetadata_payload_verification" [".json"]
+   "live_feature_parity_baseline" [".json" ".csv" ".md"]
+   "live_feature_model_usage" [".json" ".csv" ".md"]
+   "neutralization_audit" [".json" ".csv" ".md"]
+   "market_evidence_readiness" [".json" ".md"]})
+
+(def optional-artifacts
+  {"live_feature_prediction_delta_aggregate" [".json" ".csv" ".md"]
+   "live_feature_parity_gate" [".json" ".md"]
+   "neutralized_feature_unlock_plan" [".json" ".csv" ".md"]
+   "neutralized_feature_evidence_report" [".json" ".csv" ".md"]
+   "blocked_feature_provenance_audit" [".json" ".csv" ".md"]
+   "legacy_greek_formula_search" [".json" ".csv" ".md"]
+   "greek_feature_reconstruction_audit" [".json" ".csv" ".md"]
+   "raw_feature_unlock_audit" [".json" ".csv" ".md"]
+   "raw_feature_unlock_candidates" [".json"]
+   "v3_grid_unlock_audit" [".json" ".csv" ".md"]
+   "greek_reconstruction_promotion_gate" [".json" ".csv" ".md"]
+   "neutralization_unmask_dry_run" [".json"]
+   "capture_v2_runtime_preflight" [".json"]
+   "capture_v2_sidecar_check" [".json"]
+   "option_surface_sidecar" [".json" ".npz"]
+   "option_surface_sidecar_check" [".json"]
+   "historical_feature_cohort" [".json"]
+   "historical_features" [".npz"]
+   "grid_feature_input_parity" [".json" ".md"]
+   "matched_feature_parity" [".json" ".csv" ".md"]})
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn read-json [p] (json/loads (.read_text p)))
+(defn path [parent child] (.joinpath parent child))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp (str (resolve-basilisp)))
+
+(defn write-json! [p payload]
+  (.write_text p (str (dumps payload) "\n")))
+
+(defn write-text! [p text]
+  (.write_text p text))
+
+(defn write-artifact! [analysis name ext]
+  (let [p (path analysis (str name "_" stamp ext))]
+    (cond
+      (and (= name "thetadata_capability_probe") (= ext ".json"))
+      (write-json!
+       p
+       {"target_date" "2026-07-05"
+        "generated_at" "2026-07-05T14:00:00Z"
+        "summary" {"total" 2 "ok" 2 "usable" 2 "failed" 0 "payload_examples" 2 "error_classes" {}}
+        "results" [{"name" "option.expirations"
+                    "ok" true
+                    "usable" true
+                    "summary" {"required_ok" true "row_width_valid" true}
+                    "payload_example" "PAYLOAD_QUOTE"}
+                   {"name" "option.snapshot.quote"
+                    "ok" true
+                    "usable" true
+                    "summary" {"required_ok" true "row_width_valid" true}
+                    "payload_example" "PAYLOAD_TRADE"}]})
+
+      (and (= name "thetadata_payload_verification") (= ext ".json"))
+      (write-json!
+       p
+       {"target_date" stamp
+        "generated_at" "2026-07-05T14:01:00Z"
+        "status" "ok"
+        "valid?" true
+        "total" 2
+        "checked" 2
+        "skipped" 0
+        "invalid" 0
+        "example_generated_date_counts" {stamp 2}
+        "example_path_date_counts" {stamp 2}
+        "results" [{"probe" "option.expirations" "path" "PAYLOAD_QUOTE" "status" "ok" "valid?" true}
+                   {"probe" "option.snapshot.quote" "path" "PAYLOAD_TRADE" "status" "ok" "valid?" true}]})
+
+      (and (= name "market_evidence_readiness") (= ext ".json"))
+      (write-json!
+       p
+       {"target_date" "2026-07-05"
+        "verdict" "PASS"
+        "reasons" []
+        "fail_reasons" []
+        "watch_reasons" []
+        "thetadata_probe" {"available" true
+                           "total" 2
+                           "usable" 2
+                           "failed" 0
+                           "payload_examples" 2
+                           "error_classes" {}
+                           "result_counts" {"total" 2 "ok" 2 "usable" 2 "failed" 0 "payload_examples" 2}}
+        "thetadata_payload_verification" {"available" true
+                                          "status" "ok"
+                                          "total" 2
+                                          "checked" 2
+                                          "skipped" 0
+                                          "invalid" 0
+                                          "valid" true
+                                          "result_counts" {"total" 2 "checked" 2 "skipped" 0 "invalid" 0}}
+        "legacy_greek_formula_search" {"available" false
+                                       "candidate_formula_hits" 0
+                                       "legacy_formula_provenance_hits" 0
+                                       "candidate_reconstruction_hits" 0
+                                       "manifest_reference_count" 0
+                                       "manifest_impl_classes_missing" 0}})
+
+      (and (#{"live_feature_parity_baseline" "live_feature_model_usage" "neutralization_audit"} name) (= ext ".json"))
+      (write-json! p {"target_date" "2026-07-05" "summary" {}})
+
+      :else
+      (write-text! p (str name ext "\n")))))
+
+(defn patch-payload-paths! [analysis payloads]
+  (let [quote (str (path (path payloads stamp) "quote.json"))
+        trade (str (path (path payloads stamp) "trade.json"))]
+    (doseq [filename [(str "thetadata_capability_probe_" stamp ".json")
+                      (str "thetadata_payload_verification_" stamp ".json")]]
+      (let [p (path analysis filename)
+            text (.read_text p)]
+        (.write_text p (-> text
+                           (.replace "PAYLOAD_QUOTE" quote)
+                           (.replace "PAYLOAD_TRADE" trade)))))))
+
+(defn patch-probe-payload-paths-to-remote! [analysis]
+  (let [probe (path analysis (str "thetadata_capability_probe_" stamp ".json"))
+        payload (read-json probe)
+        results (get payload "results")]
+    (aset (get results 0)
+          "payload_example"
+          (str "/opt/stevetrading/shared/payload_examples/" stamp "/quote.json"))
+    (aset (get results 1)
+          "payload_example"
+          (str "/opt/stevetrading/shared/payload_examples/" stamp "/trade.json"))
+    (write-json! probe payload)))
+
+(defn write-parity-proof! [analysis]
+  (write-json! (path analysis (str "capture_v2_sidecar_check_" stamp ".json"))
+               {"ok" true "status" "ok" "target_date" "2026-07-05" "rows" 120})
+  (write-json! (path analysis (str "capture_v2_runtime_preflight_" stamp ".json"))
+               {"ok" true
+                "status" "ok"
+                "target_date" "2026-07-05"
+                "sidecar_every" {"effective" 1
+                                  "ok" true
+                                  "parity_evidence_complete" true}
+                "target_capture_check" {"ok" true
+                                        "status" "ok"
+                                        "row_count" 120}
+                "issues" []
+                "warnings" []})
+  (write-json! (path analysis (str "historical_feature_cohort_" stamp ".json"))
+               {"ok" true
+                "status" "ok"
+                "target_date" "2026-07-05"
+                "rows" 120
+                "features" 918
+                "row_provenance_summary" {"rows" 120
+                                          "chain_present_rows" 120
+                                          "grid_appended_rows" 120
+                                          "carried_grid_rows" 0
+                                          "min_grid_history_len" 1
+                                          "max_grid_history_len" 10}
+                "contract_field_coverage" {"SPY" {"contracts" 24000
+                                                  "field_counts" {"volume" 24000 "open_interest" 24000}
+                                                  "field_coverage" {"volume" 1.0 "open_interest" 1.0}}}})
+  (.write_bytes (path analysis (str "historical_features_" stamp ".npz"))
+                (.encode "synthetic historical tensor\n" "utf-8"))
+  (write-json! (path analysis (str "matched_feature_parity_" stamp ".json"))
+               {"summary" {"target_date" "2026-07-05"
+                           "generated_at" "2026-07-05T14:30:00Z"
+                           "matched_rows" 120
+                           "feature_count" 918
+                           "problem_feature_count" 0
+                           "status_counts" {"MATCH" 918}}
+                "features" []})
+  (write-text! (path analysis (str "matched_feature_parity_" stamp ".csv"))
+               "feature,status,correlation,max_abs_deviation\nspy_close,MATCH,1.0,0.0\n")
+  (write-text! (path analysis (str "matched_feature_parity_" stamp ".md"))
+               "# Matched Feature Parity\n"))
+
+(defn write-bundle! [analysis payloads]
+  (.mkdir analysis ** :parents true :exist_ok true)
+  (doseq [[name exts] required-artifacts
+          ext exts]
+    (write-artifact! analysis name ext))
+  (let [payload-dir (path payloads stamp)]
+    (.mkdir payload-dir ** :parents true :exist_ok true)
+    (write-text! (path payload-dir "quote.json") "{\"header\":[\"ms_of_day\",\"bid\"],\"response\":[[34200000,1.23]]}\n")
+    (write-text! (path payload-dir "trade.json") "{\"header\":[\"ms_of_day\",\"price\"],\"response\":[[34200001,1.24]]}\n"))
+  (patch-payload-paths! analysis payloads)
+  (write-parity-proof! analysis))
+
+(defn write-optional-diagnostics! [analysis]
+  (doseq [[name exts] optional-artifacts
+          ext exts]
+    (let [p (path analysis (str name "_" stamp ext))]
+      (cond
+        (and (= name "neutralization_unmask_dry_run") (= ext ".json"))
+        (write-json! p {"applied" false
+                        "candidate_count" 4
+                        "candidate_features" ["raw_0" "raw_1" "v3_0" "greek_0"]
+                        "candidate_provenance" [{"feature" "raw_0" "sources" ["raw_feature_unlock_audit"]}
+                                                {"feature" "raw_1" "sources" ["raw_feature_unlock_audit"]}
+                                                {"feature" "v3_0" "sources" ["v3_grid_unlock_audit"]}
+                                                {"feature" "greek_0" "sources" ["greek_reconstruction_promotion_gate"]}]
+                        "readiness_json" (str (path analysis (str "market_evidence_readiness_" stamp ".json")))
+                        "readiness_available" true
+                        "readiness_target_date" "2026-07-05"
+                        "readiness_target_matches" true
+                        "readiness_verdict" "PASS"
+                        "readiness_reason_count" 0
+                        "readiness_reasons" []
+                        "readiness_error" nil
+                        "verified_by_audit" true
+                        "extra_audits" [{"path" (str (path analysis (str "v3_grid_unlock_audit_" stamp ".json")))
+                                         "target_date" "2026-07-05"
+                                         "candidate_count" 1}
+                                        {"path" (str (path analysis (str "greek_reconstruction_promotion_gate_" stamp ".json")))
+                                         "target_date" "2026-07-05"
+                                         "candidate_count" 1}]
+                        "results" [{"account" "chestnut" "removed" 4 "missing" 0
+                                    "before_sha256" "before-chestnut"
+                                    "planned_after_sha256" "after-chestnut"}
+                                   {"account" "lynx" "removed" 4 "missing" 0
+                                    "before_sha256" "before-lynx"
+                                    "planned_after_sha256" "after-lynx"}
+                                   {"account" "moose" "removed" 4 "missing" 0
+                                    "before_sha256" "before-moose"
+                                    "planned_after_sha256" "after-moose"}]})
+
+        (and (= name "raw_feature_unlock_audit") (= ext ".json"))
+        (write-json! p {"summary" {"target_date" "2026-07-05"
+                                   "neutralized_total" 703
+                                   "supported_neutralized" 172
+                                   "unsupported_neutralized" 531
+                                   "unsupported_neutralized_by_family" {"index-proxy" 247}
+                                   "candidate_count" 2
+                                   "candidate_features" ["raw_0" "raw_1"]}
+                        "features" []})
+
+        (and (= name "raw_feature_unlock_candidates") (= ext ".json"))
+        (write-json! p ["raw_0" "raw_1"])
+
+        (and (= name "neutralized_feature_evidence_report") (= ext ".json"))
+        (write-json! p {"summary" {"target_date" "2026-07-05"
+                                   "neutralized_total" 703
+                                   "current_status_counts" {"blocked-by-current-evidence" 312
+                                                            "blocked-by-missing-market-evidence" 391}
+                                   "current_status_by_source" {"option_surface_formula" {"blocked-by-missing-market-evidence" 135}}
+                                   "current_status_by_family" {"index-proxy" {"blocked-by-missing-market-evidence" 200}}
+                                   "missing_market_evidence_by_source" {"option_surface_formula" 135}
+                                   "missing_market_evidence_by_family" {"index-proxy" 200}
+                                   "missing_market_evidence_reason_counts" {"missing-option-surface-prefix:SPX" 391}
+                                   "raw_supported_neutralized" 181
+                                   "raw_unsupported_neutralized" 522
+                                   "v3_neutralized_features" 131
+                                   "readiness_verdict" "FAIL"
+                                   "readiness_reason_count" 23}
+                        "features" []})
+
+        (and (= name "v3_grid_unlock_audit") (= ext ".json"))
+        (write-json! p {"summary" {"target_date" "2026-07-05" "candidate_count" 1 "candidate_features" ["v3_0"]}
+                        "features" []})
+
+        (and (= name "greek_reconstruction_promotion_gate") (= ext ".json"))
+        (write-json! p {"summary" {"target_date" "2026-07-05"
+                                   "evaluated_count" 1
+                                   "candidate_count" 1
+                                   "min_evaluated_count" 1
+                                   "raw_guarded_greek_reconstruction_count" 1
+                                   "coverage_ok" true
+                                   "coverage_reasons" []
+                                   "candidate_features" ["greek_0"]}
+                        "features" [{"feature" "greek_0"
+                                     "candidate" true
+                                     "reason" "passes synthetic promotion fixture"}]})
+
+        (and (= name "option_surface_sidecar") (= ext ".json"))
+        (write-json! p {"generated_at" "2026-07-05T14:20:00Z"
+                        "target_date" "2026-07-05"
+                        "surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                        "surface_contracts" {"SPX" 300 "SPXW" 300 "VIX" 113 "VIXW" 61}})
+
+        (and (= name "option_surface_sidecar_check") (= ext ".json"))
+        (write-json! p {"ok" true
+                        "generated_at" "2026-07-05T14:21:00Z"
+                        "target_date" "2026-07-05"
+                        "row_count" 4
+                        "useful_row_count" 4
+                        "required_prefixes" ["SPXW" "VIXW" "SPX" "VIX"]
+                        "prefixes_present" ["SPX" "SPXW" "VIX" "VIXW"]
+                        "contracts_by_prefix" {"SPX" 1200 "SPXW" 1200 "VIX" 452 "VIXW" 244}
+                        "malformed_by_prefix" {"SPX" 0 "SPXW" 0 "VIX" 0 "VIXW" 0}
+                        "issues" []})
+
+        (and (= name "legacy_greek_formula_search") (= ext ".json"))
+        (write-json! p {"summary" {"candidate_formula_hits" 0
+                                   "legacy_formula_provenance_hits" 0
+                                   "candidate_reconstruction_hits" 28
+                                   "manifest_reference_count" 60
+                                   "manifest_impl_classes_missing" 60}
+                        "hits" []})
+
+        (and (= name "historical_feature_cohort") (= ext ".json"))
+        (write-json! p {"ok" true
+                        "status" "ok"
+                        "target_date" "2026-07-05"
+                        "start_time" "09:30:00"
+                        "end_time" "10:40:00"
+                        "first_time" "2026-07-05T13:30:00Z"
+                        "last_time" "2026-07-05T14:40:00Z"
+                        "rows" 120
+                        "features" 918
+                        "surface_minutes" {"SPX" 120 "SPXW" 120 "VIX" 120 "VIXW" 120}
+                        "contract_field_coverage" {"SPY" {"contracts" 24000
+                                                           "field_counts" {"volume" 24000 "open_interest" 24000}
+                                                           "field_coverage" {"volume" 1.0 "open_interest" 1.0}}
+                                                   "SPX" {"contracts" 9000
+                                                           "field_counts" {"volume" 9000 "open_interest" 9000}
+                                                           "field_coverage" {"volume" 1.0 "open_interest" 1.0}}}})
+
+        (and (= name "matched_feature_parity") (= ext ".json"))
+        (write-json! p {"summary" {"target_date" "2026-07-05"
+                                   "generated_at" "2026-07-05T14:30:00Z"
+                                   "matched_rows" 120
+                                   "matched_start" "2026-07-05T13:30:00Z"
+                                   "matched_end" "2026-07-05T15:30:00Z"
+                                   "feature_count" 1
+                                   "problem_feature_count" 0
+                                   "status_counts" {"MATCH" 1}
+                                   "max_abs_deviation" 0.0
+                                   "min_correlation" 1.0}
+                        "features" [{"feature" "SPY_close"
+                                     "status" "MATCH"
+                                     "neutralized" false
+                                     "active_problem" false}]})
+
+        (and (= name "grid_feature_input_parity") (= ext ".json"))
+        (write-json! p {"target_date" "2026-07-05"
+                        "status" "ok"
+                        "ok" true
+                        "matched_rows" 120
+                        "matched_start" "2026-07-05T13:30:00Z"
+                        "matched_end" "2026-07-05T15:30:00Z"
+                        "max_abs_deviation" 0.0
+                        "min_correlation" 1.0
+                        "shape" [120 6 21 8]
+                        "contract_density" {"reason" "historical SPY option universe density is comparable to live"
+                                            "historical_to_live_median_ratio" 1.0
+                                            "live" {"available" true
+                                                    "matched_contracts_per_minute" {"median" 240.0}}
+                                            "historical" {"available" true
+                                                          "contracts_per_minute" {"median" 240.0}}}
+                        "live_chain_observed_at_delta" {"reason" "live option_chain_json observed_at is aligned within 180 seconds of matched row times"
+                                                        "rows_with_observed_at" 120
+                                                        "rows_over_180_seconds" 0
+                                                        "rows_future_over_180_seconds" 0
+                                                        "signed_seconds" {"median" 60.0}
+                                                        "absolute_seconds" {"median" 60.0}}
+                        "live_grid_history_tail" {"reason" "live grids match grid_history_json tail on matched rows"
+                                                  "rows_with_grid_history" 120
+                                                  "tail_mismatch_rows" 0
+                                                  "tail_abs_delta" {"max" 0.0}
+                                                  "history_length" {"median" 10.0}}
+                        "grid_history_sequence" {"reason" "live grid_history_json sequence matches historical grid_histories tail"
+                                                 "available" true
+                                                 "rows_compared" 120
+                                                 "sequence_mismatch_rows" 0
+                                                 "sequence_abs_delta" {"max" 0.0}}
+                        "historical_time_shift_summaries" [{"historical_shift_minutes" 0
+                                                            "matched_rows" 120
+                                                            "min_correlation" 1.0}]
+                        "best_historical_time_shift" {"historical_shift_minutes" 0
+                                                      "matched_rows" 120
+                                                      "min_correlation" 1.0}
+                        "sequence_lag_summaries" [{"lag_minutes" 0
+                                                   "greek_count" 1
+                                                   "min_correlation" 1.0}]
+                        "best_sequence_lag" {"lag_minutes" 0
+                                             "greek_count" 1
+                                             "min_correlation" 1.0}
+                        "best_sequence_lag_by_mean" {"lag_minutes" 0
+                                                     "greek_count" 1
+                                                     "mean_correlation" 1.0}
+                        "best_sequence_lag_by_min" {"lag_minutes" 0
+                                                    "greek_count" 1
+                                                    "min_correlation" 1.0}
+                        "alignment_diagnosis" {"category" "aligned"
+                                               "reason" "Grid source alignment looks acceptable."
+                                               "historical_carried_grid_rows" 0
+                                               "historical_grid_appended_rows" 120}
+                        "rows" [{"greek" "iv"
+                                 "correlation" 1.0
+                                 "max_abs_deviation" 0.0
+                                 "live_nonzero_frac" 0.21
+                                 "historical_nonzero_frac" 0.21}]})
+
+        (and (= name "capture_v2_runtime_preflight") (= ext ".json"))
+        (write-json! p {"ok" true
+                        "status" "ok"
+                        "target_date" "2026-07-05"
+                        "sidecar_every" {"effective" 1
+                                          "ok" true
+                                          "parity_evidence_complete" true}
+                        "target_capture_check" {"ok" true
+                                                "status" "ok"
+                                                "row_count" 120
+                                                "issues" []}
+                        "issues" []
+                        "warnings" []})
+
+        (and (= name "historical_feature_cohort") (= ext ".json"))
+        (write-json! p {"ok" true
+                        "status" "ok"
+                        "target_date" "2026-07-05"
+                        "rows" 120
+                        "features" 918
+                        "row_provenance_summary" {"rows" 120
+                                                  "chain_present_rows" 120
+                                                  "grid_appended_rows" 120
+                                                  "carried_grid_rows" 0
+                                                  "min_grid_history_len" 1
+                                                  "max_grid_history_len" 10}
+                        "contract_field_coverage" {"SPY" {"contracts" 24000
+                                                          "field_counts" {"volume" 24000 "open_interest" 24000}
+                                                          "field_coverage" {"volume" 1.0 "open_interest" 1.0}}}})
+
+        (= ext ".json")
+        (write-json! p {"target_date" "2026-07-05" "diagnostic" name})
+
+        (= ext ".csv")
+        (write-text! p "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\nlynx,0.05,0.09\n")
+
+        :else
+        (write-text! p (str "# " name "\n")))))
+  (let [readiness-path (path analysis (str "market_evidence_readiness_" stamp ".json"))
+        readiness (read-json readiness-path)]
+    (.__setitem__ readiness "legacy_greek_formula_search"
+                  (jsonable {"available" true
+                             "candidate_formula_hits" 0
+                             "legacy_formula_provenance_hits" 0
+                             "candidate_reconstruction_hits" 28
+                             "manifest_reference_count" 60
+                             "manifest_impl_classes_missing" 60}))
+    (.__setitem__ readiness "matched_feature_parity"
+                  (jsonable {"available" true
+                             "matched_rows" 120
+                             "problem_feature_count" 0
+                             "max_abs_deviation" 0.0
+                             "min_correlation" 1.0
+                             "matched_start" "2026-07-05T13:30:00Z"
+                             "matched_end" "2026-07-05T15:30:00Z"}))
+    (write-json! (path analysis (str "neutralization_verified_apply_validation_" stamp ".json"))
+                 {"target_date" "2026-07-05"
+                  "apply" false
+                  "candidate_count" 4
+                  "candidate_features" ["raw_0" "raw_1" "v3_0" "greek_0"]
+                  "command" ["basilisp" "run" "scripts/apply_neutralization_candidates.lpy" "--" "--target-date" "2026-07-05"]
+                  "command_text" "basilisp run scripts/apply_neutralization_candidates.lpy -- --target-date 2026-07-05"})
+    (write-json! readiness-path readiness)))
+
+(defn run-manifest [args & [opts]]
+  (let [cwd (or (get opts :cwd) root)
+        env (.copy os/environ)]
+    (when-let [extra-env (get opts :env)]
+      (.update env (jsonable extra-env)))
+    (subprocess/run
+     (python/list (concat [basilisp "run" (str script) "--"] args))
+     ** :cwd (str cwd)
+        :env env
+        :text true
+        :capture_output true
+        :check false)))
+
+(deftest market-evidence-manifest-writes-and-verifies-complete-bundle
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (write-bundle! analysis payloads)
+      (let [written (run-manifest ["--target-date" "2026-07-05"
+                                   "--analysis-dir" (str analysis)
+                                   "--payload-dir" (str payloads)
+                                   "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written))
+        (let [payload (read-json manifest)]
+          (is (= true (get payload "valid?")))
+          (is (= stamp (get payload "target_stamp")))
+          (is (= 2 (get payload "payload_example_count")))
+          (is (= true (get-in payload ["artifacts" "market_evidence_readiness.json" "exists"]))))))))
+
+(deftest market-evidence-manifest-accepts-rsynced-remote-payload-example-paths
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (write-bundle! analysis payloads)
+      (patch-probe-payload-paths-to-remote! analysis)
+      (let [written (run-manifest ["--target-date" "2026-07-05"
+                                   "--analysis-dir" (str analysis)
+                                   "--payload-dir" (str payloads)
+                                   "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written))
+        (let [payload (read-json manifest)
+              codes (set (map #(get % "code") (get payload "issues")))]
+          (is (= true (get payload "valid?")))
+          (is (not (contains? codes "market-evidence/probe-payload-example-not-covered"))))))))
+
+(deftest market-evidence-manifest-includes-optional-diagnostics-when-present
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (write-bundle! analysis payloads)
+      (write-optional-diagnostics! analysis)
+      (let [written (run-manifest ["--target-date" "2026-07-05"
+                                   "--analysis-dir" (str analysis)
+                                   "--payload-dir" (str payloads)
+                                   "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written))
+        (let [payload (read-json manifest)
+              artifacts (get payload "artifacts")]
+          (is (= true (get payload "valid?")))
+          (doseq [artifact ["live_feature_prediction_delta_aggregate.csv"
+                            "live_feature_parity_gate.json"
+                            "neutralized_feature_unlock_plan.json"
+                            "neutralized_feature_evidence_report.json"
+                            "blocked_feature_provenance_audit.json"
+                            "legacy_greek_formula_search.json"
+                            "greek_feature_reconstruction_audit.json"
+                            "greek_reconstruction_promotion_gate.json"
+                            "capture_v2_runtime_preflight.json"
+                            "capture_v2_sidecar_check.json"
+                            "historical_feature_cohort.json"
+                            "historical_features.npz"
+                            "matched_feature_parity.json"
+                            "matched_feature_parity.csv"]]
+            (is (= true (get-in artifacts [artifact "exists"])) artifact)))))))

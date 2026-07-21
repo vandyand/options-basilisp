@@ -1,0 +1,268 @@
+;; Diagnose whether live-vs-historical option quote drift is explained by
+;; selecting a neighboring historical minute bucket.
+(import argparse datetime json math numpy os os.path sys)
+
+(require '[clojure.set :as set])
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/quote_selection_diagnostic.lpy -- "
+                "--live-capture PATH --historical-npz PATH --out-json PATH "
+                "[--target-date YYYY-MM-DD] [--minute-lags -3,-2,-1,0,1,2,3]")))
+
+(defn parse-int-list [text]
+  (vec (map #(int (python/int (.strip %)))
+            (filter #(pos? (count (.strip %))) (.split (str text) ",")))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--live-capture" ** :required true)
+    (.add_argument parser "--historical-npz" ** :required true)
+    (.add_argument parser "--out-json" ** :required true)
+    (.add_argument parser "--target-date" ** :default nil)
+    (.add_argument parser "--minute-lags" ** :default "-3,-2,-1,0,1,2,3")
+    (.parse_args parser (python/list argv))))
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (python/isinstance x numpy/integer) (int x)
+    (python/isinstance x numpy/floating) (float x)
+    :else x))
+
+(defn write-json! [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn npz-files [npz]
+  (set (map str (.-files npz))))
+
+(defn parse-chain [raw]
+  (let [text (str (or raw ""))]
+    (when (> (count text) 5)
+      (json/loads text))))
+
+(defn get-field [m k]
+  (when m
+    (try
+      (if (map? m) (get m k) (.get m k))
+      (catch python/Exception _ nil))))
+
+(defn finite-number [value]
+  (when (number? value)
+    (let [x (float value)]
+      (when (math/isfinite x) x))))
+
+(defn quote-value [contract field]
+  (finite-number (get-field contract field)))
+
+(defn mid-value [contract]
+  (let [bid (quote-value contract "bid")
+        ask (quote-value contract "ask")]
+    (when (and bid ask)
+      (/ (+ bid ask) 2.0))))
+
+(defn contract-key [contract]
+  (let [expiration (get-field contract "expiration")
+        right (get-field contract "right")
+        strike (get-field contract "strike")]
+    (when (and expiration right strike)
+      (str expiration "|" (.upper (str right)) "|" (format "%.6f" (float strike))))))
+
+(defn contract-map [payload]
+  (let [out (atom {})]
+    (doseq [contract (or (get-field payload "contracts") [])
+            :let [k (contract-key contract)]
+            :when k]
+      (swap! out assoc k contract))
+    @out))
+
+(defn time-index [times]
+  (into {} (for [i (range (len times))]
+             [(str (.__getitem__ times i)) i])))
+
+(defn preparse-chain-maps
+  ([times chains] (preparse-chain-maps times chains nil))
+  ([times chains allowed-times]
+   (let [out (atom {})
+         missing (atom 0)
+         parse-errors (atom 0)
+         skipped (atom 0)]
+     (doseq [i (range (len times))
+             :let [time (str (.__getitem__ times i))
+                   raw (str (.__getitem__ chains i))]]
+       (if (and allowed-times (not (contains? allowed-times time)))
+         (swap! skipped inc)
+         (cond
+           (<= (count raw) 5)
+           (swap! missing inc)
+
+           :else
+           (try
+             (swap! out assoc time (contract-map (parse-chain raw)))
+             (catch python/Exception _
+               (swap! parse-errors inc))))))
+     {"maps" @out
+      "missing" @missing
+      "parse_errors" @parse-errors
+      "skipped" @skipped})))
+
+(defn shift-time-key [time-key lag]
+  (let [dt (datetime.datetime/fromisoformat (.replace (str time-key) "Z" "+00:00"))
+        shifted (+ dt (datetime/timedelta ** :minutes (int lag)))]
+    (.strftime shifted "%Y-%m-%dT%H:%M:%SZ")))
+
+(defn numeric-summary [values]
+  (let [xs (vec (sort (map float values)))
+        n (count xs)
+        mean (when (pos? n) (/ (reduce + 0.0 xs) n))
+        median (when (pos? n)
+                 (if (odd? n)
+                   (nth xs (quot n 2))
+                   (/ (+ (nth xs (dec (quot n 2))) (nth xs (quot n 2))) 2.0)))
+        p95 (when (pos? n) (nth xs (min (dec n) (int (math/floor (* 0.95 (dec n)))))))]
+    {"count" n
+     "mean" mean
+     "median" median
+     "p95" p95
+     "max" (when (pos? n) (last xs))}))
+
+(defn compare-at-lag [live-maps hist-maps live-times lag]
+  (let [rows-compared (atom 0)
+        missing-hist-row (atom 0)
+        missing-live-chain (atom 0)
+        missing-hist-chain (atom 0)
+        parse-errors (atom 0)
+        shared-total (atom 0)
+        missing-contracts (atom 0)
+        extra-contracts (atom 0)
+        bid-deltas (python/list)
+        ask-deltas (python/list)
+        mid-deltas (python/list)]
+    (doseq [time live-times
+            :let [live-map (get live-maps time)
+                  hist-time (shift-time-key time lag)
+                  hist-map (get hist-maps hist-time)]]
+      (cond
+        (nil? live-map)
+        (swap! missing-live-chain inc)
+
+        (nil? hist-map)
+        (swap! missing-hist-row inc)
+
+        :else
+        (try
+          (let [live-keys (set (keys live-map))
+                hist-keys (set (keys hist-map))
+                shared (set/intersection live-keys hist-keys)]
+            (swap! rows-compared inc)
+            (swap! shared-total + (count shared))
+            (swap! missing-contracts + (count (set/difference live-keys hist-keys)))
+            (swap! extra-contracts + (count (set/difference hist-keys live-keys)))
+            (doseq [k shared
+                    :let [live-contract (get live-map k)
+                          hist-contract (get hist-map k)
+                          live-bid (quote-value live-contract "bid")
+                          hist-bid (quote-value hist-contract "bid")
+                          live-ask (quote-value live-contract "ask")
+                          hist-ask (quote-value hist-contract "ask")
+                          live-mid (mid-value live-contract)
+                          hist-mid (mid-value hist-contract)]]
+              (when (and live-bid hist-bid) (.append bid-deltas (abs (- live-bid hist-bid))))
+              (when (and live-ask hist-ask) (.append ask-deltas (abs (- live-ask hist-ask))))
+              (when (and live-mid hist-mid) (.append mid-deltas (abs (- live-mid hist-mid))))))
+          (catch python/Exception _
+            (swap! parse-errors inc)))))
+    {"lag_minutes" lag
+     "rows_compared" @rows-compared
+     "missing_historical_rows" @missing-hist-row
+     "missing_live_chain_rows" @missing-live-chain
+     "missing_historical_chain_rows" @missing-hist-chain
+     "parse_errors" @parse-errors
+     "shared_contracts" @shared-total
+     "missing_in_historical_contracts" @missing-contracts
+     "extra_in_historical_contracts" @extra-contracts
+     "bid_abs_deviation" (numeric-summary bid-deltas)
+     "ask_abs_deviation" (numeric-summary ask-deltas)
+     "mid_abs_deviation" (numeric-summary mid-deltas)}))
+
+(defn score [row]
+  (let [mid-count (get-in row ["mid_abs_deviation" "count"] 0)
+        mid-mean (get-in row ["mid_abs_deviation" "mean"])]
+    (if (and (> (int mid-count) 0) mid-mean)
+      (float mid-mean)
+      ##Inf)))
+
+(defn run-main [args]
+  (let [opts (parse-args args)
+        live (numpy/load (.-live_capture opts) ** :allow_pickle true)
+        hist (numpy/load (.-historical_npz opts) ** :allow_pickle true)
+        live-files (npz-files live)
+        hist-files (npz-files hist)]
+    (cond
+      (not (contains? live-files "option_chain_json"))
+      (do (write-json! (.-out_json opts) {"ok" false "reason" "live capture missing option_chain_json"}) 1)
+
+      (not (contains? hist-files "option_chain_json"))
+      (do (write-json! (.-out_json opts) {"ok" false "reason" "historical NPZ missing option_chain_json"}) 1)
+
+      :else
+      (let [live-times (.__getitem__ live "times")
+            hist-times (.__getitem__ hist "times")
+            live-chains (.__getitem__ live "option_chain_json")
+            hist-chains (.__getitem__ hist "option_chain_json")
+            lags (parse-int-list (.-minute_lags opts))
+            raw-live-time-keys (vec (for [i (range (len live-times))]
+                                      (str (.__getitem__ live-times i))))
+            raw-hist-time-set (set (for [i (range (len hist-times))]
+                                     (str (.__getitem__ hist-times i))))
+            allowed-live-times (set (filter (fn [time]
+                                              (boolean
+                                               (some #(contains? raw-hist-time-set
+                                                                 (shift-time-key time %))
+                                                     lags)))
+                                            raw-live-time-keys))
+            allowed-hist-times (set (for [time allowed-live-times
+                                          lag lags
+                                          :let [hist-time (shift-time-key time lag)]
+                                          :when (contains? raw-hist-time-set hist-time)]
+                                      hist-time))
+            live-preparsed (preparse-chain-maps live-times live-chains allowed-live-times)
+            hist-preparsed (preparse-chain-maps hist-times hist-chains allowed-hist-times)
+            live-chain-maps (get live-preparsed "maps")
+            hist-chain-maps (get hist-preparsed "maps")
+            live-time-keys (vec (sort (keys live-chain-maps)))
+            rows (vec (map #(compare-at-lag live-chain-maps hist-chain-maps live-time-keys %) lags))
+            best (first (sort-by score rows))
+            zero-row (first (filter #(= 0 (get % "lag_minutes")) rows))
+            payload {"ok" true
+                     "status" "ok"
+                     "target_date" (.-target_date opts)
+                     "live_capture" (.-live_capture opts)
+                     "historical_npz" (.-historical_npz opts)
+                     "preparse" {"allowed_live_rows" (count allowed-live-times)
+                                 "allowed_historical_rows" (count allowed-hist-times)
+                                 "live_missing_chain_rows" (get live-preparsed "missing")
+                                 "live_parse_errors" (get live-preparsed "parse_errors")
+                                 "live_skipped_rows" (get live-preparsed "skipped")
+                                 "historical_missing_chain_rows" (get hist-preparsed "missing")
+                                 "historical_parse_errors" (get hist-preparsed "parse_errors")
+                                 "historical_skipped_rows" (get hist-preparsed "skipped")}
+                     "lags" lags
+                     "best_lag" best
+                     "zero_lag" zero-row
+                     "zero_to_best_mean_mid_improvement" (when (and zero-row best
+                                                                    (get-in zero-row ["mid_abs_deviation" "mean"])
+                                                                    (get-in best ["mid_abs_deviation" "mean"]))
+                                                           (- (float (get-in zero-row ["mid_abs_deviation" "mean"]))
+                                                              (float (get-in best ["mid_abs_deviation" "mean"]))))
+                     "rows" rows}]
+        (write-json! (.-out_json opts) payload)
+        (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+        0))))
+
+(try
+  (python/exit (run-main *command-line-args*))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

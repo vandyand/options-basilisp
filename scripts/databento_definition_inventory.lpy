@@ -1,0 +1,50 @@
+;; Read-only, receipt-backed inventory of Databento instrument definitions.
+;; `instrument_class` is kept verbatim so no contract taxonomy is inferred.
+(import argparse datetime json pathlib databento)
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--dbn" ** :required true)
+    (.add_argument parser "--out" ** :required true)
+    (.add_argument parser "--as-of" ** :required true)
+    (.parse_args parser (python/list argv))))
+
+(defn frame-records [frame]
+  (let [columns (vec (.tolist (.-columns frame)))]
+    (vec
+     (map (fn [row]
+            (into {}
+                  (map (fn [column] [column (.get row column)]) columns)))
+          (.to_dict frame ** :orient "records")))))
+
+(defn grouped-records [frame]
+  (frame-records
+   (.reset_index
+    (.size (.groupby frame (python/list ["asset" "instrument_class" "security_type"]) ** :dropna false))
+    ** :name "definition_records")))
+
+(defn eligible-by-expiry [frame as-of]
+  (let [expiry (.get frame "expiration")]
+    (int (python/sum (.gt expiry as-of)))))
+
+(defn json-ready [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] [(str k) (json-ready v)]) value))
+    (or (vector? value) (seq? value)) (python/list (map json-ready value))
+    :else value))
+
+(let [args (parse-args (vec *command-line-args*))
+      source (.resolve (pathlib/Path (.-dbn args)))
+      target (.resolve (pathlib/Path (.-out args)))
+      as-of (datetime.datetime/fromisoformat (str (.-as_of args) "T00:00:00+00:00"))
+      frame (.to_df (databento/read_dbn (str source)) ** :schema "definition")
+      payload {"kind" "databento-definition-inventory-v1"
+               "source_dbn" (str source)
+               "as_of_utc" (str (.-as_of args) "T00:00:00Z")
+               "definition_records" (int (python/len frame))
+               "unique_instrument_ids" (int (.nunique (.get frame "instrument_id")))
+               "definitions_with_expiry_after_as_of" (eligible-by-expiry frame as-of)
+               "by_asset_instrument_class_security_type" (grouped-records frame)}]
+  (.mkdir (.-parent target) ** :parents true :exist_ok true)
+  (spit (str target) (str (json/dumps (json-ready payload) ** :indent 2 :sort_keys true) "\n"))
+  (println (str (json/dumps (json-ready payload) ** :indent 2 :sort_keys true))))

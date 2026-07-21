@@ -1,0 +1,45 @@
+(ns ops-hetzner.test-core
+  (:require [basilisp.test :refer [deftest is]]
+            [stevetrading.ops.hetzner-vps :as hv]))
+
+(def fake-pubkey
+  (str "ssh-ed25519 "
+       "AAAAC3NzaC1lZDI1NTE5AAAAIH9Q9d6r8tZ2cFx5xYqJk0w0lR5N4HwQ8aZ7vJ8fABCD "
+       "operator@workstation"))
+
+(deftest choose-server-type-picks-cheapest-matching-shape
+  (let [catalog [{:name "cx22" :memory 2 :disk 40 :cores 2 :arch "x86" :price-monthly 3.79 :location "ash" :type-id 1}
+                 {:name "cx23" :memory 4 :disk 40 :cores 2 :arch "x86" :price-monthly 4.99 :location "ash" :type-id 2}
+                 {:name "cpx31" :memory 8 :disk 160 :cores 4 :arch "x86" :price-monthly 15.99 :location "ash" :type-id 3}]
+        selected (hv/choose-server-type catalog {:min-ram 4 :min-disk 40 :arch "amd" :max-price-monthly 25.0})]
+    (is (= "cx23" (:name selected)))))
+
+(deftest choose-server-type-respects-price-ceiling
+  (let [catalog [{:name "cx23" :memory 4 :disk 40 :cores 2 :arch "x86" :price-monthly 4.99 :location "ash" :type-id 2}]]
+    (is (nil? (hv/choose-server-type catalog {:min-ram 4 :min-disk 40 :arch "amd" :max-price-monthly 4.0})))))
+
+(deftest cloud-init-is-non-tailscale-and-authorizes-bot
+  (let [rendered (hv/render-cloud-init "stevetrading-live-1" fake-pubkey)
+        lower (.lower rendered)]
+    (is (= -1 (.find lower "tailscale")))
+    (is (not= -1 (.find rendered "useradd -m -s /bin/bash bot")))
+    (is (not= -1 (.find rendered fake-pubkey)))
+    (is (not= -1 (.find rendered "PasswordAuthentication no")))
+    (is (not= -1 (.find rendered "/opt/stevetrading")))))
+
+(deftest redact-payload-masks-public-key-and-truncates-user-data
+  (let [payload {"ssh_keys" [123]
+                 "user_data" (str (hv/render-cloud-init "stevetrading-live-1" fake-pubkey)
+                                  (apply str (repeat 1000 "\n#")))}
+        redacted (hv/redact-payload payload)
+        user-data (get redacted "user_data")]
+    (is (= ["<operator-key-id>"] (get redacted "ssh_keys")))
+    (is (= -1 (.find user-data fake-pubkey)))
+    (is (not= -1 (.find user-data "ssh-<REDACTED-OPERATOR-PUBKEY>")))
+    (is (not= -1 (.find user-data "<truncated")))))
+
+(deftest pubkey-fingerprint-shape
+  (let [fp (hv/pubkey-fingerprint fake-pubkey)
+        parts (.split fp ":")]
+    (is (= 16 (count parts)))
+    (is (every? #(= 2 (count %)) parts))))

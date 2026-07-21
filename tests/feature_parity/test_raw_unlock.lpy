@@ -1,0 +1,468 @@
+(ns feature-parity.test-raw-unlock
+  (:import json math numpy)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.feature-parity.raw-unlock :as raw]))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x]
+  (json/dumps (jsonable x)))
+
+(defn approx?
+  ([actual expected] (approx? actual expected 1.0e-6))
+  ([actual expected tolerance]
+   (<= (abs (- (float actual) (float expected))) tolerance)))
+
+(deftest wavetrend-uses-sequential-ema-and-rolling-signal
+  ;; The production FeatureEngine computes ESA -> deviation EMA -> CI EMA
+  ;; (wt1) -> rolling signal (wt2). A prior native port returned CI for both.
+  (let [close (numpy/asarray (python/list (range 100.0 160.0)) ** :dtype numpy/float64)
+        high (+ close 0.7)
+        low (- close 0.4)
+        wt1 (raw/wavetrend-last high low close "wt1")
+        wt2 (raw/wavetrend-last high low close "wt2")]
+    (is (math/isfinite wt1))
+    (is (math/isfinite wt2))
+    (is (not (approx? wt1 wt2 1.0e-8)))))
+
+(deftest rsi-uses-wilder-com-smoothing
+  (let [close (numpy/asarray [100.0 103.0 101.0 105.0 102.0 107.0 104.0
+                              108.0 106.0 110.0 107.0 112.0 109.0 114.0
+                              111.0 116.0 113.0 118.0 115.0 120.0]
+                             ** :dtype numpy/float64)
+        rsi (raw/rsi-last close 14)]
+    (is (math/isfinite rsi))
+    (is (< 0.0 rsi 100.0))))
+
+(deftest compute-v2-grid-features-matches-training-formula
+  (let [grids (numpy/zeros #py (7 6 21 8) ** :dtype numpy/float64)]
+    (doseq [i (range 7)]
+      (.__setitem__ grids #py (i 0 (slice 9 12) (slice 0 2)) (+ 0.20 (* i 0.01)))
+      (.__setitem__ grids #py (i 0 (slice 9 12) (slice 5 8)) 0.10)
+      (.__setitem__ grids #py (i 0 (slice nil nil) (slice nil nil))
+                    (+ (.__getitem__ grids #py (i 0 (slice nil nil) (slice nil nil))) 0.01))
+      (.__setitem__ grids #py (i 1 (slice nil 10) (slice nil nil)) -0.5)
+      (.__setitem__ grids #py (i 1 (slice 10 nil) (slice nil nil)) 0.5))
+    (let [out (raw/compute-v2-grid-features grids)
+          iv (.__getitem__ grids #py ((slice nil nil) 0 (slice nil nil) (slice nil nil)))
+          delta (.__getitem__ grids #py ((slice nil nil) 1 (slice nil nil) (slice nil nil)))
+          vix-proxy (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 0 2))) ** :axis #py (1 2))
+          put-sum (numpy/sum (numpy/where (< delta 0.0) iv 0.0) ** :axis #py (1 2))
+          call-sum (numpy/sum (numpy/where (> delta 0.0) iv 0.0) ** :axis #py (1 2))
+          expected-pcr (/ (.__getitem__ put-sum -1) (.__getitem__ call-sum -1))]
+      (is (approx? (get out "vix_proxy") (.__getitem__ vix-proxy -1)))
+      (is (approx? (get out "vix_momentum_5") (- (.__getitem__ vix-proxy -1) (.__getitem__ vix-proxy -6))))
+      (is (approx? (get out "vix_momentum_20") (- (.__getitem__ vix-proxy -1) (.__getitem__ vix-proxy 0))))
+      (is (approx? (get out "put_call_ratio") expected-pcr)))))
+
+(deftest compute-v2-grid-feature-arrays-match-latest-formula
+  (let [grids (numpy/zeros #py (7 6 21 8) ** :dtype numpy/float64)]
+    (doseq [i (range 7)]
+      (.__setitem__ grids #py (i 0 (slice 9 12) (slice 0 2)) (+ 0.20 (* i 0.01)))
+      (.__setitem__ grids #py (i 0 (slice 9 12) (slice 5 8)) 0.10)
+      (.__setitem__ grids #py (i 0 (slice nil nil) (slice nil nil))
+                    (+ (.__getitem__ grids #py (i 0 (slice nil nil) (slice nil nil))) 0.01))
+      (.__setitem__ grids #py (i 1 (slice nil 10) (slice nil nil)) -0.5)
+      (.__setitem__ grids #py (i 1 (slice 10 nil) (slice nil nil)) 0.5))
+    (let [arrays (raw/compute-v2-grid-feature-arrays grids)
+          latest (raw/compute-v2-grid-features grids)]
+      (doseq [name ["vix_proxy" "vix_term_slope" "put_call_ratio" "vix_momentum_5" "vix_momentum_20"]]
+        (is (approx? (.__getitem__ (get arrays name) -1) (get latest name)))))))
+
+(deftest compute-live-v2-feature-map-uses-grid-history-momentum
+  (let [grids (numpy/zeros #py (7 6 21 8) ** :dtype numpy/float64)]
+    (doseq [i (range 7)]
+      (.__setitem__ grids #py (i 0 (slice 9 12) (slice 0 2)) (+ 0.20 (* i 0.01)))
+      (.__setitem__ grids #py (i 0 (slice 9 12) (slice 5 8)) 0.10)
+      (.__setitem__ grids #py (i 1 (slice nil 10) (slice nil nil)) -0.5)
+      (.__setitem__ grids #py (i 1 (slice 10 nil) (slice nil nil)) 0.5))
+    (let [expected (raw/compute-v2-grid-features grids)
+          history (python/list (for [i (range 7)]
+                                 (.__getitem__ grids i)))
+          out (raw/compute-live-v2-feature-map history {} nil)]
+      (doseq [name ["vix_proxy" "vix_term_slope" "put_call_ratio" "vix_momentum_5" "vix_momentum_20"]]
+        (is (approx? (get out name) (get expected name)))))))
+
+(deftest compute-realized-vol-feature-arrays-use-pandas-rolling-std-contract
+  (let [prices (numpy/array [100.0 101.0 102.0 101.0] ** :dtype numpy/float64)
+        out (raw/compute-realized-vol-feature-arrays prices)
+        rv20 (get out "realized_vol_20")
+        ratio (get out "vol_ratio")
+        returns (numpy/array [0.0
+                              (math/log (/ 101.0 100.0))
+                              (math/log (/ 102.0 101.0))
+                              (math/log (/ 101.0 102.0))]
+                             ** :dtype numpy/float64)]
+    (is (math/isnan (float (.__getitem__ rv20 0))))
+    (is (approx? (.__getitem__ rv20 1) (float (numpy/std (.__getitem__ returns (slice 0 2)) ** :ddof 1))))
+    (is (approx? (.__getitem__ rv20 3) (float (numpy/std returns ** :ddof 1))))
+    (is (math/isnan (float (.__getitem__ ratio 0))))))
+
+(deftest standardize-feature-columns-sorts-names-and-skips-requested-columns
+  (let [features {"z_skip" (numpy/array [0.0 1.0 0.0] ** :dtype numpy/float32)
+                  "a_norm" (numpy/array [1.0 2.0 3.0] ** :dtype numpy/float32)}
+        train-mask (numpy/array [true true false])
+        out (raw/standardize-feature-columns features train-mask #{"z_skip"})]
+    (is (= #py (3 2) (.-shape out)))
+    ;; Sorted order is a_norm, then z_skip.
+    (is (approx? (.__getitem__ out #py (0 0)) -1.0))
+    (is (approx? (.__getitem__ out #py (1 0)) 1.0))
+    (is (approx? (.__getitem__ out #py (0 1)) 0.0))
+    (is (approx? (.__getitem__ out #py (1 1)) 1.0))))
+
+(deftest count-components-uses-four-neighbor-connectivity
+  (let [mask (numpy/array [[true false true]
+                           [false true false]
+                           [true false true]]
+                          ** :dtype bool)]
+    (is (= 5 (raw/count-components mask)))))
+
+(deftest compute-tda-feature-arrays-produces-topology-and-cross-day-deltas
+  (let [grids (numpy/zeros #py (7 6 21 8) ** :dtype numpy/float32)
+        day-ids (numpy/array [0 0 0 0 0 1 1] ** :dtype numpy/int32)]
+    (doseq [bi (range 7)]
+      (.__setitem__ grids #py (bi 0 (slice nil nil) (slice nil nil)) (float bi))
+      (.__setitem__ grids #py (bi 0 10 4) (+ 10.0 bi)))
+    (let [out (raw/compute-tda-feature-arrays grids day-ids)
+          range-arr (get out "tda_iv_persistence_range")
+          rough-arr (get out "tda_iv_roughness")
+          d5-arr (get out "tda_iv_persistence_range_d5")]
+      (is (= 72 (count out)))
+      (is (approx? (.__getitem__ range-arr 0) 10.0))
+      (is (pos? (.__getitem__ rough-arr 0)))
+      (is (approx? (.__getitem__ d5-arr 5) 0.0))
+      (is (approx? (.__getitem__ d5-arr 6) 0.0)))))
+
+(deftest compute-wasserstein-feature-arrays-skips-consecutive-cross-day-boundaries
+  (let [grids (numpy/zeros #py (7 6 21 8) ** :dtype numpy/float32)
+        day-ids (numpy/array [0 0 0 0 0 1 1] ** :dtype numpy/int32)]
+    (doseq [bi (range 7)]
+      (.__setitem__ grids #py (bi 0 (slice nil nil) (slice nil nil)) (float bi)))
+    (let [out (raw/compute-wasserstein-feature-arrays grids day-ids)
+          consec (get out "wass_iv_w1_consec")
+          trailing (get out "wass_iv_w1_trailing")
+          divergence (get out "wass_iv_surface_divergence")
+          d5 (get out "wass_iv_surface_divergence_d5")]
+      (is (= 72 (count out)))
+      (is (approx? (.__getitem__ consec 1) 1.0))
+      (is (pos? (.__getitem__ trailing 4)))
+      (is (approx? (.__getitem__ divergence 5) 0.0))
+      ;; Matches the legacy formula: d5 is not separately day-boundary guarded.
+      (is (neg? (.__getitem__ d5 5))))))
+
+(deftest gaussian-filter-2d-preserves-constant-surfaces
+  (let [surface (numpy/ones #py (21 8) ** :dtype numpy/float64)
+        smoothed (raw/gaussian-filter-2d surface 2.0)]
+    (is (approx? (float (numpy/max (numpy/abs (- smoothed surface)))) 0.0 1.0e-6))))
+
+(deftest compute-scattering-feature-arrays-produces-texture-and-deltas
+  (let [grids (numpy/zeros #py (7 6 21 8) ** :dtype numpy/float32)
+        day-ids (numpy/array [0 0 0 0 0 0 0] ** :dtype numpy/int32)]
+    (doseq [bi (range 7)]
+      (.__setitem__ grids #py (bi 0 10 4) (+ 1.0 bi)))
+    (let [out (raw/compute-scattering-feature-arrays grids day-ids)
+          fine (get out "scat_iv_fine_mean")
+          energy (get out "scat_iv_fine_energy")
+          d5 (get out "scat_iv_fine_energy_d5")]
+      (is (= 84 (count out)))
+      (is (pos? (.__getitem__ fine 0)))
+      (is (pos? (.__getitem__ energy 0)))
+      (is (pos? (.__getitem__ d5 6))))))
+
+(deftest compute-dictionary-feature-arrays-uses-exported-live-atom-contract
+  (let [grids (numpy/zeros #py (2 6 21 8) ** :dtype numpy/float32)
+        components (numpy/zeros #py (64 1008) ** :dtype numpy/float32)
+        train-mean (numpy/zeros 1008 ** :dtype numpy/float32)
+        train-std (numpy/ones 1008 ** :dtype numpy/float32)]
+    (.__setitem__ grids #py (0 0 0 0) 3.0)
+    (.__setitem__ grids #py (0 0 0 1) 2.0)
+    (.__setitem__ grids #py (1 0 0 0) 1.0)
+    (.__setitem__ components #py (0 0) 1.0)
+    (.__setitem__ components #py (1 1) 1.0)
+    (let [out (raw/compute-dictionary-feature-arrays
+               grids
+               {"components" components "train_mean" train-mean "train_std" train-std})
+          code0 (get out "dict_code_0")
+          code1 (get out "dict_code_1")
+          active (get out "dict_n_active")
+          recon (get out "dict_recon_error")
+          d5 (get out "dict_recon_error_d5")
+          d20 (get out "dict_recon_error_d20")]
+      (is (= 26 (count out)))
+      (is (approx? (.__getitem__ code0 0) 3.0))
+      (is (approx? (.__getitem__ code1 0) 2.0))
+      (is (approx? (.__getitem__ active 0) 2.0))
+      (is (approx? (.__getitem__ recon 0) 0.0))
+      (is (approx? (.__getitem__ recon 1) 0.0))
+      (is (approx? (.__getitem__ d5 0) 0.0))
+      (is (approx? (.__getitem__ d20 1) 0.0)))))
+
+(deftest compute-live-v3-feature-arrays-covers-full-live-grid-family
+  (let [grids (numpy/zeros #py (6 6 21 8) ** :dtype numpy/float32)
+        components (numpy/zeros #py (64 1008) ** :dtype numpy/float32)
+        train-mean (numpy/zeros 1008 ** :dtype numpy/float32)
+        train-std (numpy/ones 1008 ** :dtype numpy/float32)]
+    (doseq [bi (range 6)]
+      (.__setitem__ grids #py (bi 0 10 4) (+ 1.0 bi)))
+    (.__setitem__ components #py (0 508) 1.0)
+    (let [out (raw/compute-live-v3-feature-arrays
+               grids
+               {"components" components "train_mean" train-mean "train_std" train-std})]
+      (is (= 254 (count out)))
+      (is (= #py (6) (.-shape (get out "tda_iv_persistence_range"))))
+      (is (= #py (6) (.-shape (get out "wass_iv_w1_consec"))))
+      (is (= #py (6) (.-shape (get out "dict_code_0"))))
+      (is (= #py (6) (.-shape (get out "scat_iv_fine_energy"))))
+      (is (pos? (.__getitem__ (get out "scat_iv_fine_energy") 0))))))
+
+(deftest compute-live-feature-vector-materializes-latest-v3-values
+  (let [grids (numpy/zeros #py (2 6 21 8) ** :dtype numpy/float32)
+        names ["tda_iv_persistence_range" "scat_iv_fine_energy"]]
+    (.__setitem__ grids #py (0 0 10 4) 1.0)
+    (.__setitem__ grids #py (1 0 10 4) 4.0)
+    (let [arrays (raw/compute-live-v3-feature-arrays grids nil)
+          vector (raw/compute-live-feature-vector names {}
+                                                  (python/list [(.__getitem__ grids 0)
+                                                                (.__getitem__ grids 1)])
+                                                  nil nil)]
+      (is (approx? (.__getitem__ vector 0)
+                   (.__getitem__ (get arrays "tda_iv_persistence_range") -1)))
+      (is (approx? (.__getitem__ vector 1)
+                   (.__getitem__ (get arrays "scat_iv_fine_energy") -1))))))
+
+(deftest live-and-historical-wasserstein-formulas-can-diverge
+  (let [grids (numpy/zeros #py (2 6 21 8) ** :dtype numpy/float32)
+        day-ids (numpy/zeros 2 ** :dtype numpy/int32)]
+    (.__setitem__ grids #py (0 0 0 0) 1.0)
+    (.__setitem__ grids #py (1 0 20 7) 1.0)
+    (let [historical (raw/compute-wasserstein-feature-arrays grids day-ids)
+          live (raw/compute-live-wasserstein-feature-arrays grids)]
+      ;; Same sorted values, moved across the surface: historical sorted-W1 is
+      ;; zero, live mean absolute surface delta is positive.
+      (is (approx? (.__getitem__ (get historical "wass_iv_w1_consec") 1) 0.0))
+      (is (pos? (.__getitem__ (get live "wass_iv_w1_consec") 1))))))
+
+(deftest live-and-historical-scattering-formulas-can-diverge
+  (let [surface (numpy/zeros #py (21 8) ** :dtype numpy/float32)]
+    (.__setitem__ surface #py (0 0) 1.0)
+    (let [historical (raw/scattering-single surface)
+          live (raw/live-scattering-single surface)]
+      (is (>= (get historical "fine_mean") 0.0))
+      ;; Live preserves the signed detail mean; historical stores abs(detail).
+      (is (not (approx? (get live "fine_mean") (get historical "fine_mean")))))))
+
+(deftest native-black-scholes-and-grid-reconstruction-populate-expected-cell
+  (let [price (raw/bs-option-price 0.0 100.0 100.0 0.25 0.04 0.20 "call")
+        iv (raw/native-implied-vol price 100.0 100.0 0.25 0.04 "call")
+        greeks (raw/native-bs-greeks 100.0 100.0 0.25 0.04 iv "call")
+        grid (raw/native-build-greeks-grid
+              [{"strike" 100.0
+                "expiration" "2026-07-17"
+                "iv" 0.20
+                "delta" 0.55
+                "vega" 20.0
+                "theta" -0.01
+                "rho" 10.0}]
+              100.0
+              "2026-07-06T10:00:00-04:00")]
+    (is (< (abs (- iv 0.20)) 1.0e-5))
+    (is (< 0.50 (get greeks "delta") 0.60))
+    (is (pos? (get greeks "vega")))
+    (is (= #py (6 21 8) (.-shape grid)))
+    (is (approx? (.__getitem__ grid #py (0 10 3)) 0.20))
+    (is (approx? (.__getitem__ grid #py (1 10 3)) 0.55))
+    (is (approx? (.__getitem__ grid #py (2 10 3)) 20.0))))
+
+(deftest native-implied-vol-updates-bisection-bracket
+  (let [call-price (raw/bs-option-price 0.0 100.0 107.0 0.08 0.04 0.37 "call")
+        put-price (raw/bs-option-price 0.0 100.0 93.0 0.08 0.04 0.42 "put")
+        call-iv (raw/native-implied-vol call-price 100.0 107.0 0.08 0.04 "call")
+        put-iv (raw/native-implied-vol put-price 100.0 93.0 0.08 0.04 "put")]
+    (is (approx? call-iv 0.37 1.0e-5))
+    (is (approx? put-iv 0.42 1.0e-5))))
+
+(deftest native-grid-reconstruction-uses-true-cell-aggregation
+  (let [grid (raw/native-build-greeks-grid
+              [{"strike" 100.0
+                "expiration" "2026-07-17"
+                "iv" 0.10
+                "delta" 0.30
+                "vega" 1.0
+                "theta" -0.01
+                "rho" 1.0}
+               {"strike" 100.1
+                "expiration" "2026-07-17"
+                "iv" 0.20
+                "delta" 0.60
+                "vega" 3.0
+                "theta" -0.02
+                "rho" 2.0}
+               {"strike" 100.2
+                "expiration" "2026-07-17"
+                "iv" 0.40
+                "delta" 0.90
+                "vega" 6.0
+                "theta" -0.03
+                "rho" 3.0}]
+              100.0
+              "2026-07-06T10:00:00-04:00")]
+    (is (approx? (.__getitem__ grid #py (0 10 3)) 0.31))
+    (is (approx? (.__getitem__ grid #py (1 10 3)) 0.60))
+    (is (approx? (.__getitem__ grid #py (2 10 3)) (/ 10.0 3.0)))
+    (is (approx? (.__getitem__ grid #py (3 10 3)) -0.02))
+    (is (approx? (.__getitem__ grid #py (4 10 3)) 2.0))
+    (is (approx? (.__getitem__ grid #py (5 10 3)) (/ (+ (* 0.30 0.10)
+                                                       (* 0.60 0.20)
+                                                       (* 0.90 0.40))
+                                                    3.0)))))
+
+(deftest build-option-greeks-grid-no-longer-needs-python-callbacks
+  (let [payload {"observed_at" "2026-07-06T10:00:00-04:00"
+                 "underlying" 100.0
+                 "contracts" [{"strike" 100.0
+                               "right" "CALL"
+                               "bid" 2.45
+                               "ask" 2.55
+                               "expiration" "2026-07-17"}]}
+        grid (raw/build-option-greeks-grid (dumps payload) nil nil nil nil)]
+    (is (= #py (6 21 8) (.-shape grid)))
+    (is (pos? (.__getitem__ grid #py (0 10 3))))
+    (is (pos? (.__getitem__ grid #py (2 10 3))))))
+
+(deftest build-option-greeks-grid-from-payload-matches-json-entrypoint
+  (let [payload {"observed_at" "2026-07-06T10:00:00-04:00"
+                 "underlying" 100.0
+                 "contracts" [{"strike" 100.0
+                               "right" "CALL"
+                               "bid" 2.45
+                               "ask" 2.55
+                               "expiration" "2026-07-17"}
+                              {"strike" 101.0
+                               "right" "PUT"
+                               "bid" 2.40
+                               "ask" 2.50
+                               "expiration" "2026-07-17"}]}
+        json-grid (raw/build-option-greeks-grid (dumps payload) nil nil nil nil)
+        payload-grid (raw/build-option-greeks-grid-from-payload payload)]
+    (is (= #py (6 21 8) (.-shape payload-grid)))
+    (is (approx? (float (numpy/max (numpy/abs (- json-grid payload-grid)))) 0.0 1.0e-7))))
+
+(deftest compute-option-features-from-quote-chain
+  (let [payload {"observed_at" "2026-07-07T15:30:00-04:00"
+                 "spy" 600.0
+                 "contracts" [{"strike" 599 "right" "PUT" "bid" 1.0 "ask" 1.2 "expiration" "2026-07-07"}
+                              {"strike" 600 "right" "PUT" "bid" 1.5 "ask" 1.7 "expiration" "2026-07-07"}
+                              {"strike" 600 "right" "CALL" "bid" 1.8 "ask" 2.0 "expiration" "2026-07-07"}
+                              {"strike" 601 "right" "CALL" "bid" 1.1 "ask" 1.3 "expiration" "2026-07-07"}
+                              {"strike" 600 "right" "PUT" "bid" 3.0 "ask" 3.2 "expiration" "2026-07-14"}
+                              {"strike" 600 "right" "CALL" "bid" 3.8 "ask" 4.2 "expiration" "2026-07-14"}]}
+        out (raw/compute-spy-option-features (dumps payload))]
+    (is (approx? (get out "SPY_opt_atm_call_midprice") 1.9))
+    (is (approx? (get out "SPY_opt_atm_put_midprice") 1.6))
+    (is (approx? (get out "SPY_opt_put_call_parity_deviation") 0.3))
+    (is (approx? (get out "SPY_opt_term_structure_slope") (/ 1.9 4.0)))
+    (is (approx? (get out "SPY_opt_near_far_put_ratio") (/ 1.6 3.1)))
+    (is (approx? (get out "SPY_opt_skew_proxy") -0.1))
+    (is (approx? (get out "SPY_opt_butterfly_spread") (- (+ 1.1 1.2) (+ 1.9 1.6))))
+    (is (approx? (get out "SPY_opt_dte_minutes") 30.0))))
+
+(deftest compute-option-features-rejects-duplicate-json-keys
+  (try
+    (raw/compute-option-features
+     "VIX"
+     "{\"observed_at\":\"2026-07-07T15:30:00-04:00\",\"underlying\":16.0,\"contracts\":[],\"contracts\":[{\"strike\":16}]}")
+    (is false)
+    (catch python/ValueError e
+      (is (not= -1 (.find (str e) "duplicate JSON key: contracts"))))))
+
+(deftest compute-option-features-supports-non-spy-prefixes-and-volume-fields
+  (let [payload {"observed_at" "2026-07-07T15:30:00-04:00"
+                 "underlying" 16.0
+                 "contracts" [{"strike" 15 "right" "PUT" "bid" 0.1 "ask" 0.2 "bid_size" 5 "ask_size" 3 "volume" 10 "expiration" "2026-07-08"}
+                              {"strike" 16 "right" "PUT" "bid" 0.4 "ask" 0.5 "bid_size" 6 "ask_size" 4 "volume" 20 "expiration" "2026-07-08"}
+                              {"strike" 16 "right" "CALL" "bid" 0.5 "ask" 0.7 "bid_size" 7 "ask_size" 5 "volume" 30 "expiration" "2026-07-08"}
+                              {"strike" 17 "right" "CALL" "bid" 0.1 "ask" 0.3 "bid_size" 8 "ask_size" 6 "volume" 40 "expiration" "2026-07-08"}]}
+        out (raw/compute-option-features "VIX" (dumps payload))]
+    (is (nil? (get out "SPY_opt_contract_count")))
+    (is (approx? (get out "VIX_opt_contract_count") 4.0))
+    (is (approx? (get out "VIX_opt_atm_call_midprice") 0.6))
+    (is (approx? (get out "VIX_opt_put_call_volume_ratio") (/ 30.0 70.0)))
+    (is (approx? (get out "VIX_opt_call_volume_skew") (* 70.0 (- 0.15 0.2))))
+    (is (approx? (get out "VIX_opt_put_volume_skew") (* 30.0 (- 0.15 0.2))))
+    (is (approx? (get out "VIX_opt_bid_ask_imbalance") (/ (- 26.0 18.0) 44.0)))))
+
+(deftest compute-greek-grid-features-from-latest-grid
+  (let [grids (numpy/zeros #py (2 6 21 8) ** :dtype numpy/float64)
+        grid (.__getitem__ grids -1)]
+    (.__setitem__ grid #py (0 (slice nil nil) (slice nil nil)) 0.20)
+    (.__setitem__ grid #py (1 (slice nil 10) (slice nil nil)) -0.35)
+    (.__setitem__ grid #py (1 (slice 10 nil) (slice nil nil)) 0.45)
+    (.__setitem__ grid #py (2 (slice nil nil) (slice nil nil)) 2.0)
+    (.__setitem__ grid #py (3 (slice nil nil) (slice nil nil)) -0.10)
+    (.__setitem__ grid #py (4 (slice nil nil) (slice nil nil)) 0.02)
+    (.__setitem__ grid #py (5 (slice nil nil) (slice nil nil))
+                  (* (numpy/abs (.__getitem__ grid 1)) (.__getitem__ grid 0)))
+    (.__setitem__ grid #py (0 9 0) 0.30)
+    (.__setitem__ grid #py (1 9 0) -0.25)
+    (.__setitem__ grid #py (0 11 0) 0.18)
+    (.__setitem__ grid #py (1 11 0) 0.25)
+    (.__setitem__ grid #py (0 10 (slice 0 2)) 0.24)
+    (.__setitem__ grid #py (1 10 (slice 0 2)) 0.50)
+    (.__setitem__ grid #py (2 10 (slice 0 2)) 3.0)
+    (.__setitem__ grid #py (3 10 (slice 0 2)) -0.20)
+    (.__setitem__ grid #py (4 10 (slice 0 2)) 0.03)
+    (.__setitem__ grid #py (0 (slice 9 12) (slice 5 8)) 0.15)
+    (let [out (raw/compute-spy-greek-grid-features grids)]
+      (is (pos? (get out "SPY_greeks_iv_mean")))
+      (is (pos? (get out "SPY_greeks_iv_std")))
+      (is (approx? (get out "SPY_greeks_atm_call_delta") (/ (+ 0.50 0.50 0.25 0.45) 4.0)))
+      (is (approx? (get out "SPY_greeks_atm_call_iv") (/ (+ 0.24 0.24 0.18 0.20) 4.0)))
+      (is (approx? (get out "SPY_greeks_atm_call_vega") (/ (+ 3.0 3.0 2.0 2.0) 4.0)))
+      (is (approx? (get out "SPY_greeks_atm_call_theta") (/ (+ -0.20 -0.20 -0.10 -0.10) 4.0)))
+      (is (approx? (get out "SPY_greeks_iv_25d_spread") (- 0.30 0.18)))
+      (is (approx? (get out "SPY_greeks_near_far_iv_spread")
+                   (- (/ (+ 0.30 0.20 0.24 0.24 0.18 0.20) 6.0) 0.15)))
+      (is (pos? (get out "SPY_greeks_dollar_gamma_proxy")))
+      (is (nil? (get out "SPY_greeks_lambda_mean")))
+      (is (= {} (raw/compute-greek-grid-features "QQQ" grids))))))
+
+(deftest compute-reconstructable-greek-features-are-guarded-candidates
+  (let [grids (numpy/zeros #py (1 6 21 8) ** :dtype numpy/float64)
+        grid (.__getitem__ grids -1)]
+    (.__setitem__ grid #py (0 (slice nil nil) (slice nil nil)) 0.20)
+    (.__setitem__ grid #py (1 (slice nil 10) (slice nil nil)) -0.30)
+    (.__setitem__ grid #py (1 (slice 10 nil) (slice nil nil)) 0.40)
+    (.__setitem__ grid #py (2 (slice nil nil) (slice nil nil)) 1.5)
+    (.__setitem__ grid #py (3 (slice nil nil) (slice nil nil)) -0.08)
+    (.__setitem__ grid #py (4 (slice nil nil) (slice nil nil)) 0.01)
+    (let [payload {"observed_at" "2026-07-07T15:30:00-04:00"
+                   "underlying" 600.0
+                   "contracts" [{"strike" 599 "right" "PUT" "bid" 1.0 "ask" 1.2 "volume" 20 "expiration" "2026-07-08"}
+                                {"strike" 600 "right" "PUT" "bid" 1.5 "ask" 1.7 "volume" 30 "expiration" "2026-07-08"}
+                                {"strike" 600 "right" "CALL" "bid" 1.8 "ask" 2.0 "volume" 25 "expiration" "2026-07-08"}
+                                {"strike" 601 "right" "CALL" "bid" 1.1 "ask" 1.3 "volume" 25 "expiration" "2026-07-08"}]}
+          out (raw/compute-reconstructable-greek-features "SPY" grids (dumps payload))
+          spxw (raw/compute-reconstructable-greek-features "SPXW" grids (dumps payload))]
+      (is (approx? (get out "SPY_greeks_dollar_delta")
+                   (* (float (numpy/mean (.__getitem__ grid 1))) 600.0 100.0)))
+      (is (approx? (get out "SPY_greeks_dollar_vega") (* 1.5 100.0)))
+      (is (approx? (get out "SPY_greeks_vega_total_exposure")
+                   (* (float (numpy/sum (.__getitem__ grid 2))) 100.0)))
+      (is (pos? (get out "SPY_greeks_lambda_mean")))
+      (is (approx? (get out "SPY_greeks_lambda_times_iv")
+                   (* (get out "SPY_greeks_lambda_mean") 0.20)))
+      (is (approx? (get out "SPY_greeks_lambda_weighted")
+                   (* (get out "SPY_greeks_lambda_mean") 100.0)))
+      (is (pos? (get out "SPY_greeks_rho_exposure")))
+      (is (approx? (get out "SPY_greeks_skew_times_volume") -10.0))
+      (is (neg? (get out "SPY_greeks_theta_exposure_ratio")))
+      (is (neg? (get out "SPY_greeks_epsilon_mean")))
+      (is (approx? (get out "SPY_greeks_epsilon_times_delta")
+                   (* (get out "SPY_greeks_epsilon_mean") (float (numpy/mean (.__getitem__ grid 1))))))
+      (is (approx? (get spxw "SPXW_greeks_lambda_mean") (get out "SPY_greeks_lambda_mean")))
+      (is (approx? (get spxw "SPXW_greeks_skew_times_volume") (get out "SPY_greeks_skew_times_volume")))
+      (is (= {} (raw/compute-reconstructable-greek-features "QQQ" grids (dumps payload)))))))

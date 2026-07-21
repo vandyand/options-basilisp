@@ -1,0 +1,50 @@
+(ns stevetrading.bridge.v2-vol.legacy
+  "Explicit legacy predictor adapter for the V2 VOL bridge."
+  (:require [stevetrading.bridge.v2-vol :as core])
+  (:import importlib sys))
+
+(def spec-vars
+  "Bot keyword -> _vol_predictor_builder spec var name."
+  {:fox-vol "FOX_VOL_V2_SPEC"
+   :fox-vol-1dte "FOX_VOL_V2_1DTE_SPEC"
+   :wolf-vol "WOLF_VOL_V2_SPEC"
+   :otter-vol "OTTER_VOL_V2_SPEC"})
+
+(defn- ensure-ref-paths! [ref-root]
+  (let [spath (.-path sys)]
+    (doseq [p [ref-root (str ref-root "/src")]]
+      (when-not (.__contains__ spath p)
+        (.insert spath 0 p)))))
+
+(defn make-legacy-vol-prediction-factory
+  [{:keys [ref-root state-dir alpaca-key alpaca-secret theta-port theta-provider]
+    :or {theta-port 25503}}]
+  (ensure-ref-paths! ref-root)
+  (let [builder (importlib/import-module
+                 "stevetrading_v2.strategies._vol_predictor_builder")
+        theta (or theta-provider
+                  (let [tdp-mod (importlib/import-module
+                                 "stevetrading_v2.data_providers.thetadata")]
+                    ((.-ThetaDataProvider tdp-mod) ** :data_port theta-port)))]
+    (fn [bot _params]
+      (let [spec-var (or (get spec-vars bot)
+                         (throw (ex-info (str "unknown v2 vol bot " bot)
+                                         {:error/bot bot})))
+            spec (python/getattr builder spec-var)
+            [pred-fn _cal] ((.-build_vol_prediction_fn builder)
+                            spec
+                            ** :state_dir state-dir
+                            :alpaca_paper_api_key alpaca-key
+                            :alpaca_paper_secret_key alpaca-secret
+                            :theta_provider theta)]
+        {:pred-fn pred-fn}))))
+
+(defn make-legacy-v2-vol-bridge
+  "Build the core V2 VOL bridge with the legacy Data-Preprocessor predictor."
+  [opts]
+  (core/make-v2-vol-bridge
+   (if (:prediction-factory opts)
+     opts
+     (assoc opts
+            :prediction-factory
+            (make-legacy-vol-prediction-factory opts)))))

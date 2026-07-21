@@ -1,0 +1,14 @@
+#!/usr/bin/env basilisp
+;; Project-local Hetzner VPS provisioning for SteveTrading.
+(import glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT")
+                   (os/getcwd)))
+
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.ops.hetzner-vps :as hv])
+
+(sys/exit (apply hv/main *command-line-args*))

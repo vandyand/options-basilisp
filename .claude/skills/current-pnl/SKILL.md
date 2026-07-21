@@ -1,41 +1,45 @@
 ---
 name: current-pnl
-description: Use when the user runs /current-pnl or asks for today's P&L across the SteveTrading bots — prints per-strategy current-day P&L for the six Alpaca paper accounts (and venturevd). Optional arg all|alpaca|sim|venturevd (default all).
+description: Use when the user runs /current-pnl, $current-pnl, or asks for today's P&L across SteveTrading live Alpaca, local sim, and VentureVD accounts. Optional groups: all|alpaca|sim|venturevd|trades (default all).
 ---
 
 # Current P&L
 
 ## Overview
-Prints today's per-strategy P&L. The six production accounts (CHESTNUT/LYNX/
-MOOSE/PARROT/OAK/DOLPHIN) are read via the proven Python report script; the
-venturevd dev account is read directly from Alpaca. Read-only (no orders).
-
-NOTE (2026-06-11): the bots now run under the BASILISP engine
-(~/contracting/upwork/steven-tran/stevetrading-basilisp), but this report reads
-broker-account equity directly, so it is engine-agnostic.
+Prints today's per-strategy P&L as Markdown tables. The six Alpaca paper
+accounts (CHESTNUT/LYNX/MOOSE/PARROT/OAK/DOLPHIN), local sim fleets, volatility
+sim strategies, V2 rows, and VentureVD are read through the Basilisp P&L CLI.
+Read-only (no orders).
 
 ## Core Pattern
-Run the engine-agnostic stdlib report (six production accounts + venturevd;
-day P&L, trade count, % time in market, avg trade duration, fill count):
+Run the Basilisp wrapper. It defaults to all groups and Markdown output:
 
 ```bash
-python3 /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/scripts/current_pnl.py "${ARG:-all}"   # ARG ∈ all | alpaca | venturevd
+~/.codex/skills/current-pnl/scripts/current-pnl "${ARG:-all}"
 ```
 
-- TRADES `N+1o` means N completed round trips plus one episode still open.
-- %MKT = share of the regular session so far with any nonzero position.
-- AVG-TRADE = mean completed-episode duration; `-` when nothing closed yet.
-- Legacy table (equity-only, per-strategy naming) if ever needed:
-  `cd .../Data-Preprocessor && python3 scripts_5yr/live/current_pnl.py alpaca`
-  (system python3 — the repo venv lacks alpaca-py).
+Equivalent repo-local command:
+
+```bash
+cd /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp
+.venv/bin/basilisp run scripts/current_pnl.lpy -- "${ARG:-all}" --markdown
+```
+
+Display every table returned. Do not collapse rows for brevity. Alpaca live
+paper accounts belong under `HETZNER / LIVE ALPACA PAPER`; sim accounts and
+strategy rows belong under `LOCAL / SIM EXPERIMENTS` and/or `LOCAL / SIM
+SHADOWS`. Volatility and V2 rows such as `VOL-TERM`, `SIM-VOL-*`,
+`SIM-TERM-*`, `V2-TERM-*`, and `V2-VOL-*` must be shown when present.
 
 ## Quick Reference
 | Group | Day-P&L definition |
 |-------|--------------------|
 | alpaca (6 bots) | `equity − last_equity` per real paper account (incl. unrealized) |
+| sim | local fact-store/sim broker P&L, including active volatility and V2 rows |
 | venturevd | same, single account |
 
 ## Common Mistakes
-- Running the script with the repo venv python (ModuleNotFoundError: alpaca) — use system python3.
-- Alpaca ConnectTimeout is intermittent; script retries 3×, else re-run.
+- Omitting flat V2/VOL rows; zero-P&L activity rows are still operational evidence.
+- Combining Alpaca and sim strategies into one table; keep live broker and sim rows separate.
+- Alpaca ConnectTimeout is intermittent; the Basilisp script retries, else re-run.
 - Strictly read-only — never add order logic here.

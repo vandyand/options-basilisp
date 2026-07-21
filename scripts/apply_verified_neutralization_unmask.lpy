@@ -1,0 +1,485 @@
+;; Apply neutralization unmask candidates only from a verified evidence bundle.
+(import argparse datetime hashlib json os os.path shlex subprocess sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[clojure.set :as set]
+         '[stevetrading.feature-parity.core :as fp])
+
+(def default-ref (os.path/join (os.path/dirname repo-root) "SteveTrading" "ref" "Data-Preprocessor"))
+(def default-analysis (os.path/join repo-root "live_runtime" "analysis"))
+(def optional-extra-audits ["v3_grid_unlock_audit.json" "greek_reconstruction_promotion_gate.json"])
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--target-date" ** :required true :help "YYYY-MM-DD")
+    (.add_argument parser "--analysis-dir" ** :default default-analysis)
+    (.add_argument parser "--manifest-json" ** :default nil)
+    (.add_argument parser "--status-json" ** :default nil)
+    (.add_argument parser "--ref-root" ** :default default-ref)
+    (.add_argument parser "--accounts" ** :nargs "*" :default (python/list ["chestnut" "lynx" "moose"]))
+    (.add_argument parser "--bundle-suffix" ** :default "_corrected")
+    (.add_argument parser "--backup-label" ** :default nil)
+    (.add_argument parser "--out-json" ** :default nil :help "apply result JSON path")
+    (.add_argument parser "--validation-json" ** :default nil :help "write the verified bundle validation JSON")
+    (.add_argument parser "--require-validation-json" ** :default nil :help "previous non-applying validation JSON required before --apply")
+    (.add_argument parser "--allow-missing-validation" ** :action "store_true")
+    (.add_argument parser "--allow-active-parity-problems" ** :action "store_true"
+                   :help "allow readiness/status FAIL caused only by already-active feature parity drift")
+    (.add_argument parser "--apply" ** :action "store_true" :help "execute the verified apply command")
+    (.add_argument parser "--allow-empty" ** :action "store_true" :help "allow a verified zero-candidate bundle")
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn py-list? [value]
+  (python/isinstance value python/list))
+
+(defn json-normalize [value]
+  (cond
+    (map? value) (into {} (map (fn [[k v]] [k (json-normalize v)]) value))
+    (py-list? value) (vec (map json-normalize (python/list value)))
+    (or (vector? value) (seq? value)) (vec (map json-normalize value))
+    :else value))
+
+(defn squote [value]
+  (str "'" value "'"))
+
+(defn py-list-repr [items]
+  (str "[" (.join ", " (map squote items)) "]"))
+
+(defn compact-date [value]
+  (try
+    (.strftime (datetime.date/fromisoformat value) "%Y%m%d")
+    (catch python/ValueError _
+      (throw (python/SystemExit (str "target date must be YYYY-MM-DD: " value))))))
+
+(defn load-json-value [path]
+  (try
+    (fp/read-json path)
+    (catch python/Exception e
+      (throw (python/SystemExit (str "failed to read JSON " path ": " e))))))
+
+(defn load-json-object [path]
+  (let [payload (load-json-value path)]
+    (when-not (map? payload)
+      (throw (python/SystemExit (str "JSON must be an object: " path))))
+    payload))
+
+(defn sha256-file [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh (* 1024 1024))]
+        (when chunk
+          (when (> (len chunk) 0)
+            (.update h chunk)
+            (recur (.read fh (* 1024 1024)))))))
+    (.hexdigest h)))
+
+(defn nonnegative-int [value label]
+  (when (or (true? value) (false? value) (not (int? value)) (neg? value))
+    (throw (python/SystemExit (str label " must be a nonnegative integer, got " (repr value)))))
+  value)
+
+(defn require-unique-strings [value label]
+  (when-not (and (py-list? value)
+                 (every? #(and (python/isinstance % python/str) (not= % ""))
+                         (python/list value)))
+    (throw (python/SystemExit (str label " must be a non-blank string list"))))
+  (let [items (vec (python/list value))]
+    (when (not= (count (set items)) (count items))
+      (throw (python/SystemExit (str label " contains duplicate feature names"))))
+    items))
+
+(defn artifact-entry [manifest name required?]
+  (let [artifacts (get manifest "artifacts")]
+    (when-not (map? artifacts)
+      (throw (python/SystemExit "manifest missing artifacts object")))
+    (let [entry (get artifacts name)]
+      (if (or (not (map? entry)) (not (true? (get entry "exists"))))
+        (if required?
+          (throw (python/SystemExit (str "manifest missing required artifact: " name)))
+          nil)
+        (let [path (str (get entry "path" ""))]
+          (when-not (os.path/exists path)
+            (throw (python/SystemExit (str "manifest artifact is missing on disk: " name ": " path))))
+          (let [expected-sha (get entry "sha256")
+                expected-bytes (get entry "bytes")
+                actual-bytes (.-st_size (os/stat path))
+                actual-sha (sha256-file path)]
+            (when (not= expected-bytes actual-bytes)
+              (throw (python/SystemExit (str "manifest artifact size mismatch for " name ": expected " expected-bytes ", got " actual-bytes))))
+            (when (not= expected-sha actual-sha)
+              (throw (python/SystemExit (str "manifest artifact checksum mismatch for " name ": " path)))))
+          path)))))
+
+(defn validate-manifest-artifacts [manifest]
+  (let [artifacts (get manifest "artifacts")]
+    (when-not (map? artifacts)
+      (throw (python/SystemExit "manifest missing artifacts object")))
+    (doseq [[name entry] artifacts]
+      (when-not (map? entry)
+        (throw (python/SystemExit (str "manifest artifact entry is not an object: " name))))
+      (let [path (str (get entry "path" ""))
+            exists (get entry "exists")]
+        (cond
+          (true? exists)
+          (do
+            (when-not (os.path/exists path)
+              (throw (python/SystemExit (str "manifest artifact is missing on disk: " name ": " path))))
+            (let [expected-sha (get entry "sha256")
+                  expected-bytes (get entry "bytes")
+                  actual-bytes (.-st_size (os/stat path))
+                  actual-sha (sha256-file path)]
+              (when (not= expected-bytes actual-bytes)
+                (throw (python/SystemExit (str "manifest artifact size mismatch for " name ": expected " expected-bytes ", got " actual-bytes))))
+              (when (not= expected-sha actual-sha)
+                (throw (python/SystemExit (str "manifest artifact checksum mismatch for " name ": " path))))))
+
+          (false? exists)
+          (when (os.path/exists path)
+            (throw (python/SystemExit (str "manifest recorded artifact missing but it now exists: " name ": " path))))
+
+          :else
+          (throw (python/SystemExit (str "manifest artifact exists flag is invalid for " name ": " (repr exists)))))))))
+
+(defn audit-candidate-features [path target-date]
+  (let [audit (load-json-object path)
+        summary (get audit "summary")]
+    (when-not (map? summary)
+      (throw (python/SystemExit (str "audit missing summary object: " path))))
+    (when (not= (get summary "target_date") target-date)
+      (throw (python/SystemExit (str "audit target_date " (squote (get summary "target_date"))
+                                     " does not match " (squote target-date) ": " path))))
+    (if (py-list? (get summary "candidate_features"))
+      (let [features (require-unique-strings (get summary "candidate_features") (str "audit candidate_features: " path))
+            candidate-count (nonnegative-int (get summary "candidate_count") (str "audit candidate_count: " path))]
+        (when (not= candidate-count (count features))
+          (throw (python/SystemExit (str "audit candidate_count does not match candidate_features: " path))))
+        features)
+      (let [rows (get audit "features")]
+        (if (py-list? rows)
+          (let [candidates (require-unique-strings
+                            (python/list
+                             (for [row (python/list rows)
+                                   :when (and (map? row)
+                                              (true? (get row "candidate"))
+                                              (python/isinstance (get row "feature") python/str)
+                                              (not= (get row "feature") ""))]
+                               (get row "feature")))
+                            (str "audit candidate feature rows: " path))
+                candidate-count (when (contains? summary "candidate_count")
+                                  (nonnegative-int (get summary "candidate_count")
+                                                   (str "audit candidate_count: " path)))]
+            (when (and candidate-count (not= candidate-count (count candidates)))
+              (throw (python/SystemExit (str "audit candidate_count does not match candidate feature rows: " path))))
+            candidates)
+          (throw (python/SystemExit (str "audit candidate_features or features rows required: " path))))))))
+
+(defn validate-greek-promotion [path target-date]
+  (let [audit (load-json-object path)
+        summary (get audit "summary")]
+    (when-not (map? summary)
+      (throw (python/SystemExit (str "Greek promotion audit missing summary object: " path))))
+    (when (not= (get summary "target_date") target-date)
+      (throw (python/SystemExit (str "Greek promotion audit target_date " (squote (get summary "target_date"))
+                                     " does not match " (squote target-date)))))
+    (when-not (true? (get summary "capture_ok"))
+      (throw (python/SystemExit "Greek promotion audit capture_ok is not true")))
+    (let [capture-reasons (get summary "capture_reasons")]
+      (when-not (py-list? capture-reasons)
+        (throw (python/SystemExit "Greek promotion audit capture_reasons must be a list")))
+      (when (> (len capture-reasons) 0)
+        (throw (python/SystemExit (str "Greek promotion audit has capture_reasons: " (repr (vec (python/list capture-reasons))))))))
+    (when-not (true? (get summary "coverage_ok"))
+      (throw (python/SystemExit "Greek promotion audit coverage_ok is not true")))
+    (let [coverage-reasons (get summary "coverage_reasons")]
+      (when-not (py-list? coverage-reasons)
+        (throw (python/SystemExit "Greek promotion audit coverage_reasons must be a list")))
+      (when (> (len coverage-reasons) 0)
+        (throw (python/SystemExit (str "Greek promotion audit has coverage_reasons: " (repr (vec (python/list coverage-reasons))))))))
+    (let [evaluated-count (nonnegative-int (get summary "evaluated_count") "Greek promotion audit evaluated_count")
+          min-evaluated-count (nonnegative-int (get summary "min_evaluated_count") "Greek promotion audit min_evaluated_count")]
+      (when (< evaluated-count min-evaluated-count)
+        (throw (python/SystemExit (str "Greek promotion audit evaluated_count below min_evaluated_count ("
+                                       evaluated-count " < " min-evaluated-count ")"))))
+      (let [rows (get audit "features")]
+        (when (and (py-list? rows) (not= (len rows) evaluated-count))
+          (throw (python/SystemExit "Greek promotion audit evaluated_count does not match feature rows")))))))
+
+(defn validate-candidate-union [dry-run raw-candidates-path raw-audit-path extra-audit-paths target-date]
+  (let [expected (atom [])]
+    (if raw-audit-path
+      (let [raw-candidates (audit-candidate-features raw-audit-path target-date)]
+        (swap! expected into raw-candidates)
+        (when raw-candidates-path
+          (let [raw-file (require-unique-strings (load-json-value raw-candidates-path) "raw_feature_unlock_candidates")]
+            (when (not= (set raw-file) (set raw-candidates))
+              (throw (python/SystemExit "raw_feature_unlock_candidates does not match raw_feature_unlock_audit"))))))
+      (when raw-candidates-path
+        (throw (python/SystemExit "raw_feature_unlock_candidates present without raw_feature_unlock_audit"))))
+    (doseq [path extra-audit-paths]
+      (when (.startswith (os.path/basename path) "greek_reconstruction_promotion_gate_")
+        (validate-greek-promotion path target-date))
+      (swap! expected into (audit-candidate-features path target-date)))
+    (let [actual (require-unique-strings (get dry-run "candidate_features") "neutralization_unmask_dry_run candidate_features")]
+      (when (not= (set @expected) (set actual))
+        (let [missing (vec (sort (set/difference (set @expected) (set actual))))
+              extra (vec (sort (set/difference (set actual) (set @expected))))]
+          (throw (python/SystemExit (str "neutralization_unmask_dry_run candidate_features do not match audit union "
+                                         "(missing=" (py-list-repr missing) ", extra=" (py-list-repr extra) ")"))))))))
+
+(defn validate-dry-run-result-coverage [dry-run candidate-count expected-accounts]
+  (let [results (get dry-run "results")]
+    (when-not (and (py-list? results) (> (len results) 0))
+      (throw (python/SystemExit "neutralization_unmask_dry_run results must be a non-empty list")))
+    (let [actual-accounts (atom [])]
+      (doseq [row (python/list results)]
+        (when-not (map? row)
+          (throw (python/SystemExit "neutralization_unmask_dry_run result rows must be objects")))
+        (let [account (get row "account")]
+          (when (or (not (python/isinstance account python/str)) (= (.strip account) ""))
+            (throw (python/SystemExit "neutralization_unmask_dry_run result account must be a non-empty string")))
+          (swap! actual-accounts conj account)
+          (let [removed (nonnegative-int (get row "removed") (str "neutralization_unmask_dry_run removed for " account))
+                missing (nonnegative-int (get row "missing") (str "neutralization_unmask_dry_run missing for " account))]
+            (when (not= missing 0)
+              (throw (python/SystemExit (str "neutralization_unmask_dry_run has " missing " missing candidate(s) for account " account))))
+            (when (not= removed candidate-count)
+              (throw (python/SystemExit (str "neutralization_unmask_dry_run removed count does not match candidate_count for account "
+                                             account ": " removed " != " candidate-count)))))))
+      (when (not= (count @actual-accounts) (count (set @actual-accounts)))
+        (throw (python/SystemExit "neutralization_unmask_dry_run result accounts contain duplicates")))
+      (when (not= (set @actual-accounts) (set expected-accounts))
+        (let [missing (vec (sort (set/difference (set expected-accounts) (set @actual-accounts))))
+              extra (vec (sort (set/difference (set @actual-accounts) (set expected-accounts))))]
+          (throw (python/SystemExit (str "neutralization_unmask_dry_run result accounts do not match requested accounts "
+                                         "(missing=" (py-list-repr missing) ", extra=" (py-list-repr extra) ")"))))))))
+
+(defn validate-prior-validation [args payload path]
+  (let [validation (load-json-object path)]
+    (when (not= (get validation "target_date") (attr args "target_date"))
+      (throw (python/SystemExit (str "validation target_date " (repr (get validation "target_date"))
+                                     " does not match " (repr (attr args "target_date"))))))
+    (when-not (false? (get validation "apply"))
+      (throw (python/SystemExit "validation artifact must be from a non-applying run")))
+    (when (not= (get validation "candidate_count") (get payload "candidate_count"))
+      (throw (python/SystemExit (str "validation candidate_count does not match verified apply payload "
+                                     "(validation=" (repr (get validation "candidate_count"))
+                                     ", current=" (repr (get payload "candidate_count")) ")"))))
+    (doseq [[field message] [["candidate_features" "validation candidate_features do not match verified apply payload"]
+                             ["manifest_json" "validation manifest_json does not match verified apply payload"]
+                             ["status_json" "validation status_json does not match verified apply payload"]
+                             ["manifest_sha256" "validation manifest_sha256 does not match verified apply payload"]
+                             ["dry_run_sha256" "validation dry_run_sha256 does not match verified apply payload"]]]
+      (when (not= (json-normalize (get validation field)) (json-normalize (get payload field)))
+        (throw (python/SystemExit message))))
+    (let [command (get validation "command")]
+      (when (or (not (py-list? command)) (some #{"--apply"} (python/list command)))
+        (throw (python/SystemExit "validation command must be non-applying"))))))
+
+(defn validate-final-status-apply-safe [status payload validation-path]
+  (let [validation-status (get status "verified_apply_validation")]
+    (when-not (map? validation-status)
+      (throw (python/SystemExit "status missing verified_apply_validation summary")))
+    (when-not (true? (get validation-status "apply_safe"))
+      (throw (python/SystemExit "status verified_apply_validation.apply_safe is not true")))
+    (when-not (true? (get validation-status "target_matches_request"))
+      (throw (python/SystemExit "status verified_apply_validation target does not match request")))
+    (when-not (true? (get validation-status "candidate_count_matches_dry_run"))
+      (throw (python/SystemExit "status verified_apply_validation candidate count does not match dry-run")))
+    (when (not= (get validation-status "candidate_count") (get payload "candidate_count"))
+      (throw (python/SystemExit "status verified_apply_validation candidate_count does not match verified apply payload")))
+    (let [status-validation-path (get validation-status "path")]
+      (when (and status-validation-path
+                 (not= (os.path/abspath (str status-validation-path))
+                       (os.path/abspath (str validation-path))))
+        (throw (python/SystemExit "status verified_apply_validation path does not match required validation JSON"))))))
+
+(def active-parity-readiness-reasons
+  #{"baseline has active live feature parity problems"
+    "baseline features contain active live feature parity problems"
+    "matched live-vs-historical feature parity has problem features"})
+
+(def active-parity-status-reasons
+  #{"manifest is missing or recorded invalid"
+    "manifest verification failed"
+    "readiness verdict is FAIL"
+    "matched feature parity diagnostic has problem features"})
+
+(defn reason-set [value]
+  (if (py-list? value)
+    (set (python/list value))
+    #{}))
+
+(defn active-parity-readiness-only? [manifest]
+  (let [issues (get manifest "issues")]
+    (and (= (get manifest "readiness_verdict") "FAIL")
+         (py-list? issues)
+         (= 1 (len issues))
+         (let [issue (first (python/list issues))
+               reasons (reason-set (get issue "reasons"))]
+           (and (map? issue)
+                (= (get issue "code") "market-evidence/readiness-not-pass")
+                (= (get issue "verdict") "FAIL")
+                (seq reasons)
+                (set/subset? reasons active-parity-readiness-reasons))))))
+
+(defn active-parity-status-only? [status]
+  (let [reasons (reason-set (get status "reasons"))]
+    (and (false? (get status "ok?"))
+         (= (get status "status") "error")
+         (seq reasons)
+         (set/subset? reasons active-parity-status-reasons))))
+
+(defn dry-run-active-parity-readiness-only? [dry-run]
+  (let [reasons (reason-set (get dry-run "readiness_reasons"))]
+    (and (= (get dry-run "readiness_verdict") "FAIL")
+         (true? (get dry-run "readiness_target_matches"))
+         (or (empty? reasons)
+             (set/subset? reasons active-parity-readiness-reasons)))))
+
+(defn shquote-join [parts]
+  (.join " " (map shlex/quote parts)))
+
+(defn validate-bundle [args]
+  (let [stamp (compact-date (attr args "target_date"))
+        analysis-dir (os.path/abspath (attr args "analysis_dir"))
+        requested-accounts (require-unique-strings (attr args "accounts") "requested accounts")
+        manifest-path (or (attr args "manifest_json") (os.path/join analysis-dir (str "market_evidence_manifest_" stamp ".json")))
+        status-path (or (attr args "status_json") (os.path/join analysis-dir (str "market_evidence_status_" stamp ".json")))
+        manifest (load-json-object manifest-path)
+        status (load-json-object status-path)]
+    (when (not= (get manifest "target_date") (attr args "target_date"))
+      (throw (python/SystemExit (str "manifest target_date " (repr (get manifest "target_date"))
+                                     " does not match " (repr (attr args "target_date"))))))
+    (when (and (or (not (true? (get manifest "valid?"))) (not= (get manifest "status") "ok"))
+               (not (and (true? (attr args "allow_active_parity_problems"))
+                         (active-parity-readiness-only? manifest))))
+      (throw (python/SystemExit "manifest is not valid/ok")))
+    (when (and (not= (get manifest "readiness_verdict") "PASS")
+               (not (and (true? (attr args "allow_active_parity_problems"))
+                         (active-parity-readiness-only? manifest))))
+      (throw (python/SystemExit (str "manifest readiness_verdict is " (repr (get manifest "readiness_verdict")) ", expected PASS"))))
+    (validate-manifest-artifacts manifest)
+    (when (not= (get status "target_date") (attr args "target_date"))
+      (throw (python/SystemExit (str "status target_date " (repr (get status "target_date"))
+                                     " does not match " (repr (attr args "target_date"))))))
+    (when (and (or (not (true? (get status "ok?"))) (not= (get status "status") "ok"))
+               (not (and (true? (attr args "allow_active_parity_problems"))
+                         (active-parity-status-only? status))))
+      (throw (python/SystemExit "status is not ok")))
+    (let [dry-run-path (artifact-entry manifest "neutralization_unmask_dry_run.json" true)
+          readiness-path (artifact-entry manifest "market_evidence_readiness.json" true)
+          raw-candidates-path (artifact-entry manifest "raw_feature_unlock_candidates.json" false)
+          raw-audit-path (artifact-entry manifest "raw_feature_unlock_audit.json" false)
+          extra-audit-paths (vec (keep #(artifact-entry manifest % false) optional-extra-audits))
+          dry-run (load-json-object dry-run-path)]
+      (when-not (false? (get dry-run "applied"))
+        (throw (python/SystemExit "neutralization_unmask_dry_run must be a dry-run artifact")))
+      (when-not (true? (get dry-run "verified_by_audit"))
+        (throw (python/SystemExit "neutralization_unmask_dry_run is not audit-verified")))
+      (when (and (or (not= (get dry-run "readiness_verdict") "PASS")
+                     (not (true? (get dry-run "readiness_target_matches"))))
+                 (not (and (true? (attr args "allow_active_parity_problems"))
+                           (dry-run-active-parity-readiness-only? dry-run))))
+        (throw (python/SystemExit "neutralization_unmask_dry_run is not tied to PASS readiness for the target date")))
+      (let [candidate-features (require-unique-strings (get dry-run "candidate_features") "neutralization_unmask_dry_run candidate_features")
+            candidate-count (nonnegative-int (get dry-run "candidate_count") "neutralization_unmask_dry_run candidate_count")]
+        (when (not= candidate-count (count candidate-features))
+          (throw (python/SystemExit "neutralization_unmask_dry_run candidate_count does not match candidate_features")))
+        (when (and (empty? candidate-features) (not (true? (attr args "allow_empty"))))
+          (throw (python/SystemExit "verified unmask bundle has zero candidates; pass --allow-empty to acknowledge")))
+        (validate-dry-run-result-coverage dry-run (count candidate-features) requested-accounts)
+        (validate-candidate-union dry-run raw-candidates-path raw-audit-path extra-audit-paths (attr args "target_date"))
+        (let [out-json (or (attr args "out_json") (os.path/join analysis-dir (str "neutralization_unmask_apply_" stamp ".json")))
+              backup-label (or (attr args "backup_label") (str "before_unmask_" stamp))
+              basilisp (or (os.environ/get "BASILISP_BIN") "basilisp")
+              command (atom [basilisp
+                             "run"
+                             (os.path/join (os.path/dirname (first *command-line-args*)) "apply_neutralization_candidates.lpy")])]
+          ;; When run by path, the dirname expression above can be empty in tests.
+          (reset! command [basilisp "run" (os.path/join repo-root "scripts" "apply_neutralization_candidates.lpy") "--"
+                           "--ref-root" (os.path/abspath (attr args "ref_root"))
+                           "--target-date" (attr args "target_date")
+                           "--readiness-json" readiness-path
+                           "--backup-label" backup-label
+                           "--out-json" out-json
+                           "--bundle-suffix" (attr args "bundle_suffix")])
+          (swap! command into ["--accounts"])
+          (swap! command into requested-accounts)
+          (if (and raw-candidates-path raw-audit-path)
+            (swap! command into ["--candidates" raw-candidates-path "--audit-json" raw-audit-path])
+            (swap! command conj "--allow-unverified-candidates"))
+          (doseq [path extra-audit-paths]
+            (swap! command into ["--extra-audit-json" path]))
+          (when (true? (attr args "apply"))
+            (swap! command conj "--apply"))
+          [{"target_date" (attr args "target_date")
+            "manifest_json" manifest-path
+            "manifest_sha256" (sha256-file manifest-path)
+            "status_json" status-path
+            "dry_run_json" dry-run-path
+            "dry_run_sha256" (sha256-file dry-run-path)
+            "candidate_count" (count candidate-features)
+            "candidate_features" candidate-features
+            "apply" (true? (attr args "apply"))
+            "out_json" out-json}
+           @command])))))
+
+(defn run-main [args]
+  (let [[payload0 command] (validate-bundle args)
+        payload (atom (assoc payload0
+                             "command" command
+                             "command_text" (shquote-join command)))]
+    (when (and (true? (attr args "apply")) (not (true? (attr args "allow_missing_validation"))))
+      (let [stamp (compact-date (attr args "target_date"))
+            analysis-dir (os.path/abspath (attr args "analysis_dir"))
+            validation-path (or (attr args "require_validation_json")
+                                (os.path/join analysis-dir (str "neutralization_verified_apply_validation_" stamp ".json")))]
+        (when-not (os.path/exists validation-path)
+          (throw (python/SystemExit (str "--apply requires prior validation JSON: " validation-path))))
+        (validate-prior-validation args @payload validation-path)
+        (let [status-path (or (attr args "status_json")
+                              (os.path/join analysis-dir (str "market_evidence_status_" stamp ".json")))
+              status (load-json-object status-path)]
+          (validate-final-status-apply-safe status @payload validation-path))
+        (swap! payload assoc "required_validation_json" validation-path)))
+    (when (and (attr args "validation_json") (not (true? (attr args "apply"))))
+      (let [validation-path (attr args "validation_json")]
+        (os/makedirs (os.path/dirname validation-path) ** :exist_ok true)
+        (spit validation-path (str (json/dumps (fp/->jsonable @payload) ** :indent 2 :sort_keys true) "\n"))))
+    (if (true? (attr args "apply"))
+      (let [proc (subprocess/run (python/list command) ** :text true :capture_output true :check false)
+            final-payload (assoc @payload
+                                 "returncode" (.-returncode proc)
+                                 "stdout" (.-stdout proc)
+                                 "stderr" (.-stderr proc))]
+        (println (json/dumps (fp/->jsonable final-payload) ** :indent 2 :sort_keys true))
+        (.-returncode proc))
+      (do
+        (println (json/dumps (fp/->jsonable @payload) ** :indent 2 :sort_keys true))
+        0))))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/SystemExit e
+    (let [code (or (python/getattr e "code" 1) 1)]
+      (if (int? code)
+        (do
+          (when (not= code 0)
+            (binding [*out* *err*] (println (str e))))
+          (python/exit code))
+        (do
+          (binding [*out* *err*] (println (str code)))
+          (python/exit 1)))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (if (.startswith (str e) "duplicate JSON key:")
+      (python/exit 1)
+      (python/exit 2)))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

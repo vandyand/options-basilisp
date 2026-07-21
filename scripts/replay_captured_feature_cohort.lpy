@@ -1,0 +1,449 @@
+;; Recompute captured Steve-v2 live features from raw capture sidecars.
+;;
+;; This is a Basilisp live-pipeline determinism check. It does not build the
+;; historical/backtest cohort; it replays captured bar buffers and Greek grids
+;; through native Basilisp formulas and compares the resulting model input
+;; tensor with what live trading used.
+(import argparse collections datetime importlib json math numpy os os.path sys traceback)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVETRADING_BASILISP_ROOT")
+                                    (os.environ/get "STEVE_REPO_ROOT")
+                                    (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.raw-unlock :as raw-unlock])
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (python/isinstance x python/dict)
+    (python/dict (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ x k))])) (.keys x)))
+    (python/isinstance x python/list) (python/list (map ->jsonable x))
+    :else x))
+
+(defn write-json! [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn add-ref-to-path! [ref-root]
+  (let [ref (os.path/abspath (str ref-root))]
+    (when-not (contains? (set (.-path sys)) ref)
+      (.insert (.-path sys) 0 ref))))
+
+(defn load-npz-optional [path]
+  (if-not (os.path/exists path)
+    nil
+    (let [data (numpy/load path)]
+      (into {} (for [name (.-files data)] [name (.__getitem__ data name)])))))
+
+(defn load-legacy-feature-engine [bundle]
+  ;; The currently deployed VPS bridge still uses this reference implementation.
+  ;; Keep the adapter in Basilisp so the captured tensor can prove exact live
+  ;; replay before native feature migration is promoted.
+  (let [module (importlib/import_module "scripts_5yr.live.feature_engine")]
+    ((.-FeatureEngine module)
+     (os.path/join bundle "feature_stats.npz")
+     (os.path/join bundle "feature_names.json"))))
+
+(defn compute-legacy-live-feature-vector [engine bar-buffers grid-history hmm-model dictionary-atoms]
+  (.compute_all_features engine
+                         ** :bar_buffers bar-buffers
+                            :greeks_grids_history (python/list grid-history)
+                            :hmm_model hmm-model
+                            :dictionary_atoms dictionary-atoms))
+
+(defn reject [reason out-json & [details]]
+  (write-json! out-json {"status" "error"
+                         "ok" false
+                         "reason" reason
+                         "details" (or details {})})
+  (binding [*out* *err*] (println reason))
+  1)
+
+(defn write-unavailable! [out-json reason & [details target-date]]
+  (write-json! out-json {"status" "unavailable"
+                         "available" false
+                         "ok" false
+                         "generated_at" (.isoformat (datetime.datetime/now datetime.timezone/utc))
+                         "target_date" target-date
+                         "reason" reason
+                         "details" (or details {})
+                         "capture_rows" 0
+                         "replayable_rows" 0
+                         "features" 0
+                         "problem_feature_count" 0
+                         "worst_features" []})
+  (binding [*out* *err*] (println reason))
+  1)
+
+(defn parse-captured-time [value]
+  (if-not (python/isinstance value python/str)
+    value
+    (let [text0 (.strip value)
+          text1 (if (and (.startswith text0 "#inst \"") (.endswith text0 "\""))
+                  (subs text0 7 (dec (count text0)))
+                  text0)
+          text (if (.endswith text1 "Z") (str (subs text1 0 (dec (count text1))) "+00:00") text1)]
+      (try
+        (datetime.datetime/fromisoformat text)
+        (catch python/ValueError _
+          value)))))
+
+(defn normalize-bar-row [row]
+  (if-not (python/isinstance row python/dict)
+    row
+    (let [out (python/dict row)]
+      (when (.__contains__ out "time")
+        (.__setitem__ out "time" (parse-captured-time (.__getitem__ out "time"))))
+      out)))
+
+(defn parse-grid-history [text]
+  (let [stripped (.strip (str (or text "")))]
+    (if (or (= stripped "") (contains? #{"[]" "{}"} stripped))
+      nil
+      (let [payload (json/loads stripped)
+            arr (numpy/asarray payload ** :dtype numpy/float32)
+            shape (.-shape arr)]
+        (if (or (not= (.-ndim arr) 4)
+                (not= (python/tuple (drop 1 (python/list shape))) #py (6 21 8))
+                (= (.__getitem__ shape 0) 0))
+          nil
+          (vec (for [row arr] (numpy/asarray row ** :dtype numpy/float32))))))))
+
+(defn as-deques [payload]
+  (let [out (python/dict)
+        deque (.-deque collections)]
+    (doseq [[k v] (.items payload)]
+      (let [rows (if (python/isinstance v python/list) v [])
+            d (deque)]
+        (doseq [row rows]
+          (.append d (normalize-bar-row row)))
+        (.__setitem__ out (str k) d)))
+    out))
+
+(defn load-json-text [text]
+  (json/loads (or text "{}")))
+
+(defn overlay-features! [vector name-to-idx values]
+  (let [count* (atom 0)
+        items (cond
+                (map? values) values
+                (python/isinstance values python/dict) (.items values)
+                :else [])]
+    (doseq [[name value] items]
+      (when-let [idx (get name-to-idx (str name))]
+        (try
+          (let [numeric (float value)]
+            (when (math/isfinite numeric)
+              (.__setitem__ vector idx numeric)
+              (swap! count* inc)))
+          (catch python/Exception _ nil))))
+    @count*))
+
+(defn load-neutralization [bundle name-to-idx]
+  (let [path (os.path/join bundle "neutralize_features.json")]
+    (if-not (os.path/exists path)
+      [(numpy/asarray [] ** :dtype numpy/int64) (numpy/asarray [] ** :dtype numpy/float32)]
+      (let [names (json/loads (slurp path))]
+        (when-not (python/isinstance names python/list)
+          (throw (python/ValueError (str "neutralize_features.json must be a list: " path))))
+        (let [stats (numpy/load (os.path/join bundle "feature_stats.npz"))
+              means (numpy/asarray (.__getitem__ stats "mean") ** :dtype numpy/float32)
+              idxs (vec (keep #(get name-to-idx %) names))
+              idx (numpy/asarray (python/list idxs) ** :dtype numpy/int64)]
+          [idx (.__getitem__ means idx)])))))
+
+(defn finite-diff-metrics [live replay]
+  (let [diff (numpy/abs (- live replay))
+        live-finite (numpy/isfinite live)
+        replay-finite (numpy/isfinite replay)
+        finite (numpy/logical_and live-finite replay-finite)
+        finite-mismatch (numpy/logical_xor live-finite replay-finite)
+        any-nonfinite (numpy/logical_not finite)
+        feature-count (int (.__getitem__ (.-shape live) 1))]
+    (if-not (bool (numpy/any finite))
+      {"max_abs_deviation" nil
+       "mean_abs_deviation" nil
+       "p95_abs_deviation" nil
+       "exact_match_fraction" 0.0
+       "live_nonfinite_count" (int (numpy/sum (numpy/logical_not live-finite)))
+       "replay_nonfinite_count" (int (numpy/sum (numpy/logical_not replay-finite)))
+       "finite_mismatch_count" (int (numpy/sum finite-mismatch))
+       "problem_feature_count" feature-count}
+      (let [per-feature-max (numpy/nanmax (numpy/where finite diff numpy/nan) ** :axis 0)
+            per-feature-nonfinite (numpy/sum any-nonfinite ** :axis 0)
+            per-feature-finite-mismatch (numpy/sum finite-mismatch ** :axis 0)
+            per-feature-problem (numpy/logical_or (> per-feature-max 1.0e-6)
+                                                  (> per-feature-nonfinite 0))]
+        {"max_abs_deviation" (float (numpy/nanmax per-feature-max))
+         "mean_abs_deviation" (float (numpy/nanmean (.__getitem__ diff finite)))
+         "p95_abs_deviation" (float (numpy/nanpercentile (.__getitem__ diff finite) 95))
+         "exact_match_fraction" (float (numpy/mean (numpy/logical_and finite (<= diff 1.0e-9))))
+         "live_nonfinite_count" (int (numpy/sum (numpy/logical_not live-finite)))
+         "replay_nonfinite_count" (int (numpy/sum (numpy/logical_not replay-finite)))
+         "finite_mismatch_count" (int (numpy/sum finite-mismatch))
+         "problem_feature_count" (int (numpy/sum per-feature-problem))}))))
+
+(defn feature-diff-rows [names live replay]
+  ;; Immutable, per-feature evidence. Any non-finite model input is a replay
+  ;; failure even if both sides happen to contain NaN in the same location.
+  (vec
+   (for [idx (range (int (.__getitem__ (.-shape live) 1)))]
+     (let [lv (.__getitem__ live #py ((slice nil nil) idx))
+           rv (.__getitem__ replay #py ((slice nil nil) idx))
+           finite (numpy/logical_and (numpy/isfinite lv) (numpy/isfinite rv))
+           diff (numpy/abs (- lv rv))
+           finite-count (int (numpy/sum finite))
+           live-nonfinite (int (numpy/sum (numpy/logical_not (numpy/isfinite lv))))
+           replay-nonfinite (int (numpy/sum (numpy/logical_not (numpy/isfinite rv))))
+           finite-mismatch (int (numpy/sum (numpy/logical_xor (numpy/isfinite lv) (numpy/isfinite rv))))
+           max-dev (when (pos? finite-count) (float (numpy/nanmax (numpy/where finite diff numpy/nan))))
+           mean-dev (when (pos? finite-count) (float (numpy/nanmean (.__getitem__ diff finite))))
+           status (cond
+                    (or (pos? live-nonfinite) (pos? replay-nonfinite)) "NONFINITE"
+                    (and max-dev (<= max-dev 1.0e-9)) "EXACT_MATCH"
+                    (and max-dev (<= max-dev 1.0e-6)) "FLOAT_TOLERANCE"
+                    :else "DRIFT")]
+       {"feature" (if (< idx (count names)) (nth names idx) (str "col_" idx))
+        "feature_index" idx
+        "status" status
+        "max_abs_deviation" max-dev
+        "mean_abs_deviation" mean-dev
+        "live_nonfinite_count" live-nonfinite
+        "replay_nonfinite_count" replay-nonfinite
+        "finite_mismatch_count" finite-mismatch
+        "live_zero_frac" (float (numpy/mean (= lv 0)))
+        "replay_zero_frac" (float (numpy/mean (= rv 0)))}))))
+
+(defn worst-features [names live replay & [limit]]
+  (let [limit (or limit 25)
+        diff (numpy/abs (- live replay))
+        per-feature-max (numpy/nanmax diff ** :axis 0)
+        order (numpy/argsort (- per-feature-max))
+        rows (atom [])]
+    (doseq [idx0 (take limit order)]
+      (let [idx (int idx0)]
+        (swap! rows conj {"feature" (if (< idx (count names)) (nth names idx) (str "col_" idx))
+                          "feature_index" idx
+                          "max_abs_deviation" (float (.__getitem__ per-feature-max idx))
+                          "live_mean" (float (numpy/nanmean (.__getitem__ live #py ((slice nil nil) idx))))
+                          "replay_mean" (float (numpy/nanmean (.__getitem__ replay #py ((slice nil nil) idx))))})))
+    @rows))
+
+(defn parser []
+  (let [p (argparse/ArgumentParser)]
+    (.add_argument p "--capture")
+    (.add_argument p "--ref-root")
+    (.add_argument p "--bundle")
+    (.add_argument p "--out-npz")
+    (.add_argument p "--out-json" ** :required true)
+    (.add_argument p "--live-array" ** :default "chestnut")
+    (.add_argument p "--implementation" ** :choices (python/list ["native" "legacy-python"]) :default "native")
+    (.add_argument p "--target-date")
+    (.add_argument p "--min-rows" ** :type int :default 1)
+    (.add_argument p "--max-rows" ** :type int :default 0)
+    (.add_argument p "--tail-rows" ** :type int :default 0)
+    (.add_argument p "--grid-history-len" ** :type int :default 60)
+    (.add_argument p "--skip-option-overlays" ** :action "store_true")
+    (.add_argument p "--write-unavailable" ** :action "store_true")
+    (.add_argument p "--unavailable-reason"
+                   ** :default "captured feature replay unavailable")
+    p))
+
+(defn main [& argv]
+  (let [argv0 (vec argv)
+        sep-idx (first (keep-indexed (fn [idx value] (when (= value "--") idx)) argv0))
+        argv (if (some? sep-idx) (subvec argv0 (inc sep-idx)) argv0)
+        args (.parse_args (parser) (python/list argv))]
+    (try
+      (let [capture-path (attr args "capture")
+            ref-root (attr args "ref_root")
+            bundle (attr args "bundle")
+            out-npz (attr args "out_npz")
+            out-json (attr args "out_json")
+            live-array (attr args "live_array")
+            target-date (attr args "target_date")]
+        (when (attr args "write_unavailable")
+          (throw (python/SystemExit
+                  (write-unavailable! out-json
+                                      (attr args "unavailable_reason")
+                                      {"capture" capture-path
+                                       "bundle" bundle
+                                       "out_npz" out-npz
+                                       "live_array" live-array
+                                       "max_rows" (attr args "max_rows")
+                                       "skip_option_overlays" (attr args "skip_option_overlays")}
+                                      target-date))))
+        (doseq [[label value] {"--capture" capture-path
+                               "--ref-root" ref-root
+                               "--bundle" bundle
+                               "--out-npz" out-npz}]
+          (when (or (nil? value) (= "" (str value)))
+            (throw (python/SystemExit
+                    (reject (str "missing required argument: " label)
+                            out-json)))))
+        (when-not (os.path/exists capture-path)
+          (throw (python/SystemExit (reject "capture NPZ missing" out-json {"capture" capture-path}))))
+        (when-not (os.path/exists bundle)
+          (throw (python/SystemExit (reject "bundle directory missing" out-json {"bundle" bundle}))))
+        (add-ref-to-path! ref-root)
+        (let [capture (numpy/load capture-path ** :allow_pickle true)
+              required #{"times" "grids" live-array "bar_buffers_json"}
+              capture-files (set (python/list (.-files capture)))
+              missing (vec (sort (filter #(not (contains? capture-files %)) required)))]
+          (when (seq missing)
+            (throw (python/SystemExit (reject "capture missing required arrays" out-json {"missing" missing}))))
+          (let [names (vec (json/loads (slurp (os.path/join bundle "feature_names.json"))))
+                name-to-idx (into {} (map-indexed (fn [idx name] [name idx]) names))
+                dictionary-atoms0 (load-npz-optional (os.path/join bundle "dictionary_atoms.npz"))
+                dictionary-atoms (when dictionary-atoms0
+                                   {"components" (get dictionary-atoms0 "components")
+                                    "train_mean" (get dictionary-atoms0 "train_mean")
+                                    "train_std" (get dictionary-atoms0 "train_std")})
+                hmm-model0 (load-npz-optional (os.path/join bundle "hmm_model.npz"))
+                hmm-model (when hmm-model0
+                            {"means" (get hmm-model0 "means")
+                             "covars" (get hmm-model0 "covars")
+                             "transmat" (get hmm-model0 "transmat")
+                             "startprob" (get hmm-model0 "startprob")})
+                implementation (attr args "implementation")
+                legacy-engine (when (= implementation "legacy-python")
+                                (load-legacy-feature-engine bundle))
+                [neutral-idx neutral-means] (load-neutralization bundle name-to-idx)
+                times (.__getitem__ capture "times")
+                grids (.__getitem__ capture "grids")
+                live (numpy/asarray (.__getitem__ capture live-array) ** :dtype numpy/float32)
+                replay-rows (atom [])
+                live-rows (atom [])
+                matched-times (atom [])
+                matched-indexes (atom [])
+                skipped-blank (atom 0)
+                skipped-parse (atom 0)
+                overlay-counts (atom {"spy_option" 0
+                                      "v2_grid" 0
+                                      "spy_greek_grid" 0
+                                      "sidecar_option" 0
+                                      "sidecar_greek_grid" 0
+                                      "neutralized" 0})
+                capture-row-count (int (len (.__getitem__ capture "bar_buffers_json")))
+                requested-max (int (attr args "max_rows"))
+                requested-tail (int (attr args "tail_rows"))
+                start-index (if (pos? requested-tail)
+                              (max 0 (- capture-row-count requested-tail))
+                              0)
+                end-index (if (pos? requested-max)
+                            (min capture-row-count (+ start-index requested-max))
+                            capture-row-count)
+                option-feature-cache (atom {})]
+            (doseq [idx (range start-index end-index)]
+              (let [raw (.__getitem__ (.__getitem__ capture "bar_buffers_json") idx)
+                    text (.strip (str raw))]
+                (if (or (= text "") (contains? #{"{}" "[]"} text))
+                  (swap! skipped-blank inc)
+                  (try
+                    (let [bar-buffers (as-deques (json/loads text))
+                          grid-history0 (when (contains? capture-files "grid_history_json")
+                                          (try
+                                            (parse-grid-history (str (.__getitem__ (.__getitem__ capture "grid_history_json") idx)))
+                                            (catch python/Exception _ nil)))
+                          grid-history (or grid-history0
+                                           (let [start (max 0 (- (inc idx) (attr args "grid_history_len")))]
+                                             (vec (for [g (.__getitem__ grids (slice start (inc idx)))]
+                                                    (numpy/asarray g ** :dtype numpy/float32)))))
+                          replay (if (= implementation "legacy-python")
+                                   (compute-legacy-live-feature-vector legacy-engine bar-buffers grid-history hmm-model dictionary-atoms)
+                                   (raw-unlock/compute-live-feature-vector names bar-buffers grid-history hmm-model dictionary-atoms))]
+                      (swap! overlay-counts update "v2_grid" + (overlay-features! replay name-to-idx (raw-unlock/compute-v2-grid-features grid-history)))
+                      (swap! overlay-counts update "spy_greek_grid" + (overlay-features! replay name-to-idx (raw-unlock/compute-spy-greek-grid-features grid-history)))
+                      (when (and (not (attr args "skip_option_overlays"))
+                                 (contains? capture-files "option_chain_json"))
+                        (let [chain-json (str (or (.__getitem__ (.__getitem__ capture "option_chain_json") idx) ""))]
+                          ;; on-chain! already appends the SPY grid captured in
+                          ;; grid_history_json. Rebuilding it here would overlay a
+                          ;; second, non-live Greek state. Option aggregates are
+                          ;; cached by exact chain payload because captures often
+                          ;; repeat the same last-chain snapshot across bar rows.
+                          (let [option-features (or (get @option-feature-cache chain-json)
+                                                    (let [computed (raw-unlock/compute-spy-option-features chain-json)]
+                                                      (swap! option-feature-cache assoc chain-json computed)
+                                                      computed))]
+                            (swap! overlay-counts update "spy_option" + (overlay-features! replay name-to-idx option-features)))))
+                      (when (and (not (attr args "skip_option_overlays"))
+                                 (contains? capture-files "option_surfaces_json"))
+                        (let [surfaces (try
+                                         (load-json-text (str (or (.__getitem__ (.__getitem__ capture "option_surfaces_json") idx) "{}")))
+                                         (catch python/Exception _ (python/dict)))]
+                          (when (python/isinstance surfaces python/dict)
+                            (doseq [[prefix surface-json0] (.items surfaces)]
+                              (let [surface-json (if (python/isinstance surface-json0 python/str)
+                                                   surface-json0
+                                                   (json/dumps surface-json0 ** :default str))]
+                                (swap! overlay-counts update "sidecar_option" + (overlay-features! replay name-to-idx (raw-unlock/compute-option-features (str prefix) surface-json)))
+                                (let [sidecar-grid (raw-unlock/build-option-greeks-grid surface-json nil nil nil nil)]
+                                  (when sidecar-grid
+                                    (swap! overlay-counts update "sidecar_greek_grid" + (overlay-features! replay name-to-idx (raw-unlock/compute-greek-grid-features (str prefix) sidecar-grid))))))))))
+                      (when (> (.-size neutral-idx) 0)
+                        (.__setitem__ replay neutral-idx neutral-means)
+                        (swap! overlay-counts update "neutralized" + (int (.-size neutral-idx))))
+                      (swap! replay-rows conj replay)
+                      (swap! live-rows conj (.__getitem__ live idx))
+                      (swap! matched-times conj (str (.__getitem__ times idx)))
+                      (swap! matched-indexes conj idx))
+                    (catch python/Exception _
+                      (swap! skipped-parse inc))))))
+            (when (< (count @replay-rows) (attr args "min_rows"))
+              (throw (python/SystemExit
+                      (reject "insufficient replayable capture rows"
+                              out-json
+                              {"replayable_rows" (count @replay-rows)
+                               "min_rows" (attr args "min_rows")
+                               "capture_rows" (int (len times))
+                               "skipped_blank_sidecars" @skipped-blank
+                               "skipped_parse_errors" @skipped-parse}))))
+            (let [replay-matrix (.astype (numpy/vstack (python/list @replay-rows)) numpy/float32)
+                  live-matrix (.astype (numpy/vstack (python/list @live-rows)) numpy/float32)]
+              (os/makedirs (os.path/dirname out-npz) ** :exist_ok true)
+              (numpy/savez_compressed out-npz
+                                      ** :times (numpy/asarray @matched-times)
+                                         :replay replay-matrix
+                                         :live live-matrix
+                                         :source_indexes (numpy/asarray @matched-indexes ** :dtype numpy/int64))
+              (let [metrics (finite-diff-metrics live-matrix replay-matrix)
+                    feature-rows (feature-diff-rows names live-matrix replay-matrix)
+                    ok? (= (get metrics "problem_feature_count") 0)
+                    payload (merge {"status" (if ok? "ok" "diff")
+                                    "ok" ok?
+                                    "capture" capture-path
+                                    "bundle" bundle
+                                    "out_npz" out-npz
+                                    "live_array" live-array
+                                    "implementation" implementation
+                                    "capture_rows" (int (len times))
+                                    "scanned_rows" (- end-index start-index)
+                                    "start_index" start-index
+                                    "max_rows" requested-max
+                                    "tail_rows" requested-tail
+                                    "skip_option_overlays" (attr args "skip_option_overlays")
+                                    "replayable_rows" (int (.__getitem__ (.-shape replay-matrix) 0))
+                                    "features" (int (.__getitem__ (.-shape replay-matrix) 1))
+                                    "skipped_blank_sidecars" @skipped-blank
+                                    "skipped_parse_errors" @skipped-parse
+                                    "overlay_counts" @overlay-counts
+                                    "neutralized_feature_count" (int (.-size neutral-idx))
+                                    "feature_rows" feature-rows
+                                    "worst_features" (worst-features names live-matrix replay-matrix)}
+                                   metrics)]
+                (write-json! out-json payload)
+                (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+                (if ok? 0 1))))))
+      (catch python/Exception e
+        (reject (str "captured feature replay failed: " e)
+                (attr args "out_json")
+                {"traceback" (traceback/format_exc)}))))
+)
+
+(sys/exit (apply main (rest (.-argv sys))))

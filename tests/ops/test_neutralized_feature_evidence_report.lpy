@@ -1,0 +1,178 @@
+(ns ops.test-neutralized-feature-evidence-report
+  (:import json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/neutralized_feature_evidence_report.lpy"))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp (str (resolve-basilisp)))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn write-json! [p x] (.write_text p (str (dumps x) "\n")))
+(defn read-json [p] (json/loads (.read_text p)))
+(defn path [parent child] (.joinpath parent child))
+
+(defn run-report [args]
+  (subprocess/run
+   (python/list (concat [basilisp "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :env (.copy os/environ)
+      :text true
+      :capture_output true
+      :check false))
+
+(deftest neutralized-feature-evidence-report-joins-current-audit-outcomes
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out (path tmp "out")
+          plan (path tmp "plan.json")
+          raw (path tmp "raw.json")
+          raw2 (path tmp "raw2.json")
+          v3 (path tmp "v3.json")
+          grid (path tmp "grid.json")
+          readiness (path tmp "readiness.json")
+          capture (path tmp "capture.json")]
+      (.mkdir out ** :parents true :exist_ok true)
+      (write-json! plan
+                   {"summary" {"target_date" "2026-07-09"}
+                    "features" [{"feature" "SPX_bb_bandwidth_20"
+                                 "family" "index-proxy"
+                                 "unlock_status" "awaiting-market-evidence"
+                                 "source_note" "bar_buffer_replay"
+                                 "requirement" "SPX bar_buffers_json"
+                                 "next_evidence" "capture pass"
+                                 "model_gain" 10.0
+                                 "model_split_count" 3}
+                                {"feature" "scat_rho_fine_energy"
+                                 "family" "v3-grid"
+                                 "unlock_status" "awaiting-market-evidence"
+                                 "source_note" "v3_grid_unlock_audit"
+                                 "requirement" "V3 grid audit"
+                                 "next_evidence" "v3 pass"
+                                 "model_gain" 9.0
+                                 "model_split_count" 2}
+                                {"feature" "VIX_opt_skew_proxy"
+                                 "family" "index-proxy"
+                                 "unlock_status" "awaiting-market-evidence"
+                                 "source_note" "option_surface_formula"
+                                 "requirement" "VIX surface"
+                                 "next_evidence" "surface pass"
+                                 "model_gain" 8.0
+                                 "model_split_count" 1}
+                                {"feature" "HYG_adx_14"
+                                 "family" "equity-base"
+                                 "unlock_status" "awaiting-market-evidence"
+                                 "source_note" "bar_buffer_replay"
+                                 "requirement" "HYG bars"
+                                 "next_evidence" "bar replay audit"
+                                 "model_gain" 7.0
+                                 "model_split_count" 1}]})
+	      (write-json! raw
+	                   {"summary" {"supported_neutralized" 1
+	                               "unsupported_neutralized" 2
+	                               "source_counts" {"bar_buffer_replay" 1}}
+	                    "features" [{"feature" "SPX_bb_bandwidth_20"
+	                                 "candidate" false
+	                                 "baseline_status" "DEGENERATE_LIVE"
+                                 "recomputed_status" "DEGENERATE_LIVE"
+                                 "live_mean" 1.0
+                                 "live_std" 0.0
+                                 "z_mean" 0.1
+                                 "z_std" 0.0
+                                 "zero_frac" 0.0}]})
+	      (write-json! raw2
+	                   {"summary" {"supported_neutralized" 2
+	                               "unsupported_neutralized" 1
+	                               "source_counts" {"option_surface_formula" 1}}
+	                    "features" [{"feature" "VIX_opt_skew_proxy"
+	                                 "candidate" true
+	                                 "baseline_status" "ZERO_FILLED_LIVE"
+                                 "recomputed_status" "SANE"
+                                 "live_mean" 2.0
+                                 "live_std" 0.5
+                                 "z_mean" 0.2
+                                 "z_std" 1.0
+                                 "zero_frac" 0.0}]})
+      (write-json! v3
+                   {"summary" {"neutralized_v3_features" 1}
+                    "features" [{"feature" "scat_rho_fine_energy"
+                                 "candidate" false
+                                 "baseline_status" "ZERO_FILLED_LIVE"
+                                 "recomputed_status" "ZERO_FILLED_LIVE"
+                                 "live_mean" 0.0
+                                 "live_std" 0.0
+                                 "z_mean" 0.0
+                                 "z_std" 0.0
+                                 "zero_frac" 1.0}]})
+      (write-json! grid
+                   {"status" "ok"
+                    "ok" true
+                    "matched_rows" 60
+                    "min_correlation" 0.54
+                    "best_sequence_lag" {"lag_minutes" -1}
+                    "alignment_diagnosis" {"category" "historical-carried-grid"
+                                           "reason" "Historical cohort emitted rows where no same-minute SPY chain produced a new grid; stale carried grids can create sequence lag."
+                                           "historical_carried_grid_rows" 12
+                                           "historical_grid_appended_rows" 48}})
+      (write-json! readiness
+                   {"verdict" "FAIL"
+                    "reasons" ["matched parity has problem features"]
+                    "baseline" {"target_date_rows" 60 "min_rows" 60}
+                    "capture_v2_sidecars" {"missing_option_surface_prefixes" []}
+                    "historical_feature_cohort" {"ok" true}
+                    "thetadata_probe" {"usable" 1}})
+      (write-json! capture {"ok" true})
+      (let [result (run-report ["--plan-json" (str plan)
+                                "--raw-unlock-json" (str raw)
+                                "--raw-unlock-json" (str raw2)
+                                "--v3-unlock-json" (str v3)
+                                "--grid-input-parity-json" (str grid)
+                                "--readiness-json" (str readiness)
+                                "--capture-check-json" (str capture)
+                                "--out-dir" (str out)
+                                "--target-date" "2026-07-09"])
+            payload (read-json (path out "neutralized_feature_evidence_report_20260709.json"))
+            rows (get payload "features")
+            csv-text (.read_text (path out "neutralized_feature_evidence_report_20260709.csv"))]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (= 4 (get-in payload ["summary" "neutralized_total"])))
+	        (is (= 4 (get-in payload ["summary" "current_evidenced_neutralized"])))
+	        (is (= 0 (get-in payload ["summary" "current_unevidenced_neutralized"])))
+	        (is (= nil (get-in payload ["summary" "current_status_counts" "awaiting-current-evidence"])))
+	        (is (= 3 (get-in payload ["summary" "current_status_counts" "blocked-by-current-evidence"])))
+	        (is (= 1 (get-in payload ["summary" "current_status_counts" "candidate"])))
+	        (is (= 2 (get-in payload ["summary" "raw_supported_neutralized"])))
+	        (is (= 1 (get-in payload ["summary" "raw_unsupported_neutralized"])))
+	        (is (= ["bar_buffer_replay" "option_surface_formula"]
+	               (vec (get-in payload ["summary" "raw_covered_sources"]))))
+	        (is (str/includes? (get (.__getitem__ rows 0) "current_reason") "recomputed_status=DEGENERATE_LIVE"))
+	        (is (str/includes? (get (.__getitem__ rows 1) "current_reason") "grid input parity blocker=historical-carried-grid"))
+	        (is (str/includes? (get (.__getitem__ rows 1) "current_reason") "historical_carried_grid_rows=12"))
+	        (is (= "historical-carried-grid"
+	               (get-in payload ["summary" "grid_alignment_diagnosis" "category"])))
+	        (is (= "candidate"
+	               (get (.__getitem__ rows 2) "current_evidence_status")))
+	        (is (str/includes? (get (.__getitem__ rows 2) "current_reason") "unmask candidate"))
+	        (is (= "blocked-by-current-evidence"
+	               (get (.__getitem__ rows 3) "current_evidence_status")))
+	        (is (str/includes? (get (.__getitem__ rows 3) "current_reason")
+	                           "did not produce a finite replay value"))
+        (is (str/includes? csv-text "current_evidence_status"))
+        (is (str/includes? csv-text "missing_evidence_reasons"))
+        (is (.exists (path out "neutralized_feature_evidence_report_20260709.md")))))))

@@ -1,0 +1,43 @@
+(import glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.analysis.core :as analysis])
+
+(def usage
+  "usage: basilisp run scripts/export_replay_tape.lpy -- --facts <facts.db> --out <tape.csv>")
+
+(def allowed-options #{"--facts" "--out" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (println usage)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [{:keys [facts out]} (analysis/parse-args args)]
+      (when (or (not= 1 (count facts)) (nil? out))
+        (println usage)
+        (python/exit 2))
+      (let [summary (analysis/write-replay-tape! {:facts-db (first facts)
+                                                  :out out})]
+        (println (str "wrote " (:rows summary) " replay tape rows to " out))
+        (println (pr-str (:counts summary)))
+        summary))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

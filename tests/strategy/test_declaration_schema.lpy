@@ -1,0 +1,54 @@
+(ns strategy.test-declaration-schema
+  (:import glob)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.strategy.declaration-schema :as decl-schema]
+            [stevetrading.strategy.registry :as registry]))
+
+(defn- read-decl
+  [path]
+  (edn/read-string (slurp path)))
+
+(defn- strategy-resource-paths
+  []
+  (sort
+   (concat
+    (glob/glob "resources/strategies/*.edn")
+    (glob/glob "resources/strategies/steve/*.edn"))))
+
+(defn- error-paths
+  [result]
+  (set (map :error/path (:errors result))))
+
+(deftest shipped-strategy-declarations-match-balli-shape
+  (doseq [path (strategy-resource-paths)]
+    (let [decl (read-decl path)]
+      (is (true? (decl-schema/valid? decl)) path)
+      (is (= {:valid? true} (registry/validate-strategy-decl decl)) path))))
+
+(deftest declaration-schema-catches-nested-shape-drift
+  (let [decl (read-decl "resources/strategies/simple-direction-sma-cross-v1.edn")]
+    (testing "nested execution params must stay a keyword-keyed map"
+      (let [bad (assoc-in decl [:strategy/execution :params] "not-a-map")
+            result (registry/validate-strategy-decl bad)]
+        (is (false? (:valid? result)))
+        (is (contains? (error-paths result)
+                       [:strategy/execution :params]))))
+    (testing "mode policy accepts only canonical modes"
+      (let [bad (assoc decl :strategy/mode-policy #{:mode/bogus})
+            result (decl-schema/validation-result bad)]
+        (is (false? (:valid? result)))
+        (is (some #(= :strategy/mode-policy (first %))
+                  (error-paths result)))))))
+
+(deftest registry-rejects-strategy-id-metadata-drift
+  (let [decl (read-decl "resources/strategies/simple-direction-sma-cross-v1.edn")
+        cases [(assoc decl :strategy/family :strategy-family/other)
+               (assoc decl :strategy/name :strategy-name/other)
+               (assoc decl :strategy/version 2)]]
+    (doseq [bad cases]
+      (let [result (registry/validate-strategy-decl bad)]
+        (is (false? (:valid? result)))
+        (is (some #(= :error/strategy-id-metadata-mismatch
+                      (:error/code %))
+                  (:errors result)))))))

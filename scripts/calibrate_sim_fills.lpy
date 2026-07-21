@@ -1,25 +1,53 @@
-(ns calibrate-sim-fills
-  (:require [basilisp.edn :as edn]
-            [stevetrading.analysis.core :as analysis]))
+(import glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[basilisp.edn :as edn])
+(require '[stevetrading.analysis.core :as analysis])
+
+(def usage
+  "usage: basilisp run scripts/calibrate_sim_fills.lpy -- --facts <facts.db> [--facts <facts2.db>] --out <calibration.edn> [--max-lag-seconds 90] [--prior-strength 30]")
+
+(def allowed-options
+  #{"--facts" "--out" "--max-lag-seconds" "--prior-strength" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
 
 (defn -main
   [& args]
-  (let [{:keys [facts out max-lag-seconds prior-strength]} (analysis/parse-args args)
-        max-lag (analysis/parse-double-arg max-lag-seconds 90.0)
-        prior (analysis/parse-double-arg prior-strength 30.0)]
-    (when (or (empty? facts) (nil? out))
-      (println "usage: basilisp run scripts/calibrate_sim_fills.lpy -- --facts <facts.db> [--facts <facts2.db>] --out <calibration.edn> [--max-lag-seconds 90] [--prior-strength 30]")
-      (python/exit 2))
-    (let [artifact (analysis/write-calibration!
-                    {:facts-dbs facts
-                     :out out
-                     :max-lag-seconds max-lag
-                     :prior-strength prior})]
-      (println (str "wrote sim fill calibration to " out))
-      (println (edn/write-string
-                (select-keys artifact [:input/option-fills
-                                       :input/matched-fills
-                                       :global])))
-      artifact)))
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (println usage)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [{:keys [facts out max-lag-seconds prior-strength]} (analysis/parse-args args)
+          max-lag (analysis/parse-double-arg max-lag-seconds 90.0)
+          prior (analysis/parse-double-arg prior-strength 30.0)]
+      (when (or (empty? facts) (nil? out))
+        (println usage)
+        (python/exit 2))
+      (let [artifact (analysis/write-calibration!
+                      {:facts-dbs facts
+                       :out out
+                       :max-lag-seconds max-lag
+                       :prior-strength prior})]
+        (println (str "wrote sim fill calibration to " out))
+        (println (edn/write-string
+                  (select-keys artifact [:input/option-fills
+                                         :input/matched-fills
+                                         :global])))
+        artifact))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
 
 (apply -main *command-line-args*)

@@ -1,0 +1,359 @@
+;; Remove audited candidate features from corrected neutralization lists.
+;;
+;; Conservative by design: dry-run unless --apply is present, with timestamped
+;; backups for writes and strict JSON duplicate-key rejection.
+(import argparse datetime hashlib json os os.path shutil sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[clojure.set :as set]
+         '[stevetrading.feature-parity.core :as fp])
+
+(def default-ref (os.path/join (os.path/dirname repo-root) "SteveTrading" "ref" "Data-Preprocessor"))
+(def default-accounts ["chestnut" "lynx" "moose"])
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--candidates" ** :default nil :help "JSON list of feature names to unmask")
+    (.add_argument parser "--audit-json" ** :default nil :help "raw_feature_unlock_audit_YYYYMMDD.json provenance file")
+    (.add_argument parser "--extra-audit-json" ** :action "append" :default (python/list) :help "additional audit JSON(s); candidate rows are unioned")
+    (.add_argument parser "--target-date" ** :default nil :help "YYYY-MM-DD; checked against audit JSON when provided")
+    (.add_argument parser "--readiness-json" ** :default nil :help "market_evidence_readiness_YYYYMMDD.json required for --apply")
+    (.add_argument parser "--ref-root" ** :default default-ref)
+    (.add_argument parser "--accounts" ** :nargs "*" :default (python/list default-accounts))
+    (.add_argument parser "--bundle-suffix" ** :default "_corrected")
+    (.add_argument parser "--backup-label" ** :default nil)
+    (.add_argument parser "--out-json" ** :default nil :help "write the dry-run/apply result JSON to this path")
+    (.add_argument parser "--apply" ** :action "store_true" :help "write changes; default is dry-run")
+    (.add_argument parser "--allow-unverified-candidates" ** :action "store_true")
+    (.add_argument parser "--allow-missing-readiness" ** :action "store_true")
+    (.add_argument parser "--allow-readiness-watch" ** :action "store_true")
+    (.add_argument parser "--allow-partial" ** :action "store_true")
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn bundle-path [ref-root account suffix]
+  (os.path/join ref-root "pipeline_data" (str "live_model_" account "_multihead" suffix)))
+
+(defn load-json-value [path]
+  (fp/read-json path))
+
+(defn sha256-file [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh (* 1024 1024))]
+        (when chunk
+          (when (> (len chunk) 0)
+            (.update h chunk)
+            (recur (.read fh (* 1024 1024)))))))
+    (.hexdigest h)))
+
+(defn sha256-text [value]
+  (let [h (hashlib/sha256)]
+    (.update h (.encode value "utf-8"))
+    (.hexdigest h)))
+
+(defn neutralization-text [features]
+  (str (json/dumps (fp/->jsonable features) ** :indent 2 :sort_keys true) "\n"))
+
+(defn py-list? [value]
+  (python/isinstance value python/list))
+
+(defn py-dict? [value]
+  (python/isinstance value python/dict))
+
+(defn nonnegative-int [value label]
+  (when (or (true? value) (false? value) (not (int? value)) (neg? value))
+    (throw (python/SystemExit (str label " must be a nonnegative integer, got " (repr value)))))
+  value)
+
+(defn require-feature-list [value label]
+  (when-not (py-list? value)
+    (throw (python/SystemExit (str label " must be a JSON list"))))
+  (let [items (vec (python/list value))
+        bad (vec (take 5 (filter #(or (not (python/isinstance % python/str)) (= (.strip %) "")) items)))]
+    (when (seq bad)
+      (throw (python/SystemExit (str label " contains non-string/blank feature names: " (repr bad)))))
+    (when (not= (count (set items)) (count items))
+      (throw (python/SystemExit (str label " contains duplicate feature names"))))
+    items))
+
+(defn load-feature-list [path]
+  (require-feature-list (load-json-value path) "candidate file"))
+
+(defn validate-audit-provenance [audit-path candidates target-date]
+  (let [audit (load-json-value audit-path)
+        summary (get audit "summary")]
+    (when-not (map? summary)
+      (throw (python/SystemExit (str "audit JSON missing summary object: " audit-path))))
+    (let [audit-target (get summary "target_date")]
+      (when (and target-date (not= audit-target target-date))
+        (throw (python/SystemExit (str "audit target_date " (repr audit-target)
+                                       " does not match requested " (repr target-date))))))
+    (let [audit-candidates (require-feature-list (get summary "candidate_features") "audit summary candidate_features")]
+      (when (not= (nonnegative-int (get summary "candidate_count") "audit candidate_count")
+                  (count audit-candidates))
+        (throw (python/SystemExit "audit candidate_count does not match candidate_features length")))
+      (when (and (seq candidates) (not= (set audit-candidates) (set candidates)))
+        (let [missing (vec (sort (set/difference (set audit-candidates) (set candidates))))
+              extra (vec (sort (set/difference (set candidates) (set audit-candidates))))]
+          (throw (python/SystemExit
+                  (str "candidate file does not match raw unlock audit "
+                       "(missing_from_file=" (repr (vec (take 10 missing)))
+                       ", extra_in_file=" (repr (vec (take 10 extra))) ")"))))))
+    summary))
+
+(defn candidates-from-extra-audit [audit-path target-date]
+  (let [audit (load-json-value audit-path)
+        summary (get audit "summary")]
+    (when-not (map? summary)
+      (throw (python/SystemExit (str "extra audit JSON missing summary object: " audit-path))))
+    (let [audit-target (get summary "target_date")]
+      (when (and target-date (not= audit-target target-date))
+        (throw (python/SystemExit (str "extra audit target_date " (repr audit-target)
+                                       " does not match requested " (repr target-date)
+                                       ": " audit-path)))))
+    (let [candidates (if (py-list? (get summary "candidate_features"))
+                       (get summary "candidate_features")
+                       (let [features (get audit "features")]
+                         (when-not (py-list? features)
+                           (throw (python/SystemExit (str "extra audit JSON missing features list: " audit-path))))
+                         (python/list
+                          (for [row (python/list features)
+                                :when (and (map? row) (true? (get row "candidate")))]
+                            (get row "feature")))))
+          candidates (require-feature-list candidates (str "extra audit candidate features: " audit-path))]
+      (when (contains? summary "candidate_count")
+        (when (not= (nonnegative-int (get summary "candidate_count")
+                                     (str "extra audit candidate_count: " audit-path))
+                    (count candidates))
+          (throw (python/SystemExit (str "extra audit candidate_count does not match candidate features: " audit-path)))))
+      (when (.startswith (os.path/basename audit-path) "greek_reconstruction_promotion_gate_")
+        (when-not (true? (get summary "capture_ok"))
+          (throw (python/SystemExit (str "Greek promotion audit capture_ok is not true: " audit-path))))
+        (let [capture-reasons (get summary "capture_reasons")]
+          (when-not (py-list? capture-reasons)
+            (throw (python/SystemExit (str "Greek promotion audit capture_reasons must be a list: " audit-path))))
+          (when (> (len capture-reasons) 0)
+            (throw (python/SystemExit (str "Greek promotion audit has capture_reasons: " (repr (vec (python/list capture-reasons))))))))
+        (when-not (true? (get summary "coverage_ok"))
+          (throw (python/SystemExit (str "Greek promotion audit coverage_ok is not true: " audit-path))))
+        (let [coverage-reasons (get summary "coverage_reasons")]
+          (when-not (py-list? coverage-reasons)
+            (throw (python/SystemExit (str "Greek promotion audit coverage_reasons must be a list: " audit-path))))
+          (when (> (len coverage-reasons) 0)
+            (throw (python/SystemExit (str "Greek promotion audit has coverage_reasons: " (repr (vec (python/list coverage-reasons))))))))
+        (let [evaluated-count (nonnegative-int (get summary "evaluated_count")
+                                               (str "Greek promotion audit evaluated_count: " audit-path))
+              min-evaluated-count (nonnegative-int (get summary "min_evaluated_count")
+                                                   (str "Greek promotion audit min_evaluated_count: " audit-path))]
+          (when (< evaluated-count min-evaluated-count)
+            (throw (python/SystemExit
+                    (str "Greek promotion audit evaluated_count below min_evaluated_count "
+                         "(" evaluated-count " < " min-evaluated-count "): " audit-path))))
+          (let [features (get audit "features")]
+            (when (and (py-list? features) (not= (len features) evaluated-count))
+              (throw (python/SystemExit (str "Greek promotion audit evaluated_count does not match feature rows: " audit-path)))))))
+      [summary candidates])))
+
+(defn validate-readiness [readiness-path target-date allow-watch?]
+  (let [readiness (load-json-value readiness-path)]
+    (when-not (map? readiness)
+      (throw (python/SystemExit (str "readiness JSON must be an object: " readiness-path))))
+    (let [readiness-target (get readiness "target_date")]
+      (when (and target-date (not= readiness-target target-date))
+        (throw (python/SystemExit (str "readiness target_date " (repr readiness-target)
+                                       " does not match requested " (repr target-date))))))
+    (let [verdict (get readiness "verdict")]
+      (when (= verdict "FAIL")
+        (throw (python/SystemExit "readiness verdict is FAIL; refusing apply")))
+      (when (and (= verdict "WATCH") (not allow-watch?))
+        (throw (python/SystemExit "readiness verdict is WATCH; pass --allow-readiness-watch after operator review")))
+      (when-not (or (= verdict "PASS") (and allow-watch? (= verdict "WATCH")))
+        (throw (python/SystemExit (str "readiness verdict must be PASS or explicitly allowed WATCH, got " (repr verdict))))))
+    readiness))
+
+(defn readiness-metadata [readiness-path target-date readiness]
+  (let [metadata (atom {"readiness_json" readiness-path
+                        "readiness_available" false
+                        "readiness_target_date" nil
+                        "readiness_target_matches" nil
+                        "readiness_verdict" nil
+                        "readiness_reason_count" 0
+                        "readiness_reasons" []
+                        "readiness_error" nil})]
+    (if-not readiness-path
+      @metadata
+      (do
+        (try
+          (let [payload (or readiness (load-json-value readiness-path))]
+            (when-not (map? payload)
+              (throw (python/ValueError "readiness JSON must be an object")))
+            (let [reasons0 (get payload "reasons" [])
+                  reasons (if (py-list? reasons0) (vec (python/list reasons0)) [])
+                  readiness-target (get payload "target_date")]
+              (swap! metadata merge {"readiness_available" true
+                                      "readiness_target_date" readiness-target
+                                      "readiness_target_matches" (if target-date (= readiness-target target-date) nil)
+                                      "readiness_verdict" (get payload "verdict")
+                                      "readiness_reason_count" (count reasons)
+                                      "readiness_reasons" (vec (take 10 reasons))})))
+          (catch python/Exception e
+            (swap! metadata assoc "readiness_error" (str e))))
+        @metadata))))
+
+(defn audit-source-name [path]
+  (let [name (os.path/basename path)]
+    (cond
+      (.startswith name "raw_feature_unlock_audit") "raw_feature_unlock_audit"
+      (.startswith name "v3_grid_unlock_audit") "v3_grid_unlock_audit"
+      :else (first (os.path/splitext name)))))
+
+(defn add-candidate-provenance [provenance feature source path]
+  (let [row (get @provenance feature {"feature" feature "sources" [] "audit_paths" []})
+        sources (vec (get row "sources"))
+        audit-paths (vec (get row "audit_paths"))
+        path-s (when path (str path))]
+    (swap! provenance assoc feature
+           (assoc row
+                  "sources" (if (some #{source} sources) sources (conj sources source))
+                  "audit_paths" (if (and path-s (not (some #{path-s} audit-paths)))
+                                  (conj audit-paths path-s)
+                                  audit-paths)))))
+
+(defn unique-preserve-order [items]
+  (loop [remaining (seq items)
+         seen #{}
+         out []]
+    (if-not remaining
+      out
+      (let [x (first remaining)]
+        (if (contains? seen x)
+          (recur (next remaining) seen out)
+          (recur (next remaining) (conj seen x) (conj out x)))))))
+
+(defn write-output [payload out-json]
+  (let [text (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true)]
+    (when out-json
+      (os/makedirs (os.path/dirname out-json) ** :exist_ok true)
+      (spit out-json (str text "\n")))
+    (println text)))
+
+(defn run-main [args]
+  (let [ref-root (os.path/abspath (attr args "ref_root"))
+        target-date (attr args "target_date")
+        apply? (true? (attr args "apply"))
+        candidates-path (attr args "candidates")
+        candidate-list0 (atom (if candidates-path (load-feature-list candidates-path) []))
+        candidate-provenance (atom {})
+        audit-summary (atom nil)
+        readiness-payload (atom nil)]
+    (if-let [audit-json (attr args "audit_json")]
+      (do
+        (reset! audit-summary (validate-audit-provenance audit-json @candidate-list0 target-date))
+        (when-not candidates-path
+          (reset! candidate-list0
+                  (require-feature-list (get @audit-summary "candidate_features")
+                                        "audit summary candidate_features")))
+        (doseq [feature @candidate-list0]
+          (add-candidate-provenance candidate-provenance feature (audit-source-name audit-json) audit-json)))
+      (if (and apply? (not (true? (attr args "allow_unverified_candidates"))))
+        (throw (python/SystemExit "--apply requires --audit-json unless --allow-unverified-candidates is set"))
+        (doseq [feature @candidate-list0]
+          (add-candidate-provenance candidate-provenance feature "candidate_file" nil))))
+    (let [extra-audit-summaries (atom [])
+          extra-candidate-lists (atom [])]
+      (doseq [extra-audit (python/list (attr args "extra_audit_json"))]
+        (let [[summary extra-candidates] (candidates-from-extra-audit extra-audit target-date)]
+          (swap! extra-audit-summaries conj {"path" extra-audit
+                                             "target_date" (get summary "target_date")
+                                             "candidate_count" (count extra-candidates)})
+          (swap! extra-candidate-lists conj extra-candidates)
+          (doseq [feature extra-candidates]
+            (add-candidate-provenance candidate-provenance feature (audit-source-name extra-audit) extra-audit))))
+      (when (and apply? (seq @extra-candidate-lists) (not (or @audit-summary (true? (attr args "allow_unverified_candidates")))))
+        (throw (python/SystemExit "--apply with --extra-audit-json requires --audit-json unless --allow-unverified-candidates is set")))
+      (when apply?
+        (if-let [readiness-json (attr args "readiness_json")]
+          (reset! readiness-payload (validate-readiness readiness-json target-date (true? (attr args "allow_readiness_watch"))))
+          (when-not (true? (attr args "allow_missing_readiness"))
+            (throw (python/SystemExit "--apply requires --readiness-json unless --allow-missing-readiness is set")))))
+      (let [candidate-list (unique-preserve-order (concat @candidate-list0 (apply concat @extra-candidate-lists)))
+            candidates (set candidate-list)]
+        (when (and apply? (empty? candidates))
+          (throw (python/SystemExit "candidate list is empty")))
+        (let [backup-label (or (attr args "backup_label")
+                               (.strftime (datetime.datetime/now datetime.timezone/utc) "before_unmask_%Y%m%dT%H%M%SZ"))
+              results (atom [])
+              planned-writes (atom [])]
+          (doseq [account (python/list (attr args "accounts"))]
+            (let [bundle (bundle-path ref-root account (attr args "bundle_suffix"))
+                  path (os.path/join bundle "neutralize_features.json")]
+              (when-not (os.path/exists path)
+                (throw (python/SystemExit (str "missing neutralization file: " path))))
+              (let [before-sha256 (sha256-file path)
+                    current (require-feature-list (load-json-value path) (str "neutralization file: " path))
+                    remaining (vec (for [name current :when (not (contains? candidates name))] name))
+                    planned-after-text (neutralization-text remaining)
+                    planned-after-sha256 (sha256-text planned-after-text)
+                    removed (vec (sort (set/difference (set current) (set remaining))))
+                    missing (vec (sort (set/difference candidates (set current))))
+                    backup (os.path/join bundle (str "neutralize_features." backup-label ".json"))]
+                (when (and apply? (seq missing) (not (true? (attr args "allow_partial"))))
+                  (throw (python/SystemExit
+                          (str account " neutralization file is missing " (count missing)
+                               " candidate(s); refusing partial apply without --allow-partial"))))
+                (swap! planned-writes conj [path backup planned-after-text])
+                (swap! results conj {"account" account
+                                     "path" path
+                                     "backup" (when apply? backup)
+                                     "before_sha256" before-sha256
+                                     "planned_after_sha256" planned-after-sha256
+                                     "after_sha256" nil
+                                     "backup_sha256" nil
+                                     "before" (count current)
+                                     "after" (count remaining)
+                                     "removed" (count removed)
+                                     "missing" (count missing)
+                                     "removed_features" removed
+                                     "missing_features" missing}))))
+          (when apply?
+            (doseq [[path backup planned-after-text] @planned-writes]
+              (shutil/copy2 path backup)
+              (spit path planned-after-text))
+            (reset! results
+                    (vec (for [row @results]
+                           (assoc row
+                                  "after_sha256" (sha256-file (get row "path"))
+                                  "backup_sha256" (sha256-file (get row "backup")))))))
+          (let [readiness-meta (readiness-metadata (attr args "readiness_json") target-date @readiness-payload)
+                payload (merge {"applied" apply?
+                                "candidate_count" (count candidates)
+                                "candidate_features" candidate-list
+                                "candidate_provenance" (vec (for [name candidate-list] (get @candidate-provenance name)))
+                                "audit_target_date" (when @audit-summary (get @audit-summary "target_date"))}
+                               readiness-meta
+                               {"extra_audits" @extra-audit-summaries
+                                "verified_by_audit" (boolean (or @audit-summary (seq @extra-audit-summaries)))
+                                "results" @results})]
+            (write-output payload (attr args "out_json"))
+            0))))))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/SystemExit e
+    (let [code (or (python/getattr e "code" 1) 1)]
+      (when (not= code 0)
+        (binding [*out* *err*] (println (str e))))
+      (python/exit code)))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (if (.startswith (str e) "duplicate JSON key:")
+      (python/exit 1)
+      (python/exit 2)))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

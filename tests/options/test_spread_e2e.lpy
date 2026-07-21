@@ -230,9 +230,9 @@
       (is (= :position-effect/open (:order-intent/effect intent)))
       (is (= "2.00" (:order-intent/limit-price intent))))
 
-    (testing "leg shuffle invariance holds for the 4-leg set too"
-      (let [ident (fn [ls]
-                    {:identity/version 1
+	    (testing "leg shuffle invariance holds for the 4-leg set too"
+	      (let [ident (fn [ls]
+	                    {:identity/version 1
                      :identity/decision-id (:order-intent/decision-id intent)
                      :identity/intent-slot 0
                      :identity/account-id acct
@@ -248,8 +248,8 @@
         (is (= (:order-intent/id intent)
                (sch/order-intent-id (ident (vec (shuffle legs))))))))
 
-    (testing "the sim broker acks once and fills each leg (shared broker order id)"
-      (let [broker (sim/make-sim-broker {:marks condor-marks})
+	    (testing "the sim broker acks once and fills each leg (shared broker order id)"
+	      (let [broker (sim/make-sim-broker {:marks condor-marks})
             facts (bp/submit-order-intent! broker (condor-submit-cmd intent))
             ack (first facts)
             fills (rest facts)]
@@ -270,5 +270,16 @@
                             [(get-in f [:fact/payload :fill/instrument-id])
                              (get-in f [:fact/payload :fill/price])])
                           fills))))
-        ;; duplicate submit: same ack content, no new fills (§9)
-        (is (= [ack] (bp/submit-order-intent! broker (condor-submit-cmd intent))))))))
+	        ;; duplicate submit: same ack content, no new fills (§9)
+	        (is (= [ack] (bp/submit-order-intent! broker (condor-submit-cmd intent))))))))
+
+(deftest iron-condor-without-net-credit-uses-market-intent
+  (let [plan (exe/plan-execution :execution/iron-condor-v1
+                                 (entry-ras nil)
+                                 {:instrument/id underlying
+                                  :execution/condor condor-ctx}
+                                 acct)
+        intent (first (:execution/order-intents plan))]
+    (is (= :order-type/market (:order-intent/order-type intent)))
+    (is (nil? (:order-intent/limit-price intent)))
+    (is (= 4 (count (:order-intent/legs intent))))))

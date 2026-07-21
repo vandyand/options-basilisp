@@ -1,0 +1,42 @@
+;; Exit 0 when the supplied ISO date is a regular trading day, 1 when closed.
+(import datetime glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.reporting.core :as reporting])
+
+(defn usage
+  []
+  (println "usage: basilisp run scripts/is_trading_day.lpy -- YYYY-MM-DD"))
+
+(try
+  (let [args (vec *command-line-args*)]
+    (cond
+      (and (= 1 (count args))
+           (or (= "-h" (first args)) (= "--help" (first args))))
+      (do
+        (usage)
+        (python/exit 0))
+
+      (not= 1 (count args))
+      (do
+        (usage)
+        (python/exit 2))
+
+      :else
+      (let [date-str (first args)]
+        (datetime.date/fromisoformat date-str)
+        (if (reporting/trading-day? date-str)
+          (do
+            (println (str date-str " trading-day"))
+            (python/exit 0))
+          (do
+            (println (str date-str " non-trading-day"))
+            (python/exit 1))))))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

@@ -18,16 +18,26 @@
                    "expiration" (col "expiration")
                    "timestamp" (col "timestamp")}))))
 
+(defn- header-response
+  "Build a ThetaData header/response body from row maps."
+  [rows]
+  (let [fields ["strike" "right" "bid" "ask" "bid_size" "ask_size"
+                "expiration" "timestamp"]]
+    (json/dumps
+     (python/dict
+      {"header" (python/dict {"format" (python/list fields)})
+       "response" (python/list
+                   (map (fn [row]
+                          (python/list (map #(get row %) fields)))
+                        rows))}))))
+
 (def snapshot-1
   [{"strike" 550.0 "right" "PUT" "bid" 2.15 "ask" 2.2 "bid_size" 5
     "ask_size" 7 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:30:00.100"}
    {"strike" 545.0 "right" "PUT" "bid" 0.93 "ask" 0.97 "bid_size" 3
     "ask_size" 9 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:30:00.200"}
    {"strike" 555.0 "right" "CALL" "bid" 1.4 "ask" 1.45 "bid_size" 2
-    "ask_size" 2 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:29:59.000"}
-   ;; junk right → unparseable, must be COUNTED not silently lost
-   {"strike" 560.0 "right" "???" "bid" 0.1 "ask" 0.2 "bid_size" 1
-    "ask_size" 1 "expiration" "2026-06-12" "timestamp" nil}])
+    "ask_size" 2 "expiration" "2026-06-12" "timestamp" "2026-06-10T15:29:59.000"}])
 
 (def snapshot-2
   [{"strike" 550.0 "right" "PUT" "bid" 2.4 "ask" 2.45 "bid_size" 5
@@ -77,11 +87,41 @@
              (get-in fact [:fact/payload :chain/observed-at])))
       (is (= (get-in fact [:fact/payload :chain/observed-at])
              (:cursor r))))
-    (testing "unparseable rows are counted as quality loss"
-      (is (= 1 (get-in fact [:fact/payload :data/quality
+    (testing "schema-valid snapshots report complete quality"
+      (is (= 0 (get-in fact [:fact/payload :data/quality
                              :quality/dropped-contracts])))
-      (is (false? (get-in fact [:fact/payload :data/quality
-                                :quality/complete?]))))))
+      (is (true? (get-in fact [:fact/payload :data/quality
+                               :quality/complete?]))))))
+
+(deftest row-level-contract-parser-counts-internal-unparseable-rows
+  (let [normalized {"strike" ["550.0" "555.0"]
+                    "right" ["PUT" "???"]
+                    "bid" ["2.15" "1.0"]
+                    "ask" ["2.20" "1.1"]
+                    "expiration" ["2026-06-12" "2026-06-12"]}
+        result (td/rows->contracts normalized {:underlying-symbol "SPY"})]
+    (is (= 1 (count (:contracts result))))
+    (is (= 1 (:unparseable result)))))
+
+(deftest header-response-snapshot-emits-chain-fact
+  (let [transport (fn [{:keys [url]}]
+                    (if (>= (.find url "/v3/option/snapshot/quote") 0)
+                      {:status 200 :body (header-response snapshot-2)}
+                      {:status 404 :body "?"}))
+        src (td/make-thetadata-chain-source
+             {:symbol "SPY"
+              :underlying-id "equity/NASDAQ/SPY"
+              :expiration "2026-06-12"
+              :poll-seconds 0
+              :until "2099-01-01T00:00:00Z"
+              :transport transport})
+        fact (first (:observations (mdp/next-observations src 0 1)))
+        contracts (get-in fact [:fact/payload :chain/contracts])]
+    (is (= "2026-06-10T19:31:00.000000Z"
+           (get-in fact [:fact/payload :chain/observed-at])))
+    (is (= ["option/OPRA/SPY/2026-06-12/P/550.000"]
+           (mapv :instrument/id contracts)))
+    (is (:valid? (v/validate-fact fact)))))
 
 (deftest timestamp-cursor-and-freshness
   (let [current (atom snapshot-1)
@@ -116,7 +156,7 @@
            (set (map :instrument/id
                      (get-in fact [:fact/payload :chain/contracts])))))
     (testing "range exclusions do NOT count as dropped"
-      (is (= 1 (get-in fact [:fact/payload :data/quality
+      (is (= 0 (get-in fact [:fact/payload :data/quality
                              :quality/dropped-contracts]))))))
 
 (deftest et->utc-normalization
@@ -124,6 +164,51 @@
   (is (nil? (td/et->utc nil)))
   (testing "winter (EST) offset"
     (is (= "2026-01-10T21:14:56.000000Z" (td/et->utc "2026-01-10T16:14:56")))))
+
+(deftest completed-thetadata-stock-bars-emit-canonical-facts
+  (let [body (json/dumps
+              (python/dict {"timestamp" (python/list ["2026-06-10T10:00:00.000" "2026-06-10T10:01:00.000"])
+                            "open" (python/list [600.0 0.0])
+                            "high" (python/list [601.0 0.0])
+                            "low" (python/list [599.0 0.0])
+                            "close" (python/list [600.5 0.0])
+                            "volume" (python/list [1000 0])
+                            "vwap" (python/list [600.25 600.25])
+                            "count" (python/list [15 0])}))
+        seen-url (atom nil)
+        transport (fn [{:keys [url]}]
+                    (reset! seen-url url)
+                    (if (>= (.find url "/v3/stock/history/ohlc") 0)
+                      {:status 200 :body body}
+                      {:status 404 :body "?"}))
+        src (td/make-thetadata-stock-bars-source
+             {:symbol "SPY" :instrument-id "equity/NASDAQ/SPY"
+              :poll-seconds 0 :block? false :until "2099-01-01T00:00:00Z"
+              :transport transport})
+        result (mdp/next-observations src 0 10)
+        fact (first (:observations result))]
+    (is (= 1 (count (:observations result))))
+    (is (= "2026-06-10T14:00:00.000000Z" (:cursor result)))
+    (is (= "600.25" (get-in fact [:fact/payload :bar/vwap])))
+    (is (= "15" (get-in fact [:fact/payload :bar/trade-count])))
+    (is (>= (.find @seen-url "venue=nqb") 0))
+    (is (= "nqb" (get-in fact [:fact/payload :data/request :venue])))
+    (is (= "open-time" (get-in fact [:fact/payload :data/request :bar-timestamp])))
+    (is (:valid? (v/validate-fact fact)))))
+
+(deftest thetadata-stock-source-can-seed-at-latest-completed-bar
+  (let [body (json/dumps (python/dict {"timestamp" (python/list ["2026-06-10T10:00:00.000"])
+                                       "open" (python/list [600.0]) "high" (python/list [601.0])
+                                       "low" (python/list [599.0]) "close" (python/list [600.5])
+                                       "volume" (python/list [1000]) "vwap" (python/list [600.25])
+                                       "count" (python/list [15])}))
+        src (td/make-thetadata-stock-bars-source
+             {:symbol "SPY" :instrument-id "equity/NASDAQ/SPY" :seed-latest? true
+              :poll-seconds 0 :block? false :until "2099-01-01T00:00:00Z"
+              :transport (fn [_] {:status 200 :body body})})
+        result (mdp/next-observations src 0 1)]
+    (is (empty? (:observations result)))
+    (is (= 0 (:cursor result)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Multi-expiration merged snapshots (2026-06-12 — term/calendar feeds)

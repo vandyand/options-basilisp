@@ -1,0 +1,223 @@
+(ns feature-parity.test-replay-captured-feature-cohort-cli
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (pathlib/Path (os.path/join (str root) "scripts/replay_captured_feature_cohort.lpy")))
+
+(defn existing-path
+  [candidates]
+  (first (filter (fn [p] (and p (.exists p))) candidates)))
+
+(def ref-root
+  (existing-path [(when (os.environ/get "STEVE_REF_ROOT")
+                    (pathlib/Path (os.environ/get "STEVE_REF_ROOT")))
+                  (pathlib/Path "/opt/stevetrading/shared/Data-Preprocessor")
+                  (pathlib/Path (os.path/join (str (.-parent root)) "SteveTrading/ref/Data-Preprocessor"))]))
+
+(def basilisp-bin
+  (str (existing-path [(when (os.environ/get "BASILISP_BIN")
+                         (pathlib/Path (os.environ/get "BASILISP_BIN")))
+                       (when ref-root (pathlib/Path (os.path/join (str ref-root) ".venv/bin/basilisp")))
+                       (pathlib/Path (os.path/join (str root) ".venv/bin/basilisp"))])))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads-path [path] (json/loads (.read_text path)))
+(defn join-path [parent name] (.joinpath parent name))
+
+(defn make-bundle
+  [path]
+  (.mkdir path)
+  (.write_text (join-path path "feature_names.json")
+               (dumps ["SPY_price_open" "SPY_sma_close_10" "vix_proxy"]))
+  (numpy/savez (join-path path "feature_stats.npz")
+               ** :mean (numpy/zeros 3)
+                  :std (numpy/ones 3)))
+
+(defn make-bar-buffers
+  []
+  {"SPY" (vec
+          (for [i (range 10)]
+            {"time" (format "#inst \"2026-07-07T13:%02d:00+00:00\"" (+ 30 i))
+             "open" (+ 100.0 i)
+             "high" (+ 101.0 i)
+             "low" (+ 99.0 i)
+             "close" (+ 100.5 i)
+             "volume" (+ 1000 i)
+             "trade_count" (+ 10 i)
+             "bid" (+ 100.4 i)
+             "ask" (+ 100.6 i)}))})
+
+(defn run-replay
+  [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(deftest replay-captured-feature-cohort-recomputes-and-flags-match
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          bundle (join-path tmp "bundle")
+          capture (join-path tmp "capture.npz")
+          out-npz (join-path tmp "replay.npz")
+          out-json (join-path tmp "replay.json")
+          grids (numpy/zeros #py (1 6 21 8) ** :dtype numpy/float32)
+          live (numpy/array [[109.0 105.0 0.21]] ** :dtype numpy/float32)]
+      (make-bundle bundle)
+      (.__setitem__ grids #py (0 0 (slice 9 12) (slice 0 2)) 0.21)
+      (numpy/savez capture
+                   ** :times (numpy/array ["2026-07-07T13:39:00Z"])
+                      :grids grids
+                      :chestnut live
+                      :bar_buffers_json (numpy/array [(dumps (make-bar-buffers))]))
+      (let [result (run-replay "--capture" (str capture)
+                               "--ref-root" (str ref-root)
+                               "--bundle" (str bundle)
+                               "--out-npz" (str out-npz)
+                               "--out-json" (str out-json))
+            payload (loads-path out-json)
+            out (numpy/load out-npz)
+            replay (.__getitem__ out "replay")
+            shape (.-shape replay)]
+        (is (= 0 (.-returncode result)))
+        (is (= true (.get payload "ok")))
+        (is (= 1 (.get payload "replayable_rows")))
+        (is (= "native" (.get payload "implementation")))
+        (is (= 0 (.get payload "problem_feature_count")))
+        (is (= 0 (.get payload "live_nonfinite_count")))
+        (is (= 3 (len (.get payload "feature_rows"))))
+        (is (= "EXACT_MATCH" (.get (first (.get payload "feature_rows")) "status")))
+        (is (= 1 (.__getitem__ shape 0)))
+        (is (= 3 (.__getitem__ shape 1)))))))
+
+(deftest replay-captured-feature-cohort-fails-closed-without-sidecars
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          bundle (join-path tmp "bundle")
+          capture (join-path tmp "capture.npz")
+          out-json (join-path tmp "replay.json")]
+      (make-bundle bundle)
+      (numpy/savez capture
+                   ** :times (numpy/array ["2026-07-07T13:39:00Z"])
+                      :grids (numpy/zeros #py (1 6 21 8) ** :dtype numpy/float32)
+                      :chestnut (numpy/zeros #py (1 3) ** :dtype numpy/float32)
+                      :bar_buffers_json (numpy/array [""]))
+      (let [result (run-replay "--capture" (str capture)
+                               "--ref-root" (str ref-root)
+                               "--bundle" (str bundle)
+                               "--out-npz" (str (join-path tmp "replay.npz"))
+                               "--out-json" (str out-json)
+                               "--min-rows" "1")
+            payload (loads-path out-json)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (= "insufficient replayable capture rows" (.get payload "reason")))))))
+
+(deftest replay-captured-feature-cohort-supports-bounded-fast-debug-mode
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          bundle (join-path tmp "bundle")
+          capture (join-path tmp "capture.npz")
+          out-npz (join-path tmp "replay.npz")
+          out-json (join-path tmp "replay.json")
+          grids (numpy/zeros #py (2 6 21 8) ** :dtype numpy/float32)
+          live (numpy/array [[109.0 105.0 0.21]
+                             [110.0 106.0 0.22]] ** :dtype numpy/float32)]
+      (make-bundle bundle)
+      (.__setitem__ grids #py (0 0 (slice 9 12) (slice 0 2)) 0.21)
+      (.__setitem__ grids #py (1 0 (slice 9 12) (slice 0 2)) 0.22)
+      (numpy/savez capture
+                   ** :times (numpy/array ["2026-07-07T13:39:00Z"
+                                           "2026-07-07T13:40:00Z"])
+                      :grids grids
+                      :chestnut live
+                      :bar_buffers_json (numpy/array [(dumps (make-bar-buffers))
+                                                       (dumps (make-bar-buffers))])
+                      :option_chain_json (numpy/array ["{}" "{}"])
+                      :option_surfaces_json (numpy/array ["{}" "{}"]))
+      (let [result (run-replay "--capture" (str capture)
+                               "--ref-root" (str ref-root)
+                               "--bundle" (str bundle)
+                               "--out-npz" (str out-npz)
+                               "--out-json" (str out-json)
+                               "--max-rows" "1"
+                               "--skip-option-overlays")
+            payload (loads-path out-json)
+            out (numpy/load out-npz)
+            replay (.__getitem__ out "replay")]
+        (is (= 0 (.-returncode result)))
+        (is (= true (.get payload "ok")))
+        (is (= 2 (.get payload "capture_rows")))
+        (is (= 1 (.get payload "scanned_rows")))
+        (is (= 1 (.get payload "max_rows")))
+        (is (= 0 (.get payload "tail_rows")))
+        (is (= true (.get payload "skip_option_overlays")))
+        (is (= 1 (.__getitem__ (.-shape replay) 0)))))))
+
+(deftest replay-captured-feature-cohort-can-select-recent-tail-rows
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          bundle (join-path tmp "bundle")
+          capture (join-path tmp "capture.npz")
+          out-npz (join-path tmp "replay.npz")
+          out-json (join-path tmp "replay.json")
+          grids (numpy/zeros #py (2 6 21 8) ** :dtype numpy/float32)
+          live (numpy/array [[109.0 105.0 0.21]
+                             [109.0 105.0 0.22]] ** :dtype numpy/float32)]
+      (make-bundle bundle)
+      (.__setitem__ grids #py (0 0 (slice 9 12) (slice 0 2)) 0.21)
+      (.__setitem__ grids #py (1 0 (slice 9 12) (slice 0 2)) 0.22)
+      (numpy/savez capture
+                   ** :times (numpy/array ["2026-07-07T13:39:00Z" "2026-07-07T13:40:00Z"])
+                      :grids grids :chestnut live
+                      :bar_buffers_json (numpy/array [(dumps (make-bar-buffers)) (dumps (make-bar-buffers))]))
+      (let [result (run-replay "--capture" (str capture) "--ref-root" (str ref-root)
+                               "--bundle" (str bundle) "--out-npz" (str out-npz)
+                               "--out-json" (str out-json) "--tail-rows" "1")
+            payload (loads-path out-json)
+            out (numpy/load out-npz)]
+        (is (= 0 (.-returncode result)))
+        (is (= 1 (.get payload "start_index")))
+        (is (= 1 (.get payload "scanned_rows")))
+        (is (= 1 (.__getitem__ (.-shape (.__getitem__ out "replay")) 0)))))))
+
+(deftest replay-captured-feature-cohort-writes-explicit-unavailable-artifact
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out-json (join-path tmp "replay.json")
+          out-npz (join-path tmp "replay.npz")
+          result (run-replay "--capture" (str (join-path tmp "missing.npz"))
+                             "--ref-root" (str (or ref-root root))
+                             "--bundle" (str (join-path tmp "bundle"))
+                             "--out-npz" (str out-npz)
+                             "--out-json" (str out-json)
+                             "--target-date" "2026-07-09"
+                             "--write-unavailable"
+                             "--unavailable-reason" "capture-v2 sidecar check failed")
+          payload (loads-path out-json)]
+      (is (= 1 (.-returncode result)))
+      (is (= "unavailable" (.get payload "status")))
+      (is (= false (.get payload "available")))
+      (is (= false (.get payload "ok")))
+      (is (= "2026-07-09" (.get payload "target_date")))
+      (is (= "capture-v2 sidecar check failed" (.get payload "reason")))
+      (is (= 0 (.get payload "replayable_rows")))
+      (is (not (.exists out-npz))))))
+
+(deftest replay-captured-feature-cohort-rejects-unknown-implementation
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          result (run-replay "--implementation" "unknown"
+                             "--out-json" (str (join-path tmp "replay.json")))]
+      (is (= 2 (.-returncode result)))
+      (is (not= -1 (.find (.-stderr result) "invalid choice"))))))

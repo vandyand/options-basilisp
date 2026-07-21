@@ -38,9 +38,11 @@
   (:require [clojure.string]
             [stevetrading.domain.instruments :as ins]
             [stevetrading.domain.schemas :as sch]
-            [stevetrading.market-data.protocol :as p]))
+            [stevetrading.market-data.protocol :as p]
+            [stevetrading.market-data.thetadata-schema :as ts]))
 
 (def provider :market-data/thetadata)
+(def stock-provider :market-data/thetadata-stock)
 
 (def default-base-url "http://127.0.0.1:25503")
 
@@ -83,6 +85,13 @@
           {:error (str "unparseable body: " e)}))
       {:error (or error (str "http " status))})))
 
+(defn- invalid-payload-error
+  [kind payload]
+  (let [r (ts/validation-result kind payload)]
+    (when-not (:valid? r)
+      {:error (str "invalid " (name kind) " payload: " (:schema/errors r))
+       :schema/errors (:schema/errors r)})))
+
 (defn nearest-expiration
   "First expiration >= on-or-after (dashed YYYY-MM-DD) from the
   terminal's expiration list. → dashed date string | {:error ..}"
@@ -92,11 +101,14 @@
         data (get-json transport url)]
     (if (:error data)
       data
-      (let [exps (sort (filter #(>= (compare % on-or-after) 0)
-                               (get data "expiration")))]
-        (if (seq exps)
-          (first exps)
-          {:error (str "no expiration on/after " on-or-after)})))))
+      (if-let [invalid (invalid-payload-error :thetadata/expiration-list data)]
+        invalid
+        (let [normalized (ts/normalize-table data)
+              exps (sort (filter #(>= (compare % on-or-after) 0)
+                                 (get normalized "expiration")))]
+          (if (seq exps)
+            (first exps)
+            {:error (str "no expiration on/after " on-or-after)}))))))
 
 (defn- right-kw
   [right]
@@ -170,16 +182,17 @@
                  "/v3/option/snapshot/quote?symbol=" symbol
                  "&expiration=" compact "&format=json")
         data (get-json transport url)]
-    (cond
-      (:error data) data
-      (not (contains? data "strike")) {:error "no strike column in snapshot"}
-      :else
-      (let [{:keys [contracts unparseable]}
-            (rows->contracts data {:underlying-symbol symbol
-                                   :strike-range (:strike-range opts)})]
-        {:observed-at (snapshot-observed-at data)
-         :contracts contracts
-         :dropped unparseable}))))
+    (if (:error data)
+      data
+      (if-let [invalid (invalid-payload-error :thetadata/quote-snapshot data)]
+        invalid
+        (let [normalized (ts/normalize-table data)
+              {:keys [contracts unparseable]}
+              (rows->contracts normalized {:underlying-symbol symbol
+                                           :strike-range (:strike-range opts)})]
+          {:observed-at (snapshot-observed-at normalized)
+           :contracts contracts
+           :dropped unparseable})))))
 
 (defn fetch-chains!
   "One snapshot poll across ALL the source's expirations, merged into ONE
@@ -348,3 +361,125 @@
                      :transport default-transport}
                     opts)]
     (->ThetaDataChainSource opts (atom {:snapshot nil :polled-once? false}))))
+
+;; ---------------------------------------------------------------------------
+;; Completed ThetaData stock bars. This is deliberately a separate source from
+;; the option-chain adapter so a live strategy can opt into one provider for
+;; both stock features and historical/replay reconstruction.
+
+(defn- stock-bar-row [table idx]
+  (let [close (get-in table ["close" idx])
+        open (get-in table ["open" idx])
+        high (get-in table ["high" idx])
+        low (get-in table ["low" idx])
+        volume (get-in table ["volume" idx])
+        count0 (get-in table ["count" idx])
+        number (fn [x] (try (python/float x) (catch python/Exception _ 0.0)))
+        incomplete? (and (<= (number close) 0.0) (<= (number open) 0.0)
+                         (<= (number high) 0.0) (<= (number low) 0.0)
+                         (<= (number volume) 0.0) (<= (number count0) 0.0))]
+    (when-not incomplete?
+      (let [timestamp (get-in table ["timestamp" idx])
+            vwap (or (get-in table ["vwap" idx]) close)]
+        {:t (et->utc timestamp)
+         :o (str open) :h (str high) :l (str low) :c (str close)
+         :v (str volume) :vw (str vwap) :n (str (or count0 0))}))))
+
+(defn fetch-stock-bars!
+  "Fetch completed regular-session ThetaData one-minute bars for the current
+  ET day. The terminal includes a zero-filled in-progress row at the request
+  boundary; it is explicitly discarded before any model can consume it."
+  [{:keys [transport base-url symbol venue]}]
+  (let [now (datetime.datetime/now eastern)
+        compact (.strftime now "%Y%m%d")
+        end-time (.strftime now "%H:%M:%S")
+        url (str (or base-url default-base-url)
+                 "/v3/stock/history/ohlc?symbol=" symbol
+                 "&start_date=" compact "&end_date=" compact "&date=" compact
+                 "&interval=1m&start_time=09:30:00&end_time=" end-time "&format=json")
+        url (if venue (str url "&venue=" venue) url)
+        data (get-json transport url)]
+    (if (:error data)
+      data
+      (let [table (ts/normalize-table data)
+            timestamps (get table "timestamp" [])]
+        (vec (keep #(stock-bar-row table %) (range (count timestamps))))))))
+
+(defn- stock-bar->fact [{:keys [instrument-id run-mode venue]} bar]
+  (let [at (:t bar)
+        venue (or venue "nqb")
+        pref (str "thetadata:stock-bar:" venue ":" instrument-id ":" at)
+        payload {:bar/time at :bar/timeframe :timeframe/1m
+                 :bar/open (:o bar) :bar/high (:h bar) :bar/low (:l bar)
+                 :bar/close (:c bar) :bar/volume (:v bar)
+                 :bar/vwap (:vw bar) :bar/trade-count (:n bar)
+                 :data/request {:endpoint "/v3/stock/history/ohlc"
+                                :venue venue
+                                :bar-timestamp "open-time"
+                                :bar-status "completed"}
+                 :data/provider stock-provider :data/provider-ref pref
+                 :data/received-at (utc-now-str)
+                 :data/quality {:quality/complete? true}}]
+    (sch/fact-envelope
+     {:record/type :fact/market-bar-observed :record/mode (or run-mode :mode/paper)
+      :record/source-system stock-provider :record/instrument-id instrument-id
+      :fact/occurred-at at :fact/recorded-at (utc-now-str) :fact/source-ref pref
+      :fact/dedupe-key (str "md/thetadata-stock/" instrument-id "/" at)
+      :fact/payload payload})))
+
+(defn- emit-stock-bars [opts state cursor max-n]
+  (let [cursor (or cursor (:seed-anchor @state))
+        bars (:bars @state)
+        fresh (filter #(or (nil? cursor) (= 0 cursor) (> (compare (:t %) cursor) 0)) bars)
+        selected (vec (take (max 1 (or max-n 1)) fresh))]
+    (when (seq selected)
+      {:observations (vec (map #(stock-bar->fact opts %) selected))
+       :cursor (:t (last selected)) :exhausted? false})))
+
+(defn- poll-stock-bars! [opts state]
+  (let [res (fetch-stock-bars! opts)]
+    (if (:error res)
+      (swap! state assoc :last-error (:error res) :last-poll-ok? false)
+      (swap! state (fn [current]
+                     (cond-> (assoc current :bars res :last-error nil :last-poll-ok? true
+                                     :last-poll-at (utc-now-str))
+                       (and (:seed-latest? opts) (nil? (:seed-anchor current)) (seq res))
+                       (assoc :seed-anchor (:t (last res)))))))))
+
+(defrecord ThetaDataStockBarsSource [opts state]
+  p/MarketDataSource
+  (source-id [_] stock-provider)
+  (next-observations [_ cursor max-n]
+    (let [{:keys [until poll-seconds block?]} opts]
+      (if (and (:seed-latest? opts) (not (:seeded? @state)))
+        (do (poll-stock-bars! opts state)
+            (swap! state assoc :seeded? true)
+            {:observations [] :cursor cursor :exhausted? false})
+        (if (false? block?)
+        (or (emit-stock-bars opts state cursor max-n)
+            (if (and until (>= (compare (utc-now-str) until) 0))
+              {:observations [] :cursor cursor :exhausted? true}
+              (do (when (or (nil? (:last-poll-mono @state))
+                            (>= (- (time/monotonic) (:last-poll-mono @state)) poll-seconds))
+                    (swap! state assoc :last-poll-mono (time/monotonic))
+                    (poll-stock-bars! opts state))
+                  (or (emit-stock-bars opts state cursor max-n)
+                      {:observations [] :cursor cursor :exhausted? false}))))
+        (loop []
+          (or (emit-stock-bars opts state cursor max-n)
+              (if (and until (>= (compare (utc-now-str) until) 0))
+                {:observations [] :cursor cursor :exhausted? true}
+                (do (poll-stock-bars! opts state)
+                    (time/sleep poll-seconds)
+                    (recur)))))))))
+  (source-health [_]
+    (let [{:keys [bars last-error last-poll-ok? last-poll-at]} @state]
+      {:source/provider stock-provider :source/healthy? (boolean last-poll-ok?)
+       :source/last-receipt-at (:t (peek bars)) :source/last-poll-at last-poll-at
+       :source/degradations (filterv some? [last-error]) :source/bar-count (count bars)})))
+
+(defn make-thetadata-stock-bars-source [opts]
+  (->ThetaDataStockBarsSource
+   (merge {:base-url default-base-url :venue "nqb" :poll-seconds 15 :run-mode :mode/paper :seed-latest? false
+           :transport default-transport :block? true} opts)
+   (atom {:bars [] :last-poll-ok? false :seeded? false})))

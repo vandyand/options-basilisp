@@ -1,0 +1,165 @@
+;; Freeze a bounded option contract universe before opening ThetaData streams.
+(import argparse collections.abc datetime hashlib json math os os.path re sys urllib.parse urllib.request zoneinfo)
+
+(def default-base-url "http://127.0.0.1:25503")
+(def default-landing-root "/mnt/d/stevetrading/thetadata-parity-v1")
+(def ^:private eastern (zoneinfo/ZoneInfo "America/New_York"))
+
+(defn py-list? [value] (python/isinstance value python/list))
+(defn py-dict? [value] (python/isinstance value python/dict))
+(defn py-mapping? [value] (python/isinstance value collections.abc/Mapping))
+(defn json-default [value]
+  ;; `map?` is not reliable for a PersistentMap that has passed through a
+  ;; Python call boundary. Let json.dumps make one last Mapping-to-dict
+  ;; conversion so a valid stream plan can never fail on that representation.
+  (if (py-mapping? value)
+    (python/dict value)
+    (str value)))
+(defn now-et [] (datetime.datetime/now eastern))
+(defn compact-date [value] (.replace (str value) "-" ""))
+(defn safe-name [value] (.strip (re/sub "[^A-Za-z0-9_.=-]+" "_" (str value)) "_"))
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    (py-dict? value) (python/dict (map (fn [key] (python/tuple [(str key) (->jsonable (.get value key))])) (.keys value)))
+    ;; Basilisp persistent maps can cross a Python boundary without satisfying
+    ;; map?, but they implement Python's Mapping protocol. Serialize their
+    ;; items recursively rather than leaving a PersistentMap for json.dumps.
+    (py-mapping? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) (.items value)))
+    (py-list? value) (python/list (map ->jsonable value))
+    :else value))
+
+(defn request-url [base-url path params]
+  (let [pairs (python/list (map (fn [[k v]] (python/tuple [(str k) (str v)])) (sort-by first params)))]
+    (str (.rstrip base-url "/") path "?" (urllib.parse/urlencode pairs))))
+
+(defn http-json [url timeout-s]
+  (try
+    (with-open [response (urllib.request/urlopen (urllib.request/Request url ** :headers {"Accept" "application/json"}) ** :timeout timeout-s)]
+      {"ok" true "url" url "payload" (json/loads (.decode (.read response) "utf-8" "strict"))})
+    (catch python/Exception e {"ok" false "url" url "error" (str e)})))
+
+(defn header-columns [payload]
+  (let [header (when (py-dict? payload) (.get payload "header"))
+        columns (when (py-dict? header) (or (.get header "format") (.get header "columns") (.get header "fields")))]
+    (when (py-list? columns) (vec (map str columns)))))
+
+(defn table-rows [payload]
+  (cond
+    (py-list? payload) (vec (filter py-dict? payload))
+    (and (py-dict? payload) (py-list? (.get payload "response")) (seq (header-columns payload)))
+    (let [columns (header-columns payload)]
+      (vec (keep (fn [row]
+                   (when (py-list? row)
+                     (into {} (map-indexed (fn [i column] [column (when (< i (count row)) (nth row i))]) columns))))
+                 (.get payload "response"))))
+    (py-dict? payload)
+    (let [columns (vec (filter #(py-list? (.get payload %)) (.keys payload)))
+          n (if (seq columns) (apply max (map #(count (.get payload %)) columns)) 0)]
+      (vec (for [i (range n)]
+             (into {} (map (fn [column] [column (when (< i (count (.get payload column))) (nth (.get payload column) i))]) columns)))))
+    :else []))
+
+(defn finite-number [value]
+  (try (let [n (float value)] (when (math/isfinite n) n)) (catch python/Exception _ nil)))
+
+(defn select-expiration [base-url symbol target-date timeout-s]
+  (let [result (http-json (request-url base-url "/v3/option/list/expirations" {"symbol" symbol "format" "json"}) timeout-s)]
+    (if-not (get result "ok")
+      [nil result]
+      (let [values (sort (keep (fn [row]
+                                 (try
+                                   (let [date (datetime.date/fromisoformat (str (get row "expiration")))]
+                                     (when (not (neg? (compare date target-date))) (.isoformat date)))
+                                   (catch python/Exception _ nil)))
+                               (table-rows (get result "payload"))))]
+        [(first values) (if (seq values) result (assoc result "ok" false "error" "no valid future expiration"))]))))
+
+(defn stream-contract [root row]
+  (let [strike (finite-number (get row "strike"))
+        right (.upper (str (or (get row "right") "")))
+        expiration (or (get row "expiration") "")]
+    (when (and strike (pos? (count (str expiration))) (contains? #{"C" "CALL" "P" "PUT"} right))
+      {"root" root
+       "expiration" (compact-date expiration)
+       ;; ThetaData stream strike values are tenths of one cent.
+       "strike" (str (int (round (* strike 1000.0))))
+       "right" (if (contains? #{"C" "CALL"} right) "C" "P")})))
+
+(defn option-requests [contract]
+  [{"msg_type" "STREAM" "sec_type" "OPTION" "req_type" "QUOTE" "add" true "contract" contract}
+   {"msg_type" "STREAM" "sec_type" "OPTION" "req_type" "TRADE" "add" true "contract" contract}])
+
+(defn index-request [symbol]
+  {"msg_type" "STREAM" "sec_type" "INDEX" "req_type" "TRADE" "add" true "contract" {"root" symbol}})
+
+(defn stock-requests [symbol]
+  [{"msg_type" "STREAM" "sec_type" "STOCK" "req_type" "QUOTE" "add" true "contract" {"root" symbol}}
+   {"msg_type" "STREAM" "sec_type" "STOCK" "req_type" "TRADE" "add" true "contract" {"root" symbol}}])
+
+(defn parse-csv [value]
+  (vec (filter #(pos? (count %)) (map #(.upper (.strip %)) (.split value ",")))))
+
+(defn write-plan! [landing-root date payload]
+  (let [dir (os.path/join landing-root "plans" date)
+        path (os.path/join dir "thetadata-stream-plan.json")
+        text (str (json/dumps (->jsonable payload) ** :default json-default :indent 2 :sort_keys true) "\n")]
+    (os/makedirs dir ** :exist_ok true)
+    (spit path text)
+    path))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--symbols" ** :default "SPY,SPX,SPXW,VIX,VIXW")
+    (.add_argument parser "--index-symbols" ** :default "SPX,VIX")
+    (.add_argument parser "--stock-symbols" ** :default "SPY,HYG,TLT,VXX")
+    (.add_argument parser "--strike-range" ** :type int :default 50)
+    (.add_argument parser "--base-url" ** :default default-base-url)
+    (.add_argument parser "--landing-root" ** :default default-landing-root)
+    (.add_argument parser "--timeout-s" ** :type float :default 20.0)
+    (.add_argument parser "--target-date")
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (try
+    (let [args (parse-args argv)
+          _ (when (or (<= (.-strike_range args) 0) (> (.-strike_range args) 500))
+              (throw (python/ValueError "--strike-range must be 1..500")))
+          target (if (.-target_date args) (datetime.date/fromisoformat (.-target_date args)) (.date (now-et)))
+          symbols (parse-csv (.-symbols args))
+          option-results
+          (vec (for [symbol symbols]
+                 (let [[expiration expiration-result] (select-expiration (.-base_url args) symbol target (.-timeout_s args))]
+                   (if-not (get expiration-result "ok")
+                     {"symbol" symbol "ok" false "error" (get expiration-result "error")}
+                     (let [url (request-url (.-base_url args) "/v3/option/snapshot/quote"
+                                            {"symbol" symbol "expiration" (compact-date expiration)
+                                             "strike_range" (.-strike_range args) "format" "json"})
+                           snapshot (http-json url (.-timeout_s args))
+                           contracts (vec (keep #(stream-contract symbol %) (table-rows (get snapshot "payload"))))]
+                       {"symbol" symbol "expiration" expiration "ok" (and (get snapshot "ok") (seq contracts))
+                        "url" url "error" (when-not (and (get snapshot "ok") (seq contracts)) (or (get snapshot "error") "no valid contracts"))
+                        "contracts" contracts "raw_snapshot" (get snapshot "payload")})))))
+          contracts (vec (mapcat #(get % "contracts" []) option-results))
+          stock-symbols (parse-csv (.-stock_symbols args))
+          requests (vec (concat (mapcat option-requests contracts) (map index-request (parse-csv (.-index_symbols args))) (mapcat stock-requests stock-symbols)))
+          failed (vec (filter #(not (get % "ok")) option-results))
+          payload {"schema_version" 1 "generated_at" (.isoformat (now-et)) "session_date" (.isoformat target)
+                   "base_url" (.-base_url args) "strike_range" (.-strike_range args)
+                   "option_roots" option-results "option_contract_count" (count contracts)
+                   "index_symbols" (parse-csv (.-index_symbols args)) "stock_symbols" stock-symbols "requests" requests
+                   "status" (if (seq failed) "INCOMPLETE" "READY")}
+          path (write-plan! (.-landing_root args) (.isoformat target) payload)]
+      (println (json/dumps (->jsonable {"status" (get payload "status") "path" path "option_contract_count" (count contracts)
+                                        "request_count" (count requests) "failed_roots" (count failed)}) ** :sort_keys true))
+      (if (seq failed) 1 0))
+    (catch python/Exception e
+      (binding [*out* *err*] (println (str "ThetaData stream plan error: " e)))
+      2)))
+
+(try (python/exit (run-main (vec *command-line-args*)))
+     (catch python/Exception e
+       (binding [*out* *err*] (println (str "ThetaData stream plan fatal error: " e)))
+       (python/exit 2)))

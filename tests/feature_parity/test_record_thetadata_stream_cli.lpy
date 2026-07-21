@@ -1,0 +1,82 @@
+(ns feature-parity.test-record-thetadata-stream-cli
+  (:import json os pathlib shutil subprocess sys tempfile threading time websockets.sync.server)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "record_thetadata_stream.lpy"))
+(def payload (atom {}))
+
+(defn resolve-basilisp []
+  (cond (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+        (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+        (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+        (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+        :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable [value]
+  (cond (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+        (or (vector? value) (seq? value)) (python/list (map jsonable value))
+        :else value))
+
+(defn handler [socket]
+  (.recv socket)
+  (.send socket (json/dumps (jsonable @payload)))
+  ;; Keep the connection open until the short fixture duration expires.
+  (time/sleep 0.4))
+
+(defn run-recorder [tmp websocket-url]
+  (let [plan (.joinpath tmp "plan.json")]
+    (.write_text plan (json/dumps (jsonable {"session_date" "2026-07-13"
+                                              "requests" [{"msg_type" "STREAM" "sec_type" "OPTION"
+                                                           "req_type" "QUOTE" "add" true
+                                                           "contract" {"root" "SPY" "expiration" "20260717"
+                                                                       "strike" "600000" "right" "C"}}]})))
+    (subprocess/run [basilisp-bin "run" (str script) "--" "--plan-file" (str plan)
+                     "--landing-root" (str tmp) "--websocket-url" websocket-url
+                     "--duration-s" "0.12" "--receive-timeout-s" "0.02" "--max-reconnects" "0"]
+                    ** :cwd (str root) :text true :capture_output true :check false)))
+
+(defn latest-receipt [tmp]
+  (let [dir (.joinpath tmp "receipts" "2026-07-13" "stream-events")]
+    (json/loads (.read_text (first (iterator-seq (.glob dir "*.json")))))))
+
+(defn with-server [f]
+  (let [server (websockets.sync.server/serve handler "127.0.0.1" 0)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)
+        port (second (.getsockname (.-socket server)))]
+    (.start thread)
+    (try (f (str "ws://127.0.0.1:" port))
+         (finally (.shutdown server)))))
+
+(deftest header-only-stream-message-is-inconclusive
+  (let [tmp (pathlib/Path (tempfile/mkdtemp))]
+    (reset! payload {"msg_type" "CONNECTED" "id" 1})
+    (try
+      (with-server (fn [url]
+                     (let [result (run-recorder tmp url) receipt (latest-receipt tmp)
+                           summary (.get receipt "summary")]
+                       (is (= 1 (.-returncode result)) (.-stderr result))
+                       (is (= "INCONCLUSIVE" (.get receipt "status")))
+                       (is (= 1 (.get summary "event_count")))
+                       (is (= 0 (.get summary "market_event_count")))
+                       (is (= (.get summary "event_schema_fingerprint")
+                              (.get receipt "event_schema_fingerprint"))))))
+      (finally (shutil/rmtree tmp ** :ignore_errors true)))))
+
+(deftest market-stream-message-is-captured
+  (let [tmp (pathlib/Path (tempfile/mkdtemp))]
+    (reset! payload {"sec_type" "OPTION" "req_type" "QUOTE"
+                     "contract" {"root" "SPY" "expiration" "20260717" "strike" "600000" "right" "C"}
+                     "quote" {"date" "20260713" "ms_of_day" 34260000 "bid" 1.0 "ask" 1.1}})
+    (try
+      (with-server (fn [url]
+                     (let [result (run-recorder tmp url) receipt (latest-receipt tmp)
+                           summary (.get receipt "summary")]
+                       (is (= 0 (.-returncode result)) (.-stderr result))
+                       (is (= "CAPTURED" (.get receipt "status")))
+                       (is (= 1 (.get summary "market_event_count")))
+                       (is (contains? (set (.get (.get summary "event_body_schema_fields") "OPTION/QUOTE")) "ms_of_day"))
+                       (is (pos? (count (.get summary "event_schema_fingerprint")))))))
+      (finally (shutil/rmtree tmp ** :ignore_errors true)))))

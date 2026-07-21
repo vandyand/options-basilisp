@@ -68,6 +68,8 @@
                 "2026-06-10T19:34:00Z"
                 "2026-06-10T19:35:00Z"] times))
         (is (= "2026-06-10T19:35:00Z" (:cursor rb)))
+        (is (= "725.5" (get-in (first (:observations rb)) [:fact/payload :bar/vwap])))
+        (is (= "10" (get-in (first (:observations rb)) [:fact/payload :bar/trade-count])))
         (is (every? #(:valid? (v/validate-fact %)) (:observations rb)))))
     (testing "re-reading the same timestamp cursor re-emits identically"
       (let [src-c (make-source available)

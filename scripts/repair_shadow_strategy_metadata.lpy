@@ -1,0 +1,155 @@
+;; Repair orphaned sim shadow strategy metadata.
+;;
+;; Legacy simulator writes can leave shadow_fills/shadow_pnl rows referencing
+;; strategy IDs that are missing from shadow_strategies. With SQLite FK checks
+;; enabled, later shadow_pnl materialization then fails. This script registers
+;; conservative placeholder shadow_strategies rows without disabling FKs or
+;; modifying fills/P&L.
+(import datetime json os os.path sqlite3 sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/repair_shadow_strategy_metadata.lpy -- "
+                "--db-path DB [--apply]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:apply? false}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--db-path")
+          (recur (nnext remaining) (assoc out :db-path (option-value remaining arg)))
+
+          (= arg "--apply")
+          (recur (next remaining) (assoc out :apply? true))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn validate-opts
+  [opts]
+  (when-not (:db-path opts)
+    (throw (python/ValueError "missing required --db-path")))
+  (when-not (os.path/exists (:db-path opts))
+    (throw (python/ValueError (str "db does not exist: " (:db-path opts)))))
+  opts)
+
+(defn now-utc
+  []
+  (.isoformat (datetime.datetime/now datetime.timezone/utc)))
+
+(def orphan-sql
+  "SELECT strategy_id, SUM(n) AS ref_count
+   FROM (
+     SELECT f.strategy_id AS strategy_id, COUNT(*) AS n
+     FROM shadow_fills f
+     LEFT JOIN shadow_strategies s ON s.strategy_id = f.strategy_id
+     WHERE s.strategy_id IS NULL
+     GROUP BY f.strategy_id
+     UNION ALL
+     SELECT p.strategy_id AS strategy_id, COUNT(*) AS n
+     FROM shadow_pnl p
+     LEFT JOIN shadow_strategies s ON s.strategy_id = p.strategy_id
+     WHERE s.strategy_id IS NULL
+     GROUP BY p.strategy_id
+   )
+   GROUP BY strategy_id
+   ORDER BY ref_count DESC, strategy_id")
+
+(def insert-sql
+  "INSERT OR IGNORE INTO shadow_strategies (
+     strategy_id, factory_module, factory_kwargs_json, inherits_calibration_from,
+     state, state_changed_at, created_at, notes, promoted_account, mirror_of)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+
+(defn row->orphan
+  [row]
+  {"strategy_id" (.__getitem__ row "strategy_id")
+   "ref_count" (int (.__getitem__ row "ref_count"))})
+
+(defn orphan-strategies
+  [conn]
+  (set! (.-row_factory conn) sqlite3/Row)
+  (vec (map row->orphan (.fetchall (.execute conn orphan-sql)))))
+
+(defn repair!
+  [conn orphans]
+  (let [ts (now-utc)]
+    (doseq [orphan orphans]
+      (.execute conn insert-sql
+                [(get orphan "strategy_id")
+                 "legacy.shadow_metadata_repair"
+                 "{}"
+                 nil
+                 "live_shadow_qualified"
+                 ts
+                 ts
+                 "auto-registered by Basilisp shadow strategy metadata repair"
+                 nil
+                 nil]))
+    (.commit conn)))
+
+(defn foreign-key-violations
+  [conn]
+  (vec (map (fn [row]
+              {"table" (.__getitem__ row 0)
+               "rowid" (.__getitem__ row 1)
+               "parent" (.__getitem__ row 2)
+               "fkid" (.__getitem__ row 3)})
+            (.fetchall (.execute conn "PRAGMA foreign_key_check")))))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(try
+  (let [opts (validate-opts (parse-args (vec *command-line-args*)))
+        conn (sqlite3/connect (:db-path opts))]
+    (try
+      (.execute conn "PRAGMA foreign_keys = ON")
+      (let [before (orphan-strategies conn)]
+        (when (:apply? opts)
+          (repair! conn before))
+        (let [after (orphan-strategies conn)
+              violations (foreign-key-violations conn)
+              result {"db_path" (:db-path opts)
+                      "applied" (boolean (:apply? opts))
+                      "missing_before" (count before)
+                      "missing_after" (count after)
+                      "inserted" (if (:apply? opts) (- (count before) (count after)) 0)
+                      "orphans_before" before
+                      "orphans_after" after
+                      "foreign_key_violations" violations
+                      "valid?" (and (empty? after) (empty? violations))}]
+          (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))
+          (python/exit (if (get result "valid?") 0 1))))
+      (finally
+        (.close conn))))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch sqlite3/Error e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

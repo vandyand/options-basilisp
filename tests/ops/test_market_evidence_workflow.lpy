@@ -1,0 +1,433 @@
+(ns ops.test-market-evidence-workflow
+  (:import datetime os pathlib shutil subprocess sys tempfile zoneinfo)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/collect_market_evidence.sh"))
+
+(defn merged-env [m]
+  (let [env (.copy os/environ)]
+    (.update env (python/dict (map (fn [[k v]] (python/tuple [(str k) (str v)])) (or m {}))))
+    env))
+
+(defn run-collect [args & [env]]
+  (subprocess/run
+   (python/list (concat [(str script)] args))
+   ** :cwd (str root)
+      :env (merged-env env)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn write-exec! [path text]
+  (.write_text path text)
+  (.chmod path 493)
+  path)
+
+(defn dry-run
+  ([] (dry-run {}))
+  ([opts]
+   (let [args (get opts :args [])
+         env (get opts :env nil)
+         result (run-collect (concat ["--dry-run"] args) env)]
+   (is (= 0 (.-returncode result)) (.-stderr result))
+    (vec (filter #(.startswith % "+ ") (.splitlines (.-stdout result)))))))
+
+(defn line-containing [lines needle]
+  (first (filter #(str/includes? % needle) lines)))
+
+(deftest collect-market-evidence-threads-target-date-through-all-artifacts
+  (let [lines (dry-run {:args ["--target-date" "2026-07-05"]})
+        text (str/join "\n" lines)
+        script-text (.read_text script)]
+    (is (= 34 (count lines)))
+    (is (str/includes? text "scripts/thetadata_capability_probe.lpy"))
+    (is (str/includes? text "--save-payloads"))
+    (is (str/includes? (get lines 0) "scripts/capture_v2_sidecar_check.lpy"))
+    (is (str/includes? (get lines 0) "--target-date 2026-07-05"))
+    (is (str/includes? (get lines 0) "--sidecar-row-limit 120"))
+    (is (str/includes? (get lines 0) "capture_v2_sidecar_check_20260705.json"))
+    (is (str/includes? text "scripts/verify_thetadata_payload_examples.lpy"))
+    (is (str/includes? text "thetadata_payload_verification_20260705.json"))
+    (is (str/includes? text "scripts/collect_option_surface_sidecar.lpy"))
+    (is (str/includes? text "scripts/option_surface_sidecar_check.lpy"))
+    (is (str/includes? text "option_surface_sidecar_check_20260705.json"))
+    (is (str/includes? text "scripts/live_feature_parity_baseline.lpy"))
+    (is (str/includes? text "--dates 20260705"))
+    (is (str/includes? text "scripts/live_feature_prediction_delta.lpy"))
+    (is (str/includes? text "--candidate-mode aggregate"))
+    (is (str/includes? text "scripts/live_feature_parity_gate.lpy"))
+    (is (str/includes? text "scripts/neutralized_feature_unlock_plan.lpy"))
+    (is (str/includes? text "scripts/blocked_feature_provenance_audit.lpy"))
+    (is (str/includes? text "scripts/legacy_greek_formula_search.lpy"))
+    (is (str/includes? text "scripts/greek_feature_reconstruction_audit.lpy"))
+    (is (str/includes? text "scripts/raw_feature_unlock_audit.lpy"))
+    (let [primary-raw-line (line-containing lines "raw_feature_unlock_audit.lpy -- --target-date 2026-07-05")]
+      (is (str/includes? primary-raw-line "--max-rows 40"))
+      (is (str/includes? primary-raw-line "--max-option-contracts 40"))
+      (is (str/includes? primary-raw-line "--max-surface-contracts 40"))
+      (is (str/includes? primary-raw-line "--include-sources base\\,v2"))
+      (is (str/includes? primary-raw-line "--skip-option-formulas"))
+      (is (str/includes? primary-raw-line "--skip-greek-reconstruction")))
+    (let [max-row-lines (dry-run {:args ["--target-date" "2026-07-05"]
+                                  :env {"RAW_FEATURE_UNLOCK_MAX_ROWS" "20"}})]
+      (is (str/includes? (str/join "\n" max-row-lines) "--max-rows 20")))
+    (let [full-row-lines (dry-run {:args ["--target-date" "2026-07-05"]
+                                   :env {"RAW_FEATURE_UNLOCK_MAX_ROWS" "full"}})
+          primary-full-line (line-containing full-row-lines "raw_feature_unlock_audit.lpy -- --target-date 2026-07-05")]
+      (is (not (str/includes? primary-full-line "--max-rows"))))
+    (let [base-bars-line (line-containing lines "--label base-bars30")
+          option-chain-line (line-containing lines "--label option-chain")
+          spy-grid-line (line-containing lines "--label spy-grid60")
+          surface-grid-line (line-containing lines "--label surface-greek-grid60-full")
+          option-sidecar-line (line-containing lines "--label option_surface_sidecar")]
+      (is (str/includes? base-bars-line "--include-sources base"))
+      (is (str/includes? base-bars-line "--skip-option-formulas"))
+      (is (str/includes? option-chain-line "--include-sources option-chain"))
+      (is (str/includes? option-chain-line "--max-option-contracts 30"))
+      (is (str/includes? spy-grid-line "--include-sources spy-grid"))
+      (is (str/includes? surface-grid-line "--include-sources option-surface\\,greek-grid"))
+      (is (str/includes? surface-grid-line "--option-surface-prefixes SPY\\,SPX\\,SPXW\\,VIX\\,VIXW"))
+      (is (str/includes? option-sidecar-line "option_surface_sidecar_20260705.npz"))
+      (is (str/includes? option-sidecar-line "--include-sources option-surface\\,greek\\,greek-grid\\,greek-reconstruction"))
+      (is (str/includes? option-sidecar-line "--option-surface-prefixes SPXW\\,VIXW\\,SPX\\,VIX")))
+    (let [no-supplement-lines (dry-run {:args ["--target-date" "2026-07-05"]
+                                        :env {"RAW_FEATURE_UNLOCK_SUPPLEMENTAL_PRESETS" "none"}})
+          no-supplement-text (str/join "\n" no-supplement-lines)]
+      (is (= 30 (count no-supplement-lines)))
+      (is (not (str/includes? no-supplement-text "--label base-bars30")))
+      (is (not (str/includes? no-supplement-text "--label surface-greek-grid60-full"))))
+    (is (str/includes? text "scripts/v3_grid_unlock_audit.lpy"))
+    (let [v3-line (line-containing lines "scripts/v3_grid_unlock_audit.lpy")]
+      (is (str/includes? v3-line "--write-unavailable"))
+      (is (str/includes? v3-line "V3_GRID_UNLOCK_MAX_PREDICTION_ROWS=0")))
+    (let [v3-scored-lines (dry-run {:args ["--target-date" "2026-07-05"]
+                                    :env {"V3_GRID_UNLOCK_MAX_PREDICTION_ROWS" "10"}})
+          v3-scored-line (line-containing v3-scored-lines "scripts/v3_grid_unlock_audit.lpy")]
+      (is (str/includes? v3-scored-line "--max-prediction-rows 10")))
+    (is (str/includes? text "scripts/replay_captured_feature_cohort.lpy"))
+    (let [replay-line (line-containing lines "scripts/replay_captured_feature_cohort.lpy")]
+      (is (str/includes? replay-line "--max-rows 30"))
+      (is (str/includes? replay-line "--skip-option-overlays")))
+    (is (str/includes? text "scripts/greek_reconstruction_promotion_gate.lpy"))
+    (is (str/includes? script-text "greek_promotion_cmd+=(--extra-raw-audit-json \"$supplemental_raw_audit\")"))
+    (is (str/includes? text "scripts/build_thetadata_historical_feature_cohort.lpy"))
+    (let [historical-line (first (filter #(str/includes? % "scripts/build_thetadata_historical_feature_cohort.lpy") lines))]
+      (is (str/includes? historical-line "--base-url http://127.0.0.1:25503"))
+      (is (str/includes? historical-line "--start-time 09:30:00"))
+      (is (str/includes? historical-line "--stock-start-time 04:00:00"))
+      (is (str/includes? historical-line "--end-time 15:59:00"))
+      (is (str/includes? historical-line "--chain-horizon-days 1"))
+      (is (str/includes? historical-line "--surface-horizon-days 45"))
+      (is (str/includes? historical-line "--surface-symbols ''"))
+      (is (str/includes? historical-line "--implementation native"))
+      (is (str/includes? historical-line "--stock-venue nqb"))
+      (is (str/includes? historical-line "--option-reconstruction at-time-quote"))
+      (is (str/includes? historical-line "--skip-option-enrichment"))
+      (is (str/includes? historical-line "--cohort-window-minutes 75"))
+      (is (str/includes? historical-line "--grid-contracts-only"))
+      (is (str/includes? historical-line "--jobs 8"))
+      (is (str/includes? historical-line "--thetadata-cache-dir"))
+      (is (str/includes? historical-line "thetadata-cache"))
+      (is (str/includes? historical-line "--spy-strike-range 100"))
+      (is (not (str/includes? historical-line "--allow-missing-surfaces"))))
+    (let [allow-missing-lines (dry-run {:args ["--target-date" "2026-07-05"]
+                                        :env {"HISTORICAL_FEATURE_ALLOW_MISSING_SURFACES" "1"}})
+          historical-line (first (filter #(str/includes? % "scripts/build_thetadata_historical_feature_cohort.lpy") allow-missing-lines))]
+      (is (str/includes? historical-line "--allow-missing-surfaces")))
+    (let [surface-lines (dry-run {:args ["--target-date" "2026-07-05"]
+                                  :env {"HISTORICAL_FEATURE_SURFACE_SYMBOLS" "SPX,VIX"}})
+          historical-line (first (filter #(str/includes? % "scripts/build_thetadata_historical_feature_cohort.lpy") surface-lines))]
+      (is (str/includes? historical-line "--surface-symbols SPX\\,VIX")))
+    (let [grid-line (line-containing lines "scripts/grid_feature_input_parity.lpy")
+          matched-line (line-containing lines "scripts/matched_feature_parity_report.lpy")
+          readiness-line (line-containing lines "scripts/market_evidence_readiness.lpy")
+          evidence-line (line-containing lines "scripts/neutralized_feature_evidence_report.lpy")
+          unmask-line (line-containing lines "scripts/apply_neutralization_candidates.lpy")]
+      (is (str/includes? grid-line "--historical-npz"))
+      (is (str/includes? grid-line "--historical-cohort-json"))
+      (is (str/includes? grid-line "grid_feature_input_parity_20260705.json"))
+      (is (str/includes? grid-line "grid_feature_input_parity_20260705.md"))
+      (is (str/includes? matched-line "--min-rows 60"))
+      (is (str/includes? matched-line "--write-unavailable-on-error"))
+      (is (str/includes? readiness-line "--historical-cohort-json"))
+      (is (str/includes? readiness-line "--raw-unlock-json"))
+      (is (str/includes? readiness-line "--v3-unlock-json"))
+      (is (str/includes? readiness-line "--matched-parity-json"))
+      (is (str/includes? evidence-line "--plan-json"))
+      (is (str/includes? evidence-line "--raw-unlock-json"))
+      (is (str/includes? evidence-line "--v3-unlock-json"))
+      (is (str/includes? evidence-line "--grid-input-parity-json"))
+      (is (str/includes? unmask-line "--backup-label before_unmask_20260705")))
+    (is (str/includes? script-text "scripts/audit_captured_source_parity.lpy"))
+    (is (str/includes? script-text "captured_source_parity_$STAMP.json"))
+    (is (str/includes? script-text "--bar-tolerance \"$SOURCE_PARITY_BAR_TOLERANCE\""))
+    (is (str/includes? script-text "scripts/build_verified_feature_corpus.lpy"))
+    (is (str/includes? script-text "verified_feature_corpus_$STAMP.json"))
+    (is (str/includes? script-text "scripts/summarize_matched_feature_parity.lpy"))
+    (is (str/includes? script-text "--usage-csv \"$MODEL_USAGE_CSV\""))
+    (is (str/includes? script-text "--grid-input-parity-json \"$GRID_INPUT_PARITY_JSON\""))
+    (is (str/includes? script-text "--target-date \"$TARGET_DATE\""))
+    (is (str/includes? script-text "raw_feature_unlock_audit_${STAMP}_*.json"))
+    (is (str/includes? script-text "unmask_dry_run_cmd+=(--extra-audit-json \"$supplemental_raw_audit\")"))
+    (is (str/includes? script-text "\"capture_ok\"[[:space:]]*:[[:space:]]*true"))
+    (is (str/includes? script-text "\"coverage_ok\"[[:space:]]*:[[:space:]]*true"))
+    (is (str/includes? text "scripts/market_evidence_manifest.lpy"))
+    (is (str/includes? text "scripts/market_evidence_status.lpy"))
+    (is (str/includes? text "scripts/apply_verified_neutralization_unmask.lpy"))
+    (is (not (str/includes? text "projects/ops/scripts/run_verified_unmask_apply.sh")))
+    (is (str/includes? script-text "\"scripts/verify_neutralization_unmask_apply.lpy\""))
+    (is (not (str/includes? text "scripts/verify_neutralization_unmask_apply.lpy")))
+    (is (str/includes? text "neutralization_verified_apply_validation_20260705.json"))
+    (is (str/includes? (get lines (- (count lines) 4)) "--verify"))
+    (is (str/includes? (get lines (- (count lines) 2)) "--allow-empty"))))
+
+(deftest collect-market-evidence-uses-completed-intraday-historical-window-for-current-target
+  (let [lines (dry-run {:args ["--target-date" "2026-07-07"]
+                        :env {"MARKET_EVIDENCE_NOW_ET" "2026-07-07T10:45:00"}})
+        historical-line (line-containing lines "scripts/build_thetadata_historical_feature_cohort.lpy")]
+    (is (str/includes? historical-line "--start-time 09:30:00"))
+    (is (str/includes? historical-line "--implementation native"))
+    (is (str/includes? historical-line "--cohort-window-minutes 75"))
+    (is (str/includes? historical-line "--end-time 10:40:00"))))
+
+(deftest collect-market-evidence-honors-explicit-historical-end-time
+  (let [lines (dry-run {:args ["--target-date" "2026-07-07"]
+                        :env {"MARKET_EVIDENCE_NOW_ET" "2026-07-07T10:45:00"
+                              "HISTORICAL_FEATURE_END_TIME" "15:59:00"}})
+        historical-line (line-containing lines "scripts/build_thetadata_historical_feature_cohort.lpy")]
+    (is (str/includes? historical-line "--end-time 15:59:00"))))
+
+(deftest collect-market-evidence-archive-mode-keeps-old-historical-cache-path
+  (let [lines (dry-run {:args ["--target-date" "2026-07-05"]
+                        :env {"HISTORICAL_FEATURE_MODE" "archive"}})
+        text (str/join "\n" lines)
+        historical-line (line-containing lines "scripts/prepare_historical_feature_cohort.lpy")]
+    (is (str/includes? text "scripts/prepare_historical_feature_cohort.lpy"))
+    (is (not (str/includes? text "scripts/build_thetadata_historical_feature_cohort.lpy")))
+    (is (str/includes? historical-line "--historical-source"))
+    (is (str/includes? historical-line "full_features_5yr_v3.npz"))
+    (is (str/includes? historical-line "--date-map"))
+    (is (str/includes? historical-line "date_map_5yr_v3.json"))))
+
+(deftest collect-market-evidence-rejects-malformed-target-dates
+  (let [result (run-collect ["--dry-run" "--target-date" "20260705"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "target date must be YYYY-MM-DD"))))
+
+(deftest collect-market-evidence-rejects-invalid-calendar-target-dates
+  (let [result (run-collect ["--dry-run" "--target-date" "2026-02-31"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "target date is not a valid calendar date"))))
+
+(deftest collect-market-evidence-rejects-missing-target-date-value
+  (let [result (run-collect ["--dry-run" "--target-date"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "missing value for --target-date"))))
+
+(deftest collect-market-evidence-rejects-target-date-value-that-is-another-flag
+  (let [result (run-collect ["--target-date" "--dry-run"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "missing value for --target-date"))))
+
+(deftest collect-market-evidence-refuses-real-backdated-runs-by-default
+  (let [et (zoneinfo/ZoneInfo "America/New_York")
+        yesterday (.isoformat (- (.date (datetime.datetime/now et))
+                                 (datetime/timedelta ** :days 1)))
+        result (run-collect ["--target-date" yesterday])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "refusing non-dry-run target date"))))
+
+(deftest collect-market-evidence-help-documents-dry-run-and-target-date
+  (let [result (run-collect ["--help"])]
+    (is (= 0 (.-returncode result)))
+    (is (str/includes? (.-stdout result) "--dry-run"))
+    (is (str/includes? (.-stdout result) "--target-date"))))
+
+(deftest collect-market-evidence-skips-expensive-parity-build-after-capture-check-failure
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (.joinpath tmp "analysis")
+          payloads (.joinpath tmp "payloads")
+          captures (.joinpath tmp "captures")
+          log (.joinpath tmp "calls.log")
+          fake-python (.joinpath tmp "fake-python")
+          fake-basilisp (.joinpath tmp "fake-basilisp")
+          capture (.joinpath captures "live_features_20260705.npz")]
+      (.mkdir captures)
+      (.mkdir analysis)
+      (.write_bytes capture (.encode "poisoned capture placeholder" "utf-8"))
+      (.write_bytes (.joinpath analysis "historical_features_20260705.npz")
+                    (.encode "previous historical tensor" "utf-8"))
+      (.write_bytes (.joinpath analysis "replayed_feature_cohort_20260705.npz")
+                    (.encode "previous replay tensor" "utf-8"))
+      (.write_text (.joinpath analysis "matched_feature_parity_summary_20260705.json")
+                   "{\"previous\":true}\n")
+      (write-exec!
+       fake-python
+       (str "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "echo \"PY $*\" >> " log "\n"
+            "mkdir -p " analysis " " payloads "/20260705\n"
+            "case \"$*\" in\n"
+            "  *build_thetadata_historical_feature_cohort.lpy*|*prepare_historical_feature_cohort.lpy*|*replay_captured_feature_cohort.lpy*)\n"
+            "    touch " analysis "/forbidden-expensive-step\n"
+            "    exit 44\n"
+            "    ;;\n"
+            "esac\n"))
+      (write-exec!
+       fake-basilisp
+       (str "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "echo \"BASILISP $*\" >> " log "\n"
+            "mkdir -p " analysis "\n"
+            "case \"$*\" in\n"
+            "  *capture_v2_sidecar_check.lpy*)\n"
+            "    printf '{\"ok\":false,\"status\":\"fail\",\"issues\":[\"malformed sidecars\"]}\\n' > " analysis "/capture_v2_sidecar_check_20260705.json\n"
+            "    exit 6\n"
+            "    ;;\n"
+            "  *live_feature_parity_baseline.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"available\":false,\"target_date\":\"2026-07-05\",\"rows\":0,\"capture_file_count\":0,\"features\":0,\"active_problem_count\":0,\"captures\":{\"files\":[],\"rows_by_file\":{},\"skipped_files\":{}},\"per_capture\":[]},\"features\":[]}\\n' > " analysis "/live_feature_parity_baseline_20260705.json\n"
+            "    printf 'feature,family,status\\n' > " analysis "/live_feature_parity_baseline_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/live_feature_parity_baseline_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *live_feature_prediction_delta.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"status\":\"unavailable\",\"available\":false,\"candidate_by_date\":{\"20260705\":[]},\"rows\":[]}\\n' > " analysis "/live_feature_prediction_delta_aggregate_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/live_feature_prediction_delta_aggregate_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/live_feature_prediction_delta_aggregate_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *live_feature_model_usage_audit.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"status\":\"unavailable\",\"target_date\":\"2026-07-05\",\"features\":[]}\\n' > " analysis "/live_feature_model_usage_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/live_feature_model_usage_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/live_feature_model_usage_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *live_feature_parity_gate.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"status\":\"unavailable\",\"verdict\":\"FAIL\",\"target_date\":\"2026-07-05\",\"reasons\":[\"baseline missing\"]}\\n' > " analysis "/live_feature_parity_gate_20260705.json\n"
+            "    printf '# unavailable\\n' > " analysis "/live_feature_parity_gate_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *neutralization_audit.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"target_date\":\"2026-07-05\",\"candidate_now\":0,\"review_count\":0,\"blocked_count\":0,\"neutralized_features\":0},\"features\":[]}\\n' > " analysis "/neutralization_audit_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/neutralization_audit_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/neutralization_audit_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *matched_feature_parity_report.lpy*)\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"unavailable_reason\":\"capture failed\"}}\\n' > " analysis "/matched_feature_parity_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/matched_feature_parity_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/matched_feature_parity_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *replay_captured_feature_cohort.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"status\":\"unavailable\",\"available\":false,\"ok\":false,\"target_date\":\"2026-07-05\",\"replayable_rows\":0}\\n' > " analysis "/replayed_feature_cohort_20260705.json\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *greek_feature_reconstruction_audit.lpy*)\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"target_date\":\"2026-07-05\",\"candidate_reconstructable\":0}}\\n' > " analysis "/greek_feature_reconstruction_audit_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/greek_feature_reconstruction_audit_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/greek_feature_reconstruction_audit_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *greek_reconstruction_promotion_gate.lpy*)\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"target_date\":\"2026-07-05\",\"candidate_count\":0}}\\n' > " analysis "/greek_reconstruction_promotion_gate_20260705.json\n"
+            "    printf 'feature,candidate\\n' > " analysis "/greek_reconstruction_promotion_gate_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/greek_reconstruction_promotion_gate_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *raw_feature_unlock_audit.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"target_date\":\"2026-07-05\",\"candidate_count\":0,\"candidate_features\":[]},\"features\":[]}\\n' > " analysis "/raw_feature_unlock_audit_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/raw_feature_unlock_audit_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/raw_feature_unlock_audit_20260705.md\n"
+            "    printf '[]\\n' > " analysis "/raw_feature_unlock_candidates_20260705.json\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *v3_grid_unlock_audit.lpy*)\n"
+            "    if [[ \"$*\" != *\"--write-unavailable\"* ]]; then touch " analysis "/forbidden-expensive-step; exit 44; fi\n"
+            "    printf '{\"summary\":{\"status\":\"unavailable\",\"target_date\":\"2026-07-05\",\"recomputed_candidate_now\":0},\"features\":[]}\\n' > " analysis "/v3_grid_unlock_audit_20260705.json\n"
+            "    printf 'feature,status\\n' > " analysis "/v3_grid_unlock_audit_20260705.csv\n"
+            "    printf '# unavailable\\n' > " analysis "/v3_grid_unlock_audit_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *grid_feature_input_parity.lpy*)\n"
+            "    printf '{\"status\":\"unavailable\",\"ok\":false,\"target_date\":\"2026-07-05\",\"matched_rows\":0}\\n' > " analysis "/grid_feature_input_parity_20260705.json\n"
+            "    printf '# unavailable\\n' > " analysis "/grid_feature_input_parity_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *market_evidence_readiness.lpy*)\n"
+            "    touch " analysis "/readiness-invoked\n"
+            "    printf '{\"verdict\":\"FAIL\",\"reasons\":[\"capture-v2 sidecar check did not pass\"]}\\n' > " analysis "/market_evidence_readiness_20260705.json\n"
+            "    printf 'readiness fail\\n' > " analysis "/market_evidence_readiness_20260705.md\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *market_evidence_manifest.lpy*)\n"
+            "    touch " analysis "/manifest-invoked\n"
+            "    printf '{\"valid?\":false,\"status\":\"error\"}\\n' > " analysis "/market_evidence_manifest_20260705.json\n"
+            "    ;;\n"
+            "  *market_evidence_status.lpy*)\n"
+            "    touch " analysis "/status-invoked\n"
+            "    printf '{\"ok?\":false,\"status\":\"error\",\"reasons\":[\"capture-v2 sidecar check did not pass\"]}\\n' > " analysis "/market_evidence_status_20260705.json\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "esac\n"))
+      (let [env {"BASILISP_BIN" (str fake-basilisp)
+                 "ANALYSIS_DIR" (str analysis)
+                 "PAYLOAD_DIR" (str payloads)
+                 "CAPTURE_DIR" (str captures)
+                 "ALLOW_NON_TODAY_TARGET" "1"}
+            result (run-collect ["--target-date" "2026-07-05"] env)
+            calls (.read_text log)]
+        (is (= 6 (.-returncode result)) (.-stderr result))
+        (is (str/includes? calls "capture_v2_sidecar_check.lpy"))
+        (is (str/includes? calls "market_evidence_readiness.lpy"))
+        (doseq [forbidden ["build_thetadata_historical_feature_cohort.lpy"
+                           "prepare_historical_feature_cohort.lpy"]]
+          (is (not (str/includes? calls forbidden)) forbidden))
+        (is (str/includes? calls "live_feature_parity_baseline.lpy"))
+        (is (str/includes? calls "matched_feature_parity_report.lpy"))
+        (is (str/includes? calls "--write-unavailable"))
+        (is (str/includes? calls "live_feature_parity_gate.lpy"))
+        (is (str/includes? calls "live_feature_model_usage_audit.lpy"))
+        (is (str/includes? calls "neutralization_audit.lpy"))
+        (is (str/includes? calls "raw_feature_unlock_audit.lpy"))
+        (is (str/includes? calls "v3_grid_unlock_audit.lpy"))
+        (is (str/includes? calls "greek_feature_reconstruction_audit.lpy"))
+        (is (str/includes? calls "greek_reconstruction_promotion_gate.lpy"))
+        (is (str/includes? calls "grid_feature_input_parity.lpy"))
+        (is (not (.exists (.joinpath analysis "forbidden-expensive-step"))))
+        (is (.exists (.joinpath analysis "live_feature_parity_baseline_20260705.json")))
+        (is (.exists (.joinpath analysis "live_feature_parity_gate_20260705.json")))
+        (is (.exists (.joinpath analysis "live_feature_model_usage_20260705.json")))
+        (is (.exists (.joinpath analysis "neutralization_audit_20260705.json")))
+        (is (.exists (.joinpath analysis "raw_feature_unlock_audit_20260705.json")))
+        (is (.exists (.joinpath analysis "raw_feature_unlock_candidates_20260705.json")))
+        (is (.exists (.joinpath analysis "v3_grid_unlock_audit_20260705.json")))
+        (is (.exists (.joinpath analysis "matched_feature_parity_20260705.json")))
+        (is (.exists (.joinpath analysis "greek_feature_reconstruction_audit_20260705.json")))
+        (is (.exists (.joinpath analysis "greek_reconstruction_promotion_gate_20260705.json")))
+        (is (.exists (.joinpath analysis "grid_feature_input_parity_20260705.json")))
+        (is (.exists (.joinpath analysis "readiness-invoked")))
+        (is (.exists (.joinpath analysis "manifest-invoked")))
+        (is (.exists (.joinpath analysis "status-invoked")))
+        (is (false? (.exists (.joinpath analysis "historical_features_20260705.npz"))))
+        (let [retained-root (.joinpath analysis "market_evidence_retained" "20260705")
+              retained-dirs (vec (.glob retained-root "*"))]
+          (is (= 1 (count retained-dirs)))
+          (let [retained-dir (first retained-dirs)]
+            (is (.exists (.joinpath retained-dir "historical_features_20260705.npz")))
+            (is (.exists (.joinpath retained-dir "replayed_feature_cohort_20260705.npz")))
+            (is (.exists (.joinpath retained-dir "matched_feature_parity_summary_20260705.json")))))
+        (is (str/includes? (.-stderr result) "skipping historical feature cohort preparation because capture-v2 sidecar check failed"))
+        (is (str/includes? (.-stderr result) "retained 3 previous market-evidence artifact(s) before cleanup"))
+        (is (str/includes? (.-stderr result) "skipping grid feature input parity because capture-v2 sidecar check failed"))
+        (is (str/includes? (.-stderr result) "skipping matched feature parity report because capture-v2 sidecar check failed"))))))

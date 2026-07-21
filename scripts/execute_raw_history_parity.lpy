@@ -1,0 +1,239 @@
+;; Fetch receipt-derived ThetaData history and match it against raw live events.
+(import argparse concurrent.futures decimal json os os.path sys urllib.parse urllib.request)
+
+(def field-map {"option-quote" ["bid" "ask" "bid_size" "ask_size" "bid_exchange" "ask_exchange" "bid_condition" "ask_condition"]
+                "option-trade" ["price" "size" "exchange" "condition"]
+                "stock-quote" ["bid" "ask" "bid_size" "ask_size" "bid_exchange" "ask_exchange" "bid_condition" "ask_condition"]
+                "stock-trade" ["price" "size" "exchange" "condition"]
+                "index-price" ["price"]})
+
+(defn py-list? [x] (python/isinstance x python/list))
+(defn py-dict? [x] (python/isinstance x python/dict))
+(defn jsonable [x]
+  (cond (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+        (or (vector? x) (seq? x) (set? x)) (python/list (map jsonable x)) :else x))
+
+(defn rows [payload]
+  (cond
+    (py-list? payload) (vec (filter py-dict? payload))
+    ;; Terminal JSON may be a header/response table instead of a row array.
+    (and (py-dict? payload) (py-list? (.get payload "response"))
+         (py-dict? (.get payload "header"))
+         (py-list? (or (.get (.get payload "header") "format")
+                        (.get (.get payload "header") "columns"))))
+    (let [columns (or (.get (.get payload "header") "format")
+                      (.get (.get payload "header") "columns"))]
+      (vec (keep (fn [row]
+                   (when (py-list? row)
+                     (into {} (map-indexed (fn [i key] [key (when (< i (count row)) (nth row i))]) columns))))
+                 (.get payload "response"))))
+    (py-dict? payload)
+    (let [ks (vec (filter #(py-list? (.get payload %)) (.keys payload)))
+          n (if (seq ks) (apply max (map #(count (.get payload %)) ks)) 0)]
+      (vec (for [i (range n)]
+             (into {} (map (fn [k] [k (when (< i (count (.get payload k))) (nth (.get payload k) i))]) ks)))))
+    :else []))
+
+(defn url [base endpoint params]
+  (str (.rstrip base "/") endpoint "?"
+       (urllib.parse/urlencode
+        (python/list (map (fn [[k v]] (python/tuple [k (str v)])) (sort-by first params))))))
+
+(defn fetch [u timeout]
+  (try
+    (with-open [r (urllib.request/urlopen u ** :timeout timeout)]
+      {"ok" true "url" u "payload" (json/loads (.decode (.read r) "utf-8"))})
+    (catch python/Exception e {"ok" false "url" u "error" (str e)})))
+
+(defn date-str [d]
+  (let [s (str d)] (if (= 8 (count s)) (str (subs s 0 4) "-" (subs s 4 6) "-" (subs s 6 8)) s)))
+(defn compact-date [d] (.replace (str d) "-" ""))
+(defn canonical-right [v]
+  (if (contains? #{"C" "CALL"} (.upper (str v))) "C" "P"))
+(defn canonical-strike [v]
+  (try (str (int (round (* (float v) 1000.0)))) (catch python/Exception _ (str v))))
+(defn stream-strike [v]
+  ;; WebSocket contracts already encode strikes in thousandths of a dollar.
+  (try (str (int (float v))) (catch python/Exception _ (str v))))
+(defn live-ts [body]
+  (let [n (int (.get body "ms_of_day"))]
+    (format "%sT%02d:%02d:%02d.%03d" (date-str (.get body "date"))
+            (quot n 3600000) (quot (mod n 3600000) 60000)
+            (quot (mod n 60000) 1000) (mod n 1000))))
+(defn kind [r]
+  (case (.get r "class") "option-quote" "OPTION/QUOTE" "option-trade" "OPTION/TRADE"
+                       "stock-quote" "STOCK/QUOTE" "stock-trade" "STOCK/TRADE"
+                       "index-price" "INDEX/TRADE"))
+
+(defn option-contract-key [contract]
+  [(str (.get contract "root")) (compact-date (.get contract "expiration"))
+   (stream-strike (.get contract "strike")) (canonical-right (.get contract "right"))])
+(defn selected-option-keys [req]
+  (set (map option-contract-key (or (.get req "selected_contracts") []))))
+(defn option-class? [class] (.startswith class "option-"))
+
+(defn event-record [event expected-kind]
+  (let [header (.get event "header") contract (.get event "contract")
+        security (or (.get event "sec_type")
+                     (when (py-dict? contract) (.get contract "security_type")))
+        req (or (.get event "req_type")
+                (when (py-dict? header) (.get header "type")))]
+    (when (= expected-kind (str security "/" req))
+      (let [body (or (.get event "quote") (.get event "trade"))]
+      (when (and body (.get body "date") (.get body "ms_of_day"))
+        {"timestamp" (live-ts body) "fields" body "contract" contract})))))
+
+(defn matches-request? [record req]
+  (let [contract (.get record "contract") params (.get req "params") class (.get req "class")
+        selected (selected-option-keys req)
+        timestamp (str (.get record "timestamp"))
+        time-et (if (> (count timestamp) 11) (subs timestamp 11) timestamp)
+        start-time (str (.get req "start_time_et"))
+        end-time (str (.get req "end_time_et"))]
+    (and (<= start-time time-et end-time)
+         (= (str (.get contract "root")) (str (.get params "symbol")))
+         (or (not (option-class? class))
+             (if (seq selected)
+               (contains? selected (option-contract-key contract))
+               (and (= (compact-date (.get contract "expiration")) (compact-date (.get params "expiration")))
+                    (= (canonical-right (.get contract "right")) (canonical-right (.get params "right")))
+                    (or (= "*" (.get params "strike"))
+                        (= (stream-strike (.get contract "strike")) (canonical-strike (.get params "strike"))))))))))
+
+(defn historical-contract [row req]
+  {"root" (or (.get row "symbol") (.get (.get req "params") "symbol"))
+   "expiration" (or (.get row "expiration") (.get (.get req "params") "expiration"))
+   "strike" (canonical-strike (.get row "strike")) "right" (or (.get row "right") "")})
+
+(defn record-key [record class req]
+  (if (option-class? class)
+    [(.get record "timestamp") (option-contract-key (.get record "contract"))]
+    [(.get record "timestamp") (str (.get (.get req "params") "symbol"))]))
+
+(defn historical-key [row class req]
+  (let [timestamp (or (.get row "timestamp") (.get row "trade_timestamp"))]
+    (when timestamp
+      (if (option-class? class)
+        [(str timestamp) (option-contract-key (historical-contract row req))]
+        [(str timestamp) (str (.get (.get req "params") "symbol"))]))))
+
+(defn selected-history? [row class req selected]
+  (or (not (option-class? class))
+      (or (empty? selected)
+          (contains? selected (option-contract-key (historical-contract row req))))))
+
+(defn decimal-value [value]
+  (try (decimal/Decimal (str value)) (catch python/Exception _ nil)))
+(defn same-value? [left right]
+  (let [a (decimal-value left) b (decimal-value right)]
+    (if (and a b) (= a b) (= (str left) (str right)))))
+
+(defn different-fields [live-fields history-record fields]
+  (vec (for [field fields
+             :when (not (same-value? (.get live-fields field)
+                                     (.get history-record field)))] field)))
+
+(defn take-history-match! [remaining key live-fields fields]
+  ;; Multiple raw messages can share a contract and millisecond. Historical
+  ;; ordering is not an identity guarantee, so consume an exact field match
+  ;; first and only then report the closest remaining occurrence as different.
+  (let [candidates (get @remaining key [])]
+    (when (seq candidates)
+      (let [comparisons (vec (map #(different-fields live-fields % fields) candidates))
+            exact-index (first (keep-indexed (fn [index different]
+                                               (when (empty? different) index)) comparisons))
+            index (or exact-index 0)
+            history-record (nth candidates index)
+            different (nth comparisons index)]
+        (swap! remaining assoc key
+               (vec (concat (take index candidates) (drop (inc index) candidates))))
+        {"history_record" history-record "different_fields" different}))))
+
+(defn compare [live history class req]
+  (let [fields (get field-map class)
+        ;; Build the frozen option universe once per request. Rebuilding it for
+        ;; every historical tick made a busy-open comparison effectively
+        ;; quadratic in the number of observed contracts and history rows.
+        selected (selected-option-keys req)
+        historical (vec (filter #(selected-history? % class req selected) history))
+        by-key (reduce (fn [acc row]
+                         (if-let [key (historical-key row class req)]
+                           (update acc key (fnil conj []) row) acc)) {} historical)
+        remaining (atom by-key)
+        records (vec (for [live-record live
+                           :let [key (record-key live-record class req)
+                                 match (take-history-match! remaining key (.get live-record "fields") fields)
+                                 history-record (get match "history_record")
+                                 different (get match "different_fields" [])]]
+                       {"timestamp" (.get live-record "timestamp") "matched" (boolean history-record)
+                        "different_fields" different}))
+        missing (count (filter #(not (.get % "matched")) records))
+        different (reduce + 0 (map #(count (.get % "different_fields")) records))]
+    {"status" (cond (empty? live) "INCONCLUSIVE" (empty? history) "INCONCLUSIVE"
+                     (and (zero? missing) (zero? different)) "PASS" :else "FAIL")
+     "live_events" (count live) "historical_events" (count historical)
+     "matched_events" (- (count live) missing) "missing_live_events" missing
+     "different_fields" different "sample" (vec (take 20 records))}))
+
+(defn task [index req]
+  (for [venue (or (.get req "historical_venues") [nil])]
+    {"index" index "request" req "historical_venue" venue}))
+
+(defn execute-task [task-data events base-url landing-root timeout reuse-raw?]
+  (let [index (.get task-data "index") req (.get task-data "request") venue (.get task-data "historical_venue")
+        params (merge (.get req "params") {"start_time" (.get req "start_time_et")
+                                             "end_time" (.get req "end_time_et")}
+                      (when venue {"venue" venue}))
+        raw (os.path/join landing-root "historical" (str index "-" (or venue "canonical") ".json"))
+        got (if (and reuse-raw? (os.path/exists raw))
+              (json/loads (slurp raw))
+              (fetch (url base-url (.get req "endpoint") params) timeout))
+        expected-kind (kind req)
+        live (vec (filter #(matches-request? % req)
+                          (keep #(event-record % expected-kind) events)))
+        result (if (.get got "ok")
+                 (compare live (rows (.get got "payload")) (.get req "class") req)
+                 {"status" "INCONCLUSIVE" "error" (.get got "error")})]
+    (os/makedirs (os.path/dirname raw) ** :exist_ok true)
+    (spit raw (str (json/dumps (jsonable got) ** :indent 2 :sort_keys true) "\n"))
+    {"request_index" index "request" req "historical_venue" venue
+     "raw_response" raw "comparison" result}))
+
+(defn parse [argv]
+  (let [p (argparse/ArgumentParser)]
+    (.add_argument p "--request-manifest" ** :required true)
+    (.add_argument p "--base-url" ** :required true)
+    (.add_argument p "--landing-root" ** :required true)
+    (.add_argument p "--timeout-s" ** :type float :default 30.0)
+    (.add_argument p "--jobs" ** :type int :default 6)
+    (.add_argument p "--reuse-raw-responses" ** :action "store_true")
+    (.parse_args p (python/list argv))))
+
+(defn main [argv]
+  (let [a (parse argv) manifest (json/loads (slurp (.-request_manifest a)))
+        events (vec (keep (fn [line] (try (json/loads line) (catch python/Exception _ nil)))
+                          (.splitlines (slurp (.get manifest "event_path")))))
+        tasks (vec (mapcat (fn [[index req]] (task index req))
+                           (map-indexed vector (.get manifest "historical_requests"))))
+        worker #(execute-task % events (.-base_url a) (.-landing_root a) (.-timeout_s a)
+                              (.-reuse_raw_responses a))
+        workers (min (max 1 (.-jobs a)) (max 1 (count tasks)))
+        results (if (= workers 1)
+                  (vec (map worker tasks))
+                  (let [pool (concurrent.futures/ThreadPoolExecutor ** :max_workers workers)
+                        futures (vec (map #(.submit pool worker %) tasks))]
+                    (try (vec (map #(.result %) futures)) (finally (.shutdown pool true)))))
+        sorted-results (vec (sort-by (fn [result] [(get result "request_index")
+                                              (str (or (get result "historical_venue") ""))]) results))
+        counts (frequencies (map #(get-in % ["comparison" "status"]) sorted-results))
+        result {"schema_version" 2 "request_manifest" (.-request_manifest a)
+                "live_events_parsed" (count events) "summary" {"requests" (count tasks)
+                "pass" (get counts "PASS" 0) "fail" (get counts "FAIL" 0)
+                "inconclusive" (get counts "INCONCLUSIVE" 0)} "results" sorted-results}
+        path (str (.-request_manifest a) ".comparison.json")]
+    (spit path (str (json/dumps (jsonable result) ** :indent 2 :sort_keys true) "\n"))
+    (println (json/dumps (jsonable {"comparison_path" path "summary" (get result "summary")}) ** :sort_keys true))
+    0))
+
+(try (python/exit (main (vec *command-line-args*)))
+     (catch python/Exception e (binding [*out* *err*] (println (str e))) (python/exit 2)))

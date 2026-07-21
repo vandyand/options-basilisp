@@ -1,0 +1,61 @@
+(ns feature-parity.test-audit-alpaca-capture-stock-bars-cli
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "audit_alpaca_capture_stock_bars.lpy"))
+(def basilisp-bin (or (os.environ/get "BASILISP_BIN")
+                      (str (.joinpath root ".venv/bin/basilisp"))))
+
+(defn live-bar [close count]
+  (python/dict {"time" "2026-07-09T15:30:00Z"
+                "open" close "high" (+ close 1.0) "low" (- close 1.0)
+                "close" close "volume" 100.0 "vwap" close "trade_count" count}))
+
+(defn write-capture! [path]
+  (numpy/savez_compressed
+   path
+   ** :bar_buffers_json
+      (numpy/array
+       (python/list
+        [(json/dumps
+          (python/dict
+           (into {} (for [symbol ["SPY" "HYG" "TLT" "VXX"]]
+                      [symbol (python/list [(live-bar 600.0 7.0)])]))))])
+       ** :dtype object)))
+
+(defn write-fixture! [path]
+  (.write_text path
+               (json/dumps
+                (python/dict
+                 (into {} (for [symbol ["SPY" "HYG" "TLT" "VXX"]]
+                            [symbol (python/list
+                                     [(python/dict {"t" "2026-07-09T15:30:00Z"
+                                                    "o" 600.0 "h" 601.0 "l" 599.0 "c" 600.0
+                                                    "v" 100.0 "vw" 600.0 "n" 9.0})])]))))))
+
+(deftest audit-alpaca-stock-bars-reports-field-level-drift
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture (.joinpath tmp "capture.npz")
+          fixture (.joinpath tmp "fixture.json")
+          ref-env (.joinpath tmp "ref.env")
+          out (.joinpath tmp "audit.json")]
+      (write-capture! capture)
+      (write-fixture! fixture)
+      (.write_text ref-env "ALPACA_CHESTNUT_API_KEY=unused\nALPACA_CHESTNUT_API_SECRET=unused\n")
+      (let [result (subprocess/run
+                    (python/list [basilisp-bin "run" (str script) "--"
+                                  "--capture" (str capture) "--ref-env" (str ref-env)
+                                  "--out-json" (str out) "--bars-fixture-json" (str fixture)])
+                    ** :cwd (str root) :text true :capture_output true :check false)]
+        (if-not (.exists out)
+          (is false (str (.-stdout result) "\n" (.-stderr result)))
+          (let [payload (json/loads (.read_text out))
+                count-field (.get (.get (.get payload "by_symbol") "SPY") "trade_count")]
+            (is (= 1 (.-returncode result)))
+            (is (= 2.0 (.get payload "max_abs_deviation")))
+            (is (= 2.0 (.get count-field "max_abs_deviation")))
+            (is (= 1 (.get count-field "count")))
+            (is (= 7.0 (.get (first (.get count-field "samples")) "live_value")))
+            (is (= 9.0 (.get (first (.get count-field "samples")) "historical_value")))))))))

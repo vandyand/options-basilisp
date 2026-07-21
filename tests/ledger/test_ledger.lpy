@@ -15,15 +15,17 @@
 (def instrument-id "equity/ARCA/SPY")
 
 (defn fill-fact
-  [{:keys [fill-id qty price at fees account broker-order-id intent-id]
+  [{:keys [fill-id qty price at fees account broker-order-id intent-id
+           strategy]
     :or {at "2026-06-10T14:30:03Z"
          account account-id
          broker-order-id "sim-1"
-         intent-id "oi_a"}}]
+         intent-id "oi_a"
+         strategy strategy-id}}]
   (sch/fact-envelope
    {:record/type :fact/fill-observed
     :record/mode :mode/sim
-    :record/strategy-id strategy-id
+    :record/strategy-id strategy
     :record/account-id account
     :record/instrument-id instrument-id
     :record/source-system :broker/sim
@@ -40,13 +42,15 @@
                     (some? fees) (assoc :fill/fees fees))}))
 
 (defn ctx
-  [effect side & {:keys [intent-id account]
-                  :or {intent-id "oi_a" account account-id}}]
+  [effect side & {:keys [intent-id account strategy]
+                  :or {intent-id "oi_a"
+                       account account-id
+                       strategy strategy-id}}]
   {:order-intent/id intent-id
    :order-intent/effect effect
    :order-intent/side side
    :order-intent/account-id account
-   :order-intent/strategy-id strategy-id
+   :order-intent/strategy-id strategy
    :order-intent/instrument-id instrument-id})
 
 (def open-buy (ctx :position-effect/open :order-side/buy))
@@ -174,6 +178,49 @@
     (testing "one lot remains open with quantity 1"
       (is (= [["lot-broker/sim/account/sim/test/sim-1/t2" "1"]]
              (mapv (juxt :lot/id :lot/remaining-quantity)
+                   (led/open-lots l3)))))))
+
+(deftest close-consumes-only-originating-strategy-lots
+  (let [strategy-a "strategy/sim-local-sma/sma-03-08/v1"
+        strategy-b "strategy/sim-local-sma/sma-06-22/v1"
+        [l1 _] (derive+fold led/empty-ledger
+                            (fill-fact {:fill-id "a-open"
+                                        :broker-order-id "sim-a-open"
+                                        :qty "50"
+                                        :price "740.88"
+                                        :strategy strategy-a
+                                        :intent-id "oi_a_open"})
+                            (ctx :position-effect/open :order-side/buy
+                                 :strategy strategy-a
+                                 :intent-id "oi_a_open"))
+        [l2 _] (derive+fold l1
+                            (fill-fact {:fill-id "b-open"
+                                        :broker-order-id "sim-b-open"
+                                        :qty "50"
+                                        :price "740.88"
+                                        :strategy strategy-b
+                                        :intent-id "oi_b_open"})
+                            (ctx :position-effect/open :order-side/buy
+                                 :strategy strategy-b
+                                 :intent-id "oi_b_open"))
+        [l3 derived] (derive+fold l2
+                                  (fill-fact {:fill-id "b-close"
+                                              :broker-order-id "sim-b-close"
+                                              :qty "50"
+                                              :price "740.37"
+                                              :strategy strategy-b
+                                              :intent-id "oi_b_close"})
+                                  (ctx :position-effect/close :order-side/sell
+                                       :strategy strategy-b
+                                       :intent-id "oi_b_close"))
+        close (first (filterv #(= :fact/position-lot-closed (:record/type %))
+                              derived))]
+    (testing "a shared-account close is FIFO only inside its strategy"
+      (is (= strategy-b (get-in close [:fact/payload :lot/strategy-id])))
+      (is (= [["lot-broker/sim/account/sim/test/sim-a-open/a-open"
+               strategy-a
+               "50"]]
+             (mapv (juxt :lot/id :lot/strategy-id :lot/remaining-quantity)
                    (led/open-lots l3)))))))
 
 (deftest over-close-derives-no-lot-fact-for-remainder

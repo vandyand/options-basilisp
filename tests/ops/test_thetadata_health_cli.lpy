@@ -1,0 +1,78 @@
+(ns ops.test-thetadata-health-cli
+  (:import http.server os pathlib shutil subprocess threading)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/wait_thetadata_health.lpy"))
+(def response-body (atom "{\"response\":[{\"expiration\":20260710}]}"))
+(def response-status (atom 200))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(defn write-response!
+  [handler]
+  (let [body (.encode (str @response-body) "utf-8")]
+    (.send_response handler @response-status)
+    (.send_header handler "Content-Type" "application/json")
+    (.send_header handler "Content-Length" (str (count body)))
+    (.end_headers handler)
+    (.write (.-wfile handler) body)))
+
+(defn fake-log-message [_self _fmt & _args] nil)
+(defn fake-do-get [self] (write-response! self))
+
+(def HealthHandler
+  (python/type
+   "HealthHandler"
+   (python/tuple [http.server/BaseHTTPRequestHandler])
+   (python/dict {"log_message" fake-log-message
+                 "do_GET" fake-do-get})))
+
+(defn run-health
+  [url]
+  (subprocess/run
+   (python/list [(str (resolve-basilisp)) "run" (str script) "--"
+                 "--url" url
+                 "--timeout-seconds" "0"
+                 "--poll-seconds" "0.01"])
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn with-server
+  []
+  (let [server (http.server/ThreadingHTTPServer (python/tuple ["127.0.0.1" 0]) HealthHandler)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)]
+    (.start thread)
+    [server (str "http://127.0.0.1:" (.-server_port server) "/health")]))
+
+(deftest wait-thetadata-health-rejects-http-200-error-body
+  (let [[server url] (with-server)]
+    (try
+      (reset! response-status 200)
+      (reset! response-body "{\"error\":\"terminal down\"}")
+      (let [result (run-health url)]
+        (is (= 2 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "unusable response body")))
+      (finally
+        (.shutdown server)
+        (.server_close server)))))
+
+(deftest wait-thetadata-health-accepts-http-200-data-body
+  (let [[server url] (with-server)]
+    (try
+      (reset! response-status 200)
+      (reset! response-body "{\"response\":[{\"expiration\":20260710}]}")
+      (let [result (run-health url)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (str/includes? (.-stdout result) "ThetaData terminal healthy")))
+      (finally
+        (.shutdown server)
+        (.server_close server)))))

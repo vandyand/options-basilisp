@@ -1,0 +1,226 @@
+(ns feature-parity.test-thetadata-capability-probe-cli
+  (:import http.server json os pathlib shutil socket subprocess sys tempfile threading urllib.parse)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "thetadata_capability_probe.lpy"))
+
+(defn resolve-basilisp
+  []
+  (cond
+    (os.environ/get "BASILISP_BIN")
+    (pathlib/Path (os.environ/get "BASILISP_BIN"))
+
+    (.exists (.joinpath root ".venv/bin/basilisp"))
+    (.joinpath root ".venv/bin/basilisp")
+
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp"))
+    (.with_name (pathlib/Path sys/executable) "basilisp")
+
+    (shutil/which "basilisp")
+    (pathlib/Path (shutil/which "basilisp"))
+
+    :else
+    (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn write-json!
+  [handler payload status]
+  (let [body (.encode (json/dumps (jsonable payload)) "utf-8")]
+    (.send_response handler status)
+    (.send_header handler "Content-Type" "application/json")
+    (.send_header handler "Content-Length" (str (count body)))
+    (.end_headers handler)
+    (.write (.-wfile handler) body)))
+
+(defn fake-log-message
+  [_self _fmt & _args]
+  nil)
+
+(defn fake-do-get
+  [self]
+  (let [parsed (urllib.parse/urlparse (.-path self))
+        query (urllib.parse/parse_qs (.-query parsed))
+        symbol (first (get query "symbol" [""]))]
+    (cond
+      (= (.-path parsed) "/v3/option/list/expirations")
+      (write-json! self {"header" {"format" ["expiration"]}
+                         "response" [["2026-07-17"] ["2026-07-24"]]}
+                   200)
+
+      (and (= (.-path parsed) "/v3/option/snapshot/quote")
+           (= symbol "SPY"))
+      (write-json! self {"strike" [690.0 691.0 692.0]
+                         "right" ["CALL" "CALL" "PUT"]
+                         "bid" [1.1 0.0 2.3]
+                         "ask" [1.2 0.0 2.5]}
+                   200)
+
+      (and (= (.-path parsed) "/v3/option/snapshot/greeks/first_order")
+           (= symbol "SPY"))
+      (write-json! self {"strike" [690.0 691.0]
+                         "right" ["CALL" "PUT"]
+                         "iv" [0.25 0.27]
+                         "delta" [0.51 -0.49]}
+                   200)
+
+      :else
+      (write-json! self {"error" "missing fixture"} 404))))
+
+(def FakeThetaHandler
+  (python/type
+   "FakeThetaHandler"
+   (python/tuple [http.server/BaseHTTPRequestHandler])
+   (python/dict {"log_message" fake-log-message
+                 "do_GET" fake-do-get})))
+
+(defn run-probe-cli
+  [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn with-fake-theta-server
+  []
+  (let [server (http.server/ThreadingHTTPServer (python/tuple ["127.0.0.1" 0]) FakeThetaHandler)
+        thread (threading/Thread ** :target (.-serve_forever server) :daemon true)]
+    (.start thread)
+    [server (str "http://127.0.0.1:" (.-server_port server))]))
+
+(defn unused-local-port
+  []
+  (let [sock (socket/socket socket/AF_INET socket/SOCK_STREAM)]
+    (try
+      (.bind sock (python/tuple ["127.0.0.1" 0]))
+      (second (.getsockname sock))
+      (finally
+        (.close sock)))))
+
+(deftest probe-cli-rejects-invalid-target-date-before-network
+  (let [result (run-probe-cli "--target-date" "2026-02-31")]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "expected YYYY-MM-DD calendar date"))))
+
+(deftest probe-cli-rejects-invalid-expiration-before-network
+  (let [result (run-probe-cli "--expiration" "20260231")]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "expected valid expiration calendar date"))))
+
+(deftest probe-cli-rejects-nonpositive-timeout-and-sample-limit
+  (let [timeout (run-probe-cli "--timeout-s" "0")
+        sample (run-probe-cli "--sample-limit" "-1")]
+    (is (= 2 (.-returncode timeout)))
+    (is (str/includes? (.-stderr timeout) "expected positive number"))
+    (is (= 2 (.-returncode sample)))
+    (is (str/includes? (.-stderr sample) "expected positive integer"))))
+
+(deftest probe-cli-writes-json-markdown-and-payload-examples
+  (let [[server base-url] (with-fake-theta-server)
+        tmp-path (pathlib/Path (tempfile/mkdtemp))
+        payload-dir (.joinpath tmp-path "payloads")
+        out-dir (.joinpath tmp-path "analysis")]
+    (try
+      (let [result (run-probe-cli "--base-url" base-url
+                                  "--out-dir" (str out-dir)
+                                  "--payload-dir" (str payload-dir)
+                                  "--save-payloads"
+                                  "--target-date" "2026-07-05"
+                                  "--option-symbols" "SPY"
+                                  "--index-symbols" ""
+                                  "--stock-symbols" ""
+                                  "--sample-limit" "100"
+                                  "--timeout-s" "2")
+            probe-json (.joinpath out-dir "thetadata_capability_probe_20260705.json")
+            probe-md (.joinpath out-dir "thetadata_capability_probe_20260705.md")
+            payload (json/loads (.read_text probe-json))
+            quote (first (filter #(= "option.snapshot.quote" (.get % "name"))
+                                 (.get payload "results")))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (.exists probe-json))
+        (is (.exists probe-md))
+        (is (= "2026-07-05" (.get payload "target_date")))
+        (is (= 10 (.get (.get payload "summary") "total")))
+        (is (>= (.get (.get payload "summary") "usable") 2))
+        (is (>= (.get (.get payload "summary") "payload_examples") 2))
+        (is (= "available" (.get (.get (.get payload "unlock_assessment") "options_base_basic") "status")))
+        (is (= "available" (.get (.get (.get payload "unlock_assessment") "native_greek_surface") "status")))
+        (is (= "columnar-dict" (.get (.get quote "summary") "shape")))
+        (is (= true (.get (.get quote "summary") "required_ok")))
+        (is (.exists (pathlib/Path (.get quote "payload_example"))))
+        (is (str/includes? (.read_text probe-md) "ThetaData Capability Probe")))
+      (finally
+        (.shutdown server)
+        (.server_close server)
+        (shutil/rmtree tmp-path ** :ignore_errors true)))))
+
+(deftest probe-cli-writes-explicit-terminal-unreachable-artifact
+  (let [tmp-path (pathlib/Path (tempfile/mkdtemp))
+        out-dir (.joinpath tmp-path "analysis")
+        base-url (str "http://127.0.0.1:" (unused-local-port))
+        result (run-probe-cli "--base-url" base-url
+                              "--out-dir" (str out-dir)
+                              "--target-date" "2026-07-05"
+                              "--option-symbols" "SPY"
+                              "--index-symbols" ""
+                              "--stock-symbols" ""
+                              "--timeout-s" "0.25")
+        probe-json (.joinpath out-dir "thetadata_capability_probe_20260705.json")
+        probe-md (.joinpath out-dir "thetadata_capability_probe_20260705.md")]
+    (try
+      (let [payload (json/loads (.read_text probe-json))
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (.exists probe-json))
+        (is (.exists probe-md))
+        (is (= "2026-07-05" (.get payload "target_date")))
+        (is (= 10 (.get summary "total")))
+        (is (= 0 (.get summary "ok")))
+        (is (= 0 (.get summary "usable")))
+        (is (= 10 (.get summary "failed")))
+        (is (= 0 (.get summary "payload_examples")))
+        (is (= 10 (.get (.get summary "error_classes") "terminal-unreachable")))
+        (is (every? #(= "terminal-unreachable" (.get % "error_class"))
+                    (.get payload "results")))
+        (is (str/includes? (.read_text probe-md) "terminal-unreachable")))
+      (finally
+        (shutil/rmtree tmp-path ** :ignore_errors true)))))
+
+(deftest probe-cli-does-not-clobber-same-date-artifacts
+  (let [[server base-url] (with-fake-theta-server)
+        tmp-path (pathlib/Path (tempfile/mkdtemp))
+        out-dir (.joinpath tmp-path "analysis")]
+    (try
+      (let [args ["--base-url" base-url
+                  "--out-dir" (str out-dir)
+                  "--target-date" "2026-07-05"
+                  "--option-symbols" "SPY"
+                  "--index-symbols" ""
+                  "--stock-symbols" ""
+                  "--sample-limit" "10"
+                  "--timeout-s" "2"]
+            first-run (apply run-probe-cli args)
+            first-json (.joinpath out-dir "thetadata_capability_probe_20260705.json")
+            second-run (apply run-probe-cli args)
+            second-json (.joinpath out-dir "thetadata_capability_probe_20260705_1.json")]
+        (is (= 0 (.-returncode first-run)) (.-stderr first-run))
+        (is (= 0 (.-returncode second-run)) (.-stderr second-run))
+        (is (.exists first-json))
+        (is (.exists second-json))
+        (is (str/includes? (.-stdout first-run) "thetadata_capability_probe_20260705.json"))
+        (is (str/includes? (.-stdout second-run) "thetadata_capability_probe_20260705_1.json")))
+      (finally
+        (.shutdown server)
+        (.server_close server)
+        (shutil/rmtree tmp-path ** :ignore_errors true)))))

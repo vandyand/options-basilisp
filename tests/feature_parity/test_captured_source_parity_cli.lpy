@@ -1,0 +1,135 @@
+(ns feature-parity.test-captured-source-parity-cli
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "audit_captured_source_parity.lpy"))
+(def basilisp-bin (or (os.environ/get "BASILISP_BIN")
+                      (str (.joinpath root ".venv/bin/basilisp"))))
+
+(defn provenance
+  ([] (provenance false "nqb"))
+  ([historical?] (provenance historical? "nqb" "100"))
+  ([historical? venue] (provenance historical? venue "100"))
+  ([historical? venue strike-range]
+  (json/dumps
+   (python/dict {"schema_version" 2
+                 "feature_contract" "steve-v2-canonical-input/v2"
+                 "stock" (python/dict {"provider" "thetadata" "provider_family" "thetadata-v3"
+                                        "endpoint" "/v3/stock/history/ohlc" "venue" venue
+                                        "timeframe" "1m" "bar_status" "completed" "bar_timestamp" "open-time"
+                                        "symbols" (python/list ["SPY" "HYG" "TLT" "VXX"])})
+                 "options" (python/dict {"provider" "thetadata" "provider_family" "thetadata-v3"
+                                          "endpoint" (if historical? "/v3/option/at_time/quote" "/v3/option/snapshot/quote")
+                                          "snapshot_kind" (if historical? "last-nbbo-at-requested-time" "last-nbbo")
+                                          "selection" "all-contracts-per-selected-expiration"
+                                          "strike_range" strike-range
+                                          "reconstruction" (when historical? "at-time-quote")
+                                          "symbols" (python/list ["SPY"])})
+                 "capture" (python/dict {"feature_implementation" "native"
+                                           "greeks_policy" "bridge-local-bs-v1/rate-0.043/no-dividend"})}))))
+
+(defn bars [close]
+  (json/dumps
+   (python/dict
+    (into {} (for [symbol ["SPY" "HYG" "TLT" "VXX"]]
+               [symbol (python/list [(python/dict {"time" "2026-07-09T15:30:00Z"
+                                                    "open" close "high" close "low" close
+                                                    "close" close "volume" 10.0 "vwap" close
+                                                    "trade_count" 2.0})])])))))
+
+(defn chain [bid]
+  (json/dumps (python/dict {"contracts" (python/list
+                                          [(python/dict {"strike" 600.0 "right" "CALL"
+                                                        "expiration" "2026-07-09"
+                                                        "bid" bid "ask" (+ bid 0.1)})])})))
+
+(defn write-artifact!
+  ([path close bid historical?] (write-artifact! path close bid historical? "nqb"))
+  ([path close bid historical? venue] (write-artifact! path close bid historical? venue "100"))
+  ([path close bid historical? venue strike-range]
+  (numpy/savez_compressed
+   path
+   ** :times (numpy/array (python/list ["2026-07-09T15:30:00Z"]))
+      :provenance_json (numpy/array (python/list [(provenance historical? venue strike-range)]) ** :dtype object)
+      :bar_buffers_json (numpy/array (python/list [(bars close)]) ** :dtype object)
+      :option_chain_json (numpy/array (python/list [(chain bid)]) ** :dtype object))))
+
+(defn run-audit [args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root) :text true :capture_output true :check false))
+
+(defn read-json [path] (json/loads (.read_text path)))
+
+(deftest captured-source-parity-passes-only-identical-canonical-inputs
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (.joinpath tmp "live.npz")
+          historical (.joinpath tmp "historical.npz")
+          out (.joinpath tmp "audit.json")]
+      (write-artifact! live 600.0 1.0 false)
+      (write-artifact! historical 600.0 1.0 true)
+      (let [result (run-audit ["--live-capture" (str live)
+                               "--historical-inputs" (str historical)
+                               "--out-json" (str out)
+                               "--min-rows" "1"])
+            payload (read-json out)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "certifiable")))
+        (is (= true (.get (.get payload "bars") "pass")))
+        (is (= true (.get (.get payload "option_chains") "pass")))))))
+
+(deftest captured-source-parity-rejects-source-value-drift
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (.joinpath tmp "live.npz")
+          historical (.joinpath tmp "historical.npz")
+          out (.joinpath tmp "audit.json")]
+      (write-artifact! live 600.0 1.0 false)
+      (write-artifact! historical 600.1 1.0 true)
+      (let [result (run-audit ["--live-capture" (str live)
+                               "--historical-inputs" (str historical)
+                               "--out-json" (str out)
+                               "--min-rows" "1"])
+            payload (read-json out)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "certifiable")))
+        (is (= false (.get (.get payload "bars") "pass")))))))
+
+(deftest captured-source-parity-rejects-different-stock-venue
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (.joinpath tmp "live.npz")
+          historical (.joinpath tmp "historical.npz")
+          out (.joinpath tmp "audit.json")]
+      (write-artifact! live 600.0 1.0 false "nqb")
+      (write-artifact! historical 600.0 1.0 true "utp_cta")
+      (let [result (run-audit ["--live-capture" (str live)
+                               "--historical-inputs" (str historical)
+                               "--out-json" (str out)
+                               "--min-rows" "1"])
+            payload (read-json out)
+            contract (.get payload "provenance_compatibility")]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "certifiable")))
+        (is (= false (.get contract "pass")))
+        (is (contains? (set (.get contract "stock_mismatches")) "stock_venue"))))))
+
+(deftest captured-source-parity-rejects-different-option-strike-range
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (.joinpath tmp "live.npz")
+          historical (.joinpath tmp "historical.npz")
+          out (.joinpath tmp "audit.json")]
+      (write-artifact! live 600.0 1.0 false "nqb" "100")
+      (write-artifact! historical 600.0 1.0 true "nqb" "99")
+      (let [result (run-audit ["--live-capture" (str live)
+                               "--historical-inputs" (str historical)
+                               "--out-json" (str out)
+                               "--min-rows" "1"])
+            payload (read-json out)
+            contract (.get payload "provenance_compatibility")]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "certifiable")))
+        (is (contains? (set (.get contract "option_mismatches")) "option_strike_range"))))))

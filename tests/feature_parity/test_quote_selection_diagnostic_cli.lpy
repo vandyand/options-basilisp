@@ -1,0 +1,88 @@
+(ns feature-parity.test-quote-selection-diagnostic-cli
+  (:import json numpy os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/quote_selection_diagnostic.lpy"))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn run-script [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn path [parent name] (.joinpath parent name))
+(defn read-json [p] (json/loads (.read_text p)))
+
+(defn chain-json [bid ask]
+  (json/dumps
+   (python/dict {"contracts" (python/list
+                              [(python/dict {"expiration" "2026-07-09"
+                                             "right" "CALL"
+                                             "strike" 700
+                                             "bid" bid
+                                             "ask" ask})])})))
+
+(deftest quote-selection-diagnostic-identifies-better-neighbor-minute
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "hist.npz")
+          out (path tmp "quote.json")]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :option_chain_json (numpy/array [(chain-json 1.0 1.2)] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:29:00Z"
+                                          "2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :option_chain_json (numpy/array [(chain-json 1.0 1.2)
+                                                      (chain-json 2.0 2.2)
+                                                      (chain-json 3.0 3.2)]
+                                                     ** :dtype object))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--target-date" "2026-07-09"
+                               "--minute-lags=-1,0,1")
+            payload (read-json out)
+            best (.get payload "best_lag")
+            zero (.get payload "zero_lag")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "ok")))
+        (is (= -1 (.get best "lag_minutes")))
+        (is (= 0.0 (.get (.get best "mid_abs_deviation") "mean")))
+        (is (= 1.0 (.get (.get zero "mid_abs_deviation") "mean")))
+        (is (= 1.0 (.get payload "zero_to_best_mean_mid_improvement")))))))
+
+(deftest quote-selection-diagnostic-fails-closed-without-historical-chains
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "hist.npz")
+          out (path tmp "quote.json")]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :option_chain_json (numpy/array [(chain-json 1.0 1.2)] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"]))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out))
+            payload (read-json out)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (str/includes? (.get payload "reason") "historical NPZ missing option_chain_json"))))))

@@ -1,0 +1,100 @@
+(ns stevetrading.reporting.schema
+  "Balli structural schemas for report-day validation inputs."
+  (:require [balli.core :as b]
+            [balli.error :as be])
+  (:import math))
+
+(def schema-version 1)
+
+(defn numeric-wire?
+  [x]
+  (try
+    (let [n (cond
+              (nil? x) 0.0
+              (string? x) (python/float x)
+              (and (number? x) (not (boolean? x))) (python/float x)
+              :else nil)]
+      (and (some? n) (math/isfinite n)))
+    (catch python/Exception _ false)))
+
+(defn nonnegative-int-wire?
+  [x]
+  (try
+    (let [n (cond
+              (nil? x) 0
+              (string? x) (python/int x)
+              (and (integer? x) (not (boolean? x))) x
+              :else nil)]
+      (and (some? n) (>= n 0)))
+    (catch python/Exception _ false)))
+
+(defn optional-string?
+  [x]
+  (or (nil? x) (string? x)))
+
+(def numeric-wire
+  [:fn {:error/message "should be numeric or numeric text"} numeric-wire?])
+
+(def nonnegative-int-wire
+  [:fn {:error/message "should be a non-negative integer or integer text"}
+   nonnegative-int-wire?])
+
+(def optional-string
+  [:fn {:error/message "should be nil or string"} optional-string?])
+
+(def open-position
+  [:map
+   [:instrument/id {:optional true} optional-string]
+   [:position/side {:optional true} :any]
+   [:position/quantity {:optional true} numeric-wire]
+   [:position/market-value {:optional true} numeric-wire]
+   [:position/unrealized-pnl {:optional true} numeric-wire]])
+
+(def account-day
+  [:map
+   [:account/id {:optional true} optional-string]
+   [:report/date {:optional true} optional-string]
+   [:report/rendered? :boolean]
+   [:trading-day? :boolean]
+   [:trade/closed-count nonnegative-int-wire]
+   [:order/count nonnegative-int-wire]
+   [:positions/open-count nonnegative-int-wire]
+   [:positions/open [:vector open-position]]
+   [:pnl/realized numeric-wire]
+   [:pnl/unrealized numeric-wire]
+   [:pnl/equity-day numeric-wire]
+   [:pnl/closed-trades numeric-wire]
+   [:broker/equity-observed? {:optional true} :any]
+   [:report/explanations :any]])
+
+(def report-day
+  [:map
+   [:report/date {:optional true} optional-string]
+   [:report/rendered? {:optional true} :boolean]
+   [:accounts [:vector :any]]])
+
+(def schemas
+  {:reporting/account-day account-day
+   :reporting/report-day report-day})
+
+(defn schema
+  [kind]
+  (get schemas kind))
+
+(defn explain
+  [kind row]
+  (b/explain (schema kind) row))
+
+(defn humanize
+  [kind row]
+  (when-let [e (explain kind row)]
+    (be/humanize e)))
+
+(defn validation-result
+  [kind row]
+  (if-let [e (explain kind row)]
+    {:valid? false
+     :schema/kind kind
+     :schema/errors (humanize kind row)
+     :schema/explain e}
+    {:valid? true}))

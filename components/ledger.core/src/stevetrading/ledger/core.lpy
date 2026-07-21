@@ -190,13 +190,16 @@
        (filterv #(> (->dec (:lot/remaining-quantity %)) dec-zero))))
 
 (defn- consumable-lots
-  "Open lots a closing fill may consume, FIFO: same account + instrument,
-  side opposite the closing fill's side."
-  [ledger account-id instrument-id close-side]
+  "Open lots a closing fill may consume, FIFO: same strategy + account +
+  instrument, side opposite the closing fill's side. Strategy scoping is
+  required when many strategies share one broker account; otherwise one
+  strategy's exit can consume another strategy's lot and strand its own."
+  [ledger strategy-id account-id instrument-id close-side]
   (let [open-side (if (= :order-side/sell close-side)
                     :order-side/buy
                     :order-side/sell)]
-    (filterv #(and (= account-id (:lot/account-id %))
+    (filterv #(and (= strategy-id (:lot/strategy-id %))
+                   (= account-id (:lot/account-id %))
                    (= instrument-id (:lot/instrument-id %))
                    (= open-side (:lot/side %)))
              (open-lots ledger))))
@@ -303,7 +306,8 @@
              :lot/price (str price)
              :lot/cost-basis (str principal)})]
           ;; close: consume FIFO with partial-close splitting
-          (loop [lots (consumable-lots ledger account-id instrument-id side)
+          (loop [lots (consumable-lots ledger strategy-id account-id
+                                       instrument-id side)
                  remaining qty
                  acc []]
             (if (or (empty? lots) (<= remaining dec-zero))

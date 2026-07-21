@@ -1,0 +1,119 @@
+;; Validate same-day market-evidence preflight status.
+(import datetime json sys zoneinfo)
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/check_market_evidence_preflight.lpy -- "
+                "--status-file PATH --target-date YYYY-MM-DD")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--status-file")
+          (recur (nnext remaining) (assoc out :status-file (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (let [s (option-value remaining arg)]
+            (datetime.date/fromisoformat s)
+            (recur (nnext remaining) (assoc out :target-date s)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn reject-duplicate-json-object
+  [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining) (conj seen k) (assoc out k v))))))
+
+(defn read-json
+  [path]
+  (with-open [fh (python/open path ** :encoding "utf-8")]
+    (json/load fh ** :object_pairs_hook reject-duplicate-json-object)))
+
+(defn fail!
+  [message]
+  (binding [*out* *err*]
+    (println (str "RESULT: FAILED - " message)))
+  (python/exit 2))
+
+(defn parse-generated-at
+  [value]
+  (try
+    (datetime.datetime/fromisoformat (.replace (str value) "Z" "+00:00"))
+    (catch python/Exception e
+      (fail! (str "preflight status generated_at is unreadable: "
+                  (repr value) ": " e)))))
+
+(defn validate!
+  [status-file target-date]
+  (let [target-stamp (.replace target-date "-" "")
+        payload (try
+                  (read-json status-file)
+                  (catch python/Exception e
+                    (fail! (str "unreadable preflight status " status-file ": " e))))
+        et (zoneinfo/ZoneInfo "America/New_York")
+        generated-at (get payload "generated_at")
+        generated-dt (parse-generated-at generated-at)
+        generated-et (.astimezone generated-dt et)
+        target-day (datetime.date/fromisoformat target-date)
+        due-at (datetime.datetime/combine target-day (datetime/time 9 10) et)]
+    (when-not (= "preflight" (get payload "mode"))
+      (fail! (str "preflight status mode " (repr (get payload "mode"))
+                  " does not equal 'preflight'")))
+    (when-not (= target-date (get payload "target_date"))
+      (fail! (str "preflight status target_date " (repr (get payload "target_date"))
+                  " does not match collect target " (repr target-date))))
+    (when-not (= target-stamp (get payload "target_stamp"))
+      (fail! (str "preflight status target_stamp " (repr (get payload "target_stamp"))
+                  " does not match collect target " (repr target-stamp))))
+    (when-not (= target-date (.isoformat (.date generated-et)))
+      (fail! (str "preflight status generated_at ET date "
+                  (repr (.isoformat (.date generated-et)))
+                  " does not match collect target " (repr target-date))))
+    (when (< generated-et due-at)
+      (fail! (str "preflight status generated_at " (.isoformat generated-et)
+                  " predates scheduled preflight " (.isoformat due-at))))
+    (when (or (not= "ok" (get payload "status"))
+              (not= 0 (get payload "returncode")))
+      (fail! (str "preflight status is not ok: status="
+                  (repr (get payload "status"))
+                  " returncode="
+                  (repr (get payload "returncode")))))
+    (println (str "OK: same-day preflight status passed: " status-file))))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        status-file (:status-file opts)
+        target-date (:target-date opts)]
+    (when-not status-file
+      (throw (python/ValueError "missing required --status-file")))
+    (when-not target-date
+      (throw (python/ValueError "missing required --target-date")))
+    (validate! status-file target-date)
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2)))

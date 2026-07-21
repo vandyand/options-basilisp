@@ -1,0 +1,584 @@
+;; Audit neutralized non-V3 features from raw capture sidecars.
+;;
+;; Native Basilisp entrypoint. Base/V2/sidecar replay is computed with Basilisp
+;; formulas so this audit can run without the legacy Python feature engine.
+(import argparse datetime importlib json math numpy os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT")
+                                    (os/getcwd))))
+(def default-ref (os.path/join (os.path/dirname repo-root) "SteveTrading" "ref" "Data-Preprocessor"))
+
+(doseq [path [(os.path/join repo-root "components" "feature-parity.core" "src")]]
+  (when-not (contains? (set (.-path sys)) path)
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.feature-parity.raw-unlock :as raw])
+
+(def v2-engine-replay-features
+  #{"realized_vol_20" "realized_vol_60" "vol_ratio"
+    "hmm_state_0" "hmm_state_1" "hmm_state_2"})
+
+(def candidate-sources
+  #{"bar_buffer_replay" "option_chain_quote_formula"
+    "option_surface_greek_grid_formula" "option_surface_formula"
+    "spy_greek_grid_formula" "v2_engine_replay" "v2_grid_formula"})
+
+(def greek-reconstruction-source "greek_reconstruction_candidate_formula")
+
+(def csv-fields
+  ["feature" "family" "source_note" "baseline_status" "recomputed_status"
+   "candidate" "model_gain" "model_split_count" "live_mean" "live_std"
+   "z_mean" "z_std" "zero_frac" "train_mean" "train_std"])
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn py-dict? [x]
+  (python/isinstance x python/dict))
+
+(defn py-list? [x]
+  (python/isinstance x python/list))
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (py-dict? x) (python/dict (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ x k))])) (.keys x)))
+    (py-list? x) (python/list (map ->jsonable x))
+    (python/isinstance x numpy/integer) (int x)
+    (python/isinstance x numpy/floating) (float x)
+    :else x))
+
+(defn load-json-value [path]
+  (raw/loads-json-value (slurp path)))
+
+(defn mget
+  ([m k] (mget m k nil))
+  ([m k default]
+   (cond
+     (nil? m) default
+     (map? m) (get m k default)
+     (py-dict? m) (.get m k default)
+     :else default)))
+
+(defn parse-args [& argv]
+  (let [argv0 (vec argv)
+        sep-idx (first (keep-indexed (fn [idx value] (when (= value "--") idx)) argv0))
+        argv1 (if (some? sep-idx) (subvec argv0 (inc sep-idx)) argv0)
+        parser (argparse/ArgumentParser)]
+    (.add_argument parser "--target-date" ** :required true :help "YYYY-MM-DD")
+    (.add_argument parser "--ref-root" ** :default default-ref)
+    (.add_argument parser "--capture" ** :default nil)
+    (.add_argument parser "--baseline-json" ** :default nil)
+    (.add_argument parser "--usage-json" ** :default nil)
+    (.add_argument parser "--bundle" ** :default nil)
+    (.add_argument parser "--out-dir" ** :default (os.path/join repo-root "live_runtime" "analysis"))
+    (.add_argument parser "--label" ** :default nil
+                   :help "Optional artifact label suffix, e.g. v2 for raw_feature_unlock_audit_YYYYMMDD_v2.json.")
+    (.add_argument parser "--max-rows" ** :type int :default nil
+                   :help "Process at most the latest N capture rows for fast targeted diagnostics.")
+    (.add_argument parser "--max-surface-contracts" ** :type int :default nil
+                   :help "Limit expensive Greek reconstruction to the nearest N contracts per sidecar surface.")
+    (.add_argument parser "--max-option-contracts" ** :type int :default nil
+                   :help "Limit option-chain and option-surface formula computation to the nearest N contracts.")
+    (.add_argument parser "--option-surface-prefixes" ** :default nil
+                   :help "Comma-separated option surface prefixes to replay, e.g. VIX,VIXW,SPXW.")
+    (.add_argument parser "--skip-greek-reconstruction" ** :action "store_true"
+                   :help "Skip expensive option Greek reconstruction formulas for fast quote/formula diagnostics.")
+    (.add_argument parser "--skip-option-formulas" ** :action "store_true"
+                   :help "Skip option-chain and option-surface formulas for fast non-option diagnostics.")
+    (.add_argument parser "--include-sources" ** :default nil
+                   :help "Comma-separated source families to run: base,v2,spy-grid,option,option-chain,option-surface,greek,greek-grid,greek-reconstruction.")
+    (.add_argument parser "--write-unavailable" ** :action "store_true"
+                   :help "Write explicit unavailable audit artifacts and exit non-zero.")
+    (.add_argument parser "--unavailable-reason" ** :default "raw feature unlock audit unavailable")
+    (.parse_args parser (python/list argv1))))
+
+(defn compact-date [date]
+  (let [parts (.split date "-")]
+    (when (or (not= (count parts) 3)
+              (some #(not (.isdigit %)) parts))
+      (throw (python/ValueError (str "invalid --target-date: " date))))
+    (apply str parts)))
+
+(defn artifact-stem [base stamp label]
+  (if (or (nil? label) (= "" (str label)))
+    (str base "_" stamp)
+    (str base "_" stamp "_" (str label))))
+
+(defn feature-family [name]
+  (let [head (first (.split name "_" 1))]
+    (cond
+      (contains? #{"dict" "scat" "tda" "wass"} head) "v3-grid"
+      (contains? #{"vix_proxy" "vix_term_slope" "put_call_ratio"
+                   "vix_momentum_5" "vix_momentum_20"
+                   "realized_vol_20" "realized_vol_60" "vol_ratio"
+                   "hmm_state_0" "hmm_state_1" "hmm_state_2"} name) "v2-grid"
+      (contains? #{"SPX" "VIX" "TNX"} head) "index-proxy"
+      (or (>= (.find name "opt") 0)
+          (>= (.find name "greeks") 0)
+          (contains? #{"SPXW" "VIXW"} head)) "options-base"
+      :else "equity-base")))
+
+(defn classify [raw-values z train-std]
+  (let [finite (numpy/logical_and (numpy/isfinite raw-values) (numpy/isfinite z))]
+    (if-not (bool (numpy/any finite))
+      "NONFINITE"
+      (let [raw-f (.__getitem__ raw-values finite)
+            z-f (.__getitem__ z finite)
+            live-zero (bool (numpy/all (= raw-f 0)))
+            z-mu (float (numpy/mean z-f))
+            z-sd (float (numpy/std z-f))]
+        (cond
+          (and live-zero (> train-std 1.0e-12)) "ZERO_FILLED_LIVE"
+          live-zero "BOTH_ZERO"
+          (< z-sd 1.0e-3) "DEGENERATE_LIVE"
+          (and (< (abs z-mu) 2.0) (< 0.1 z-sd) (< z-sd 4.0)) "SANE"
+          (>= (abs z-mu) 8.0) "WILD_OFFSET"
+          (>= z-sd 4.0) "WILD_SCALE"
+          (<= z-sd 0.1) "LOW_VARIANCE"
+          :else "OFFSET")))))
+
+(defn load-npz-dict [path keys]
+  (if-not (os.path/exists path)
+    nil
+    (let [data (numpy/load path)]
+      (python/dict
+       (keep (fn [k]
+               (when (contains? (set (python/list (.-files data))) k)
+                 (python/tuple [k (.__getitem__ data k)])))
+             keys)))))
+
+(defn load-usage [path]
+  (let [payload (load-json-value path)
+        gain (atom {})
+        splits (atom {})]
+    (doseq [row (or (mget payload "features") [])]
+      (let [name (mget row "feature")
+            total-gain (float (or (mget row "total_gain") 0.0))
+            split-count (int (float (or (mget row "split_count") 0)))]
+        (swap! gain update name (fnil + 0.0) total-gain)
+        (swap! splits update name (fnil + 0) split-count)))
+    [@gain @splits]))
+
+(defn add-ref-to-path! [ref-root]
+  (let [ref (os.path/abspath (str ref-root))]
+    (when-not (contains? (set (.-path sys)) ref)
+      (.insert (.-path sys) 0 ref))))
+
+(defn array-files [npz]
+  (set (python/list (.-files npz))))
+
+(defn parse-include-sources [value]
+  (if (or (nil? value) (= "" (str value)))
+    nil
+    (set (map #(.strip %) (.split (str value) ",")))))
+
+(defn parse-prefixes [value]
+  (if (or (nil? value) (= "" (str value)))
+    nil
+    (set (map #(.upper (.strip %)) (.split (str value) ",")))))
+
+(defn source-enabled? [include-sources source]
+  (or (nil? include-sources) (contains? include-sources source)))
+
+(defn any-source-enabled? [include-sources sources]
+  (boolean (some #(source-enabled? include-sources %) sources)))
+
+(defn greek-grid-enabled? [include-sources]
+  (any-source-enabled? include-sources ["greek" "greek-grid"]))
+
+(defn greek-reconstruction-enabled? [include-sources]
+  (any-source-enabled? include-sources ["greek" "greek-reconstruction"]))
+
+(defn present-json-text? [value]
+  (let [text (.strip (str (or value "")))]
+    (pos? (count text))))
+
+(defn row-has-required-sidecars? [bar-json chain-json option-surfaces skip-option-formulas include-sources]
+  (and
+   (or (not (any-source-enabled? include-sources ["base" "v2"]))
+       (present-json-text? bar-json))
+   (or skip-option-formulas
+       (not (any-source-enabled? include-sources ["option" "option-chain"]))
+       (present-json-text? chain-json))
+   (or skip-option-formulas
+       (not (any-source-enabled? include-sources ["option-surface" "greek" "greek-grid" "greek-reconstruction"]))
+       (present-json-text? option-surfaces))))
+
+(defn limited-option-json [surface-json max-contracts]
+  (if (nil? max-contracts)
+    (str surface-json)
+    (try
+      (let [payload (raw/loads-json-value-fast (str surface-json))
+            contracts (mget payload "contracts")]
+        (if (not (and (py-dict? payload) (py-list? contracts)))
+          (str surface-json)
+          (let [underlying (float (or (mget payload "underlying") (mget payload "spy") 0.0))
+                scored (sort-by
+                        first
+                        (keep (fn [row]
+                                (try
+                                  (let [strike (float (mget row "strike"))
+                                        distance (if (> underlying 0.0)
+                                                   (abs (- strike underlying))
+                                                   0.0)]
+                                    [distance row])
+                                  (catch python/Exception _ nil)))
+                              contracts))
+                limited (python/list (map second (take (int max-contracts) scored)))]
+            (.__setitem__ payload "contracts" limited)
+            (json/dumps payload))))
+      (catch python/Exception _
+        (str surface-json)))))
+
+(defn replay-feature-map [grids hmm-model i bar-json chain-json option-surfaces max-surface-contracts max-option-contracts option-surface-prefixes skip-greek-reconstruction skip-option-formulas include-sources]
+  (let [feat (python/dict)
+        source-notes (atom {})
+        effective-greek-limit (or max-surface-contracts max-option-contracts)
+        grid-history (python/list (.__getitem__ grids (slice nil (inc i))))
+        buffers (when (any-source-enabled? include-sources ["base" "v2"])
+                  (raw/loads-json-value (str bar-json)))]
+    (when (source-enabled? include-sources "base")
+      (doseq [[k v] (raw/compute-live-base-feature-map buffers)]
+        (.__setitem__ feat k v))
+      (doseq [k (.keys feat)]
+        (swap! source-notes assoc k "bar_buffer_replay")))
+    (when (source-enabled? include-sources "v2")
+      (doseq [[k v] (raw/compute-live-v2-feature-map grid-history buffers hmm-model)]
+        (.__setitem__ feat k v)
+        (swap! source-notes assoc k (if (contains? v2-engine-replay-features k)
+                                      "v2_engine_replay"
+                                      "v2_grid_formula")))
+      (doseq [[k v] (raw/compute-v2-grid-features grid-history)]
+        (.__setitem__ feat k v)
+        (swap! source-notes assoc k "v2_grid_formula")))
+    (when (source-enabled? include-sources "spy-grid")
+      (doseq [[k v] (raw/compute-spy-greek-grid-features grid-history)]
+        (.__setitem__ feat k v)
+        (swap! source-notes assoc k "spy_greek_grid_formula")))
+    (when (and (not skip-option-formulas) (any-source-enabled? include-sources ["option" "option-chain"]))
+      (doseq [[k v] (raw/compute-spy-option-features (limited-option-json chain-json max-option-contracts))]
+        (.__setitem__ feat k v)
+        (swap! source-notes assoc k "option_chain_quote_formula")))
+    (when (and (not skip-greek-reconstruction)
+               (not skip-option-formulas)
+               (greek-reconstruction-enabled? include-sources))
+      (let [limited-chain (limited-option-json chain-json effective-greek-limit)
+            spy-sidecar-grid (raw/build-option-greeks-grid limited-chain nil nil nil nil)]
+        (when (some? spy-sidecar-grid)
+          (doseq [[k v] (raw/compute-reconstructable-greek-features "SPY" spy-sidecar-grid limited-chain)]
+            (.__setitem__ feat k v)
+            (swap! source-notes assoc k greek-reconstruction-source)))))
+    (when (and (some? option-surfaces)
+               (not skip-option-formulas)
+               (any-source-enabled? include-sources ["option" "option-surface"]))
+      (let [surfaces (raw/loads-json-value (or (str option-surfaces) "{}"))]
+        (doseq [[prefix surface-json] (if (py-dict? surfaces) (.items surfaces) surfaces)]
+          (when (or (nil? option-surface-prefixes)
+                    (contains? option-surface-prefixes (.upper (str prefix))))
+            (let [limited-surface (limited-option-json surface-json (or max-option-contracts
+                                                                         (when (or (greek-grid-enabled? include-sources)
+                                                                                   (and (not skip-greek-reconstruction)
+                                                                                        (greek-reconstruction-enabled? include-sources)))
+                                                                           max-surface-contracts)))]
+              (doseq [[k v] (raw/compute-option-features (str prefix) limited-surface)]
+                (.__setitem__ feat k v)
+                (swap! source-notes assoc k "option_surface_formula"))
+              (when (or (greek-grid-enabled? include-sources)
+                        (and (not skip-greek-reconstruction)
+                             (greek-reconstruction-enabled? include-sources)))
+                (let [sidecar-grid (raw/build-option-greeks-grid limited-surface nil nil nil nil)]
+                  (when (some? sidecar-grid)
+                    (when (greek-grid-enabled? include-sources)
+                      (doseq [[k v] (raw/compute-greek-grid-features (str prefix) sidecar-grid)]
+                        (.__setitem__ feat k v)
+                        (swap! source-notes assoc k "option_surface_greek_grid_formula")))
+                    (when (and (not skip-greek-reconstruction)
+                               (greek-reconstruction-enabled? include-sources))
+                      (doseq [[k v] (raw/compute-reconstructable-greek-features (str prefix) sidecar-grid limited-surface)]
+                        (.__setitem__ feat k v)
+                        (swap! source-notes assoc k greek-reconstruction-source)))))))))))
+    [feat @source-notes]))
+
+(defn recompute-raw [ref-root bundle capture-path max-rows max-surface-contracts max-option-contracts option-surface-prefixes skip-greek-reconstruction skip-option-formulas include-sources]
+  (let [cap (numpy/load capture-path ** :allow_pickle true)
+        required #{"bar_buffers_json" "option_chain_json" "option_surfaces_json"}
+        files (array-files cap)
+        missing (vec (sort (remove files required)))]
+    (when (seq missing)
+      (throw (python/SystemExit
+              (str "capture lacks raw replay arrays " missing
+                   "; deploy bridge capture_version=2 and collect a new market-hours capture"))))
+    (when (and (some? max-rows) (<= (int max-rows) 0))
+      (throw (python/SystemExit "--max-rows must be positive when provided")))
+    (add-ref-to-path! ref-root)
+      (let [hmm-model (load-npz-dict (os.path/join bundle "hmm_model.npz")
+                                   ["means" "covars" "transmat" "startprob"])
+          grids (.__getitem__ cap "grids")
+          bar-buffers (.__getitem__ cap "bar_buffers_json")
+          chain-jsons (.__getitem__ cap "option_chain_json")
+          option-surfaces (.__getitem__ cap "option_surfaces_json")
+          total-rows (len bar-buffers)
+          start-index (if (some? max-rows) (max 0 (- total-rows (int max-rows))) 0)
+          rows (atom [])
+          all-source-notes (atom {})
+              feature-names (vec (load-json-value (os.path/join bundle "feature_names.json")))
+              name-to-idx (into {} (map-indexed (fn [idx name] [name idx]) feature-names))]
+      (doseq [i (range start-index total-rows)]
+        (let [bar-json (.__getitem__ bar-buffers i)
+              chain-json (.__getitem__ chain-jsons i)
+              surface-json (.__getitem__ option-surfaces i)]
+          (when (row-has-required-sidecars? bar-json chain-json surface-json skip-option-formulas include-sources)
+            (let [[feat source-notes] (replay-feature-map grids hmm-model i
+                                                          bar-json
+                                                          chain-json
+                                                          surface-json
+                                                          max-surface-contracts
+                                                          max-option-contracts
+                                                          option-surface-prefixes
+                                                          skip-greek-reconstruction
+                                                          skip-option-formulas
+                                                          include-sources)
+              arr (numpy/full (count feature-names) numpy/nan ** :dtype numpy/float64)]
+              (swap! all-source-notes merge source-notes)
+              (doseq [[name value] (.items feat)]
+                (let [idx (get name-to-idx name)]
+                  (when (and (some? idx) (some? value) (math/isfinite (float value)))
+                    (.__setitem__ arr idx (float value)))))
+              (swap! rows conj arr)))))
+      (when (empty? @rows)
+        (throw (python/SystemExit "capture contains no rows to replay")))
+      [feature-names
+       (numpy/stack (python/list @rows))
+       @all-source-notes
+       {"capture_rows" total-rows
+        "replayed_rows" (count @rows)
+        "replay_start_index" start-index
+        "max_rows" max-rows
+        "max_surface_contracts" max-surface-contracts
+        "max_option_contracts" max-option-contracts
+        "option_surface_prefixes" (if (nil? option-surface-prefixes) nil (vec (sort option-surface-prefixes)))
+        "skip_greek_reconstruction" skip-greek-reconstruction
+        "skip_option_formulas" skip-option-formulas
+        "include_sources" (if (nil? include-sources) nil (vec (sort include-sources)))}])))
+
+(defn csv-escape [value]
+  (let [s (str (or value ""))]
+    (if (or (>= (.find s ",") 0) (>= (.find s "\"") 0) (>= (.find s "\n") 0))
+      (str "\"" (.replace s "\"" "\"\"") "\"")
+      s)))
+
+(defn write-csv! [path rows]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path
+        (str (apply str (interpose "," csv-fields))
+             "\n"
+             (apply str
+                    (for [row rows]
+                      (str (apply str (interpose "," (map #(csv-escape (get row % "")) csv-fields))) "\n"))))))
+
+(defn md-table [headers rows]
+  (str "| " (apply str (interpose " | " headers)) " |\n"
+       "| " (apply str (interpose " | " (repeat (count headers) "---"))) " |\n"
+       (apply str (for [row rows]
+                    (str "| " (apply str (interpose " | " (map str row))) " |\n")))))
+
+(defn count-by [f xs]
+  (into {} (for [k (sort (set (map f xs)))]
+             [k (count (filter #(= (f %) k) xs))])))
+
+(defn write-unavailable! [out-dir stamp target-date reason]
+  (let [generated-at (.isoformat (datetime.datetime/now datetime.timezone/utc))
+        base-path (os.path/join out-dir (artifact-stem "raw_feature_unlock_audit" stamp nil))
+        csv-path (str base-path ".csv")
+        json-path (str base-path ".json")
+        md-path (str base-path ".md")
+        candidates-path (os.path/join out-dir (str "raw_feature_unlock_candidates_" stamp ".json"))
+        summary {"status" "unavailable"
+                 "available" false
+                 "ok" false
+                 "target_date" target-date
+                 "generated_at" generated-at
+                 "unavailable_reason" reason
+                 "neutralized_total" 0
+                 "supported_neutralized" 0
+                 "unsupported_neutralized" 0
+                 "recomputed_neutralized_supported" 0
+                 "guarded_greek_reconstruction_count" 0
+                 "candidate_count" 0
+                 "candidate_model_gain" 0.0
+                 "status_counts" {}
+                 "source_counts" {}
+                 "candidate_features" []}]
+    (os/makedirs out-dir ** :exist_ok true)
+    (write-csv! csv-path [])
+    (spit json-path (str (json/dumps (->jsonable {"summary" summary "features" []})
+                                     ** :indent 2 :sort_keys true) "\n"))
+    (spit candidates-path "[]\n")
+    (spit md-path
+          (str "# Raw Feature Unlock Audit\n\n"
+               "- Target date: `" target-date "`\n"
+               "- Status: `unavailable`\n"
+               "- Reason: `" reason "`\n"
+               "- Candidate features: `0`\n"))
+    (println (json/dumps (->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote " md-path))
+    (println (str "wrote " csv-path))
+    (println (str "wrote " json-path))
+    (println (str "wrote " candidates-path))
+    1))
+
+(defn main [& argv]
+  (let [args (apply parse-args argv)
+        target-date (attr args "target_date")
+        stamp (compact-date target-date)
+        ref-root (os.path/abspath (attr args "ref_root"))
+        out-dir (attr args "out_dir")
+        label (attr args "label")
+        write-unavailable (attr args "write_unavailable")
+        unavailable-reason (attr args "unavailable_reason")]
+    (if write-unavailable
+      (write-unavailable! out-dir stamp target-date unavailable-reason)
+      (let [capture (or (attr args "capture")
+                    (os.path/join repo-root "live_runtime" "feature-capture" (str "live_features_" stamp ".npz")))
+        baseline-json (or (attr args "baseline_json")
+                          (os.path/join out-dir (str "live_feature_parity_baseline_" stamp ".json")))
+        usage-json (or (attr args "usage_json")
+                       (os.path/join out-dir (str "live_feature_model_usage_" stamp ".json")))
+        bundle (or (attr args "bundle")
+                   (os.path/join ref-root "pipeline_data" "live_model_chestnut_multihead_corrected"))
+        max-rows (attr args "max_rows")
+        max-surface-contracts (attr args "max_surface_contracts")
+        max-option-contracts (attr args "max_option_contracts")
+        option-surface-prefixes (parse-prefixes (attr args "option_surface_prefixes"))
+        skip-greek-reconstruction (attr args "skip_greek_reconstruction")
+        skip-option-formulas (attr args "skip_option_formulas")
+        include-sources (parse-include-sources (attr args "include_sources"))
+        baseline (mget (load-json-value baseline-json) "features")
+        baseline-by-name (into {} (for [row baseline] [(mget row "feature") row]))
+        [gain splits] (load-usage usage-json)
+        [names raw-values source-notes replay-meta] (recompute-raw ref-root bundle capture max-rows max-surface-contracts max-option-contracts option-surface-prefixes skip-greek-reconstruction skip-option-formulas include-sources)
+        stats (numpy/load (os.path/join bundle "feature_stats.npz"))
+        train-mean (.astype (.__getitem__ stats "mean") numpy/float64)
+        train-std (.astype (.__getitem__ stats "std") numpy/float64)
+        neutralized-names (vec (for [row baseline :when (mget row "neutralized")] (mget row "feature")))
+        supported-neutralized (vec (filter #(contains? source-notes %) neutralized-names))
+        unsupported-neutralized (vec (filter #(not (contains? source-notes %)) neutralized-names))
+        rows (atom [])]
+    (doseq [[idx name] (map-indexed vector names)]
+      (let [base (get baseline-by-name name)]
+        (when (and base (mget base "neutralized") (contains? source-notes name))
+          (let [values (.__getitem__ raw-values #py ((slice nil nil) idx))
+                finite-values (.__getitem__ values (numpy/isfinite values))
+                stdv (float (.__getitem__ train-std idx))
+                denom (if (not= stdv 0.0) stdv 1.0)
+                z (/ (- values (.__getitem__ train-mean idx)) denom)
+                status (if (= (.-size finite-values) 0) "NONFINITE" (classify values z stdv))
+                source (get source-notes name)
+                candidate (and (contains? #{"SANE" "BOTH_ZERO"} status)
+                               (contains? candidate-sources source))]
+            (swap! rows conj {"feature" name
+                              "family" (feature-family name)
+                              "source_note" source
+                              "baseline_status" (mget base "status")
+                              "recomputed_status" status
+                              "candidate" candidate
+                              "model_gain" (float (get gain name 0.0))
+                              "model_split_count" (int (get splits name 0))
+                              "live_mean" (float (numpy/nanmean values))
+                              "live_std" (float (numpy/nanstd values))
+                              "z_mean" (float (numpy/nanmean z))
+                              "z_std" (float (numpy/nanstd z))
+                              "zero_frac" (float (numpy/mean (= values 0)))
+                              "train_mean" (float (.__getitem__ train-mean idx))
+                              "train_std" stdv})))))
+    (let [sorted-rows (vec (sort-by #(- (get % "model_gain")) @rows))
+          candidates (vec (filter #(get % "candidate") sorted-rows))
+          guarded (vec (filter #(= (get % "source_note") greek-reconstruction-source) sorted-rows))
+          unsupported-by-family (into {}
+                                      (for [family (sort (set (map feature-family unsupported-neutralized)))]
+                                        [family (count (filter #(= (feature-family %) family) unsupported-neutralized))]))
+          summary {"target_date" target-date
+                   "label" label
+                   "capture" capture
+                   "bundle" bundle
+                   "capture_rows" (get replay-meta "capture_rows")
+                   "replayed_rows" (get replay-meta "replayed_rows")
+                   "replay_start_index" (get replay-meta "replay_start_index")
+                   "max_rows" (get replay-meta "max_rows")
+                   "max_surface_contracts" (get replay-meta "max_surface_contracts")
+                   "max_option_contracts" (get replay-meta "max_option_contracts")
+                   "option_surface_prefixes" (get replay-meta "option_surface_prefixes")
+                   "skip_greek_reconstruction" (get replay-meta "skip_greek_reconstruction")
+                   "skip_option_formulas" (get replay-meta "skip_option_formulas")
+                   "include_sources" (get replay-meta "include_sources")
+                   "neutralized_total" (count neutralized-names)
+                   "supported_neutralized" (count supported-neutralized)
+                   "unsupported_neutralized" (count unsupported-neutralized)
+                   "unsupported_neutralized_by_family" unsupported-by-family
+                   "unsupported_neutralized_top" (vec (take 50 unsupported-neutralized))
+                   "recomputed_neutralized_supported" (count sorted-rows)
+                   "guarded_greek_reconstruction_count" (count guarded)
+                   "guarded_greek_reconstruction_model_gain" (float (reduce + (map #(get % "model_gain") guarded)))
+                   "candidate_count" (count candidates)
+                   "candidate_model_gain" (float (reduce + (map #(get % "model_gain") candidates)))
+                   "status_counts" (count-by #(get % "recomputed_status") sorted-rows)
+                   "source_counts" (count-by #(get % "source_note") sorted-rows)
+                   "candidate_features" (vec (map #(get % "feature") candidates))}
+          base-path (os.path/join out-dir (artifact-stem "raw_feature_unlock_audit" stamp label))
+          csv-path (str base-path ".csv")
+          json-path (str base-path ".json")
+          md-path (str base-path ".md")
+          candidates-path (str (os.path/join out-dir (artifact-stem "raw_feature_unlock_candidates" stamp label)) ".json")]
+      (os/makedirs out-dir ** :exist_ok true)
+      (write-csv! csv-path sorted-rows)
+      (spit json-path (str (json/dumps (->jsonable {"summary" summary "features" sorted-rows})
+                                       ** :indent 2 :sort_keys true) "\n"))
+      (spit candidates-path (str (json/dumps (->jsonable (get summary "candidate_features"))
+                                             ** :indent 2 :sort_keys true) "\n"))
+      (spit md-path
+            (str "# Raw Feature Unlock Audit\n\n"
+                 "- Target date: `" target-date "`\n"
+                 "- Neutralized total: `" (get summary "neutralized_total") "`\n"
+                 "- Supported neutralized features recomputed: `" (get summary "recomputed_neutralized_supported") "`\n"
+                 "- Unsupported neutralized features: `" (get summary "unsupported_neutralized") "`\n"
+                 "- Guarded Greek reconstruction features: `" (get summary "guarded_greek_reconstruction_count") "`\n"
+                 "- Candidate features: `" (get summary "candidate_count") "`\n"
+                 "- Candidate model gain: `" (.format "{:.4f}" (get summary "candidate_model_gain")) "`\n\n"
+                 "## Unsupported Neutralized By Family\n\n"
+                 (md-table ["Family" "Count"] (for [[k v] (get summary "unsupported_neutralized_by_family")] [k v]))
+                 "\n## Unsupported Neutralized Examples\n\n"
+                 (md-table ["Feature"] (for [name (take 30 (get summary "unsupported_neutralized_top"))] [(str "`" name "`")]))
+                 "\n## Status Counts\n\n"
+                 (md-table ["Status" "Count"] (for [[k v] (get summary "status_counts")] [k v]))
+                 "\n## Source Counts\n\n"
+                 (md-table ["Source" "Count"] (for [[k v] (get summary "source_counts")] [k v]))
+                 "\n## Top Recomputed Features\n\n"
+                 (md-table ["Gain" "Family" "Status" "Candidate" "Source" "Feature"]
+                           (for [r (take 30 sorted-rows)]
+                             [(.format "{:.2f}" (get r "model_gain"))
+                              (get r "family")
+                              (get r "recomputed_status")
+                              (get r "candidate")
+                              (get r "source_note")
+                              (str "`" (get r "feature") "`")]))))
+      (println (json/dumps (->jsonable summary) ** :indent 2 :sort_keys true))
+      (println (str "wrote " md-path))
+      (println (str "wrote " csv-path))
+      (println (str "wrote " json-path))
+      (println (str "wrote " candidates-path))
+      0)))))
+
+(try
+  (sys/exit (apply main (rest (.-argv sys))))
+  (catch python/SystemExit e
+    (let [code (or (.-code e) 1)]
+      (when (not= code 0)
+        (binding [*out* *err*]
+          (println (str e))))
+      (sys/exit code)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (sys/exit 2)))

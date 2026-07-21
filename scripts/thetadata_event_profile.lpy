@@ -1,0 +1,27 @@
+;; CLI for the streaming ThetaData NDJSON physical profiler.
+(import argparse glob os os.path sys)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.analysis.thetadata-profile :as profile])
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--raw-dir" ** :required true)
+    (.add_argument parser "--out" ** :required true)
+    (.add_argument parser "--top-contracts" ** :type int :default 30)
+    (.parse_args parser (python/list argv))))
+
+(try
+  (let [args (parse-args (vec *command-line-args*))]
+    (when (<= (.-top_contracts args) 0)
+      (throw (python/ValueError "--top-contracts must be positive")))
+    (println (profile/json-text
+              (profile/write-profile! (.-raw_dir args) (.-out args) (.-top_contracts args))))
+    (python/exit 0))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2)))

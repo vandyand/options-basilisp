@@ -1,0 +1,1789 @@
+(ns stevetrading.feature-parity.raw-unlock
+  "Formula helpers for raw feature-unlock and historical parity replay."
+  (:import builtins datetime importlib json math numpy zoneinfo))
+
+(def et (zoneinfo/ZoneInfo "America/New_York"))
+
+(def supported-option-prefixes #{"SPY" "SPX" "VIX" "VIXW"})
+(def supported-greek-prefixes #{"SPY" "SPX" "SPXW" "VIX" "VIXW"})
+
+(def supported-option-suffixes
+  #{"atm_call_midprice" "atm_call_spread" "atm_call_spread_squared"
+    "atm_implied_vol" "atm_put_midprice" "atm_put_spread" "avg_midprice"
+    "bid_ask_imbalance" "butterfly_spread" "butterfly_times_volume"
+    "call_volume_skew" "contract_count" "dte_minutes" "dte_times_iv"
+    "iv_squared" "iv_times_spread" "moneyness" "moneyness_squared"
+    "moneyness_times_iv" "near_far_put_ratio" "otm_call_midprice"
+    "otm_put_midprice" "put_call_midprice_ratio" "put_call_parity_deviation"
+    "put_call_spread_ratio" "put_call_volume_ratio" "put_volume_skew"
+    "skew_proxy" "skew_squared" "skew_times_term_structure"
+    "spread_ratio_squared" "spread_ratio_times_volume" "spread_skew"
+    "spread_std" "spread_times_volume" "term_structure_slope"
+    "term_structure_squared" "total_options_volume" "volume_concentration"
+    "volume_concentration_times_skew" "volume_ratio_squared"
+    "volume_ratio_times_iv" "volume_times_skew" "volume_weighted_dte"
+    "volume_weighted_moneyness"})
+
+(def supported-option-features
+  (set (for [prefix supported-option-prefixes
+             suffix supported-option-suffixes]
+         (str prefix "_opt_" suffix))))
+
+(def supported-v2-grid-features
+  #{"vix_proxy" "vix_term_slope" "put_call_ratio" "vix_momentum_5" "vix_momentum_20"})
+
+(def greek-names ["iv" "delta" "vega" "theta" "rho" "gamma"])
+(def stock-instruments ["SPY" "HYG" "TLT" "VXX"])
+(def index-instruments ["SPX" "TNX" "VIX"])
+(def all-instruments (concat stock-instruments index-instruments))
+
+(def supported-greek-suffixes
+  #{"atm_call_delta" "atm_call_iv" "atm_call_theta" "atm_call_vega"
+    "atm_put_delta" "atm_put_iv" "atm_put_theta" "atm_put_vega"
+    "butterfly_times_skew" "delta_squared" "delta_std" "delta_times_iv"
+    "delta_vw_mean" "dollar_gamma_proxy" "iv_25d_spread" "iv_butterfly"
+    "iv_cubed" "iv_mean" "iv_range" "iv_skew_greeks" "iv_skew_squared"
+    "iv_skew_stat" "iv_squared" "iv_std" "iv_std_times_skew"
+    "near_far_iv_spread" "near_far_times_iv" "otm_call_iv" "otm_put_iv"
+    "put_call_iv_spread" "rho_mean" "rho_times_delta" "theta_delta_ratio"
+    "theta_mean" "theta_squared" "theta_times_iv" "theta_vega_ratio"
+    "theta_vw" "vega_concentration" "vega_delta_ratio" "vega_mean"
+    "vega_squared" "vega_theta_product"})
+
+(def supported-greek-features
+  (set (for [prefix supported-greek-prefixes
+             suffix supported-greek-suffixes]
+         (str prefix "_greeks_" suffix))))
+
+(def reconstructable-greek-suffixes
+  #{"dollar_delta" "dollar_vega" "epsilon_exposure" "epsilon_mean"
+    "epsilon_times_delta" "lambda_mean" "lambda_times_iv" "lambda_weighted"
+    "rho_exposure" "skew_times_volume" "theta_exposure_ratio"
+    "vega_total_exposure"})
+
+(def reconstructable-greek-features
+  (set (for [prefix supported-greek-prefixes
+             suffix reconstructable-greek-suffixes]
+         (str prefix "_greeks_" suffix))))
+
+(defn reject-duplicate-json-object [pairs]
+  (let [seen (builtins/set)
+        out (python/dict)]
+    (doseq [pair pairs]
+      (let [k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (.add seen k)
+        (.__setitem__ out k v)))
+    out))
+
+(defn loads-json-value [text]
+  (json/loads text ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn loads-json-value-fast
+  "Parse diagnostic-only payloads without duplicate-key checks.
+
+  Canonical evidence paths should keep using `loads-json-value`. This exists so
+  bounded raw-unlock diagnostics can pre-thin very large option surfaces before
+  expensive formula replay."
+  [text]
+  (json/loads text))
+
+(defn mget
+  ([m k] (mget m k nil))
+  ([m k default]
+   (cond
+     (nil? m) default
+     (map? m) (get m k default)
+     (python/isinstance m python/dict) (.get m k default)
+     :else default)))
+
+(defn right-code [value]
+  (let [text (.upper (str (or value "")))]
+    (cond
+      (contains? #{"CALL" "C" ":OPTION-RIGHT/CALL"} text) "C"
+      (contains? #{"PUT" "P" ":OPTION-RIGHT/PUT"} text) "P"
+      :else (subs text 0 (min 1 (count text))))))
+
+(defn strike-thousandths [value]
+  (let [strike0 (float value)
+        strike (if (< strike0 10000.0) (* strike0 1000.0) strike0)]
+    (int (round strike))))
+
+(defn parse-time [value]
+  (let [text0 (str value)
+        text1 (if (.startswith text0 "#inst \"") (subs text0 7 (dec (count text0))) text0)
+        text (.replace text1 "Z" "+00:00")
+        parsed (datetime.datetime/fromisoformat text)
+        with-tz (if (nil? (.-tzinfo parsed)) (.replace parsed ** :tzinfo et) parsed)]
+    (.astimezone with-tz et)))
+
+(defn dte-minutes [current-time expiration]
+  (let [exp (.replace (datetime.datetime/fromisoformat (str expiration))
+                      ** :tzinfo et :hour 16 :minute 0 :second 0 :microsecond 0)]
+    (max (/ (.total_seconds (- exp current-time)) 60.0) 0.0)))
+
+(defn row-number [row & keys]
+  (or (some (fn [k]
+              (let [value0 (mget row k)
+                    value (if (nil? value0) (mget row (str ":" k)) value0)]
+                (when (some? value)
+                  (try
+                    (let [num (float value)]
+                      (when (math/isfinite num) num))
+                    (catch python/Exception _ nil)))))
+            keys)
+      ##NaN))
+
+(defn mid [row]
+  (let [bid (float (or (mget row "bid") (mget row "quote/bid") 0.0))
+        ask (float (or (mget row "ask") (mget row "quote/ask") 0.0))]
+    (if (or (<= bid 0.0) (<= ask 0.0))
+      ##NaN
+      (/ (+ bid ask) 2.0))))
+
+(defn spread [row]
+  (let [bid (float (or (mget row "bid") (mget row "quote/bid") 0.0))
+        ask (float (or (mget row "ask") (mget row "quote/ask") 0.0))]
+    (if (or (<= bid 0.0) (<= ask 0.0))
+      ##NaN
+      (- ask bid))))
+
+(defn finite-map [features allowed]
+  (into {} (for [[k v] features
+                 :let [f (float v)]
+                 :when (and (contains? allowed k) (math/isfinite f))]
+             [k f])))
+
+(defn compute-option-features [prefix chain-json]
+  (if (or (not (contains? supported-option-prefixes prefix))
+          (not chain-json)
+          (= "" (str chain-json)))
+    {}
+    (let [feature (fn [suffix] (str prefix "_opt_" suffix))
+          payload (loads-json-value chain-json)
+          contracts (or (mget payload "contracts") [])
+          spy (float (or (mget payload "underlying") (mget payload "spy") 0.0))
+          observed-at (parse-time (mget payload "observed_at"))
+          rows (vec (keep (fn [contract]
+                            (try
+                              (let [row (if (python/isinstance contract python/dict)
+                                          contract
+                                          (python/dict (.items contract)))]
+                                (.__setitem__ row "_strike" (strike-thousandths (mget row "strike")))
+                                (.__setitem__ row "_right" (right-code (mget row "right")))
+                                (.__setitem__ row "_mid" (mid row))
+                                (.__setitem__ row "_spread" (spread row))
+                                (.__setitem__ row "_expiration" (str (mget row "expiration")))
+                                (.__setitem__ row "_volume" (row-number row "volume" "ohlc/volume"))
+                                (.__setitem__ row "_bid_size" (row-number row "bid_size" "bid-size" "quote/bid-size"))
+                                (.__setitem__ row "_ask_size" (row-number row "ask_size" "ask-size" "quote/ask-size"))
+                                row)
+                              (catch python/Exception _ nil)))
+                          contracts))]
+      (if (or (empty? rows) (<= spy 0.0))
+        {}
+        (let [strikes (vec (sort (set (map #(mget % "_strike") rows))))
+              expirations (vec (sort (set (map #(mget % "_expiration") rows))))
+              atm-strike (first (sort-by #(abs (- % (* spy 1000.0))) strikes))
+              nearest-exp (first expirations)
+              by-key (into {} (for [r rows] [[(mget r "_strike") (mget r "_expiration") (mget r "_right")] r]))
+              row-for (fn [strike exp right] (get by-key [strike exp right]))
+              atm-call (row-for atm-strike nearest-exp "C")
+              atm-put (row-for atm-strike nearest-exp "P")
+              call-mid (if atm-call (mid atm-call) ##NaN)
+              put-mid (if atm-put (mid atm-put) ##NaN)
+              call-spread (if atm-call (spread atm-call) ##NaN)
+              put-spread (if atm-put (spread atm-put) ##NaN)
+              dte (dte-minutes observed-at nearest-exp)
+              moneyness (/ spy (/ atm-strike 1000.0))
+              features (atom {(feature "contract_count") (float (count rows))
+                              (feature "dte_minutes") dte
+                              (feature "moneyness") moneyness
+                              (feature "moneyness_squared") (* moneyness moneyness)})]
+          (when (math/isfinite call-mid) (swap! features assoc (feature "atm_call_midprice") call-mid))
+          (when (math/isfinite put-mid) (swap! features assoc (feature "atm_put_midprice") put-mid))
+          (when (math/isfinite call-spread)
+            (swap! features assoc (feature "atm_call_spread") call-spread
+                   (feature "atm_call_spread_squared") (* call-spread call-spread)))
+          (when (math/isfinite put-spread) (swap! features assoc (feature "atm_put_spread") put-spread))
+          (when (and (math/isfinite call-mid) (math/isfinite put-mid))
+            (swap! features assoc
+                   (feature "put_call_midprice_ratio") (/ put-mid (max call-mid 1.0e-10))
+                   (feature "put_call_parity_deviation") (- call-mid put-mid (- spy (/ atm-strike 1000.0)))))
+          (when (and (math/isfinite call-spread) (math/isfinite put-spread))
+            (let [ratio (/ put-spread (max call-spread 1.0e-10))]
+              (swap! features assoc (feature "put_call_spread_ratio") ratio
+                     (feature "spread_ratio_squared") (* ratio ratio))))
+          (let [mids (vec (filter math/isfinite (map #(mget % "_mid") rows)))
+                spreads (vec (filter math/isfinite (map #(mget % "_spread") rows)))]
+            (when (seq mids) (swap! features assoc (feature "avg_midprice") (float (numpy/mean mids))))
+            (when (seq spreads) (swap! features assoc (feature "spread_std") (float (numpy/std spreads))))
+            (let [bid-sizes (vec (filter #(and (math/isfinite %) (> % 0.0)) (map #(mget % "_bid_size") rows)))
+                  ask-sizes (vec (filter #(and (math/isfinite %) (> % 0.0)) (map #(mget % "_ask_size") rows)))]
+              (when (and (seq bid-sizes) (seq ask-sizes))
+                (let [bid-sum (float (reduce + bid-sizes))
+                      ask-sum (float (reduce + ask-sizes))
+                      denom (+ bid-sum ask-sum)]
+                  (when (> denom 0.0)
+                    (swap! features assoc (feature "bid_ask_imbalance") (/ (- bid-sum ask-sum) denom))))))
+            (let [volume-rows (vec (filter #(let [v (mget % "_volume")] (and (math/isfinite v) (> v 0.0))) rows))
+                  total-volume (float (reduce + (map #(mget % "_volume") volume-rows)))]
+              (when (> total-volume 0.0)
+                (let [put-volume (float (reduce + (map #(mget % "_volume") (filter #(= "P" (mget % "_right")) volume-rows))))
+                      call-volume (float (reduce + (map #(mget % "_volume") (filter #(= "C" (mget % "_right")) volume-rows))))]
+                  (swap! features assoc
+                         (feature "total_options_volume") total-volume
+                         (feature "volume_concentration") (/ (apply max (map #(mget % "_volume") volume-rows)) total-volume))
+                  (let [weighted (vec (keep (fn [r]
+                                              (try
+                                                (let [dte-i (dte-minutes observed-at (mget r "_expiration"))
+                                                      strike-i (/ (mget r "_strike") 1000.0)
+                                                      weight (mget r "_volume")]
+                                                  (when (and (> strike-i 0.0) (math/isfinite dte-i))
+                                                    [dte-i (/ spy strike-i) weight]))
+                                                (catch python/Exception _ nil)))
+                                            volume-rows))]
+                    (when (seq weighted)
+                      (let [weights (mapv #(nth % 2) weighted)]
+                        (swap! features assoc
+                               (feature "volume_weighted_dte") (float (numpy/average (mapv first weighted) ** :weights weights))
+                               (feature "volume_weighted_moneyness") (float (numpy/average (mapv second weighted) ** :weights weights))))))
+                  (when (> call-volume 0.0)
+                    (let [volume-ratio (/ put-volume call-volume)]
+                      (swap! features assoc (feature "put_call_volume_ratio") volume-ratio
+                             (feature "volume_ratio_squared") (* volume-ratio volume-ratio))))
+                  (when (seq spreads)
+                    (swap! features assoc (feature "spread_times_volume") (* (float (numpy/mean spreads)) total-volume)))
+                  (when (contains? @features (feature "put_call_spread_ratio"))
+                    (swap! features assoc (feature "spread_ratio_times_volume")
+                           (* (get @features (feature "put_call_spread_ratio")) total-volume)))))
+            (let [atm-idx (.index strikes atm-strike)]
+              (when (and (> atm-idx 0) (< atm-idx (dec (count strikes))))
+                (let [put-row (row-for (nth strikes (dec atm-idx)) nearest-exp "P")
+                      call-row (row-for (nth strikes (inc atm-idx)) nearest-exp "C")
+                      put-otm (if put-row (mid put-row) ##NaN)
+                      call-otm (if call-row (mid call-row) ##NaN)]
+                  (when (math/isfinite put-otm) (swap! features assoc (feature "otm_put_midprice") put-otm))
+                  (when (math/isfinite call-otm) (swap! features assoc (feature "otm_call_midprice") call-otm))
+                  (when (and (math/isfinite put-otm) (math/isfinite call-otm))
+                    (let [skew (- put-otm call-otm)
+                          total-volume (get @features (feature "total_options_volume") 0.0)
+                          put-volume (float (reduce + (map #(mget % "_volume") (filter #(and (= "P" (mget % "_right"))
+                                                                                             (math/isfinite (mget % "_volume"))
+                                                                                             (> (mget % "_volume") 0.0)) rows))))
+                          call-volume (float (reduce + (map #(mget % "_volume") (filter #(and (= "C" (mget % "_right"))
+                                                                                              (math/isfinite (mget % "_volume"))
+                                                                                              (> (mget % "_volume") 0.0)) rows))))]
+                      (swap! features assoc (feature "skew_proxy") skew (feature "skew_squared") (* skew skew))
+                      (when (> total-volume 0.0)
+                        (swap! features assoc
+                               (feature "volume_times_skew") (* total-volume skew)
+                               (feature "call_volume_skew") (* call-volume skew)
+                               (feature "put_volume_skew") (* put-volume skew))
+                        (when (contains? @features (feature "volume_concentration"))
+                          (swap! features assoc (feature "volume_concentration_times_skew")
+                                 (* (get @features (feature "volume_concentration")) skew))))
+                      (when (and (math/isfinite call-mid) (math/isfinite put-mid))
+                        (swap! features assoc (feature "butterfly_spread") (- (+ put-otm call-otm) (+ call-mid put-mid)))
+                        (when (> total-volume 0.0)
+                          (swap! features assoc (feature "butterfly_times_volume")
+                                 (* (get @features (feature "butterfly_spread")) total-volume)))))))))
+            (when (>= (count expirations) 2)
+              (let [far-exp (last expirations)
+                    near-call (row-for atm-strike nearest-exp "C")
+                    far-call (row-for atm-strike far-exp "C")
+                    near-put (row-for atm-strike nearest-exp "P")
+                    far-put (row-for atm-strike far-exp "P")
+                    near-call-mid (if near-call (mid near-call) ##NaN)
+                    far-call-mid (if far-call (mid far-call) ##NaN)
+                    near-put-mid (if near-put (mid near-put) ##NaN)
+                    far-put-mid (if far-put (mid far-put) ##NaN)]
+                (when (and (math/isfinite near-call-mid) (math/isfinite far-call-mid) (> far-call-mid 0.0))
+                  (let [term (/ near-call-mid far-call-mid)]
+                    (swap! features assoc (feature "term_structure_slope") term
+                           (feature "term_structure_squared") (* term term))
+                    (when (contains? @features (feature "skew_proxy"))
+                      (swap! features assoc (feature "skew_times_term_structure")
+                             (* (get @features (feature "skew_proxy")) term)))))
+                (when (and (math/isfinite near-put-mid) (math/isfinite far-put-mid) (> far-put-mid 0.0))
+                  (swap! features assoc (feature "near_far_put_ratio") (/ near-put-mid far-put-mid)))))
+            (when (and (math/isfinite call-mid) (> dte 0.0))
+              (let [t-years (/ dte (* 252.0 390.0))]
+                (when (> t-years 0.0)
+                  (let [iv (/ call-mid (* 0.4 spy (math/sqrt t-years)))]
+                    (when (math/isfinite iv)
+                      (swap! features assoc (feature "atm_implied_vol") iv
+                             (feature "iv_squared") (* iv iv)
+                             (feature "dte_times_iv") (* dte iv)
+                             (feature "moneyness_times_iv") (* moneyness iv))
+                      (when (math/isfinite call-spread)
+                        (swap! features assoc (feature "iv_times_spread") (* iv call-spread)))
+                      (when (contains? @features (feature "spread_ratio_squared"))
+                        (swap! features assoc (feature "spread_skew")
+                               (* (get @features (feature "spread_ratio_squared")) iv)))
+                      (when (contains? @features (feature "put_call_volume_ratio"))
+                        (swap! features assoc (feature "volume_ratio_times_iv")
+                               (* (get @features (feature "put_call_volume_ratio")) iv))))))))
+            (finite-map @features supported-option-features))))))))
+
+(defn compute-spy-option-features [chain-json]
+  (compute-option-features "SPY" chain-json))
+
+(defn compute-v2-grid-features [grids]
+  (let [arr0 (numpy/asarray grids ** :dtype numpy/float64)
+        arr (if (= (.-ndim arr0) 3) (.reshape arr0 (+ #py (1) (.-shape arr0))) arr0)]
+    (if (or (not= (.-ndim arr) 4) (= (.__getitem__ (.-shape arr) 0) 0))
+      {}
+      (let [iv (.__getitem__ arr #py ((slice nil nil) 0 (slice nil nil) (slice nil nil)))
+            delta (.__getitem__ arr #py ((slice nil nil) 1 (slice nil nil) (slice nil nil)))
+            vix-proxy (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 0 2))) ** :axis #py (1 2))
+            near-iv (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 0 2))) ** :axis #py (1 2))
+            far-iv (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 5 8))) ** :axis #py (1 2))
+            put-sum (numpy/sum (numpy/where (< delta 0.0) iv 0.0) ** :axis #py (1 2))
+            call-sum (numpy/sum (numpy/where (> delta 0.0) iv 0.0) ** :axis #py (1 2))
+            put-call-ratio (/ put-sum (numpy/where (> call-sum 0.0) call-sum 1.0))
+            i (dec (.__getitem__ (.-shape arr) 0))
+            lag5 (max 0 (- i 5))
+            lag20 (max 0 (- i 20))]
+        (finite-map {"vix_proxy" (float (.__getitem__ vix-proxy i))
+                     "vix_term_slope" (float (- (.__getitem__ near-iv i) (.__getitem__ far-iv i)))
+                     "put_call_ratio" (float (.__getitem__ put-call-ratio i))
+                     "vix_momentum_5" (float (- (.__getitem__ vix-proxy i) (.__getitem__ vix-proxy lag5)))
+                     "vix_momentum_20" (float (- (.__getitem__ vix-proxy i) (.__getitem__ vix-proxy lag20)))}
+                    supported-v2-grid-features)))))
+
+(defn compute-v2-grid-feature-arrays
+  "Training-cache version of the Steve V2 grid formulas.
+
+  Unlike `compute-v2-grid-features`, this returns one full-length vector per
+  feature so historical cache construction does not need to execute the legacy
+  Python add_features.py helper."
+  [grids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float64)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (let [n (.__getitem__ (.-shape arr) 0)
+          iv (.__getitem__ arr #py ((slice nil nil) 0 (slice nil nil) (slice nil nil)))
+          delta (.__getitem__ arr #py ((slice nil nil) 1 (slice nil nil) (slice nil nil)))
+          vix-proxy (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 0 2))) ** :axis #py (1 2))
+          near-iv (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 0 2))) ** :axis #py (1 2))
+          far-iv (numpy/mean (.__getitem__ iv #py ((slice nil nil) (slice 9 12) (slice 5 8))) ** :axis #py (1 2))
+          put-sum (numpy/sum (numpy/where (< delta 0.0) iv 0.0) ** :axis #py (1 2))
+          call-sum (numpy/sum (numpy/where (> delta 0.0) iv 0.0) ** :axis #py (1 2))
+          put-call-ratio (/ put-sum (numpy/where (> call-sum 0.0) call-sum 1.0))
+          momentum-5 (numpy/empty n ** :dtype numpy/float32)
+          momentum-20 (numpy/empty n ** :dtype numpy/float32)]
+      (when (> n 0)
+        (.__setitem__ momentum-5 0 0.0)
+        (.__setitem__ momentum-20 0 0.0))
+      (doseq [i (range 1 n)]
+        (.__setitem__ momentum-5 i (- (.__getitem__ vix-proxy i)
+                                      (.__getitem__ vix-proxy (max 0 (- i 5)))))
+        (.__setitem__ momentum-20 i (- (.__getitem__ vix-proxy i)
+                                       (.__getitem__ vix-proxy (max 0 (- i 20))))))
+      {"vix_proxy" (.astype vix-proxy numpy/float32)
+       "vix_term_slope" (.astype (- near-iv far-iv) numpy/float32)
+       "put_call_ratio" (.astype put-call-ratio numpy/float32)
+       "vix_momentum_5" momentum-5
+       "vix_momentum_20" momentum-20})))
+
+(defn rolling-sample-std
+  "Pandas rolling(...).std() equivalent for one vector with min_periods=1.
+  A one-observation window is NaN because pandas uses ddof=1 by default."
+  [values window]
+  (let [arr (numpy/asarray values ** :dtype numpy/float64)
+        n (len arr)
+        out (numpy/empty n ** :dtype numpy/float32)]
+    (doseq [i (range n)]
+      (let [start (max 0 (inc (- i window)))
+            segment (.__getitem__ arr (slice start (inc i)))
+            value (if (< (len segment) 2)
+                    ##NaN
+                    (float (numpy/std segment ** :ddof 1)))]
+        (.__setitem__ out i value)))
+    out))
+
+(defn compute-realized-vol-feature-arrays
+  "Training-cache version of add_features.py compute_vol_features."
+  [spy-prices]
+  (let [prices (numpy/asarray spy-prices ** :dtype numpy/float64)
+        n (len prices)
+        log-ret (numpy/empty n ** :dtype numpy/float64)]
+    (when (> n 0)
+      (.__setitem__ log-ret 0 0.0))
+    (when (> n 1)
+      (.__setitem__ log-ret (slice 1 nil)
+                    (numpy/log (/ (.__getitem__ prices (slice 1 nil))
+                                  (numpy/maximum (.__getitem__ prices (slice nil -1)) 1.0e-8)))))
+    (let [rv20 (rolling-sample-std log-ret 20)
+          rv60 (rolling-sample-std log-ret 60)]
+      {"realized_vol_20" rv20
+       "realized_vol_60" rv60
+       "vol_ratio" (.astype (/ rv20 (numpy/maximum rv60 1.0e-8)) numpy/float32)})))
+
+(defn safe-last-number [rows key default]
+  (if (empty? rows)
+    default
+    (try
+      (let [num (float (mget (last rows) key default))]
+        (if (math/isfinite num) num default))
+      (catch python/Exception _ default))))
+
+(defn numeric-series [rows key fallback-key default]
+  (numpy/asarray
+   (python/list
+    (map (fn [row]
+           (try
+             (let [value (or (mget row key) (when fallback-key (mget row fallback-key)) default)
+                   num (float value)]
+               (if (math/isfinite num) num default))
+             (catch python/Exception _ default)))
+         rows))
+   ** :dtype numpy/float64))
+
+(defn finite-or-zero [value]
+  (try
+    (let [num (float value)]
+      (if (math/isfinite num) num 0.0))
+    (catch python/Exception _ 0.0)))
+
+(defn rolling-mean-last [arr window]
+  (let [n (len arr)]
+    (if (< n window)
+      0.0
+      (finite-or-zero (numpy/mean (.__getitem__ arr (slice (- n window) nil)))))))
+
+(defn rolling-std-last [arr window]
+  (let [n (len arr)]
+    (if (< n window)
+      0.0
+      (finite-or-zero (numpy/std (.__getitem__ arr (slice (- n window) nil)) ** :ddof 1)))))
+
+(declare ewm-adjusted-series)
+
+(defn ewm-adjusted-last [arr span min-periods]
+  (let [series (ewm-adjusted-series arr span min-periods)]
+    (if (zero? (len series)) 0.0 (finite-or-zero (.__getitem__ series -1)))))
+
+(defn ewm-adjusted-series [arr span min-periods]
+  (let [n (len arr)
+        out (numpy/zeros n ** :dtype numpy/float64)
+        alpha (/ 2.0 (+ span 1.0))
+        values (numpy/asarray arr ** :dtype numpy/float64)]
+    (doseq [i (range n)]
+      (when (>= (inc i) min-periods)
+        (let [segment (.__getitem__ values (slice 0 (inc i)))
+              indexes (numpy/arange (inc i))
+              weights (numpy/power (- 1.0 alpha) (- i indexes))
+              mask (numpy/isfinite segment)
+              denom (numpy/sum (.__getitem__ weights mask))]
+          (.__setitem__ out i
+                        (if (> denom 0.0)
+                          (/ (numpy/sum (* (.__getitem__ segment mask) (.__getitem__ weights mask))) denom)
+                          ##NaN)))))
+    out))
+
+(defn ewm-com-last [arr com min-periods]
+  (let [n (len arr)]
+    (if (< n min-periods)
+      0.0
+      (let [alpha (/ 1.0 (+ com 1.0))
+            indexes (numpy/arange n)
+            weights (numpy/power (- 1.0 alpha) (- (dec n) indexes))
+            values (numpy/asarray arr ** :dtype numpy/float64)
+            mask (numpy/isfinite values)
+            denom (numpy/sum (.__getitem__ weights mask))]
+        (if (> denom 0.0)
+          (finite-or-zero (/ (numpy/sum (* (.__getitem__ values mask) (.__getitem__ weights mask))) denom))
+          0.0)))))
+
+(defn rsi-last [close period]
+  (let [n (len close)]
+    (if (< n (inc period))
+      0.0
+      (let [delta (numpy/diff close)
+            gains (numpy/maximum delta 0.0)
+            losses (numpy/maximum (- delta) 0.0)
+            avg-gain (ewm-com-last gains (dec period) period)
+            avg-loss (ewm-com-last losses (dec period) period)]
+        (if (<= avg-loss 1.0e-12)
+          100.0
+          (let [rs (/ avg-gain avg-loss)]
+            (finite-or-zero (- 100.0 (/ 100.0 (+ 1.0 rs))))))))))
+
+(defn bollinger-last [close window output]
+  (if (< (len close) window)
+    0.0
+    (let [segment (.__getitem__ close (slice (- (len close) window) nil))
+          middle (float (numpy/mean segment))
+          std (float (numpy/std segment ** :ddof 1))
+          upper (+ middle (* 2.0 std))
+          lower (- middle (* 2.0 std))]
+      (case output
+        "upper" upper
+        "lower" lower
+        "bandwidth" (if (> (abs middle) 1.0e-12) (/ (- upper lower) middle) 0.0)
+        middle))))
+
+(defn cci-last [high low close period]
+  (let [n (len close)]
+    (if (< n (* 2 period))
+      0.0
+      (let [tp (/ (+ high low close) 3.0)
+            sma-tp (rolling-mean-last tp period)
+            recent (.__getitem__ tp (slice (- n period) nil))
+            mean-dev (float (numpy/mean (numpy/abs (- recent sma-tp))))
+            denom (* 0.015 mean-dev)]
+        (if (> (abs denom) 1.0e-12)
+          (finite-or-zero (/ (- (float (.__getitem__ tp -1)) sma-tp) denom))
+          0.0)))))
+
+(defn true-range-series [high low close]
+  (let [n (len close)
+        out (numpy/zeros n ** :dtype numpy/float64)]
+    (doseq [i (range n)]
+      (if (= i 0)
+        (.__setitem__ out i (- (float (.__getitem__ high i)) (float (.__getitem__ low i))))
+        (let [h (float (.__getitem__ high i))
+              l (float (.__getitem__ low i))
+              pc (float (.__getitem__ close (dec i)))]
+          (.__setitem__ out i (max (- h l) (abs (- h pc)) (abs (- l pc)))))))
+    out))
+
+(defn adx-like-last [high low close period output]
+  (let [n (len close)]
+    (if (< n (inc period))
+      0.0
+      (let [up (- (.__getitem__ high (slice 1 nil)) (.__getitem__ high (slice nil -1)))
+            down (- (.__getitem__ low (slice nil -1)) (.__getitem__ low (slice 1 nil)))
+            plus-dm (numpy/where (numpy/logical_and (> up down) (> up 0.0)) up 0.0)
+            minus-dm (numpy/where (numpy/logical_and (> down up) (> down 0.0)) down 0.0)
+            tr (.__getitem__ (true-range-series high low close) (slice 1 nil))
+            atr (ewm-com-last tr (dec period) period)
+            smooth-plus (ewm-com-last plus-dm (dec period) period)
+            smooth-minus (ewm-com-last minus-dm (dec period) period)
+            plus-di (if (> atr 1.0e-12) (* 100.0 (/ smooth-plus atr)) 0.0)
+            minus-di (if (> atr 1.0e-12) (* 100.0 (/ smooth-minus atr)) 0.0)
+            dx (if (> (+ plus-di minus-di) 1.0e-12)
+                 (* 100.0 (/ (abs (- plus-di minus-di)) (+ plus-di minus-di)))
+                 0.0)]
+        (case output
+          "plus_di" plus-di
+          "minus_di" minus-di
+          "dx" dx
+          dx)))))
+
+(defn wavetrend-last [high low close output]
+  (let [ap (/ (+ high low close) 3.0)
+        esa (ewm-adjusted-series ap 10 10)
+        abs-dev (numpy/abs (- ap esa))
+        d (ewm-adjusted-series abs-dev 10 10)
+        denom (* 0.015 d)
+        ci (numpy/full (len ap) ##NaN ** :dtype numpy/float64)
+        valid (numpy/logical_and (numpy/isfinite denom) (> (numpy/abs denom) 1.0e-12))
+        _ (when (bool (numpy/any valid))
+            (.__setitem__ ci valid
+                          (/ (.__getitem__ (- ap esa) valid)
+                             (.__getitem__ denom valid))))
+        wt1 (ewm-adjusted-series ci 21 21)
+        wt2 (rolling-mean-last wt1 4)]
+    (case output
+      "wt1" (if (zero? (len wt1)) 0.0 (finite-or-zero (.__getitem__ wt1 -1)))
+      "wt2" wt2
+      0.0)))
+
+(defn vwap-last [rows high low close volume]
+  (let [n (len close)]
+    (if (= n 0)
+      0.0
+      (let [last-date (try (.date (parse-time (mget (last rows) "time")))
+                           (catch python/Exception _ nil))
+            idxs (vec (keep-indexed
+                       (fn [idx row]
+                         (try
+                           (when (or (nil? last-date)
+                                     (= last-date (.date (parse-time (mget row "time")))))
+                             idx)
+                           (catch python/Exception _ idx)))
+                       rows))
+            idx-arr (numpy/asarray (python/list idxs) ** :dtype numpy/int64)
+            tp (/ (+ high low close) 3.0)
+            vols (.__getitem__ volume idx-arr)
+            prices (.__getitem__ tp idx-arr)
+            denom (float (numpy/sum vols))]
+        (if (> denom 1.0e-12)
+          (finite-or-zero (/ (numpy/sum (* prices vols)) denom))
+          0.0)))))
+
+(defn spread-relative [bid ask]
+  (let [mid (/ (+ bid ask) 2.0)]
+    (if (> (abs mid) 1.0e-12) (* 100.0 (/ (- ask bid) mid)) 0.0)))
+
+(defn compute-live-base-feature-map [bar-buffers]
+  (let [features (atom {})]
+    (doseq [sym all-instruments]
+      (let [buf (mget bar-buffers sym)
+            rows (vec (if (nil? buf) [] buf))]
+        (when (seq rows)
+          (let [stock? (contains? (set stock-instruments) sym)
+                open (numeric-series rows "open" "close" 0.0)
+                high (numeric-series rows "high" "close" 0.0)
+                low (numeric-series rows "low" "close" 0.0)
+                close (numeric-series rows "close" nil 0.0)
+                volume (numeric-series rows "volume" nil 0.0)
+                bid-val (safe-last-number rows "bid" (float (.__getitem__ close -1)))
+                ask-val (safe-last-number rows "ask" (float (.__getitem__ close -1)))
+                trade-count (safe-last-number rows "trade_count" 0.0)]
+            (if stock?
+              (do
+                (swap! features assoc
+                       (str sym "_price_open") (float (.__getitem__ open -1))
+                       (str sym "_price_high") (float (.__getitem__ high -1))
+                       (str sym "_price_low") (float (.__getitem__ low -1)))
+                (when (not= sym "SPY")
+                  (swap! features assoc (str sym "_price_close") (float (.__getitem__ close -1))))
+                (doseq [suffix ["open" "high" "low" "close"]]
+                  (swap! features assoc
+                         (str sym "_bid_" suffix) bid-val
+                         (str sym "_ask_" suffix) ask-val))
+                (swap! features assoc
+                       (str sym "_bid_avg") bid-val
+                       (str sym "_bid_count") trade-count
+                       (str sym "_bid_tot") (float (.__getitem__ volume -1))
+                       (str sym "_ask_avg") ask-val
+                       (str sym "_ask_count") trade-count
+                       (str sym "_ask_tot") (float (.__getitem__ volume -1))
+                       (str sym "_trade_avg") (float (.__getitem__ close -1))
+                       (str sym "_trade_count") trade-count
+                       (str sym "_trade_tot") (float (.__getitem__ volume -1))))
+              (swap! features assoc
+                     (str sym "_price_open") (float (.__getitem__ open -1))
+                     (str sym "_price_high") (float (.__getitem__ high -1))
+                     (str sym "_price_low") (float (.__getitem__ low -1))
+                     (str sym "_price_close") (float (.__getitem__ close -1))))
+            (swap! features assoc
+                   (str sym "_sma_close_10") (rolling-mean-last close 10)
+                   (str sym "_ema_close_9") (ewm-adjusted-last close 9 9)
+                   (str sym "_ema_close_21") (ewm-adjusted-last close 21 21)
+                   (str sym "_rsi_14") (rsi-last close 14)
+                   (str sym "_bb_upper_20") (bollinger-last close 20 "upper")
+                   (str sym "_bb_lower_20") (bollinger-last close 20 "lower")
+                   (str sym "_bb_bandwidth_20") (bollinger-last close 20 "bandwidth")
+                   (str sym "_cci_20") (cci-last high low close 20)
+                   (str sym "_adx_14") (adx-like-last high low close 14 "adx")
+                   (str sym "_plus_di_14") (adx-like-last high low close 14 "plus_di")
+                   (str sym "_minus_di_14") (adx-like-last high low close 14 "minus_di")
+                   (str sym "_wt1_10_21") (wavetrend-last high low close "wt1")
+                   (str sym "_wt2_10_21") (wavetrend-last high low close "wt2"))
+            (when stock?
+              (swap! features assoc
+                     (str sym "_vwap") (vwap-last rows high low close volume)
+                     (str sym "_spread_relative") (spread-relative bid-val ask-val)
+                     (str sym "_spread_raw") (- ask-val bid-val)))))))
+    @features))
+
+(defn hmm-predict-state [obs hmm-model]
+  (let [means (mget hmm-model "means")
+        covars (mget hmm-model "covars")
+        best-state (atom 0)
+        best-ll (atom -1.0e300)]
+    (when (and means covars)
+      (doseq [s (range 3)]
+        (try
+          (let [diff (- obs (.__getitem__ means s))
+                cov-inv ((.-inv (.-linalg numpy)) (.__getitem__ covars s))
+                ll (float (* -0.5 (numpy/matmul (numpy/matmul diff cov-inv) diff)))]
+            (when (> ll @best-ll)
+              (reset! best-ll ll)
+              (reset! best-state s)))
+          (catch python/Exception _ nil))))
+    @best-state))
+
+(defn compute-live-v2-feature-map [grids-history bar-buffers hmm-model]
+  (let [features (atom {})
+        grids (vec (or grids-history []))]
+    (if (seq grids)
+      (swap! features merge (compute-v2-grid-features grids))
+      (swap! features assoc
+             "vix_proxy" 0.0
+             "vix_term_slope" 0.0
+             "put_call_ratio" 0.0
+             "vix_momentum_5" 0.0
+             "vix_momentum_20" 0.0))
+    (let [spy-rows (vec (or (mget bar-buffers "SPY") []))]
+      (if (>= (count spy-rows) 20)
+        (let [prices (numeric-series spy-rows "close" nil 0.0)
+              prev (numpy/maximum (.__getitem__ prices (slice nil -1)) 1.0e-10)
+              log-rets (numpy/log (/ (.__getitem__ prices (slice 1 nil)) prev))
+              n (len log-rets)
+              rv20 (if (>= n 20) (float (numpy/std (.__getitem__ log-rets (slice (- n 20) nil)))) 0.0)
+              rv60 (if (>= n 60) (float (numpy/std (.__getitem__ log-rets (slice (- n 60) nil)))) rv20)
+              spy-rv (if (>= n 60)
+                       (* (float (numpy/std (.__getitem__ log-rets (slice (- n 60) nil)) ** :ddof 1))
+                          (math/sqrt (* 252.0 390.0)))
+                       0.0)]
+          (swap! features assoc
+                 "realized_vol_20" rv20
+                 "realized_vol_60" rv60
+                 "vol_ratio" (/ rv20 (max rv60 1.0e-10))
+                 "spy_rv_60m" spy-rv)
+          (if (and hmm-model (>= (count spy-rows) 2))
+            (let [daily-return (float (math/log (/ (float (.__getitem__ prices -1))
+                                                   (max (float (.__getitem__ prices -2)) 1.0e-10))))
+                  daily-vol (float (numpy/std (.__getitem__ log-rets (slice (- n (min 390 n)) nil))))
+                  state (hmm-predict-state (numpy/asarray [daily-return daily-vol] ** :dtype numpy/float64) hmm-model)]
+              (swap! features assoc
+                     "hmm_state_0" (if (= state 0) 1.0 0.0)
+                     "hmm_state_1" (if (= state 1) 1.0 0.0)
+                     "hmm_state_2" (if (= state 2) 1.0 0.0)))
+            (swap! features assoc "hmm_state_0" 0.0 "hmm_state_1" 0.0 "hmm_state_2" 0.0)))
+        (swap! features assoc
+               "realized_vol_20" 0.0 "realized_vol_60" 0.0 "vol_ratio" 0.0 "spy_rv_60m" 0.0
+               "hmm_state_0" 0.0 "hmm_state_1" 0.0 "hmm_state_2" 0.0)))
+    @features))
+
+(declare compute-live-v3-feature-arrays)
+
+(defn latest-feature-values [feature-arrays]
+  ;; V3 builders produce one value per grid-history row. Live inference needs
+  ;; the final observation, not the array object (which float conversion would
+  ;; otherwise reject and silently leave at zero in the output vector).
+  (into {}
+        (for [[name values] feature-arrays]
+          (let [arr (numpy/asarray values)]
+            [name (if (zero? (.-size arr))
+                    0.0
+                    (finite-or-zero (.__getitem__ arr -1)))]))))
+
+(defn compute-live-feature-map [bar-buffers grids-history hmm-model dictionary-atoms]
+  (merge (compute-live-base-feature-map bar-buffers)
+         (compute-live-v2-feature-map grids-history bar-buffers hmm-model)
+         (if (seq (vec (or grids-history [])))
+           (latest-feature-values (compute-live-v3-feature-arrays grids-history dictionary-atoms))
+           {})))
+
+(defn compute-live-feature-vector [feature-names bar-buffers grids-history hmm-model dictionary-atoms]
+  (let [features (compute-live-feature-map bar-buffers grids-history hmm-model dictionary-atoms)
+        out (numpy/zeros (count feature-names) ** :dtype numpy/float32)]
+    (doseq [[idx name] (map-indexed vector feature-names)]
+      (let [value (get features name)]
+        (when (some? value)
+          (try
+            (let [numeric (float value)]
+              (when (math/isfinite numeric)
+                (.__setitem__ out idx numeric)))
+            (catch python/Exception _ nil)))))
+    out))
+
+(defn standardize-feature-columns
+  "Stack feature arrays in sorted-key order and z-score them using train-mask.
+  Mirrors add_features.py standardize_features, including NaN->0 before stats
+  and skipping one-hot HMM state columns when requested."
+  ([feat-dict train-mask] (standardize-feature-columns feat-dict train-mask #{}))
+  ([feat-dict train-mask skip-keys]
+   (let [names (vec (sort (keys feat-dict)))
+         mask (numpy/asarray train-mask ** :dtype builtins/bool)
+         cols (python/list)]
+     (doseq [name names]
+       (let [arr0 (.astype (numpy/asarray (get feat-dict name)) numpy/float32)
+             arr (numpy/nan_to_num arr0 ** :nan 0.0)
+             out (if (contains? skip-keys name)
+                   arr
+                   (let [train-arr (.__getitem__ arr mask)
+                         mu (float (numpy/mean train-arr))
+                         std0 (float (numpy/std train-arr))
+                         std (if (< std0 1.0e-8) 1.0 std0)]
+                     (/ (- arr mu) std)))]
+         (.append cols out)))
+     (numpy/column_stack cols))))
+
+(defn count-components
+  "Count four-neighbor connected components in a 2D boolean mask."
+  [mask]
+  (let [visited (numpy/zeros_like mask ** :dtype builtins/bool)
+        rows (.__getitem__ (.-shape mask) 0)
+        cols (.__getitem__ (.-shape mask) 1)
+        n-components (atom 0)]
+    (doseq [r (range rows)
+            c (range cols)]
+      (when (and (bool (.__getitem__ mask #py (r c)))
+                 (not (bool (.__getitem__ visited #py (r c)))))
+        (swap! n-components inc)
+        (loop [stack [[r c]]]
+          (when (seq stack)
+            (let [[cr cc] (peek stack)
+                  rest-stack (pop stack)]
+              (if (or (< cr 0) (>= cr rows) (< cc 0) (>= cc cols)
+                      (bool (.__getitem__ visited #py (cr cc)))
+                      (not (bool (.__getitem__ mask #py (cr cc)))))
+                (recur rest-stack)
+                (do
+                  (.__setitem__ visited #py (cr cc) true)
+                  (recur (conj rest-stack [(dec cr) cc] [(inc cr) cc] [cr (dec cc)] [cr (inc cc)])))))))))
+    @n-components))
+
+(defn temporal-delta-5
+  ([raw] (temporal-delta-5 raw nil))
+  ([raw day-ids]
+   (let [arr (numpy/asarray raw ** :dtype numpy/float32)
+         out (numpy/zeros_like arr)]
+     (when (>= (.__getitem__ (.-shape arr) 0) 6)
+       (.__setitem__ out (slice 5 nil) (- (.__getitem__ arr (slice 5 nil))
+                                          (.__getitem__ arr (slice nil -5)))))
+     (when (some? day-ids)
+       (doseq [i (range 1 (.__getitem__ (.-shape arr) 0))]
+         (when (not= (str (.__getitem__ day-ids i)) (str (.__getitem__ day-ids (dec i))))
+           (.__setitem__ out i 0.0))))
+     out)))
+
+(defn compute-tda-feature-arrays
+  "Basilisp port of add_advanced_features.py compute_tda_features."
+  [grids day-ids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float32)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (let [n-bars (.__getitem__ (.-shape arr) 0)
+          n-greeks 6
+          n-feat 6
+          raw (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)]
+      (doseq [gi (range n-greeks)]
+        (let [col-base (* gi n-feat)]
+          (doseq [bi (range n-bars)]
+            (let [surface (.__getitem__ arr #py (bi gi (slice nil nil) (slice nil nil)))
+                  vmin (float (numpy/min surface))
+                  vmax (float (numpy/max surface))
+                  span (- vmax vmin)
+                  diff-h (numpy/abs (numpy/diff surface ** :axis 0))
+                  diff-v (numpy/abs (numpy/diff surface ** :axis 1))
+                  rough (/ (+ (float (numpy/mean diff-h)) (float (numpy/mean diff-v))) 2.0)]
+              (.__setitem__ raw #py (bi (+ col-base 3)) span)
+              (.__setitem__ raw #py (bi (+ col-base 4)) rough)
+              (when (>= span 1.0e-8)
+                (let [thresholds [(+ vmin (* 0.25 span))
+                                  (+ vmin (* 0.50 span))
+                                  (+ vmin (* 0.75 span))]
+                      betti (atom 0)]
+                  (doseq [[ti threshold] (map-indexed vector thresholds)]
+                    (let [n-comp (count-components (>= surface threshold))]
+                      (.__setitem__ raw #py (bi (+ col-base ti)) n-comp)
+                      (swap! betti + n-comp)))
+                  (.__setitem__ raw #py (bi (+ col-base 5)) (/ @betti 3.0))))))))
+      (let [raw-clean (numpy/nan_to_num raw ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            delta-5 (temporal-delta-5 raw-clean day-ids)
+            suffixes ["n_comp_low" "n_comp_mid" "n_comp_high"
+                      "persistence_range" "roughness" "betti_auc"]
+            result (atom {})]
+        (doseq [gi (range n-greeks)
+                fi (range n-feat)
+                :let [col (+ (* gi n-feat) fi)
+                      base (str "tda_" (nth greek-names gi) "_" (nth suffixes fi))]]
+          (swap! result assoc base (.__getitem__ raw-clean #py ((slice nil nil) col)))
+          (swap! result assoc (str base "_d5") (.__getitem__ delta-5 #py ((slice nil nil) col))))
+        @result))))
+
+(defn rolling-mean-2d
+  "Pandas DataFrame(...).rolling(window, min_periods=1).mean() equivalent."
+  [values window]
+  (let [arr (numpy/asarray values ** :dtype numpy/float64)
+        n (.__getitem__ (.-shape arr) 0)
+        out (numpy/empty_like arr)]
+    (doseq [i (range n)]
+      (let [start (max 0 (inc (- i window)))
+            segment (.__getitem__ arr (slice start (inc i)))]
+        (.__setitem__ out i (numpy/mean segment ** :axis 0))))
+    out))
+
+(defn center-of-mass-shift [curr prev size]
+  (let [abs-curr (numpy/abs curr)
+        abs-prev (numpy/abs prev)
+        total-curr (float (numpy/sum abs-curr))
+        total-prev (float (numpy/sum abs-prev))]
+    (if (and (> total-curr 1.0e-8) (> total-prev 1.0e-8))
+      (- (float (numpy/average (numpy/arange size) ** :weights abs-curr))
+         (float (numpy/average (numpy/arange size) ** :weights abs-prev)))
+      0.0)))
+
+(defn compute-wasserstein-feature-arrays
+  "Basilisp port of add_advanced_features.py compute_wasserstein_features."
+  [grids day-ids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float32)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (let [n-bars (.__getitem__ (.-shape arr) 0)
+          n-greeks 6
+          n-feat 6
+          raw (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)]
+      (doseq [gi (range n-greeks)]
+        (let [col-base (* gi n-feat)
+              surfaces (.__getitem__ arr #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+              flat (.astype (.reshape surfaces #py (n-bars -1)) numpy/float64)
+              trailing (rolling-mean-2d flat 30)
+              moneyness-marginal (numpy/sum surfaces ** :axis 2)
+              dte-marginal (numpy/sum surfaces ** :axis 1)]
+          (doseq [bi (range 1 n-bars)]
+            (when (= (str (.__getitem__ day-ids bi)) (str (.__getitem__ day-ids (dec bi))))
+              (let [curr-sorted (numpy/sort (.__getitem__ flat bi))
+                    prev-sorted (numpy/sort (.__getitem__ flat (dec bi)))
+                    trail-sorted (numpy/sort (.__getitem__ trailing bi))
+                    w1-consec (float (numpy/mean (numpy/abs (- curr-sorted prev-sorted))))
+                    w1-trailing (float (numpy/mean (numpy/abs (- curr-sorted trail-sorted))))
+                    w1-ratio (/ w1-consec (+ w1-trailing 1.0e-10))
+                    flow-moneyness (center-of-mass-shift (.__getitem__ moneyness-marginal bi)
+                                                         (.__getitem__ moneyness-marginal (dec bi))
+                                                         21)
+                    flow-dte (center-of-mass-shift (.__getitem__ dte-marginal bi)
+                                                   (.__getitem__ dte-marginal (dec bi))
+                                                   8)
+                    surface-div (float (numpy/sum (numpy/abs (- (.__getitem__ flat bi)
+                                                               (.__getitem__ flat (dec bi))))))]
+                (.__setitem__ raw #py (bi col-base) w1-consec)
+                (.__setitem__ raw #py (bi (+ col-base 1)) w1-trailing)
+                (.__setitem__ raw #py (bi (+ col-base 2)) w1-ratio)
+                (.__setitem__ raw #py (bi (+ col-base 3)) flow-moneyness)
+                (.__setitem__ raw #py (bi (+ col-base 4)) flow-dte)
+                (.__setitem__ raw #py (bi (+ col-base 5)) surface-div))))))
+      (let [raw-clean (numpy/nan_to_num raw ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            delta-5 (temporal-delta-5 raw-clean)
+            suffixes ["w1_consec" "w1_trailing" "w1_ratio"
+                      "flow_moneyness" "flow_dte" "surface_divergence"]
+            result (atom {})]
+        (doseq [gi (range n-greeks)
+                fi (range n-feat)
+                :let [col (+ (* gi n-feat) fi)
+                      base (str "wass_" (nth greek-names gi) "_" (nth suffixes fi))]]
+          (swap! result assoc base (.__getitem__ raw-clean #py ((slice nil nil) col)))
+          (swap! result assoc (str base "_d5") (.__getitem__ delta-5 #py ((slice nil nil) col))))
+        @result))))
+
+(defn reflect-index [idx size]
+  (loop [i idx]
+    (cond
+      (< i 0) (recur (- (- i) 1))
+      (>= i size) (recur (- (* 2 size) i 1))
+      :else i)))
+
+(defn gaussian-kernel [sigma]
+  (let [radius (int (+ (* 4.0 sigma) 0.5))
+        xs (range (- radius) (inc radius))
+        weights (vec (map (fn [x] (math/exp (/ (- (* x x)) (* 2.0 sigma sigma)))) xs))
+        total (reduce + weights)]
+    (vec (map #(/ % total) weights))))
+
+(defn gaussian-filter-2d-fallback
+  "Small separable Gaussian filter for the fixed 21x8 Greek surfaces.
+  Uses reflect-edge indexing when SciPy is not available in a development venv."
+  [surface sigma]
+  (let [arr (numpy/asarray surface ** :dtype numpy/float64)
+        rows (.__getitem__ (.-shape arr) 0)
+        cols (.__getitem__ (.-shape arr) 1)
+        kernel (gaussian-kernel sigma)
+        kernel-arr (numpy/asarray kernel ** :dtype numpy/float64)
+        radius (quot (count kernel) 2)
+        pad-cols (python/tuple [(python/tuple [0 0]) (python/tuple [radius radius])])
+        pad-rows (python/tuple [(python/tuple [radius radius]) (python/tuple [0 0])])
+        padded-cols (numpy/pad arr pad-cols ** :mode "reflect")
+        row-smoothed (numpy/vstack
+                      (python/list
+                       (for [r (range rows)]
+                         (numpy/convolve (.__getitem__ padded-cols r) kernel-arr ** :mode "valid"))))
+        padded-rows (numpy/pad row-smoothed pad-rows ** :mode "reflect")]
+    (numpy/column_stack
+     (python/list
+      (for [c (range cols)]
+        (numpy/convolve (.__getitem__ padded-rows #py ((slice nil nil) c)) kernel-arr ** :mode "valid"))))))
+
+(defn gaussian-filter-2d [surface sigma]
+  ;; Production FeatureEngine uses scipy.ndimage.gaussian_filter. Prefer that
+  ;; exact implementation whenever the reference runtime is present; retain a
+  ;; deterministic fallback so formula-only unit tests do not require SciPy.
+  (try
+    (let [ndimage (importlib/import_module "scipy.ndimage")]
+      (.gaussian_filter ndimage (numpy/asarray surface ** :dtype numpy/float64) ** :sigma sigma))
+    (catch python/Exception _
+      (gaussian-filter-2d-fallback surface sigma))))
+
+(defn corrcoef-1d [a b]
+  (let [x (numpy/asarray a ** :dtype numpy/float64)
+        y (numpy/asarray b ** :dtype numpy/float64)
+        sx (float (numpy/std x))
+        sy (float (numpy/std y))]
+    (if (and (> sx 1.0e-8) (> sy 1.0e-8))
+      (let [xm (- x (float (numpy/mean x)))
+            ym (- y (float (numpy/mean y)))]
+        (float (/ (numpy/mean (* xm ym)) (* sx sy))))
+      0.0)))
+
+(defn scattering-single [surface]
+  (let [arr (numpy/asarray surface ** :dtype numpy/float64)
+        scales [[1.0 "fine"] [2.0 "med"] [4.0 "coarse"]]
+        result (atom {})
+        responses (atom [])]
+    (doseq [[sigma name] scales]
+      (let [smoothed (gaussian-filter-2d arr sigma)
+            detail (- arr smoothed)
+            detail-abs (numpy/abs detail)]
+        (swap! result assoc
+               (str name "_mean") (float (numpy/mean detail-abs))
+               (str name "_energy") (float (numpy/sqrt (numpy/mean (* detail-abs detail-abs)))))
+        (swap! responses conj (.flatten detail))))
+    (swap! result assoc "cross_scale_corr" (corrcoef-1d (first @responses) (second @responses)))
+    @result))
+
+(defn compute-scattering-feature-arrays
+  "Basilisp port of add_advanced_features.py compute_scattering_features."
+  [grids day-ids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float32)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (let [n-bars (.__getitem__ (.-shape arr) 0)
+          n-greeks 6
+          n-feat 7
+          raw (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)
+          suffixes ["fine_mean" "fine_energy" "med_mean" "med_energy"
+                    "coarse_mean" "coarse_energy" "cross_scale_corr"]]
+      (doseq [gi (range n-greeks)]
+        (let [col-base (* gi n-feat)]
+          (doseq [bi (range n-bars)]
+            (let [vals (scattering-single (.__getitem__ arr #py (bi gi (slice nil nil) (slice nil nil))))]
+              (doseq [[fi suffix] (map-indexed vector suffixes)]
+                (.__setitem__ raw #py (bi (+ col-base fi)) (get vals suffix 0.0)))))))
+      (let [raw-clean (numpy/nan_to_num raw ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            delta-5 (temporal-delta-5 raw-clean)
+            result (atom {})]
+        (doseq [gi (range n-greeks)
+                fi (range n-feat)
+                :let [col (+ (* gi n-feat) fi)
+                      base (str "scat_" (nth greek-names gi) "_" (nth suffixes fi))]]
+          (swap! result assoc base (.__getitem__ raw-clean #py ((slice nil nil) col)))
+          (swap! result assoc (str base "_d5") (.__getitem__ delta-5 #py ((slice nil nil) col))))
+        @result))))
+
+(defn compute-dictionary-feature-arrays
+  "Artifact-backed dictionary feature computation matching live feature_engine.py.
+
+  The old historical script fit MiniBatchDictionaryLearning at runtime. The live
+  system instead uses exported `dictionary_atoms.npz` and a top-8 projection.
+  Using the artifact here removes the sklearn runtime dependency and gives the
+  parity pipeline the same deployable dictionary formula used at inference."
+  [grids dictionary-atoms]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float64)
+        components (numpy/asarray (get dictionary-atoms "components") ** :dtype numpy/float64)
+        train-mean (numpy/asarray (get dictionary-atoms "train_mean") ** :dtype numpy/float64)
+        train-std (numpy/asarray (get dictionary-atoms "train_std") ** :dtype numpy/float64)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (when (or (not= (python/tuple (.-shape components)) (python/tuple [64 1008]))
+              (not= (python/tuple (.-shape train-mean)) (python/tuple [1008]))
+              (not= (python/tuple (.-shape train-std)) (python/tuple [1008])))
+      (throw (python/ValueError
+              (str "dictionary_atoms must contain components (64,1008), train_mean (1008,), train_std (1008,); got "
+                   (.-shape components) " " (.-shape train-mean) " " (.-shape train-std)))))
+    (let [n-bars (.__getitem__ (.-shape arr) 0)
+          flat (.reshape arr #py (n-bars -1))
+          safe-std (numpy/where (< (numpy/abs train-std) 1.0e-8) 1.0 train-std)
+          normed (/ (- flat train-mean) safe-std)
+          code-cols (vec (for [_ (range 20)] (numpy/zeros n-bars ** :dtype numpy/float32)))
+          n-active (numpy/zeros n-bars ** :dtype numpy/float32)
+          recon-error (numpy/zeros n-bars ** :dtype numpy/float32)
+          top-weight (numpy/zeros n-bars ** :dtype numpy/float32)
+          entropy (numpy/zeros n-bars ** :dtype numpy/float32)]
+      (doseq [bi (range n-bars)]
+        (let [x (.__getitem__ normed bi)
+              codes (numpy/matmul x (.-T components))
+              top-idx (.__getitem__ (numpy/argsort (- (numpy/abs codes))) (slice nil 8))
+              sparse (numpy/zeros 64 ** :dtype numpy/float64)]
+          (.__setitem__ sparse top-idx (.__getitem__ codes top-idx))
+          (let [reconstructed (numpy/matmul sparse components)
+                residual (- x reconstructed)
+                err (float (numpy/sqrt (numpy/sum (* residual residual))))
+                sorted-codes (.__getitem__ sparse (numpy/argsort (- (numpy/abs sparse))))
+                active (numpy/abs sparse)
+                active-nz (.__getitem__ active (> active 1.0e-6))]
+            (doseq [ki (range 20)]
+              (.__setitem__ (nth code-cols ki) bi (float (.__getitem__ sorted-codes ki))))
+            (.__setitem__ n-active bi (float (len active-nz)))
+            (.__setitem__ recon-error bi err)
+            (.__setitem__ top-weight bi (float (numpy/max (numpy/abs sparse))))
+            (.__setitem__ entropy bi
+                          (if (> (len active-nz) 1)
+                            (let [p (/ active-nz (float (numpy/sum active-nz)))]
+                              (float (- (numpy/sum (* p (numpy/log (+ p 1.0e-10)))))))
+                            0.0)))))
+      (let [result (atom {"dict_n_active" n-active
+                          "dict_recon_error" recon-error
+                          "dict_top_weight" top-weight
+                          "dict_code_entropy" entropy
+                          ;; The frozen live feature contract emits zero for both
+                          ;; dictionary reconstruction deltas.
+                          "dict_recon_error_d5" (numpy/zeros n-bars ** :dtype numpy/float32)
+                          "dict_recon_error_d20" (numpy/zeros n-bars ** :dtype numpy/float32)})]
+        (doseq [ki (range 20)]
+          (swap! result assoc (str "dict_code_" ki) (nth code-cols ki)))
+        @result))))
+
+(defn live-wasserstein-single [curr prev trailing]
+  (let [cur-flat (.flatten (numpy/asarray curr ** :dtype numpy/float64))
+        prev-flat (.flatten (numpy/asarray prev ** :dtype numpy/float64))
+        trail-flat (.flatten (numpy/asarray trailing ** :dtype numpy/float64))
+        diff (- curr prev)
+        w1-consec (float (numpy/mean (numpy/abs (- cur-flat prev-flat))))
+        w1-trailing (float (numpy/mean (numpy/abs (- cur-flat trail-flat))))
+        w1-ratio (/ w1-consec (+ w1-trailing 1.0e-10))
+        flow-moneyness (float (numpy/mean (numpy/abs (numpy/diff diff ** :axis 0))))
+        flow-dte (float (numpy/mean (numpy/abs (numpy/diff diff ** :axis 1))))
+        surface-divergence (float (numpy/mean (numpy/abs diff)))]
+    [w1-consec w1-trailing w1-ratio flow-moneyness flow-dte surface-divergence]))
+
+(defn compute-live-wasserstein-feature-arrays
+  "Live Steve V2-compatible Wasserstein/flow formulas.
+
+  These intentionally differ from historical add_advanced_features.py:
+  live uses mean absolute surface deltas and roughness of the delta surface,
+  while the historical training script uses sorted W1 and center-of-mass flow."
+  [grids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float32)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (let [n-bars (.__getitem__ (.-shape arr) 0)
+          n-greeks 6
+          n-feat 6
+          raw (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)
+          delta-5 (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)
+          suffixes ["w1_consec" "w1_trailing" "w1_ratio"
+                    "flow_moneyness" "flow_dte" "surface_divergence"]]
+      (doseq [gi (range n-greeks)]
+        (let [surfaces (.__getitem__ arr #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+              col-base (* gi n-feat)]
+          (doseq [bi (range n-bars)]
+            (let [curr (.__getitem__ surfaces bi)
+                  prev (.__getitem__ surfaces (max 0 (dec bi)))
+                  start (max 0 (inc (- bi 30)))
+                  history (.__getitem__ surfaces (slice start (inc bi)))
+                  trailing (if (>= (.__getitem__ (.-shape history) 0) 30)
+                             (numpy/mean history ** :axis 0)
+                             prev)
+                  vals (live-wasserstein-single curr prev trailing)
+                  old (if (>= bi 5)
+                        (let [grid-5ago (.__getitem__ surfaces (- bi 5))]
+                          (live-wasserstein-single grid-5ago prev trailing))
+                        vals)]
+              (doseq [[fi value] (map-indexed vector vals)]
+                (.__setitem__ raw #py (bi (+ col-base fi)) value)
+                (.__setitem__ delta-5 #py (bi (+ col-base fi)) (- value (nth old fi))))))))
+      (let [raw-clean (numpy/nan_to_num raw ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            d5-clean (numpy/nan_to_num delta-5 ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            result (atom {})]
+        (doseq [gi (range n-greeks)
+                fi (range n-feat)
+                :let [col (+ (* gi n-feat) fi)
+                      base (str "wass_" (nth greek-names gi) "_" (nth suffixes fi))]]
+          (swap! result assoc base (.__getitem__ raw-clean #py ((slice nil nil) col)))
+          (swap! result assoc (str base "_d5") (.__getitem__ d5-clean #py ((slice nil nil) col))))
+        @result))))
+
+(defn live-scattering-single [surface]
+  (let [arr (numpy/asarray surface ** :dtype numpy/float64)
+        scales [[1.0 "fine"] [2.0 "med"] [4.0 "coarse"]]
+        result (atom {})
+        smoothed (atom [])]
+    (doseq [[sigma name] scales]
+      (let [smooth (gaussian-filter-2d arr sigma)
+            detail (- arr smooth)]
+        (swap! result assoc
+               (str name "_mean") (float (numpy/mean detail))
+               (str name "_energy") (float (numpy/sqrt (numpy/mean (* detail detail)))))
+        (swap! smoothed conj smooth)))
+    (let [fine (.flatten (- arr (first @smoothed)))
+          coarse (.flatten (- arr (nth @smoothed 2)))]
+      (swap! result assoc "cross_scale_corr" (corrcoef-1d fine coarse)))
+    @result))
+
+(defn compute-live-scattering-feature-arrays
+  "Live Steve V2-compatible scattering formulas.
+
+  Live keeps signed detail means and correlates fine/coarse details. The
+  historical training script used absolute details and fine/medium correlation."
+  [grids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float32)]
+    (when (or (not= (.-ndim arr) 4)
+              (not= (python/tuple (drop 1 (python/list (.-shape arr)))) (python/tuple [6 21 8])))
+      (throw (python/ValueError (str "grids must have shape (n, 6, 21, 8), got " (.-shape arr)))))
+    (let [n-bars (.__getitem__ (.-shape arr) 0)
+          n-greeks 6
+          n-feat 7
+          raw (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)
+          delta-5 (numpy/zeros #py (n-bars (* n-greeks n-feat)) ** :dtype numpy/float32)
+          suffixes ["fine_mean" "fine_energy" "med_mean" "med_energy"
+                    "coarse_mean" "coarse_energy" "cross_scale_corr"]]
+      (doseq [gi (range n-greeks)]
+        (let [col-base (* gi n-feat)]
+          (doseq [bi (range n-bars)]
+            (let [vals (live-scattering-single (.__getitem__ arr #py (bi gi (slice nil nil) (slice nil nil))))
+                  old-vals (if (>= bi 5)
+                             (live-scattering-single (.__getitem__ arr #py ((- bi 5) gi (slice nil nil) (slice nil nil))))
+                             vals)]
+              (doseq [[fi suffix] (map-indexed vector suffixes)]
+                (let [value (get vals suffix 0.0)
+                      old-value (get old-vals suffix 0.0)]
+                  (.__setitem__ raw #py (bi (+ col-base fi)) value)
+                  (.__setitem__ delta-5 #py (bi (+ col-base fi)) (- value old-value))))))))
+      (let [raw-clean (numpy/nan_to_num raw ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            d5-clean (numpy/nan_to_num delta-5 ** :nan 0.0 :posinf 0.0 :neginf 0.0)
+            result (atom {})]
+        (doseq [gi (range n-greeks)
+                fi (range n-feat)
+                :let [col (+ (* gi n-feat) fi)
+                      base (str "scat_" (nth greek-names gi) "_" (nth suffixes fi))]]
+          (swap! result assoc base (.__getitem__ raw-clean #py ((slice nil nil) col)))
+          (swap! result assoc (str base "_d5") (.__getitem__ d5-clean #py ((slice nil nil) col))))
+        @result))))
+
+(defn compute-live-v3-feature-arrays
+  "Compute the full live V3-grid feature family from captured grids."
+  [grids dictionary-atoms]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float32)
+        n-bars (.__getitem__ (.-shape arr) 0)
+        day-ids (numpy/zeros n-bars ** :dtype numpy/int32)
+        dict-features (if dictionary-atoms
+                        (compute-dictionary-feature-arrays arr dictionary-atoms)
+                        (merge (into {} (for [ki (range 20)]
+                                          [(str "dict_code_" ki)
+                                           (numpy/zeros n-bars ** :dtype numpy/float32)]))
+                               {"dict_n_active" (numpy/zeros n-bars ** :dtype numpy/float32)
+                                "dict_recon_error" (numpy/zeros n-bars ** :dtype numpy/float32)
+                                "dict_top_weight" (numpy/zeros n-bars ** :dtype numpy/float32)
+                                "dict_code_entropy" (numpy/zeros n-bars ** :dtype numpy/float32)
+                                "dict_recon_error_d5" (numpy/zeros n-bars ** :dtype numpy/float32)
+                                "dict_recon_error_d20" (numpy/zeros n-bars ** :dtype numpy/float32)}))]
+    (merge (compute-tda-feature-arrays arr day-ids)
+           (compute-live-wasserstein-feature-arrays arr)
+           dict-features
+           (compute-live-scattering-feature-arrays arr))))
+
+(defn latest-grid [grids]
+  (let [arr (numpy/asarray grids ** :dtype numpy/float64)]
+    (cond
+      (and (= (.-ndim arr) 4) (> (.__getitem__ (.-shape arr) 0) 0))
+      (.__getitem__ arr -1)
+      (= (.-ndim arr) 3) arr
+      :else nil)))
+
+(defn finite-values
+  ([values] (finite-values values :positive false :nonzero true))
+  ([values & {:keys [positive nonzero] :or {positive false nonzero true}}]
+   (let [arr (numpy/asarray values ** :dtype numpy/float64)
+         mask0 (numpy/isfinite arr)
+         mask (cond
+                positive (numpy/logical_and mask0 (> arr 0.0))
+                nonzero (numpy/logical_and mask0 (numpy/not_equal arr 0.0))
+                :else mask0)]
+     (.__getitem__ arr mask))))
+
+(defn safe-mean
+  ([values] (safe-mean values :positive false :nonzero true))
+  ([values & {:keys [positive nonzero] :or {positive false nonzero true}}]
+   (let [vals (finite-values values :positive positive :nonzero nonzero)]
+     (if (= (.-size vals) 0) ##NaN (float (numpy/mean vals))))))
+
+(defn safe-std
+  ([values] (safe-std values :positive false :nonzero true))
+  ([values & {:keys [positive nonzero] :or {positive false nonzero true}}]
+   (let [vals (finite-values values :positive positive :nonzero nonzero)]
+     (if (= (.-size vals) 0) ##NaN (float (numpy/std vals))))))
+
+(defn vega-weighted [values vega]
+  (let [vals (numpy/asarray values ** :dtype numpy/float64)
+        weights (numpy/asarray vega ** :dtype numpy/float64)
+        mask (numpy/logical_and (numpy/logical_and (numpy/logical_and (numpy/isfinite vals)
+                                                                      (numpy/isfinite weights))
+                                                   (numpy/not_equal vals 0.0))
+                                (> weights 0.0))]
+    (if-not (bool (numpy/any mask))
+      ##NaN
+      (float (numpy/average (.__getitem__ vals mask) ** :weights (.__getitem__ weights mask))))))
+
+(defn closest-by-delta [channel delta target]
+  (let [values (numpy/asarray channel ** :dtype numpy/float64)
+        deltas (numpy/asarray delta ** :dtype numpy/float64)
+        mask (numpy/logical_and (numpy/logical_and (numpy/logical_and (numpy/isfinite values)
+                                                                      (numpy/isfinite deltas))
+                                                   (numpy/not_equal values 0.0))
+                                (numpy/not_equal deltas 0.0))]
+    (if-not (bool (numpy/any mask))
+      ##NaN
+      (let [masked-values (.__getitem__ values mask)
+            masked-deltas (.__getitem__ deltas mask)
+            idx (int (numpy/argmin (numpy/abs (- masked-deltas target))))]
+        (float (.__getitem__ masked-values idx))))))
+
+(defn compute-greek-grid-features [prefix grids]
+  (if-not (contains? supported-greek-prefixes prefix)
+    {}
+    (let [feature (fn [suffix] (str prefix "_greeks_" suffix))
+          grid (latest-grid grids)]
+      (if (or (nil? grid) (not= (python/tuple (.-shape grid)) #py (6 21 8)))
+        {}
+        (let [iv (.__getitem__ grid 0)
+              delta (.__getitem__ grid 1)
+              vega (.__getitem__ grid 2)
+              theta (.__getitem__ grid 3)
+              rho (.__getitem__ grid 4)
+              gamma-proxy (.__getitem__ grid 5)
+              valid-iv (numpy/logical_and (numpy/isfinite iv) (> iv 0.0))]
+          (if-not (bool (numpy/any valid-iv))
+            {}
+            (let [near (slice 0 2)
+                  far (slice 5 8)
+                  atm (slice 9 12)
+                  put-mask (< delta 0.0)
+                  call-mask (> delta 0.0)
+                  near-atm-iv (safe-mean (.__getitem__ iv #py ((slice 9 12) (slice 0 2))) :positive true)
+                  far-atm-iv (safe-mean (.__getitem__ iv #py ((slice 9 12) (slice 5 8))) :positive true)
+                  otm-put-region (.__getitem__ iv #py ((slice nil 10) (slice 0 2)))
+                  otm-put-mask (.__getitem__ put-mask #py ((slice nil 10) (slice 0 2)))
+                  otm-call-region (.__getitem__ iv #py ((slice 11 nil) (slice 0 2)))
+                  otm-call-mask (.__getitem__ call-mask #py ((slice 11 nil) (slice 0 2)))
+                  atm-call-mask (.__getitem__ call-mask #py ((slice 9 12) (slice 0 2)))
+                  atm-put-mask (.__getitem__ put-mask #py ((slice 9 12) (slice 0 2)))
+                  atm-near-iv (.__getitem__ iv #py ((slice 9 12) (slice 0 2)))
+                  atm-near-delta (.__getitem__ delta #py ((slice 9 12) (slice 0 2)))
+                  atm-near-vega (.__getitem__ vega #py ((slice 9 12) (slice 0 2)))
+                  atm-near-theta (.__getitem__ theta #py ((slice 9 12) (slice 0 2)))
+                  atm-call-iv (safe-mean (.__getitem__ atm-near-iv atm-call-mask) :positive true)
+                  atm-put-iv (safe-mean (.__getitem__ atm-near-iv atm-put-mask) :positive true)
+                  otm-put-iv (safe-mean (.__getitem__ otm-put-region otm-put-mask) :positive true)
+                  otm-call-iv (safe-mean (.__getitem__ otm-call-region otm-call-mask) :positive true)
+                  iv-mean (safe-mean iv :positive true)
+                  iv-std (safe-std iv :positive true)
+                  valid-iv-values (.__getitem__ iv valid-iv)
+                  iv-min (float (numpy/min valid-iv-values))
+                  iv-max (float (numpy/max valid-iv-values))
+                  iv-skew (if (and (math/isfinite otm-put-iv) (math/isfinite otm-call-iv)) (- otm-put-iv otm-call-iv) ##NaN)
+                  iv-butterfly (if (every? math/isfinite [otm-put-iv otm-call-iv near-atm-iv])
+                                 (- (/ (+ otm-put-iv otm-call-iv) 2.0) near-atm-iv)
+                                 ##NaN)
+                  put-call-iv-spread (if (and (math/isfinite atm-put-iv) (math/isfinite atm-call-iv)) (- atm-put-iv atm-call-iv) ##NaN)
+                  near-far (if (and (math/isfinite near-atm-iv) (math/isfinite far-atm-iv)) (- near-atm-iv far-atm-iv) ##NaN)
+                  vega-positive (finite-values vega :positive true)
+                  features (atom {(feature "atm_call_delta") (safe-mean (.__getitem__ atm-near-delta atm-call-mask))
+                                  (feature "atm_call_iv") atm-call-iv
+                                  (feature "atm_call_theta") (safe-mean (.__getitem__ atm-near-theta atm-call-mask))
+                                  (feature "atm_call_vega") (safe-mean (.__getitem__ atm-near-vega atm-call-mask) :positive true)
+                                  (feature "atm_put_delta") (safe-mean (.__getitem__ atm-near-delta atm-put-mask))
+                                  (feature "atm_put_iv") atm-put-iv
+                                  (feature "atm_put_theta") (safe-mean (.__getitem__ atm-near-theta atm-put-mask))
+                                  (feature "atm_put_vega") (safe-mean (.__getitem__ atm-near-vega atm-put-mask) :positive true)
+                                  (feature "delta_std") (safe-std delta)
+                                  (feature "delta_vw_mean") (vega-weighted delta vega)
+                                  (feature "dollar_gamma_proxy") (safe-mean gamma-proxy :positive true)
+                                  (feature "iv_25d_spread") (- (closest-by-delta iv delta -0.25)
+                                                               (closest-by-delta iv delta 0.25))
+                                  (feature "iv_butterfly") iv-butterfly
+                                  (feature "iv_mean") iv-mean
+                                  (feature "iv_range") (- iv-max iv-min)
+                                  (feature "iv_skew_greeks") iv-skew
+                                  (feature "iv_skew_stat") iv-skew
+                                  (feature "iv_std") iv-std
+                                  (feature "near_far_iv_spread") near-far
+                                  (feature "otm_call_iv") otm-call-iv
+                                  (feature "otm_put_iv") otm-put-iv
+                                  (feature "put_call_iv_spread") put-call-iv-spread
+                                  (feature "rho_mean") (safe-mean rho)
+                                  (feature "theta_mean") (safe-mean theta)
+                                  (feature "theta_vw") (vega-weighted theta vega)
+                                  (feature "vega_concentration") (if (> (.-size vega-positive) 0)
+                                                                    (float (/ (numpy/max vega-positive) (numpy/sum vega-positive)))
+                                                                    ##NaN)
+                                  (feature "vega_mean") (safe-mean vega :positive true)})
+                  delta-std (get @features (feature "delta_std"))
+                  delta-mean (safe-mean delta)
+                  rho-mean (get @features (feature "rho_mean"))
+                  theta-mean (get @features (feature "theta_mean"))
+                  vega-mean (get @features (feature "vega_mean"))]
+              (when (math/isfinite delta-std)
+                (swap! features assoc (feature "delta_squared") (* delta-std delta-std)))
+              (when (math/isfinite iv-mean)
+                (swap! features assoc (feature "iv_squared") (* iv-mean iv-mean)
+                       (feature "iv_cubed") (* iv-mean iv-mean iv-mean)))
+              (when (math/isfinite iv-skew)
+                (swap! features assoc (feature "iv_skew_squared") (* iv-skew iv-skew))
+                (when (math/isfinite iv-std)
+                  (swap! features assoc (feature "iv_std_times_skew") (* iv-std iv-skew))))
+              (when (and (math/isfinite near-far) (math/isfinite iv-mean))
+                (swap! features assoc (feature "near_far_times_iv") (* near-far iv-mean)))
+              (when (and (math/isfinite delta-mean) (math/isfinite iv-mean))
+                (swap! features assoc (feature "delta_times_iv") (* delta-mean iv-mean)))
+              (when (and (math/isfinite rho-mean) (math/isfinite delta-mean))
+                (swap! features assoc (feature "rho_times_delta") (* rho-mean delta-mean)))
+              (when (math/isfinite theta-mean)
+                (swap! features assoc (feature "theta_squared") (* theta-mean theta-mean))
+                (when (math/isfinite iv-mean)
+                  (swap! features assoc (feature "theta_times_iv") (* theta-mean iv-mean)))
+                (when (and (math/isfinite delta-mean) (> (abs delta-mean) 1.0e-10))
+                  (swap! features assoc (feature "theta_delta_ratio") (/ theta-mean delta-mean))))
+              (when (and (math/isfinite theta-mean) (math/isfinite vega-mean))
+                (swap! features assoc (feature "vega_theta_product") (* vega-mean theta-mean))
+                (when (> (abs vega-mean) 1.0e-10)
+                  (swap! features assoc (feature "theta_vega_ratio") (/ theta-mean vega-mean))))
+              (when (math/isfinite vega-mean)
+                (swap! features assoc (feature "vega_squared") (* vega-mean vega-mean))
+                (when (and (math/isfinite delta-mean) (> (abs delta-mean) 1.0e-10))
+                  (swap! features assoc (feature "vega_delta_ratio") (/ vega-mean delta-mean))))
+              (when (and (math/isfinite iv-butterfly) (math/isfinite iv-skew))
+                (swap! features assoc (feature "butterfly_times_skew") (* iv-butterfly iv-skew)))
+              (finite-map @features supported-greek-features))))))))
+
+(defn compute-spy-greek-grid-features [grids]
+  (compute-greek-grid-features "SPY" grids))
+
+(defn compute-reconstructable-greek-features
+  "Compute guarded legacy Greek exposure formula candidates.
+
+  These are intentionally candidate-only formulas. They provide evidence for
+  later validation gates but should not be treated as automatically safe
+  unmask candidates."
+  [prefix grids chain-json]
+  (if-not (contains? supported-greek-prefixes prefix)
+    {}
+    (let [feature (fn [suffix] (str prefix "_greeks_" suffix))
+          grid (latest-grid grids)]
+      (if (or (nil? grid) (not= (python/tuple (.-shape grid)) #py (6 21 8)))
+        {}
+        (try
+          (let [payload (loads-json-value (or chain-json "{}"))
+                underlying (float (or (mget payload "underlying") (mget payload "spy") 0.0))]
+            (if (<= underlying 0.0)
+              {}
+              (let [iv (.__getitem__ grid 0)
+                    delta (.__getitem__ grid 1)
+                    vega (.__getitem__ grid 2)
+                    theta (.__getitem__ grid 3)
+                    rho (.__getitem__ grid 4)
+                    valid (numpy/logical_and (numpy/logical_and (numpy/isfinite iv) (> iv 0.0))
+                                             (numpy/isfinite delta))]
+                (if-not (bool (numpy/any valid))
+                  {}
+                  (let [valid-delta (.__getitem__ delta valid)
+                        valid-iv (.__getitem__ iv valid)
+                        valid-vega (.__getitem__ vega valid)
+                        valid-rho (.__getitem__ rho valid)
+                        valid-theta (.__getitem__ theta valid)
+                        delta-mean (safe-mean valid-delta)
+                        abs-delta-mean (safe-mean (numpy/abs valid-delta) :positive true)
+                        iv-mean (safe-mean valid-iv :positive true)
+                        vega-mean (safe-mean valid-vega :positive true)
+                        vega-positive (finite-values valid-vega :positive true)
+                        vega-total (if (> (.-size vega-positive) 0) (float (numpy/sum vega-positive)) ##NaN)
+                        rho-mean (safe-mean valid-rho)
+                        theta-mean (safe-mean valid-theta)
+                        observed-at (parse-time (mget payload "observed_at"))
+                        contract-rows
+                        (vec
+                         (keep (fn [row0]
+                                 (try
+                                   (let [row (if (python/isinstance row0 python/dict)
+                                               row0
+                                               (python/dict (.items row0)))]
+                                     (.__setitem__ row "_strike" (strike-thousandths (mget row "strike")))
+                                     (.__setitem__ row "_right" (right-code (mget row "right")))
+                                     (.__setitem__ row "_mid" (mid row))
+                                     (.__setitem__ row "_volume" (row-number row "volume" "ohlc/volume"))
+                                     (.__setitem__ row "_dte_years" (/ (dte-minutes observed-at (mget row "expiration"))
+                                                                       (* 365.0 24.0 60.0)))
+                                     row)
+                                   (catch python/Exception _ nil)))
+                               (or (mget payload "contracts") [])))
+                        mids (vec (filter math/isfinite (map #(mget % "_mid") contract-rows)))
+                        avg-mid (if (seq mids) (float (numpy/mean mids)) ##NaN)
+                        volume-rows (vec (filter #(let [v (mget % "_volume")]
+                                                    (and (math/isfinite v) (> v 0.0)))
+                                                 contract-rows))
+                        total-volume (if (seq volume-rows)
+                                       (float (reduce + (map #(mget % "_volume") volume-rows)))
+                                       ##NaN)
+                        skew-proxy
+                        (if (seq contract-rows)
+                          (let [strikes (vec (sort (set (map #(mget % "_strike") contract-rows))))]
+                            (if (seq strikes)
+                              (let [atm-strike (first (sort-by #(abs (- % (* underlying 1000.0))) strikes))
+                                    atm-idx (.index strikes atm-strike)
+                                    by-key (into {} (for [row contract-rows]
+                                                      [[(mget row "_strike") (mget row "_right")] row]))]
+                                (if (and (> atm-idx 0) (< atm-idx (dec (count strikes))))
+                                  (let [put-row (get by-key [(nth strikes (dec atm-idx)) "P"])
+                                        call-row (get by-key [(nth strikes (inc atm-idx)) "C"])
+                                        put-otm (if put-row (mid put-row) ##NaN)
+                                        call-otm (if call-row (mid call-row) ##NaN)]
+                                    (if (and (math/isfinite put-otm) (math/isfinite call-otm))
+                                      (- put-otm call-otm)
+                                      ##NaN))
+                                  ##NaN))
+                              ##NaN))
+                          ##NaN)
+                        features (atom {})
+                        multiplier 100.0]
+                    (when (math/isfinite delta-mean)
+                      (let [dollar-delta (* delta-mean underlying multiplier)]
+                        (swap! features assoc (feature "dollar_delta") dollar-delta)
+                        (when (and (math/isfinite theta-mean) (> (abs dollar-delta) 1.0e-10))
+                          (swap! features assoc (feature "theta_exposure_ratio")
+                                 (/ theta-mean (abs dollar-delta))))))
+                    (when (math/isfinite vega-mean)
+                      (swap! features assoc (feature "dollar_vega") (* vega-mean multiplier)))
+                    (when (math/isfinite vega-total)
+                      (swap! features assoc (feature "vega_total_exposure") (* vega-total multiplier)))
+                    (let [lambda-mean (if (and (math/isfinite abs-delta-mean)
+                                                (math/isfinite avg-mid)
+                                                (> avg-mid 1.0e-10))
+                                        (/ (* abs-delta-mean underlying) avg-mid)
+                                        ##NaN)]
+                      (when (math/isfinite lambda-mean)
+                        (swap! features assoc (feature "lambda_mean") lambda-mean)
+                        (when (math/isfinite iv-mean)
+                          (swap! features assoc (feature "lambda_times_iv") (* lambda-mean iv-mean)))
+                        (when (and (math/isfinite total-volume) (> total-volume 0.0))
+                          (swap! features assoc (feature "lambda_weighted") (* lambda-mean total-volume)))))
+                    (when (and (math/isfinite rho-mean) (math/isfinite abs-delta-mean))
+                      (swap! features assoc (feature "rho_exposure")
+                             (* rho-mean abs-delta-mean underlying multiplier)))
+                    (when (and (math/isfinite skew-proxy) (math/isfinite total-volume) (> total-volume 0.0))
+                      (swap! features assoc (feature "skew_times_volume") (* skew-proxy total-volume)))
+                    (let [dte-years (vec (filter #(and (math/isfinite %) (> % 0.0))
+                                                 (map #(mget % "_dte_years") contract-rows)))
+                          dte-years-mean (if (seq dte-years) (float (numpy/mean dte-years)) ##NaN)]
+                      (when (and (math/isfinite dte-years-mean) (math/isfinite delta-mean))
+                        (let [epsilon-mean (* -1.0 underlying dte-years-mean delta-mean)]
+                          (swap! features assoc
+                                 (feature "epsilon_mean") epsilon-mean
+                                 (feature "epsilon_times_delta") (* epsilon-mean delta-mean))
+                          (when (math/isfinite abs-delta-mean)
+                            (swap! features assoc (feature "epsilon_exposure")
+                                   (* epsilon-mean abs-delta-mean multiplier))))))
+                    (finite-map @features reconstructable-greek-features))))))
+          (catch python/Exception _ {}))))))
+
+(defn option-type [value]
+  (if (= (right-code value) "P") "put" "call"))
+
+(def moneyness-bin-edges (numpy/linspace 0.90 1.10 22))
+(def dte-bin-edges-minutes (numpy/asarray [0.0 390.0 1170.0 2340.0 4680.0 9360.0 18720.0 37440.0 ##Inf]))
+
+(defn norm-cdf [x]
+  (* 0.5 (+ 1.0 (math/erf (/ x (math/sqrt 2.0))))))
+
+(defn norm-pdf [x]
+  (/ (math/exp (* -0.5 x x)) (math/sqrt (* 2.0 math/pi))))
+
+(defn bs-d1d2 [s k t r sigma]
+  (let [d1 (/ (+ (math/log (/ s k)) (* (+ r (* 0.5 sigma sigma)) t))
+              (* sigma (math/sqrt t)))
+        d2 (- d1 (* sigma (math/sqrt t)))]
+    [d1 d2]))
+
+(defn bs-option-price [market-price s k t r sigma option-type]
+  (if (or (<= t 0.0) (<= sigma 0.0))
+    (if (= option-type "call")
+      (max (- s k) 0.0)
+      (max (- k s) 0.0))
+    (let [[d1 d2] (bs-d1d2 s k t r sigma)]
+      (if (= option-type "call")
+        (- (* s (norm-cdf d1)) (* k (math/exp (* (- r) t)) (norm-cdf d2)))
+        (- (* k (math/exp (* (- r) t)) (norm-cdf (- d2))) (* s (norm-cdf (- d1))))))))
+
+(defn native-implied-vol
+  ([market-price s k t r option-type]
+   (native-implied-vol market-price s k t r option-type 0.001 5.0))
+  ([market-price s k t r option-type vol-lo vol-hi]
+   (if (or (<= t 0.0) (<= market-price 0.0))
+     0.0
+     (let [intrinsic (if (= option-type "call") (max (- s k) 0.0) (max (- k s) 0.0))]
+       (if (< market-price (- intrinsic 0.01))
+         0.0
+         (letfn [(objective [sigma]
+                   (- (bs-option-price market-price s k t r sigma option-type) market-price))]
+           (try
+             (let [f-lo (objective vol-lo)
+                   f-hi (objective vol-hi)]
+               (if (> (* f-lo f-hi) 0.0)
+                 (if (< (abs f-lo) (abs f-hi)) vol-lo vol-hi)
+                 (loop [lo vol-lo
+                        hi vol-hi
+                        i 0]
+                   (let [mid (/ (+ lo hi) 2.0)
+                         f-mid (objective mid)]
+                     (if (or (>= i 32) (< (- hi lo) 1.0e-6))
+                       mid
+                       ;; Black-Scholes option value is monotonic in sigma, so
+                       ;; the objective sign directly tells which half remains.
+                       (if (< f-mid 0.0)
+                         (recur mid hi (inc i))
+                         (recur lo mid (inc i))))))))
+             (catch python/Exception _ 0.0))))))))
+
+(defn native-bs-greeks [s k t r sigma option-type]
+  (if (or (<= t 0.0) (<= sigma 0.0))
+    (let [itm (if (= option-type "call") (> s k) (> k s))]
+      {"delta" (* (if itm 1.0 0.0) (if (= option-type "call") 1.0 -1.0))
+       "gamma" 0.0 "vega" 0.0 "theta" 0.0 "rho" 0.0})
+    (let [[d1 d2] (bs-d1d2 s k t r sigma)
+          sqrt-t (math/sqrt t)
+          exp-rt (math/exp (* (- r) t))
+          n-d1 (norm-pdf d1)
+          gamma (/ n-d1 (* s sigma sqrt-t))
+          vega (* s n-d1 sqrt-t)]
+      (if (= option-type "call")
+        {"delta" (norm-cdf d1)
+         "gamma" gamma
+         "vega" vega
+         "theta" (/ (- (- (/ (* s n-d1 sigma) (* 2.0 sqrt-t)))
+                       (* r k exp-rt (norm-cdf d2)))
+                    365.0)
+         "rho" (* k t exp-rt (norm-cdf d2))}
+        {"delta" (- (norm-cdf d1) 1.0)
+         "gamma" gamma
+         "vega" vega
+         "theta" (/ (+ (- (/ (* s n-d1 sigma) (* 2.0 sqrt-t)))
+                       (* r k exp-rt (norm-cdf (- d2))))
+                    365.0)
+         "rho" (* (- k) t exp-rt (norm-cdf (- d2)))}))))
+
+(defn native-time-to-expiry [expiration now]
+  (let [exp-date (cond
+                   (python/isinstance expiration (.-datetime datetime)) (.date expiration)
+                   (python/isinstance expiration (.-date datetime)) expiration
+                   :else ((.-fromisoformat (.-date datetime)) (str expiration)))
+        now-et (parse-time now)
+        exp-dt ((.-datetime datetime) (.-year exp-date) (.-month exp-date) (.-day exp-date) 16 0 0 ** :tzinfo et)
+        seconds (.total_seconds (- exp-dt now-et))]
+    (max (/ seconds (* 365.25 24.0 3600.0)) 0.0)))
+
+(defn grid-dte-minutes [bar-time expiration]
+  (let [bar (parse-time bar-time)
+        exp-date (cond
+                   (python/isinstance expiration (.-datetime datetime)) (.date expiration)
+                   (python/isinstance expiration (.-date datetime)) expiration
+                   :else ((.-fromisoformat (.-date datetime)) (str expiration)))
+        bar-date (.date bar)
+        mins-left (max 0 (- (* 16 60) (+ (* (.-hour bar) 60) (.-minute bar))))]
+    (cond
+      (= exp-date bar-date) (float mins-left)
+      (< exp-date bar-date) 0.0
+      :else (let [bdays (int (numpy/busday_count bar-date exp-date))]
+              (if (<= bdays 0)
+                (float mins-left)
+                (float (+ mins-left (* (dec bdays) 390) 390)))))))
+
+(defn native-build-greeks-grid [contracts underlying bar-time]
+  (let [grid (numpy/zeros #py (6 21 8) ** :dtype numpy/float32)
+        counts (numpy/zeros #py (21 8) ** :dtype numpy/float64)
+        iv-vega-sums (numpy/zeros #py (21 8) ** :dtype numpy/float64)
+        delta-sums (numpy/zeros #py (21 8) ** :dtype numpy/float64)
+        vega-sums (numpy/zeros #py (21 8) ** :dtype numpy/float64)
+        theta-sums (numpy/zeros #py (21 8) ** :dtype numpy/float64)
+        rho-sums (numpy/zeros #py (21 8) ** :dtype numpy/float64)
+        gamma-sums (numpy/zeros #py (21 8) ** :dtype numpy/float64)]
+    (when (and (seq contracts) (> underlying 0.0))
+      (doseq [contract contracts]
+        (try
+          (let [strike (float (mget contract "strike"))
+                moneyness (/ strike underlying)
+                dte-mins (grid-dte-minutes bar-time (mget contract "expiration"))
+                m-bin (dec (int (numpy/digitize moneyness moneyness-bin-edges)))
+                d-bin (dec (int (numpy/digitize dte-mins dte-bin-edges-minutes)))]
+            (when (and (>= moneyness 0.90) (<= moneyness 1.10)
+                       (> dte-mins 0.0)
+                       (>= m-bin 0) (< m-bin 21)
+                       (>= d-bin 0) (< d-bin 8))
+              (let [iv (float (or (mget contract "iv") 0.0))
+                    delta (float (or (mget contract "delta") 0.0))
+                    vega (float (or (mget contract "vega") 0.0))
+                    theta (float (or (mget contract "theta") 0.0))
+                    rho (float (or (mget contract "rho") 0.0))
+                    gamma-proxy (* (abs delta) iv)]
+                (.__setitem__ counts #py (m-bin d-bin)
+                              (+ (.__getitem__ counts #py (m-bin d-bin)) 1.0))
+                (.__setitem__ iv-vega-sums #py (m-bin d-bin)
+                              (+ (.__getitem__ iv-vega-sums #py (m-bin d-bin)) (* iv vega)))
+                (.__setitem__ delta-sums #py (m-bin d-bin)
+                              (+ (.__getitem__ delta-sums #py (m-bin d-bin)) delta))
+                (.__setitem__ vega-sums #py (m-bin d-bin)
+                              (+ (.__getitem__ vega-sums #py (m-bin d-bin)) vega))
+                (.__setitem__ theta-sums #py (m-bin d-bin)
+                              (+ (.__getitem__ theta-sums #py (m-bin d-bin)) theta))
+                (.__setitem__ rho-sums #py (m-bin d-bin)
+                              (+ (.__getitem__ rho-sums #py (m-bin d-bin)) rho))
+                (.__setitem__ gamma-sums #py (m-bin d-bin)
+                              (+ (.__getitem__ gamma-sums #py (m-bin d-bin)) gamma-proxy)))))
+          (catch python/Exception _ nil))))
+    (doseq [m-bin (range 21)
+            d-bin (range 8)
+            :let [n (.__getitem__ counts #py (m-bin d-bin))
+                  vega-sum (.__getitem__ vega-sums #py (m-bin d-bin))]
+            :when (pos? (float n))]
+      (when (> vega-sum 0.0)
+        (.__setitem__ grid #py (0 m-bin d-bin)
+                      (/ (.__getitem__ iv-vega-sums #py (m-bin d-bin)) vega-sum)))
+      (.__setitem__ grid #py (1 m-bin d-bin) (/ (.__getitem__ delta-sums #py (m-bin d-bin)) n))
+      (.__setitem__ grid #py (2 m-bin d-bin) (/ vega-sum n))
+      (.__setitem__ grid #py (3 m-bin d-bin) (/ (.__getitem__ theta-sums #py (m-bin d-bin)) n))
+      (.__setitem__ grid #py (4 m-bin d-bin) (/ (.__getitem__ rho-sums #py (m-bin d-bin)) n))
+      (.__setitem__ grid #py (5 m-bin d-bin) (/ (.__getitem__ gamma-sums #py (m-bin d-bin)) n)))
+    grid))
+
+(defn build-option-greeks-grid-from-payload
+  ([payload] (build-option-greeks-grid-from-payload payload 0.043))
+  ([payload risk-free-rate]
+   (try
+     (let [underlying (float (or (mget payload "underlying") (mget payload "spy") 0.0))]
+       (if (<= underlying 0.0)
+         nil
+         (let [observed-at (parse-time (mget payload "observed_at"))
+               contracts (python/list)]
+           (doseq [row0 (or (mget payload "contracts") [])]
+             (try
+               (let [row (if (or (map? row0) (python/isinstance row0 python/dict))
+                           row0
+                           (python/dict (.items row0)))
+                     strike (float (mget row "strike"))
+                     bid (float (or (mget row "bid") (mget row "quote/bid") 0.0))
+                     ask (float (or (mget row "ask") (mget row "quote/ask") 0.0))]
+                 (when (and (> bid 0.0)
+                            (> ask 0.0)
+                            (< (/ (abs (- strike underlying)) underlying) 0.12))
+                   (let [mid-px (/ (+ bid ask) 2.0)
+                         opt-type (option-type (mget row "right"))
+                         expiration (.date (datetime.datetime/fromisoformat (str (mget row "expiration"))))
+                         t-exp (native-time-to-expiry expiration observed-at)]
+                     (when (> t-exp 0.0)
+                       (let [iv (native-implied-vol mid-px underlying strike t-exp risk-free-rate opt-type)]
+                         (when (> iv 0.0)
+                           (let [greeks (native-bs-greeks underlying strike t-exp risk-free-rate iv opt-type)]
+                             (.append contracts {"strike" strike
+                                                 "expiration" expiration
+                                                 "option_type" opt-type
+                                                 "iv" iv
+                                                 "delta" (mget greeks "delta")
+                                                 "vega" (mget greeks "vega")
+                                                 "theta" (mget greeks "theta")
+                                                 "rho" (mget greeks "rho")}))))))))
+               (catch python/Exception _ nil)))
+           (if (zero? (len contracts))
+             nil
+             (native-build-greeks-grid contracts underlying observed-at)))))
+     (catch python/Exception _ nil))))
+
+(defn build-option-greeks-grid
+  ([chain-json grid-builder implied-vol-fn bs-greeks-fn time-to-expiry-fn]
+   (build-option-greeks-grid chain-json grid-builder implied-vol-fn bs-greeks-fn time-to-expiry-fn 0.043))
+  ([chain-json grid-builder implied-vol-fn bs-greeks-fn time-to-expiry-fn risk-free-rate]
+   (if (or (not chain-json) (= "" (str chain-json)))
+     nil
+     (build-option-greeks-grid-from-payload (loads-json-value chain-json) risk-free-rate))))

@@ -1,0 +1,99 @@
+;; Print the completed trading day that reports should build.
+;;
+;; Explicit REPORTS_TARGET_DATE/REPORTS_DATE still wins in run_reports.sh. This
+;; helper is for scheduled runs: before today's market close, use the previous
+;; trading day; after close, use today's session.
+(import datetime glob os os.path sys zoneinfo)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.reporting.core :as reporting])
+
+(def et (zoneinfo/ZoneInfo "America/New_York"))
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/report_target_date.lpy -- "
+                "[--now ISO_DATETIME]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--now")
+          (recur (nnext remaining) (assoc out :now (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do
+            (usage)
+            (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn parse-now
+  [s]
+  (if (seq (or s ""))
+    (let [dt (datetime.datetime/fromisoformat (if (.endswith s "Z")
+                                                (.replace s "Z" "+00:00")
+                                                s))]
+      (if (nil? (.-tzinfo dt))
+        (.replace dt ** :tzinfo et)
+        (.astimezone dt et)))
+    (datetime.datetime/now et)))
+
+(defn previous-trading-day
+  [start]
+  (loop [candidate (- start (datetime/timedelta ** :days 1))
+         remaining 21]
+    (cond
+      (neg? remaining)
+      (throw (python/RuntimeError
+              (str "could not find previous trading day before " (.isoformat start))))
+
+      (reporting/trading-day? (.isoformat candidate))
+      candidate
+
+      :else
+      (recur (- candidate (datetime/timedelta ** :days 1))
+             (dec remaining)))))
+
+(defn report-target-date
+  [now]
+  (let [today (.date now)
+        today-s (.isoformat today)
+        session (reporting/market-session today-s)
+        close-at (datetime.datetime/combine today (:market/close-time session) et)]
+    (if (and (:trading-day? session)
+             (not (< (.timestamp now) (.timestamp close-at))))
+      today
+      (previous-trading-day today))))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        target (report-target-date (parse-now (:now opts)))]
+    (println (.isoformat target))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

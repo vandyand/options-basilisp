@@ -1,0 +1,1357 @@
+;; Compare live-captured Greek grids with same-timestamp historical grids.
+;;
+;; This is an input-level diagnostic for V3 structural features
+;; (tda_*/scat_*/wass_/dict_*). Those features are deterministic transforms of
+;; greeks_grids_history, so when matched feature parity is red this report tells
+;; us whether the source grid inputs already diverge.
+(import datetime json math numpy os os.path sys)
+
+(require '[clojure.set :as set]
+         '[clojure.string :as str])
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVETRADING_BASILISP_ROOT")
+                                    (os.environ/get "STEVE_REPO_ROOT")
+                                    (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.raw-unlock :as raw-unlock])
+
+(def greek-names ["iv" "delta" "vega" "theta" "rho" "gamma"])
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/grid_feature_input_parity.lpy -- "
+                "--live-capture PATH --historical-npz PATH --out-json PATH "
+                "[--historical-cohort-json PATH] [--md-out PATH] "
+                "[--target-date YYYY-MM-DD] [--min-rows N] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-int [value arg]
+  (try
+    (let [n (python/int value)]
+      (when (<= n 0)
+        (throw (python/ValueError (str arg " must be positive"))))
+      n)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid integer for " arg ": " value))))))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:min-rows 60}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--live-capture") (recur (nnext remaining) (assoc out :live-capture (option-value remaining arg)))
+          (= arg "--historical-npz") (recur (nnext remaining) (assoc out :historical-npz (option-value remaining arg)))
+          (= arg "--historical-cohort-json") (recur (nnext remaining) (assoc out :historical-cohort-json (option-value remaining arg)))
+          (= arg "--out-json") (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+          (= arg "--md-out") (recur (nnext remaining) (assoc out :md-out (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+          (= arg "--min-rows") (recur (nnext remaining) (assoc out :min-rows (parse-int (option-value remaining arg) arg)))
+          (= arg "--write-unavailable") (recur (next remaining) (assoc out :write-unavailable true))
+          (= arg "--unavailable-reason") (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map ->jsonable x))
+    (python/isinstance x numpy/integer) (int x)
+    (python/isinstance x numpy/floating) (float x)
+    :else x))
+
+(defn write-json! [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn parse-time [value]
+  (let [raw0 (.strip (str value))
+        raw1 (if (and (.startswith raw0 "#inst \"") (.endswith raw0 "\""))
+               (subs raw0 7 (dec (count raw0)))
+               raw0)
+        raw (.replace raw1 "Z" "+00:00")
+        parsed (datetime.datetime/fromisoformat raw)
+        with-tz (if (nil? (.-tzinfo parsed))
+                  (.replace parsed ** :tzinfo datetime.timezone/utc)
+                  parsed)]
+    (.astimezone with-tz datetime.timezone/utc)))
+
+(defn time-key [value]
+  (.strftime (parse-time value) "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn shifted-time-key [value minutes]
+  (let [dt (+ (parse-time value) (datetime/timedelta ** :minutes minutes))]
+    (.strftime dt "%Y-%m-%dT%H:%M:%SZ")))
+
+(defn npz-files [npz]
+  (set (map str (.-files npz))))
+
+(defn reject [opts reason details]
+  (let [payload {"ok" false
+                 "status" "error"
+                 "target_date" (:target-date opts)
+                 "reason" reason
+                 "details" (or details {})}
+        existing-target? (and (:out-json opts) (os.path/exists (:out-json opts)))
+        json-target (if existing-target? (str (:out-json opts) ".error") (:out-json opts))
+        md-target (when (:md-out opts)
+                    (if (and existing-target? (os.path/exists (:md-out opts)))
+                      (str (:md-out opts) ".error")
+                      (:md-out opts)))]
+    (write-json! json-target
+                 (cond-> payload
+                   existing-target?
+                   (assoc "preserved_existing_artifact" (:out-json opts))))
+    (when (:md-out opts)
+      (spit md-target
+            (str "# Grid Feature Input Parity\n\n"
+                 "- Status: `error`\n"
+                 "- Reason: `" reason "`\n"
+                 (when existing-target?
+                   (str "- Preserved existing artifact: `" (:out-json opts) "`\n")))))
+    (binding [*out* *err*] (println reason))
+    1))
+
+(defn write-unavailable [opts]
+  (when-not (:out-json opts)
+    (throw (python/ValueError "missing required --out-json")))
+  (when-not (:target-date opts)
+    (throw (python/ValueError "missing required --target-date for --write-unavailable")))
+  (let [reason (or (:unavailable-reason opts) "grid feature input parity unavailable")
+        payload {"ok" false
+                 "status" "unavailable"
+                 "available" false
+                 "target_date" (:target-date opts)
+                 "reason" reason
+                 "details" {"live_capture" (str (:live-capture opts))
+                            "historical_npz" (str (:historical-npz opts))
+                            "historical_cohort_json" (str (:historical-cohort-json opts))}
+                 "matched_rows" 0
+                 "matched_start" nil
+                 "matched_end" nil
+                 "shape" nil
+                 "max_abs_deviation" nil
+                 "min_correlation" nil
+                 "rows" []}]
+    (write-json! (:out-json opts) payload)
+    (when (:md-out opts)
+      (os/makedirs (os.path/dirname (:md-out opts)) ** :exist_ok true)
+      (spit (:md-out opts)
+            (str "# Grid Feature Input Parity\n\n"
+                 "- Status: `unavailable`\n"
+                 "- Reason: `" reason "`\n")))
+    (binding [*out* *err*]
+      (println reason)
+      (println (str "wrote unavailable grid parity artifact " (:out-json opts))))
+    1))
+
+(defn index-by-time [times]
+  (let [out (atom {})]
+    (doseq [idx (range (len times))]
+      (let [k (time-key (.__getitem__ times idx))]
+        (when-not (contains? @out k)
+          (swap! out assoc k idx))))
+    @out))
+
+(defn finite-frac [arr]
+  (float (numpy/mean (numpy/isfinite arr))))
+
+(defn nonzero-frac [arr]
+  (float (numpy/mean (numpy/not_equal arr 0.0))))
+
+(defn load-json-file [path]
+  (when (and path (os.path/exists path))
+    (json/loads (slurp path))))
+
+(def bar-buffer-symbols ["SPY" "HYG" "TLT" "VXX" "SPX" "TNX" "VIX"])
+(def bar-buffer-fields ["open" "high" "low" "close" "volume" "vwap" "trade_count" "bid" "ask"])
+
+(defn finite-float-or-nil [value]
+  (try
+    (let [out (float value)]
+      (when (math/isfinite out) out))
+    (catch python/Exception _ nil)))
+
+(defn latest-buffer-bar [raw symbol]
+  (let [payload (json/loads (str raw))
+        bars (.get payload symbol)]
+    (when (and (python/isinstance bars python/list) (pos? (len bars)))
+      (.__getitem__ bars -1))))
+
+(defn bar-buffer-source-diagnostic [live hist matched-times live-by-time hist-by-time]
+  ;; Compare the final buffered bar used at each inference timestamp. This is
+  ;; the direct source boundary for rolling equity, proxy, and V3 features.
+  (let [live-files (npz-files live)
+        hist-files (npz-files hist)]
+    (cond
+      (not (contains? live-files "bar_buffers_json"))
+      {"available" false "reason" "live capture missing bar_buffers_json"}
+
+      (not (contains? hist-files "bar_buffers_json"))
+      {"available" false "reason" "historical cohort missing bar_buffers_json"}
+
+      :else
+      (let [live-buffers (.__getitem__ live "bar_buffers_json")
+            hist-buffers (.__getitem__ hist "bar_buffers_json")
+            records (atom [])
+            missing (atom 0)
+            parse-errors (atom 0)
+            tail-time-mismatches (atom 0)
+            tail-time-samples (atom [])]
+        (doseq [time matched-times]
+          (try
+            (let [live-raw (.__getitem__ live-buffers (get live-by-time time))
+                  hist-raw (.__getitem__ hist-buffers (get hist-by-time time))]
+              (doseq [symbol bar-buffer-symbols]
+                (let [live-bar (latest-buffer-bar live-raw symbol)
+                      hist-bar (latest-buffer-bar hist-raw symbol)]
+                  (if (and live-bar hist-bar)
+                    (do
+                      (when (not= (time-key (.get live-bar "time"))
+                                  (time-key (.get hist-bar "time")))
+                        (swap! tail-time-mismatches inc)
+                        (when (< (count @tail-time-samples) 10)
+                          (swap! tail-time-samples conj {"row_time" time
+                                                         "symbol" symbol
+                                                         "live_bar_time" (str (.get live-bar "time"))
+                                                         "historical_bar_time" (str (.get hist-bar "time"))})))
+                      (doseq [field bar-buffer-fields
+                              :let [left (finite-float-or-nil (.get live-bar field))
+                                    right (finite-float-or-nil (.get hist-bar field))]
+                              :when (and (some? left) (some? right))]
+                        (swap! records conj {"symbol" symbol
+                                             "field" field
+                                             "live" left
+                                             "historical" right
+                                             "abs_deviation" (abs (- left right))
+                                             "exact" (= left right)})))
+                    (swap! missing inc)))))
+            (catch python/Exception _
+              (swap! parse-errors inc))))
+        (let [rows (vec (for [symbol bar-buffer-symbols]
+                          {"symbol" symbol
+                           "fields" (vec (for [field bar-buffer-fields
+                                                :let [xs (filter #(and (= symbol (get % "symbol"))
+                                                                       (= field (get % "field"))) @records)
+                                                      ds (map #(get % "abs_deviation") xs)
+                                                      worst (apply max-key #(get % "abs_deviation") xs)]
+                                                :when (seq xs)]
+                                            {"field" field
+                                             "count" (count xs)
+                                             "exact_count" (count (filter #(get % "exact") xs))
+                                             "mean_abs_deviation" (/ (reduce + 0.0 ds) (count ds))
+                                             "max_abs_deviation" (get worst "abs_deviation")
+                                             "worst_live" (get worst "live")
+                                             "worst_historical" (get worst "historical")}))}))]
+          {"available" true
+           "matched_rows" (count matched-times)
+           "fields_compared" (count @records)
+           "missing_symbol_buffers" @missing
+           "parse_errors" @parse-errors
+           "tail_time_mismatches" @tail-time-mismatches
+           "tail_time_samples" @tail-time-samples
+           "reason" (cond
+                      (zero? (count @records)) "no comparable final buffered bars"
+                      (pos? @tail-time-mismatches) "live and historical buffer tails use different timestamps"
+                      (pos? (count (filter #(pos? (get % "abs_deviation")) @records))) "live and historical final bar values differ"
+                      :else "live and historical final buffered bars match")
+           "rows" rows})))))
+
+(defn contracts-per-minute-stats [counts]
+  (let [xs (vec (sort (filter some? counts)))
+        n (count xs)
+        median (when (pos? n)
+                 (if (odd? n)
+                   (nth xs (quot n 2))
+                   (/ (+ (nth xs (dec (quot n 2))) (nth xs (quot n 2))) 2.0)))]
+	    {"min" (if (seq xs) (first xs) 0)
+	     "median" (or median 0)
+	     "max" (if (seq xs) (last xs) 0)}))
+
+(defn expiration-counts-from-contracts [contracts]
+  (let [counts (atom {})]
+    (doseq [contract contracts
+            :let [expiration (when contract
+                               (if (map? contract)
+                                 (get contract "expiration")
+                                 (.get contract "expiration")))]
+            :when (and expiration (pos? (count (str expiration))))]
+      (swap! counts update (str expiration) (fnil inc 0)))
+    @counts))
+
+(defn merge-count-map [left right]
+  (reduce (fn [out [k v]]
+            (update out (str k) (fnil + 0) (int v)))
+          left
+          right))
+
+(defn numeric-summary [values]
+  (let [xs (vec (sort (map float (filter some? values))))
+        n (count xs)
+        median (when (pos? n)
+                 (if (odd? n)
+                   (nth xs (quot n 2))
+                   (/ (+ (nth xs (dec (quot n 2))) (nth xs (quot n 2))) 2.0)))]
+    {"count" n
+     "min" (when (pos? n) (first xs))
+     "median" median
+     "max" (when (pos? n) (last xs))}))
+
+(defn live-chain-observed-deltas [live matched-times live-by-time target-date]
+  (let [files (npz-files live)]
+    (when (contains? files "option_chain_json")
+      (let [chains (.__getitem__ live "option_chain_json")
+            deltas (atom [])
+            same-day-contracts (atom 0)
+            parse-errors (atom 0)
+            missing (atom 0)]
+        (doseq [time matched-times
+                :let [idx (get live-by-time time)
+                      raw (when (some? idx) (str (.__getitem__ chains idx)))]]
+          (try
+            (if (and raw (> (count raw) 5))
+	              (let [payload (json/loads raw)
+	                    observed (.get payload "observed_at")]
+	                (doseq [contract (.get payload "contracts" [])
+	                        :let [expiration (if (map? contract)
+	                                           (get contract "expiration")
+	                                           (.get contract "expiration"))]
+	                        :when (= (str expiration) (str target-date))]
+	                  (swap! same-day-contracts inc))
+	                (if (and observed (pos? (count (str observed))))
+	                  (let [row-time (parse-time time)
+	                        observed-time (parse-time observed)
+                        delta (.total_seconds (- observed-time row-time))]
+                    (swap! deltas conj delta))
+                  (swap! missing inc)))
+              (swap! missing inc))
+            (catch python/Exception _
+              (swap! parse-errors inc))))
+        (let [xs @deltas
+              abs-xs (map abs xs)]
+	          {"available" true
+	           "matched_rows" (count matched-times)
+	           "rows_with_observed_at" (count xs)
+	           "missing_observed_at" @missing
+	           "parse_errors" @parse-errors
+	           "same_day_contracts" @same-day-contracts
+	           "signed_seconds" (numeric-summary xs)
+	           "absolute_seconds" (numeric-summary abs-xs)
+	           "rows_over_30_seconds" (count (filter #(> (abs %) 30.0) xs))
+	           "rows_over_180_seconds" (count (filter #(> (abs %) 180.0) xs))
+	           "rows_future_over_180_seconds" (count (filter #(> % 180.0) xs))
+	           "rows_past_over_180_seconds" (count (filter #(< % -180.0) xs))
+	           "reason" (cond
+	                      (empty? xs) "live option_chain_json has no observed_at values on matched rows"
+	                      (pos? (count (filter #(> % 180.0) xs))) "live option_chain_json observed_at is materially after some matched row times"
+	                      (pos? (count (filter #(< % -180.0) xs))) "live option_chain_json observed_at is materially before some matched row times"
+	                      (and (pos? @same-day-contracts)
+	                           (pos? (count (filter #(> (abs %) 30.0) xs))))
+	                      "live same-day option_chain_json observed_at is offset enough to affect 0DTE Greeks"
+	                      :else "live option_chain_json observed_at is aligned within 180 seconds of matched row times")})))))
+
+(defn live-chain-contract-density [live matched-times live-by-time]
+  (let [files (npz-files live)]
+    (when (contains? files "option_chain_json")
+      (let [chains (.__getitem__ live "option_chain_json")
+            expiration-counts (atom {})
+            counts (vec (for [time matched-times
+                              :let [idx (get live-by-time time)
+                                    raw (when (some? idx) (str (.__getitem__ chains idx)))]]
+                          (try
+                            (if (and raw (> (count raw) 5))
+                              (let [contracts (.get (json/loads raw) "contracts" [])]
+                                (swap! expiration-counts merge-count-map
+                                       (expiration-counts-from-contracts contracts))
+                                (count contracts))
+                              0)
+                            (catch python/Exception _ 0))))]
+        {"available" true
+         "matched_contracts_per_minute" (contracts-per-minute-stats counts)
+         "matched_minutes" (count counts)
+         "expiration_counts" @expiration-counts}))))
+
+(defn historical-chain-contract-density [cohort-json]
+  (when cohort-json
+    (let [spy (get-in cohort-json ["contract_field_coverage" "SPY"])
+          cpm0 (get spy "contracts_per_minute")
+          contracts (get spy "contracts")
+          minutes (get spy "minutes_with_contracts")
+          inferred (when (and contracts minutes (> (float minutes) 0.0))
+                     (/ (float contracts) (float minutes)))
+          cpm (if (seq cpm0)
+                cpm0
+                (when inferred {"min" inferred "median" inferred "max" inferred}))]
+      {"available" (boolean spy)
+       "chain_horizon_days" (get cohort-json "chain_horizon_days")
+       "spy_strike_range" (get cohort-json "spy_strike_range")
+	       "spy_expirations" (get cohort-json "spy_expirations")
+	       "spy_chain_minutes" (get cohort-json "spy_chain_minutes")
+	       "contracts" contracts
+	       "minutes_with_contracts" minutes
+	       "expiration_counts" (or (get spy "expiration_counts") {})
+	       "contracts_per_minute" (or cpm {})})))
+
+(defn expiration-distribution-diagnostic [live-density historical-density]
+  (let [live-counts (or (get live-density "expiration_counts") {})
+        hist-counts (or (get historical-density "expiration_counts") {})
+        live-minutes (or (get live-density "matched_minutes") 0)
+        hist-minutes (or (get historical-density "minutes_with_contracts") 0)
+        live-set (set (keys live-counts))
+        hist-set (set (keys hist-counts))
+        missing (vec (sort (set/difference live-set hist-set)))
+        extra (vec (sort (set/difference hist-set live-set)))
+        shared (vec (sort (set/intersection live-set hist-set)))
+        live-total (reduce + 0 (vals live-counts))
+        hist-total (reduce + 0 (vals hist-counts))
+        per-expiration (into {}
+                             (for [expiration shared
+                                   :let [live-cpm (when (pos? (float live-minutes))
+                                                    (/ (float (get live-counts expiration 0))
+                                                       (float live-minutes)))
+                                         hist-cpm (when (pos? (float hist-minutes))
+                                                    (/ (float (get hist-counts expiration 0))
+                                                       (float hist-minutes)))
+                                         ratio (when (and live-cpm hist-cpm (> live-cpm 0.0))
+                                                 (/ hist-cpm live-cpm))]]
+                               [expiration {"live_contracts_per_minute" live-cpm
+                                            "historical_contracts_per_minute" hist-cpm
+                                            "historical_to_live_ratio" ratio}]))
+        weak-expirations (vec (sort (for [[expiration stats] per-expiration
+                                           :let [ratio (get stats "historical_to_live_ratio")]
+                                           :when (and ratio (< (float ratio) 0.85))]
+                                       expiration)))
+        wide-expirations (vec (sort (for [[expiration stats] per-expiration
+                                           :let [ratio (get stats "historical_to_live_ratio")]
+                                           :when (and ratio (> (float ratio) 1.18))]
+                                       expiration)))
+        reason (cond
+                 (empty? live-counts) "live expiration distribution unavailable"
+                 (empty? hist-counts) "historical expiration distribution unavailable"
+                 (seq missing) "historical cohort is missing live SPY option expirations"
+                 (seq extra) "historical cohort includes SPY option expirations absent from matched live rows"
+                 (seq weak-expirations) "historical cohort is materially undercovered for some live SPY expirations"
+                 (seq wide-expirations) "historical cohort is materially overcovered for some live SPY expirations"
+                 :else "live and historical SPY option expiration sets match")]
+    {"live" live-counts
+     "historical" hist-counts
+     "live_total" live-total
+     "historical_total" hist-total
+     "shared_expirations" shared
+     "missing_in_historical" missing
+     "extra_in_historical" extra
+     "per_expiration" per-expiration
+     "undercovered_expirations" weak-expirations
+     "overcovered_expirations" wide-expirations
+     "reason" reason}))
+
+(defn contract-density-diagnostic [live-density historical-density]
+  (let [live-med (get-in live-density ["matched_contracts_per_minute" "median"])
+        hist-med (get-in historical-density ["contracts_per_minute" "median"])
+        ratio (when (and live-med hist-med (> (float live-med) 0.0))
+                (/ (float hist-med) (float live-med)))
+        reason (cond
+                 (not live-density) "live capture missing option_chain_json"
+                 (not (get historical-density "available")) "historical cohort missing SPY contract coverage"
+                 (nil? ratio) "contract density unavailable"
+                 (< ratio 0.75) "historical SPY option universe is materially narrower than live"
+                 (> ratio 1.35) "historical SPY option universe is materially wider than live"
+                 :else "historical SPY option universe density is comparable to live")]
+	    {"live" (or live-density {"available" false})
+	     "historical" (or historical-density {"available" false})
+	     "historical_to_live_median_ratio" ratio
+	     "expiration_distribution" (expiration-distribution-diagnostic live-density historical-density)
+	     "reason" reason}))
+
+(defn parse-grid-history-json [text]
+  (try
+    (let [raw (str (or text ""))]
+      (when (and (pos? (count raw)) (not= raw "[]"))
+        (numpy/asarray (json/loads raw) ** :dtype numpy/float64)))
+    (catch python/Exception _
+      nil)))
+
+(defn live-grid-history-tail-diagnostic [live matched-times live-by-time live-grids]
+  (let [files (npz-files live)]
+    (when (contains? files "grid_history_json")
+      (let [history-json (.__getitem__ live "grid_history_json")
+            deltas (atom [])
+            lengths (atom [])
+            missing (atom 0)
+            malformed (atom 0)]
+        (doseq [time matched-times
+                :let [idx (get live-by-time time)
+                      raw (when (some? idx) (str (.__getitem__ history-json idx)))
+                      history (when raw (parse-grid-history-json raw))]]
+          (cond
+            (nil? idx)
+            (swap! missing inc)
+
+            (or (nil? history)
+                (not= (.-ndim history) 4)
+                (not= (python/tuple (rest (vec (.-shape history)))) #py (6 21 8))
+                (zero? (int (first (.-shape history)))))
+            (if (and raw (pos? (count raw)) (not= raw "[]"))
+              (swap! malformed inc)
+              (swap! missing inc))
+
+            :else
+            (let [tail (.__getitem__ history -1)
+                  grid (.__getitem__ live-grids idx)
+                  diff (numpy/abs (- tail (.astype grid numpy/float64)))
+                  finite (.__getitem__ diff (numpy/isfinite diff))
+                  delta (if (> (len finite) 0) (float (numpy/max finite)) nil)]
+              (swap! lengths conj (int (first (.-shape history))))
+              (when (some? delta)
+                (swap! deltas conj delta)))))
+        (let [xs @deltas
+              mismatches (count (filter #(> % 1.0e-6) xs))]
+          {"available" true
+           "matched_rows" (count matched-times)
+           "rows_with_grid_history" (count xs)
+           "missing_grid_history" @missing
+           "malformed_grid_history" @malformed
+           "history_length" (numeric-summary @lengths)
+           "tail_abs_delta" (numeric-summary xs)
+           "tail_mismatch_rows" mismatches
+           "reason" (cond
+                      (empty? xs) "live grid_history_json has no usable rows on matched times"
+                      (pos? mismatches) "live grids differ from grid_history_json tail on matched rows"
+	                      :else "live grids match grid_history_json tail on matched rows")})))))
+
+(defn live-chain-grid-rebuild-diagnostic [live matched-times live-by-time live-grids]
+  (let [files (npz-files live)]
+    (if-not (contains? files "option_chain_json")
+      {"available" false
+       "reason" "live capture missing option_chain_json"}
+      (let [chains (.__getitem__ live "option_chain_json")
+            deltas (atom [])
+            means (atom [])
+            live-nz (atom [])
+            rebuilt-nz (atom [])
+            live-samples (atom [])
+            rebuilt-samples (atom [])
+            rows (atom [])
+            missing (atom 0)
+            malformed (atom 0)
+            max-sample-rows 10
+            rebuild-tolerance 1.0e-5]
+        (doseq [time (take max-sample-rows matched-times)
+                :let [idx (get live-by-time time)
+                      raw-chain (when (some? idx) (str (.__getitem__ chains idx)))]]
+          (try
+            (if (and raw-chain (> (count raw-chain) 5))
+              (if-let [rebuilt (raw-unlock/build-option-greeks-grid raw-chain nil nil nil nil)]
+                (let [live-grid (.__getitem__ live-grids idx)
+                      diff (numpy/abs (- (.astype live-grid numpy/float64)
+                                         (.astype rebuilt numpy/float64)))
+                      finite (.__getitem__ diff (numpy/isfinite diff))
+                      max-delta (if (> (len finite) 0) (float (numpy/max finite)) nil)
+                      mean-delta (if (> (len finite) 0) (float (numpy/mean finite)) nil)
+                      live-nonzero (float (numpy/mean (numpy/not_equal live-grid 0.0)))
+                      rebuilt-nonzero (float (numpy/mean (numpy/not_equal rebuilt 0.0)))]
+                  (when (some? max-delta) (swap! deltas conj max-delta))
+                  (when (some? mean-delta) (swap! means conj mean-delta))
+                  (swap! live-nz conj live-nonzero)
+                  (swap! rebuilt-nz conj rebuilt-nonzero)
+                  (swap! live-samples conj (.astype live-grid numpy/float64))
+                  (swap! rebuilt-samples conj (.astype rebuilt numpy/float64))
+                  (swap! rows conj {"time" time
+                                    "max_abs_deviation" max-delta
+                                    "mean_abs_deviation" mean-delta
+                                    "live_nonzero_frac" live-nonzero
+                                    "rebuilt_nonzero_frac" rebuilt-nonzero}))
+                (swap! malformed inc))
+              (swap! missing inc))
+            (catch python/Exception _
+              (swap! malformed inc))))
+        (let [max-deltas @deltas
+              live-stack (when (seq @live-samples)
+                           (numpy/stack (python/list @live-samples) ** :axis 0))
+              rebuilt-stack (when (seq @rebuilt-samples)
+                              (numpy/stack (python/list @rebuilt-samples) ** :axis 0))
+              by-greek (if (and live-stack rebuilt-stack)
+                         (vec (for [gi (range (count greek-names))
+                                    :let [live-greek (.__getitem__ live-stack #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+                                          rebuilt-greek (.__getitem__ rebuilt-stack #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+                                          diff (numpy/abs (- live-greek rebuilt-greek))
+                                          finite (.__getitem__ diff (numpy/isfinite diff))]]
+                                {"greek" (nth greek-names gi)
+                                 "max_abs_deviation" (when (> (len finite) 0) (float (numpy/max finite)))
+                                 "mean_abs_deviation" (when (> (len finite) 0) (float (numpy/mean finite)))
+                                 "live_nonzero_frac" (float (numpy/mean (numpy/not_equal live-greek 0.0)))
+                                 "rebuilt_nonzero_frac" (float (numpy/mean (numpy/not_equal rebuilt-greek 0.0)))}))
+                         [])
+              mismatch-rows (count (filter #(> % rebuild-tolerance) max-deltas))]
+          {"available" true
+           "sampled_rows" (count @rows)
+           "max_sample_rows" max-sample-rows
+           "tolerance" rebuild-tolerance
+           "missing_chain_rows" @missing
+           "malformed_or_unbuildable_rows" @malformed
+           "mismatch_rows" mismatch-rows
+           "max_abs_deviation" (when (seq max-deltas) (apply max max-deltas))
+           "mean_abs_deviation" (when (seq @means) (/ (reduce + 0.0 @means) (count @means)))
+           "live_nonzero_frac" (when (seq @live-nz) (/ (reduce + 0.0 @live-nz) (count @live-nz)))
+           "rebuilt_nonzero_frac" (when (seq @rebuilt-nz) (/ (reduce + 0.0 @rebuilt-nz) (count @rebuilt-nz)))
+           "by_greek" by-greek
+           "rows" @rows
+           "reason" (cond
+                      (empty? max-deltas) "no live option_chain_json rows could be rebuilt into grids"
+                      (pos? mismatch-rows) "current Basilisp grid builder does not reproduce live captured grids from the same option_chain_json"
+                      :else "current Basilisp grid builder reproduces live captured grids from option_chain_json")})))))
+
+(defn get-field [m k]
+  (when m
+    (try
+      (if (map? m)
+        (get m k)
+        (.get m k))
+      (catch python/Exception _
+        nil))))
+
+(defn parse-chain-payload [raw]
+  (let [text (str (or raw ""))]
+    (when (> (count text) 5)
+      (json/loads text))))
+
+(defn contract-key [contract]
+  (let [expiration (get-field contract "expiration")
+        right (get-field contract "right")
+        strike (get-field contract "strike")]
+    (when (and expiration right strike)
+      (str expiration "|" (.upper (str right)) "|" (format "%.6f" (float strike))))))
+
+(defn contract-quote-map [payload]
+  (let [out (atom {})]
+    (doseq [contract (or (get-field payload "contracts") [])
+            :let [k (contract-key contract)]
+            :when k]
+      (swap! out assoc k contract))
+    @out))
+
+(defn finite-number [value]
+  (when (number? value)
+    (let [x (float value)]
+      (when (math/isfinite x) x))))
+
+(defn quote-value [contract field]
+  (finite-number (get-field contract field)))
+
+(defn mid-value [contract]
+  (let [bid (quote-value contract "bid")
+        ask (quote-value contract "ask")]
+    (when (and bid ask)
+      (/ (+ bid ask) 2.0))))
+
+(defn summarize-deltas [values]
+  (let [xs (vec (sort (map float values)))
+        n (count xs)
+        mean (when (pos? n) (/ (reduce + 0.0 xs) n))
+        p95 (when (pos? n) (nth xs (min (dec n) (int (math/floor (* 0.95 (dec n)))))))]
+    {"count" n
+     "mean_abs_deviation" mean
+     "p95_abs_deviation" p95
+     "max_abs_deviation" (when (pos? n) (last xs))}))
+
+(defn chain-quote-source-diagnostic [live hist matched-times live-by-time hist-by-time]
+  (let [live-files (npz-files live)
+        hist-files (npz-files hist)]
+    (cond
+      (not (contains? live-files "option_chain_json"))
+      {"available" false
+       "reason" "live capture missing option_chain_json"}
+
+      (not (contains? hist-files "option_chain_json"))
+      {"available" false
+       "reason" "historical NPZ missing option_chain_json; rebuild historical cohort with current builder"}
+
+      :else
+      (let [live-chains (.__getitem__ live "option_chain_json")
+            hist-chains (.__getitem__ hist "option_chain_json")
+            rows (atom [])
+            bid-deltas (atom [])
+            ask-deltas (atom [])
+            mid-deltas (atom [])
+            max-examples (atom [])
+            missing-live (atom 0)
+            missing-hist (atom 0)
+            parse-errors (atom 0)
+            rows-compared (atom 0)
+            shared-total (atom 0)
+            missing-in-historical-total (atom 0)
+            extra-in-historical-total (atom 0)]
+        (doseq [time matched-times
+                :let [live-idx (get live-by-time time)
+                      hist-idx (get hist-by-time time)
+                      live-raw (when (some? live-idx) (str (.__getitem__ live-chains live-idx)))
+                      hist-raw (when (some? hist-idx) (str (.__getitem__ hist-chains hist-idx)))]]
+          (cond
+            (or (nil? live-raw) (<= (count live-raw) 5))
+            (swap! missing-live inc)
+
+            (or (nil? hist-raw) (<= (count hist-raw) 5))
+            (swap! missing-hist inc)
+
+            :else
+            (try
+              (let [live-map (contract-quote-map (parse-chain-payload live-raw))
+                    hist-map (contract-quote-map (parse-chain-payload hist-raw))
+                    live-keys (set (keys live-map))
+                    hist-keys (set (keys hist-map))
+                    shared (set/intersection live-keys hist-keys)
+                    missing-in-hist (set/difference live-keys hist-keys)
+                    extra-in-hist (set/difference hist-keys live-keys)]
+                (swap! rows-compared inc)
+                (swap! shared-total + (count shared))
+                (swap! missing-in-historical-total + (count missing-in-hist))
+                (swap! extra-in-historical-total + (count extra-in-hist))
+                (doseq [k shared
+                        :let [live-contract (get live-map k)
+                              hist-contract (get hist-map k)
+                              live-bid (quote-value live-contract "bid")
+                              hist-bid (quote-value hist-contract "bid")
+                              live-ask (quote-value live-contract "ask")
+                              hist-ask (quote-value hist-contract "ask")
+                              live-mid (mid-value live-contract)
+                              hist-mid (mid-value hist-contract)]]
+                  (when (and live-bid hist-bid)
+                    (let [delta (abs (- live-bid hist-bid))]
+                      (swap! bid-deltas conj delta)
+                      (swap! max-examples conj {"time" time
+                                                "contract" k
+                                                "field" "bid"
+                                                "live" live-bid
+                                                "historical" hist-bid
+                                                "abs_deviation" delta})))
+                  (when (and live-ask hist-ask)
+                    (let [delta (abs (- live-ask hist-ask))]
+                      (swap! ask-deltas conj delta)
+                      (swap! max-examples conj {"time" time
+                                                "contract" k
+                                                "field" "ask"
+                                                "live" live-ask
+                                                "historical" hist-ask
+                                                "abs_deviation" delta})))
+                  (when (and live-mid hist-mid)
+                    (let [delta (abs (- live-mid hist-mid))]
+                      (swap! mid-deltas conj delta)
+                      (swap! max-examples conj {"time" time
+                                                "contract" k
+                                                "field" "mid"
+                                                "live" live-mid
+                                                "historical" hist-mid
+                                                "abs_deviation" delta}))))
+                (when (< (count @rows) 10)
+                  (swap! rows conj {"time" time
+                                    "live_contracts" (count live-keys)
+                                    "historical_contracts" (count hist-keys)
+                                    "shared_contracts" (count shared)
+                                    "missing_in_historical" (count missing-in-hist)
+                                    "extra_in_historical" (count extra-in-hist)})))
+              (catch python/Exception _
+                (swap! parse-errors inc)))))
+        (let [examples (vec (take 10 (reverse (sort-by #(float (or (get % "abs_deviation") 0.0)) @max-examples))))
+              bid-summary (summarize-deltas @bid-deltas)
+              ask-summary (summarize-deltas @ask-deltas)
+              mid-summary (summarize-deltas @mid-deltas)
+              shared @shared-total
+              missing @missing-in-historical-total
+              extra @extra-in-historical-total
+              max-mid (get mid-summary "max_abs_deviation")]
+          {"available" true
+           "matched_rows" (count matched-times)
+           "rows_compared" @rows-compared
+           "missing_live_chain_rows" @missing-live
+           "missing_historical_chain_rows" @missing-hist
+           "parse_errors" @parse-errors
+           "shared_contracts" shared
+           "missing_in_historical_contracts" missing
+           "extra_in_historical_contracts" extra
+           "bid_abs_deviation" bid-summary
+           "ask_abs_deviation" ask-summary
+           "mid_abs_deviation" mid-summary
+           "largest_quote_deviations" examples
+           "rows" @rows
+           "reason" (cond
+                      (zero? @rows-compared) "no comparable live/historical option_chain_json rows"
+                      (pos? missing) "historical option_chain_json is missing live contract keys"
+                      (pos? extra) "historical option_chain_json includes extra contract keys absent from live"
+                      (and max-mid (> (float max-mid) 1.0e-6)) "shared live/historical contract quote values differ"
+                      :else "live and historical option_chain_json contract keys and quote values match on sampled rows")})))))
+
+(defn grid-history-sequence-diagnostic [live hist matched-times live-by-time hist-by-time]
+  (let [live-files (npz-files live)
+        hist-files (npz-files hist)]
+    (cond
+      (not (contains? live-files "grid_history_json"))
+      {"available" false
+       "reason" "live capture missing grid_history_json"}
+
+      (not (contains? hist-files "grid_histories"))
+      {"available" false
+       "reason" "historical NPZ missing grid_histories; rebuild historical cohort with rolling history output"}
+
+      :else
+      (let [live-history-json (.__getitem__ live "grid_history_json")
+            hist-histories (.__getitem__ hist "grid_histories")
+            deltas (atom [])
+            live-lengths (atom [])
+            hist-lengths (atom [])
+            missing (atom 0)
+            malformed (atom 0)
+            shape-mismatches (atom 0)]
+        (doseq [time matched-times
+                :let [live-idx (get live-by-time time)
+                      hist-idx (get hist-by-time time)
+                      raw (when (some? live-idx) (str (.__getitem__ live-history-json live-idx)))
+                      live-history (when raw (parse-grid-history-json raw))]]
+          (cond
+            (or (nil? live-idx) (nil? hist-idx))
+            (swap! missing inc)
+
+            (or (nil? live-history)
+                (not= (.-ndim live-history) 4)
+                (not= (python/tuple (rest (vec (.-shape live-history)))) #py (6 21 8))
+                (zero? (int (first (.-shape live-history)))))
+            (if (and raw (pos? (count raw)) (not= raw "[]"))
+              (swap! malformed inc)
+              (swap! missing inc))
+
+            :else
+            (let [hist-history (.astype (.__getitem__ hist-histories hist-idx) numpy/float64)
+                  live-n (int (first (.-shape live-history)))
+                  hist-n (int (first (.-shape hist-history)))]
+              (swap! live-lengths conj live-n)
+              (swap! hist-lengths conj hist-n)
+              (if (> live-n hist-n)
+                (swap! shape-mismatches inc)
+                (let [hist-tail (.__getitem__ hist-history
+                                             (python/tuple [(slice (- hist-n live-n) nil)
+                                                            (slice nil nil)
+                                                            (slice nil nil)
+                                                            (slice nil nil)]))
+                      diff (numpy/abs (- live-history hist-tail))
+                      finite (.__getitem__ diff (numpy/isfinite diff))
+                      delta (if (> (len finite) 0) (float (numpy/max finite)) nil)]
+                  (when (some? delta)
+                    (swap! deltas conj delta)))))))
+        (let [xs @deltas
+              mismatches (count (filter #(> % 1.0e-6) xs))]
+          {"available" true
+           "matched_rows" (count matched-times)
+           "rows_compared" (count xs)
+           "missing_grid_history" @missing
+           "malformed_grid_history" @malformed
+           "shape_mismatch_rows" @shape-mismatches
+           "live_history_length" (numeric-summary @live-lengths)
+           "historical_history_length" (numeric-summary @hist-lengths)
+           "sequence_abs_delta" (numeric-summary xs)
+           "sequence_mismatch_rows" mismatches
+           "reason" (cond
+                      (empty? xs) "no comparable live/historical grid history rows"
+                      (pos? @shape-mismatches) "live grid history is longer than historical grid history on some rows"
+                      (pos? mismatches) "live grid_history_json sequence differs from historical grid_histories tail"
+                      :else "live grid_history_json sequence matches historical grid_histories tail")})))))
+
+(defn correlation [a b]
+  (let [mask (numpy/logical_and (numpy/isfinite a) (numpy/isfinite b))
+        aa (.__getitem__ a mask)
+        bb (.__getitem__ b mask)
+        n (int (first (.-shape aa)))]
+    (when (and (>= n 2)
+               (> (float (numpy/std aa)) 1e-12)
+               (> (float (numpy/std bb)) 1e-12))
+      (float (.__getitem__ (numpy/corrcoef aa bb) #py (0 1))))))
+
+(defn quantile-value [arr q]
+  (if (> (len arr) 0)
+    (float (numpy/quantile arr q))
+    nil))
+
+(defn max-location [diff live historical matched-times]
+  (let [finite-mask (numpy/isfinite diff)]
+    (when (boolean (numpy/any finite-mask))
+      (let [safe-diff (numpy/where finite-mask diff -1.0)
+            flat-idx (int (numpy/argmax safe-diff))
+            idx (numpy/unravel_index flat-idx (.-shape safe-diff))
+            row-idx (int (.__getitem__ idx 0))
+            m-idx (int (.__getitem__ idx 1))
+            dte-idx (int (.__getitem__ idx 2))
+            tuple-idx (python/tuple [row-idx m-idx dte-idx])]
+        {"time" (nth matched-times row-idx)
+         "row_index" row-idx
+         "moneyness_bin" m-idx
+         "dte_bin" dte-idx
+         "live" (float (.__getitem__ live tuple-idx))
+         "historical" (float (.__getitem__ historical tuple-idx))
+         "abs_deviation" (float (.__getitem__ diff tuple-idx))}))))
+
+(defn bool-count [arr]
+  (int (numpy/sum arr)))
+
+(defn abs-mask-summary [diff mask]
+  (let [vals (.__getitem__ diff mask)]
+    (if (> (len vals) 0)
+      {"count" (int (len vals))
+       "max_abs_deviation" (float (numpy/max vals))
+       "mean_abs_deviation" (float (numpy/mean vals))}
+      {"count" 0
+       "max_abs_deviation" nil
+       "mean_abs_deviation" nil})))
+
+(defn grid-cell-mismatch-pattern [live64 hist64 diff]
+  (let [shape (.-shape diff)
+        rows (int (.__getitem__ shape 0))
+        m-bins (int (.__getitem__ shape 1))
+        d-bins (int (.__getitem__ shape 2))
+        finite (numpy/logical_and (numpy/isfinite live64) (numpy/isfinite hist64))
+        mismatch (numpy/logical_and finite (> diff 1.0e-6))
+        live-zero (numpy/logical_and finite (numpy/less_equal (numpy/abs live64) 1.0e-12))
+        hist-zero (numpy/logical_and finite (numpy/less_equal (numpy/abs hist64) 1.0e-12))
+        live-zero-hist-nonzero (numpy/logical_and mismatch (numpy/logical_and live-zero (numpy/logical_not hist-zero)))
+        hist-zero-live-nonzero (numpy/logical_and mismatch (numpy/logical_and hist-zero (numpy/logical_not live-zero)))
+        edge-m (numpy/zeros (python/tuple [rows m-bins d-bins]) ** :dtype numpy/bool_)
+        near-dte (numpy/zeros (python/tuple [rows m-bins d-bins]) ** :dtype numpy/bool_)]
+    (.__setitem__ edge-m (python/tuple [(slice nil nil) 0 (slice nil nil)]) true)
+    (.__setitem__ edge-m (python/tuple [(slice nil nil) (dec m-bins) (slice nil nil)]) true)
+    (.__setitem__ near-dte (python/tuple [(slice nil nil) (slice nil nil) 0]) true)
+    (.__setitem__ near-dte (python/tuple [(slice nil nil) (slice nil nil) 1]) true)
+    {"mismatch_cells" (bool-count mismatch)
+     "live_zero_hist_nonzero_cells" (bool-count live-zero-hist-nonzero)
+     "hist_zero_live_nonzero_cells" (bool-count hist-zero-live-nonzero)
+     "edge_moneyness" (abs-mask-summary diff (numpy/logical_and mismatch edge-m))
+     "near_dte" (abs-mask-summary diff (numpy/logical_and mismatch near-dte))
+     "edge_moneyness_near_dte" (abs-mask-summary diff (numpy/logical_and mismatch
+                                                                        (numpy/logical_and edge-m near-dte)))
+     "edge_live_zero_hist_nonzero_cells" (bool-count (numpy/logical_and live-zero-hist-nonzero edge-m))
+     "edge_hist_zero_live_nonzero_cells" (bool-count (numpy/logical_and hist-zero-live-nonzero edge-m))}))
+
+(defn robust-correlation [live64 hist64 diff]
+  (let [finite-diff (.__getitem__ diff (numpy/isfinite diff))]
+    (when (> (len finite-diff) 0)
+      (let [cutoff (numpy/quantile finite-diff 0.99)
+            mask (numpy/logical_and (numpy/isfinite live64)
+                                    (numpy/logical_and (numpy/isfinite hist64)
+                                                       (numpy/less_equal diff cutoff)))]
+        (correlation (.__getitem__ live64 mask) (.__getitem__ hist64 mask))))))
+
+(defn lag-slices [live historical lag]
+  (let [n (int (first (.-shape live)))]
+    (cond
+      (neg? lag) [(.__getitem__ live (slice (- lag) n))
+                  (.__getitem__ historical (slice 0 (+ n lag)))]
+      (pos? lag) [(.__getitem__ live (slice 0 (- n lag)))
+                  (.__getitem__ historical (slice lag n))]
+      :else [live historical])))
+
+(defn lag-correlations [live historical]
+  (let [n (int (first (.-shape live)))]
+    (vec (for [lag (range -3 4)]
+           (if (>= (abs lag) n)
+             {"lag_minutes" lag
+              "correlation" nil}
+             (let [[l h] (lag-slices live historical lag)]
+               {"lag_minutes" lag
+                "correlation" (correlation (.ravel l) (.ravel h))}))))))
+
+(defn best-lag [lags]
+  (let [valid (vec (filter #(some? (get % "correlation")) lags))]
+    (when (seq valid)
+      (apply max-key #(float (get % "correlation")) valid))))
+
+(defn sequence-lag-summaries [rows]
+  (vec (for [lag (range -3 4)
+             :let [corrs (vec (keep (fn [row]
+                                       (some (fn [candidate]
+                                               (when (= lag (get candidate "lag_minutes"))
+                                                 (get candidate "correlation")))
+                                             (get row "lag_correlations")))
+                                     rows))]]
+         {"lag_minutes" lag
+          "greek_count" (count corrs)
+          "min_correlation" (when (seq corrs) (apply min corrs))
+          "mean_correlation" (when (seq corrs) (/ (reduce + 0.0 corrs) (count corrs)))})))
+
+(defn best-sequence-lag-by [summaries field]
+  (let [valid (vec (filter #(some? (get % "min_correlation")) summaries))]
+    (when (seq valid)
+      (apply max-key #(float (get % field)) valid))))
+
+(defn shifted-match-times [live-by-time hist-by-time shift-minutes]
+  (vec (sort (filter (fn [time]
+                       (contains? hist-by-time (shifted-time-key time shift-minutes)))
+                     (keys live-by-time)))))
+
+(defn shift-correlation-summary [live-grids hist-grids live-by-time hist-by-time shift-minutes]
+  (let [matched-times (shifted-match-times live-by-time hist-by-time shift-minutes)
+        matched-count (count matched-times)]
+    (if (zero? matched-count)
+      {"historical_shift_minutes" shift-minutes
+       "matched_rows" 0
+       "matched_start" nil
+       "matched_end" nil
+       "min_correlation" nil
+       "mean_correlation" nil
+       "rows" []}
+      (let [live-indexes (numpy/asarray (python/list (map #(get live-by-time %) matched-times)) ** :dtype numpy/int64)
+            hist-indexes (numpy/asarray (python/list (map #(get hist-by-time (shifted-time-key % shift-minutes)) matched-times)) ** :dtype numpy/int64)
+            live-matched (.__getitem__ live-grids live-indexes)
+            hist-matched (.__getitem__ hist-grids hist-indexes)
+            rows (vec (for [gi (range (count greek-names))
+                            :let [live-greek (.__getitem__ live-matched #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+                                  hist-greek (.__getitem__ hist-matched #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))]]
+                        {"greek" (nth greek-names gi)
+                         "correlation" (correlation (.ravel (.astype live-greek numpy/float64))
+                                                    (.ravel (.astype hist-greek numpy/float64)))}))
+            corrs (vec (keep #(get % "correlation") rows))]
+        {"historical_shift_minutes" shift-minutes
+         "matched_rows" matched-count
+         "matched_start" (first matched-times)
+         "matched_end" (last matched-times)
+         "min_correlation" (when (seq corrs) (apply min corrs))
+         "mean_correlation" (when (seq corrs) (/ (reduce + 0.0 corrs) (count corrs)))
+         "rows" rows}))))
+
+(defn best-shift-summary [summaries]
+  (let [valid (vec (filter #(some? (get % "min_correlation")) summaries))]
+    (when (seq valid)
+      (apply max-key #(float (get % "min_correlation")) valid))))
+
+(defn as-float [value]
+  (when (number? value)
+    (float value)))
+
+(defn alignment-diagnosis [base-min best-shift best-seq-lag grid-history-sequence cohort-json]
+  (let [shift-min (as-float (get best-shift "min_correlation"))
+        shift-lag (get best-shift "historical_shift_minutes")
+        seq-min (as-float (get best-seq-lag "min_correlation"))
+        seq-lag (get best-seq-lag "lag_minutes")
+        row-prov (get cohort-json "row_provenance_summary")
+        carried-grid-rows (get row-prov "carried_grid_rows")
+        grid-appended-rows (get row-prov "grid_appended_rows")
+        base (as-float base-min)
+        shift-improvement (when (and shift-min base) (- shift-min base))
+        seq-improvement (when (and seq-min base) (- seq-min base))
+        sequence-mismatch-rows (get grid-history-sequence "sequence_mismatch_rows")
+        sequence-compared (get grid-history-sequence "rows_compared")
+        sequence-mismatch? (and (number? sequence-mismatch-rows) (pos? sequence-mismatch-rows))]
+    {"base_min_correlation" base
+     "best_historical_shift_minutes" shift-lag
+     "best_historical_shift_min_correlation" shift-min
+     "historical_shift_min_correlation_improvement" shift-improvement
+     "best_sequence_lag_minutes" seq-lag
+     "best_sequence_lag_min_correlation" seq-min
+     "sequence_lag_min_correlation_improvement" seq-improvement
+     "grid_history_rows_compared" sequence-compared
+     "grid_history_sequence_mismatch_rows" sequence-mismatch-rows
+     "historical_carried_grid_rows" carried-grid-rows
+     "historical_grid_appended_rows" grid-appended-rows
+     "category" (cond
+                  sequence-mismatch?
+                  "grid-history-sequence-mismatch"
+
+                  (and (number? carried-grid-rows) (pos? carried-grid-rows))
+                  "historical-carried-grid"
+
+                  (and seq-improvement
+                       (> seq-improvement 0.20)
+                       (or (nil? shift-improvement)
+                           (> seq-improvement (+ shift-improvement 0.15))))
+                  "rolling-window-sequence-lag"
+
+                  (and shift-improvement
+                       (> shift-improvement 0.20)
+                       (number? shift-lag)
+                       (not= 0 (int shift-lag)))
+                  "timestamp-bucket-shift"
+
+                  (and base (< base 0.95))
+                  "source-value-drift"
+
+                  :else
+                  "aligned")
+     "reason" (cond
+                sequence-mismatch?
+                "Live grid_history payload and historical grid_histories differ at matched timestamps; fix serialized history construction before unmasking grid-derived features."
+
+                (and (number? carried-grid-rows) (pos? carried-grid-rows))
+                "Historical cohort emitted rows where no same-minute SPY chain produced a new grid; stale carried grids can create sequence lag."
+
+                (and seq-improvement
+                     (> seq-improvement 0.20)
+                     (or (nil? shift-improvement)
+                         (> seq-improvement (+ shift-improvement 0.15))))
+                "Within-sequence lag improves correlation materially more than shifting timestamps; inspect rolling grid-history order/warmup/bucketing."
+
+                (and shift-improvement
+                     (> shift-improvement 0.20)
+                     (number? shift-lag)
+                     (not= 0 (int shift-lag)))
+                "Shifting historical timestamps materially improves correlation; inspect timestamp bucketing and close-time conventions."
+
+                (and base (< base 0.95))
+                "Matched timestamps still have weak source-grid correlation after lag checks; inspect ThetaData/live source values and contract filtering."
+
+                :else
+                "Grid source alignment looks acceptable.")}))
+
+(defn metric-row [name live historical matched-times]
+  (let [live64 (.astype live numpy/float64)
+        hist64 (.astype historical numpy/float64)
+        diff (numpy/abs (- live64 hist64))
+        finite-diff (.__getitem__ diff (numpy/isfinite diff))
+        lags (lag-correlations live64 hist64)]
+    {"greek" name
+     "live_mean" (float (numpy/nanmean live64))
+     "historical_mean" (float (numpy/nanmean hist64))
+     "live_std" (float (numpy/nanstd live64))
+     "historical_std" (float (numpy/nanstd hist64))
+     "live_finite_frac" (finite-frac live64)
+     "historical_finite_frac" (finite-frac hist64)
+     "live_nonzero_frac" (nonzero-frac live64)
+     "historical_nonzero_frac" (nonzero-frac hist64)
+     "correlation" (correlation (.ravel live64) (.ravel hist64))
+     "lag_correlations" lags
+     "best_lag" (best-lag lags)
+     "correlation_without_top_1pct_abs_dev" (robust-correlation live64 hist64 diff)
+     "mean_abs_deviation" (if (> (len finite-diff) 0) (float (numpy/mean finite-diff)) nil)
+     "p50_abs_deviation" (quantile-value finite-diff 0.50)
+     "p90_abs_deviation" (quantile-value finite-diff 0.90)
+	     "p99_abs_deviation" (quantile-value finite-diff 0.99)
+	     "max_abs_deviation" (if (> (len finite-diff) 0) (float (numpy/max finite-diff)) nil)
+	     "max_abs_location" (max-location diff live64 hist64 matched-times)
+	     "mismatch_pattern" (grid-cell-mismatch-pattern live64 hist64 diff)}))
+
+(defn md-table [headers rows]
+  (str "| " (str/join " | " headers) " |\n"
+       "| " (str/join " | " (repeat (count headers) "---")) " |\n"
+       (str/join "\n" (map (fn [row] (str "| " (str/join " | " (map str row)) " |")) rows))
+       "\n"))
+
+(defn markdown [payload]
+  (str "# Grid Feature Input Parity\n\n"
+       "- Status: `" (get payload "status") "`\n"
+       "- Matched rows: `" (get payload "matched_rows") "`\n"
+       "- Matched window: `" (get payload "matched_start") "` - `" (get payload "matched_end") "`\n"
+       "- Max abs deviation: `" (get payload "max_abs_deviation") "`\n"
+       "- Min correlation: `" (get payload "min_correlation") "`\n\n"
+	       (when-let [density (get payload "contract_density")]
+	         (str "## Contract Density\n\n"
+	              "- Reason: `" (get density "reason") "`\n"
+	              "- Historical/live median ratio: `" (get density "historical_to_live_median_ratio") "`\n\n"
+	              (when-let [exp-dist (get density "expiration_distribution")]
+	                (str "### Expiration Distribution\n\n"
+	                     "- Reason: `" (get exp-dist "reason") "`\n"
+	                     "- Missing in historical: `" (get exp-dist "missing_in_historical") "`\n"
+	                     "- Extra in historical: `" (get exp-dist "extra_in_historical") "`\n"
+	                     "- Undercovered expirations: `" (get exp-dist "undercovered_expirations") "`\n"
+	                     "- Overcovered expirations: `" (get exp-dist "overcovered_expirations") "`\n\n"))))
+	       (when-let [deltas (get payload "live_chain_observed_at_delta")]
+	         (str "## Live Chain Observed-At Delta\n\n"
+	              "- Reason: `" (get deltas "reason") "`\n"
+	              "- Same-day contracts: `" (get deltas "same_day_contracts") "`\n"
+	              "- Rows over 30s: `" (get deltas "rows_over_30_seconds") "`\n"
+	              "- Rows over 180s: `" (get deltas "rows_over_180_seconds") "`\n"
+	              "- Signed seconds median: `" (get-in deltas ["signed_seconds" "median"]) "`\n\n"))
+       (when-let [tail (get payload "live_grid_history_tail")]
+         (str "## Live Grid-History Tail\n\n"
+              "- Reason: `" (get tail "reason") "`\n"
+              "- Rows with grid history: `" (get tail "rows_with_grid_history") "`\n"
+              "- Tail mismatch rows: `" (get tail "tail_mismatch_rows") "`\n"
+              "- Tail max abs delta: `" (get-in tail ["tail_abs_delta" "max"]) "`\n\n"))
+       (when-let [rebuild (get payload "live_chain_grid_rebuild")]
+         (str "## Live Chain Grid Rebuild\n\n"
+              "- Reason: `" (get rebuild "reason") "`\n"
+              "- Sampled rows: `" (get rebuild "sampled_rows") "` / `" (get rebuild "max_sample_rows") "`\n"
+              "- Missing chain rows: `" (get rebuild "missing_chain_rows") "`\n"
+              "- Malformed/unbuildable rows: `" (get rebuild "malformed_or_unbuildable_rows") "`\n"
+              "- Mismatch rows: `" (get rebuild "mismatch_rows") "`\n"
+              "- Max abs deviation: `" (get rebuild "max_abs_deviation") "`\n"
+              "- Mean abs deviation: `" (get rebuild "mean_abs_deviation") "`\n"
+              "- Live/rebuilt nonzero frac: `" (get rebuild "live_nonzero_frac") "` / `"
+              (get rebuild "rebuilt_nonzero_frac") "`\n\n"
+              (when (seq (get rebuild "by_greek"))
+                (md-table ["Greek" "Max Abs Dev" "Mean Abs Dev" "Live NZ" "Rebuilt NZ"]
+                          (map (fn [row]
+                                 [(get row "greek")
+                                  (get row "max_abs_deviation")
+                                  (get row "mean_abs_deviation")
+                                  (get row "live_nonzero_frac")
+                                  (get row "rebuilt_nonzero_frac")])
+                               (get rebuild "by_greek"))))
+              "\n"))
+       (when-let [quote-source (get payload "chain_quote_source")]
+         (str "## Chain Quote Source\n\n"
+              "- Reason: `" (get quote-source "reason") "`\n"
+              "- Rows compared: `" (get quote-source "rows_compared") "`\n"
+              "- Shared contracts: `" (get quote-source "shared_contracts") "`\n"
+              "- Missing in historical: `" (get quote-source "missing_in_historical_contracts") "`\n"
+              "- Extra in historical: `" (get quote-source "extra_in_historical_contracts") "`\n"
+              "- Max mid abs deviation: `" (get-in quote-source ["mid_abs_deviation" "max_abs_deviation"]) "`\n\n"))
+       (when-let [seq-history (get payload "grid_history_sequence")]
+         (str "## Grid-History Sequence\n\n"
+              "- Reason: `" (get seq-history "reason") "`\n"
+              "- Rows compared: `" (get seq-history "rows_compared") "`\n"
+              "- Sequence mismatch rows: `" (get seq-history "sequence_mismatch_rows") "`\n"
+              "- Sequence max abs delta: `" (get-in seq-history ["sequence_abs_delta" "max"]) "`\n\n"))
+       (when-let [best-shift (get payload "best_historical_time_shift")]
+         (str "## Historical Time-Shift Diagnostic\n\n"
+              "- Best historical shift minutes: `" (get best-shift "historical_shift_minutes") "`\n"
+              "- Best shifted min correlation: `" (get best-shift "min_correlation") "`\n"
+              "- Best shifted matched rows: `" (get best-shift "matched_rows") "`\n\n"))
+       (when-let [best-lag (get payload "best_sequence_lag")]
+         (str "## Sequence-Lag Diagnostic\n\n"
+              "- Best sequence lag minutes: `" (get best-lag "lag_minutes") "`\n"
+              "- Best sequence-lag min correlation: `" (get best-lag "min_correlation") "`\n"
+              "- Greek count: `" (get best-lag "greek_count") "`\n\n"))
+       (when-let [diagnosis (get payload "alignment_diagnosis")]
+         (str "## Alignment Diagnosis\n\n"
+              "- Category: `" (get diagnosis "category") "`\n"
+              "- Reason: " (get diagnosis "reason") "\n"
+              "- Historical-shift improvement: `" (get diagnosis "historical_shift_min_correlation_improvement") "`\n"
+              "- Sequence-lag improvement: `" (get diagnosis "sequence_lag_min_correlation_improvement") "`\n\n"))
+	       (md-table ["Greek" "Corr" "Best Lag" "Best Lag Corr" "Robust Corr" "P99 Abs Dev" "Max Abs Dev" "Edge Mismatch" "Near-DTE Mismatch" "Live0/HistNZ" "Hist0/LiveNZ"]
+	                 (map (fn [row]
+	                        [(get row "greek")
+	                         (get row "correlation")
+	                         (get-in row ["best_lag" "lag_minutes"])
+	                         (get-in row ["best_lag" "correlation"])
+	                         (get row "correlation_without_top_1pct_abs_dev")
+	                         (get row "p99_abs_deviation")
+	                         (get row "max_abs_deviation")
+	                         (get-in row ["mismatch_pattern" "edge_moneyness" "count"])
+	                         (get-in row ["mismatch_pattern" "near_dte" "count"])
+	                         (get-in row ["mismatch_pattern" "live_zero_hist_nonzero_cells"])
+	                         (get-in row ["mismatch_pattern" "hist_zero_live_nonzero_cells"])])
+	                      (get payload "rows")))))
+
+(defn run-main [opts]
+  (if (:write-unavailable opts)
+    (write-unavailable opts)
+    (do
+      (doseq [required [:live-capture :historical-npz :out-json]]
+        (when-not (get opts required)
+          (throw (python/ValueError (str "missing required --" (.replace (name required) "_" "-"))))))
+      (cond
+        (not (os.path/exists (:live-capture opts)))
+        (reject opts "live capture NPZ missing" {"live_capture" (:live-capture opts)})
+
+        (not (os.path/exists (:historical-npz opts)))
+        (reject opts "historical NPZ missing" {"historical_npz" (:historical-npz opts)})
+
+        :else
+        (let [live (numpy/load (:live-capture opts) ** :allow_pickle true)
+          hist (numpy/load (:historical-npz opts) ** :allow_pickle true)
+          live-files (npz-files live)
+          hist-files (npz-files hist)]
+      (cond
+        (not (contains? live-files "times"))
+        (reject opts "live capture missing times array" {"arrays" (vec (.-files live))})
+
+        (not (contains? live-files "grids"))
+        (reject opts "live capture missing grids array" {"arrays" (vec (.-files live))})
+
+        (not (contains? hist-files "times"))
+        (reject opts "historical NPZ missing times array" {"arrays" (vec (.-files hist))})
+
+        (not (contains? hist-files "grids"))
+        (reject opts "historical NPZ missing grids array" {"arrays" (vec (.-files hist))
+                                                           "hint" "rebuild with build_thetadata_historical_feature_cohort.lpy version that writes :grids"})
+
+        :else
+        (let [live-times (.__getitem__ live "times")
+              hist-times (.__getitem__ hist "times")
+              live-grids (numpy/asarray (.__getitem__ live "grids") ** :dtype numpy/float32)
+              hist-grids (numpy/asarray (.__getitem__ hist "grids") ** :dtype numpy/float32)
+              live-by-time (index-by-time live-times)
+              hist-by-time (index-by-time hist-times)
+              matched-times (vec (sort (filter #(contains? hist-by-time %) (keys live-by-time))))
+              matched-count (count matched-times)]
+          (if (< matched-count (:min-rows opts))
+            (reject opts "insufficient matched grid rows"
+                    {"matched_rows" matched-count
+                     "min_rows" (:min-rows opts)
+                     "live_rows" (int (len live-times))
+                     "historical_rows" (int (len hist-times))})
+            (let [live-indexes (numpy/asarray (python/list (map #(get live-by-time %) matched-times)) ** :dtype numpy/int64)
+                  hist-indexes (numpy/asarray (python/list (map #(get hist-by-time %) matched-times)) ** :dtype numpy/int64)
+                  live-matched (.__getitem__ live-grids live-indexes)
+                  hist-matched (.__getitem__ hist-grids hist-indexes)
+                  rows (vec (for [gi (range (count greek-names))]
+                              (metric-row (nth greek-names gi)
+                                          (.__getitem__ live-matched #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+                                          (.__getitem__ hist-matched #py ((slice nil nil) gi (slice nil nil) (slice nil nil)))
+                                          matched-times)))
+                  lag-summaries (sequence-lag-summaries rows)
+                  best-seq-lag-by-min (best-sequence-lag-by lag-summaries "min_correlation")
+                  best-seq-lag-by-mean (best-sequence-lag-by lag-summaries "mean_correlation")
+                  max-devs (vec (keep #(get % "max_abs_deviation") rows))
+                  corrs (vec (keep #(get % "correlation") rows))
+                  cohort-json (load-json-file (:historical-cohort-json opts))
+                  contract-density (contract-density-diagnostic
+                                    (live-chain-contract-density live matched-times live-by-time)
+                                    (historical-chain-contract-density cohort-json))
+                  live-observed-delta (live-chain-observed-deltas live matched-times live-by-time (:target-date opts))
+                  live-grid-history-tail (live-grid-history-tail-diagnostic live matched-times live-by-time live-grids)
+                  bar-buffer-source (bar-buffer-source-diagnostic live hist matched-times live-by-time hist-by-time)
+                  live-chain-grid-rebuild (live-chain-grid-rebuild-diagnostic live matched-times live-by-time live-grids)
+                  chain-quote-source (chain-quote-source-diagnostic live hist matched-times live-by-time hist-by-time)
+                  grid-history-sequence (grid-history-sequence-diagnostic live hist matched-times live-by-time hist-by-time)
+                  shift-summaries (vec (for [shift (range -3 4)]
+                                         (shift-correlation-summary live-grids hist-grids live-by-time hist-by-time shift)))
+                  best-shift (best-shift-summary shift-summaries)
+                  base-min-correlation (if (seq corrs) (apply min corrs) nil)
+                  alignment-diagnosis (alignment-diagnosis base-min-correlation
+                                                           best-shift
+                                                           best-seq-lag-by-min
+                                                           grid-history-sequence
+                                                           cohort-json)
+                  payload {"ok" true
+                           "status" "ok"
+                           "target_date" (:target-date opts)
+                           "live_capture" (:live-capture opts)
+                           "historical_npz" (:historical-npz opts)
+                           "matched_rows" matched-count
+                           "matched_start" (first matched-times)
+                           "matched_end" (last matched-times)
+                           "shape" (vec (.-shape live-matched))
+                           "max_abs_deviation" (if (seq max-devs) (apply max max-devs) nil)
+                           "min_correlation" base-min-correlation
+                           "contract_density" contract-density
+                           "live_chain_observed_at_delta" live-observed-delta
+                           "live_grid_history_tail" live-grid-history-tail
+                           "bar_buffer_source" bar-buffer-source
+                           "live_chain_grid_rebuild" live-chain-grid-rebuild
+                           "chain_quote_source" chain-quote-source
+                           "grid_history_sequence" grid-history-sequence
+                           "historical_time_shift_summaries" shift-summaries
+                           "best_historical_time_shift" best-shift
+                           "sequence_lag_summaries" lag-summaries
+                           "best_sequence_lag" best-seq-lag-by-mean
+                           "best_sequence_lag_by_mean" best-seq-lag-by-mean
+                           "best_sequence_lag_by_min" best-seq-lag-by-min
+                           "alignment_diagnosis" alignment-diagnosis
+                           "rows" rows}]
+              (write-json! (:out-json opts) payload)
+              (when (:md-out opts)
+                (os/makedirs (os.path/dirname (:md-out opts)) ** :exist_ok true)
+                (spit (:md-out opts) (markdown payload)))
+              (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+              0)))))))))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

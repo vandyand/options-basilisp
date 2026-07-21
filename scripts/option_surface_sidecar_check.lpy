@@ -1,0 +1,191 @@
+;; Validate supplemental option-surface sidecar NPZ files.
+;;
+;; These sidecars intentionally do not contain full model-input arrays. They
+;; carry non-SPY option surfaces collected outside the trading loop, so they
+;; need a dedicated checker instead of the full capture-v2 gate.
+(import argparse datetime json math os os.path sys)
+(import numpy)
+
+(def required-contract-keys #{"strike" "right" "bid" "ask" "expiration"})
+
+(defn usage-parser []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--sidecar" ** :required true)
+    (.add_argument parser "--target-date" ** :default nil)
+    (.add_argument parser "--min-rows" ** :type int :default 1)
+    (.add_argument parser "--required-prefixes" ** :default "SPXW,VIXW,SPX,VIX")
+    (.add_argument parser "--min-contracts-per-prefix" ** :type int :default 1)
+    (.add_argument parser "--out-json" ** :default nil)
+    parser))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn split-csv [s]
+  (vec (filter #(pos? (count %))
+               (map #(.upper (.strip %)) (.split (or s "") ",")))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] [(str k) (jsonable v)]) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map jsonable x))
+    (nil? x) nil
+    :else x))
+
+(defn parse-json [s]
+  (when (and s (pos? (count (.strip (str s)))))
+    (json/loads (str s))))
+
+(defn finite-number? [x]
+  (try
+    (let [n (float x)]
+      (and (math/isfinite n) (> n 0.0)))
+    (catch python/Exception _ false)))
+
+(defn valid-right? [x]
+  (contains? #{"CALL" "PUT" "C" "P"} (.upper (str x))))
+
+(defn valid-contract? [row]
+  (and (or (map? row) (python/isinstance row python/dict))
+       (every? #(contains? row %) required-contract-keys)
+       (finite-number? (get row "strike"))
+       (valid-right? (get row "right"))
+       (finite-number? (get row "bid"))
+       (finite-number? (get row "ask"))
+       (pos? (count (str (get row "expiration"))))))
+
+(defn array-len [arr]
+  (try
+    (len arr)
+    (catch python/Exception _ 0)))
+
+(defn arr-get [arr i]
+  (try
+    (.__getitem__ arr i)
+    (catch python/Exception _ nil)))
+
+(defn sidecar-row-summary [raw]
+  (try
+    (let [outer (parse-json raw)
+          prefixes (if outer (vec (sort (map str (.keys outer)))) [])
+          contracts-by-prefix (atom {})
+          malformed-by-prefix (atom {})
+          underlying-by-prefix (atom {})]
+      (doseq [prefix prefixes]
+        (let [surface-raw (get outer prefix)
+              surface (if (string? surface-raw)
+                        (parse-json surface-raw)
+                        surface-raw)
+              contracts (vec (or (get surface "contracts") []))
+              malformed (count (remove valid-contract? contracts))]
+          (swap! contracts-by-prefix assoc prefix (count contracts))
+          (swap! malformed-by-prefix assoc prefix malformed)
+          (when (contains? surface "underlying")
+            (swap! underlying-by-prefix assoc prefix (get surface "underlying")))))
+      {"ok" true
+       "prefixes" prefixes
+       "contracts_by_prefix" @contracts-by-prefix
+       "malformed_by_prefix" @malformed-by-prefix
+       "underlying_by_prefix" @underlying-by-prefix})
+    (catch python/Exception e
+      {"ok" false
+       "error" (str e)
+       "prefixes" []
+       "contracts_by_prefix" {}
+       "malformed_by_prefix" {}})))
+
+(defn validate-target-date [target-date times]
+  (if-not target-date
+    []
+    (vec
+     (keep-indexed
+      (fn [i t]
+        (when-not (.startswith (str t) target-date)
+          (str "row " i " timestamp does not match target date " target-date ": " t)))
+      times))))
+
+(defn check-sidecar [opts]
+  (let [path (python/getattr opts "sidecar")
+        required-prefixes (split-csv (python/getattr opts "required_prefixes"))
+        min-rows (python/getattr opts "min_rows")
+        min-contracts (python/getattr opts "min_contracts_per_prefix")
+        target-date (python/getattr opts "target_date")
+        issues (atom [])]
+    (if-not (os.path/exists path)
+      {"ok" false
+       "generated_at" (now-utc)
+       "sidecar" path
+       "issues" [(str "missing sidecar NPZ: " path)]}
+      (let [data (numpy/load path ** :allow_pickle true)
+            files (set (map str (.-files data)))
+            _ (doseq [k ["times" "grids" "bar_buffers_json" "option_chain_json" "option_surfaces_json"]]
+                (when-not (contains? files k)
+                  (swap! issues conj (str "missing NPZ array: " k))))
+            times (if (contains? files "times") (.__getitem__ data "times") (numpy/array []))
+            surfaces (if (contains? files "option_surfaces_json") (.__getitem__ data "option_surfaces_json") (numpy/array []))
+            row-count (array-len times)
+            surface-row-count (array-len surfaces)
+            row-summaries (vec (for [i (range surface-row-count)]
+                                 (sidecar-row-summary (arr-get surfaces i))))
+            useful-row-count (count (filter #(seq (get % "prefixes")) row-summaries))
+            malformed-row-count (count (remove #(get % "ok") row-summaries))
+            contracts-by-prefix (into {}
+                                      (for [prefix required-prefixes]
+                                        [prefix (reduce + 0 (map #(int (get-in % ["contracts_by_prefix" prefix] 0))
+                                                                 row-summaries))]))
+            malformed-by-prefix (into {}
+                                      (for [prefix required-prefixes]
+                                        [prefix (reduce + 0 (map #(int (get-in % ["malformed_by_prefix" prefix] 0))
+                                                                 row-summaries))]))
+            prefixes-present (set (mapcat #(get % "prefixes") row-summaries))
+            missing-prefixes (vec (sort (remove prefixes-present required-prefixes)))]
+        (when (< row-count min-rows)
+          (swap! issues conj (str "row_count " row-count " < min_rows " min-rows)))
+        (when (not= row-count surface-row-count)
+          (swap! issues conj (str "times row_count " row-count
+                                  " != option_surfaces_json row_count " surface-row-count)))
+        (when (pos? malformed-row-count)
+          (swap! issues conj (str malformed-row-count " malformed JSON surface row(s)")))
+        (doseq [reason (validate-target-date target-date (vec times))]
+          (swap! issues conj reason))
+        (doseq [prefix missing-prefixes]
+          (swap! issues conj (str "missing required surface prefix: " prefix)))
+        (doseq [[prefix n] contracts-by-prefix]
+          (when (< n min-contracts)
+            (swap! issues conj (str prefix " contracts " n " < min_contracts_per_prefix " min-contracts))))
+        (doseq [[prefix n] malformed-by-prefix]
+          (when (pos? n)
+            (swap! issues conj (str prefix " malformed contracts: " n))))
+        {"ok" (empty? @issues)
+         "generated_at" (now-utc)
+         "sidecar" path
+         "target_date" target-date
+         "row_count" row-count
+         "surface_row_count" surface-row-count
+         "useful_row_count" useful-row-count
+         "malformed_row_count" malformed-row-count
+         "required_prefixes" required-prefixes
+         "prefixes_present" (vec (sort prefixes-present))
+         "contracts_by_prefix" contracts-by-prefix
+         "malformed_by_prefix" malformed-by-prefix
+         "issues" @issues}))))
+
+(defn run-main [args]
+  (let [parser (usage-parser)
+        opts (.parse_args parser (python/list args))
+        payload (check-sidecar opts)
+        out (python/getattr opts "out_json")]
+    (when out
+      (os/makedirs (os.path/dirname out) ** :exist_ok true)
+      (spit out (json/dumps (jsonable payload) ** :indent 2 :sort_keys true)))
+    (println (json/dumps (jsonable payload) ** :indent 2 :sort_keys true))
+    (if (get payload "ok") 0 1)))
+
+(try
+  (python/exit (run-main *command-line-args*))
+  (catch python/SystemExit e
+    (throw e))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

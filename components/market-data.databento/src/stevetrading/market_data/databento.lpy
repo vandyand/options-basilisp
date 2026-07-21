@@ -1,0 +1,140 @@
+(ns stevetrading.market-data.databento
+  "Cost-gated, receipt-backed Databento event collection on the Windows corpus volume."
+  (:import datetime decimal hashlib json os pathlib shutil subprocess
+           databento))
+
+(def canonical-raw-root (pathlib/Path "D:\\SteveTradingData\\raw\\v1"))
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]]
+                                     (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+
+(defn- under? [path root]
+  (try
+    (.relative_to (.resolve path) (.resolve root))
+    true
+    (catch python/ValueError _ false)))
+
+(defn- sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [stream (python/open path "rb")]
+      (loop [chunk (.read stream 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read stream 1048576)))))
+    (.hexdigest digest)))
+
+(defn assert-corpus-volume-healthy!
+  "Fail closed before any external-corpus write."
+  []
+  (when-not (= (.-name os) "nt")
+    (throw (python/RuntimeError "Databento corpus collection is Windows-only against D:\\SteveTradingData")))
+  (let [command (python/list ["powershell" "-NoProfile" "-Command"
+                              "Get-Volume -DriveLetter D | Select-Object HealthStatus,OperationalStatus | ConvertTo-Json -Compress"])
+        completed (subprocess/run command ** :check true :capture_output true :text true :timeout 20)
+        volume (json/loads (.-stdout completed))]
+    (when-not (and (= (.get volume "HealthStatus") "Healthy")
+                   (not= -1 (.find (str (.get volume "OperationalStatus")) "OK")))
+      (throw (python/RuntimeError (str "external corpus volume is not healthy: " volume))))
+    volume))
+
+(defn- non-empty-csv [value flag]
+  (let [items (vec (filter #(not (empty? %)) (map #(.strip %) (.split (str value) ","))))]
+    (when (empty? items)
+      (throw (python/ValueError (str flag " must be non-empty"))))
+    items))
+
+(defn- decimal-value [value flag]
+  (try
+    (decimal/Decimal (str value))
+    (catch python/Exception e
+      (throw (python/ValueError (str "invalid " flag ": " e))))))
+
+(defn collect!
+  "Collect one immutable, cost-approved event request and return its receipt.
+
+   `request` must name one declared class/date/schema group. The function does
+   not expand symbols, aggregate events, or make model-use decisions."
+  [{:strs [dataset class-id admission symbols stype-in schemas start end
+           out-root manifest-root max-total-cost-usd max-total-billable-bytes api-key-env]}]
+  (let [raw-root (.resolve (pathlib/Path (or out-root canonical-raw-root)))
+        manifests-root (.resolve (pathlib/Path (or manifest-root canonical-manifest-root)))
+        maximum-cost (decimal-value (or max-total-cost-usd "0") "--max-total-cost-usd")
+        maximum-bytes (int (or max-total-billable-bytes 268435456))]
+    (when (or (< maximum-cost (decimal/Decimal "0")) (<= maximum-bytes 0))
+      (throw (python/ValueError "cost ceiling must be non-negative and byte ceiling must be positive")))
+    (when-not (and (under? raw-root canonical-raw-root)
+                   (under? manifests-root canonical-manifest-root))
+      (throw (python/ValueError "collector writes only below D:\\SteveTradingData raw/v1 and manifests/v1")))
+    (assert-corpus-volume-healthy!)
+    (let [key (os.environ/get (or api-key-env "DATABENTO_API_KEY"))]
+      (when-not key (throw (python/RuntimeError (str "missing " (or api-key-env "DATABENTO_API_KEY")))) )
+      (let [symbol-list (non-empty-csv symbols "--symbols")
+            schema-list (non-empty-csv schemas "--schemas")
+            historical (databento/Historical ** :key key)
+            shared {:dataset dataset :symbols (python/list symbol-list) :stype_in stype-in :start start :end end}
+            quotes (vec (map (fn [schema]
+                               (let [cost (decimal/Decimal (str (.get_cost (.-metadata historical) ** :schema schema
+                                                                         :dataset dataset :symbols (python/list symbol-list)
+                                                                         :stype_in stype-in :start start :end end)))
+                                     size (int (.get_billable_size (.-metadata historical) ** :schema schema
+                                                                    :dataset dataset :symbols (python/list symbol-list)
+                                                                    :stype_in stype-in :start start :end end))]
+                                 {"schema" schema "quoted_cost_usd" (str cost) "billable_size_bytes" size}))
+                             schema-list))
+            total-cost (reduce + (decimal/Decimal "0") (map #(decimal/Decimal (get % "quoted_cost_usd")) quotes))
+            total-bytes (reduce + 0 (map #(get % "billable_size_bytes") quotes))
+            preflight {"approved" (and (<= total-cost maximum-cost) (<= total-bytes maximum-bytes))
+                       "checked_at_utc" (now-utc)
+                       "max_total_cost_usd" (str maximum-cost)
+                       "max_total_billable_bytes" maximum-bytes
+                       "quoted_total_cost_usd" (str total-cost)
+                       "quoted_total_billable_bytes" total-bytes
+                       "schemas" quotes
+                       "request" {"dataset" dataset "symbols" symbol-list "stype_in" stype-in "start" start "end" end}}]
+        (when-not (get preflight "approved")
+          (throw (ex-info "COST/SIZE PLAN BLOCKED: no historical request was submitted." {"preflight" preflight})))
+        (let [trade-date (subs start 0 10)
+              run-id (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y%m%dT%H%M%S%fZ")
+              relative (.joinpath (pathlib/Path "databento") dataset admission class-id (str "trade_date=" trade-date))
+              raw-final (.joinpath raw-root relative (str "run=" run-id))
+              raw-staging (.with_name raw-final (str (.-name raw-final) ".staging"))
+              manifest-path (.joinpath manifests-root relative (str "run=" run-id ".json"))]
+          (.mkdir raw-staging ** :parents true :exist_ok false)
+          (try
+            (let [payloads (vec (map (fn [schema]
+                                       (let [path (.joinpath raw-staging (str schema ".dbn"))]
+                                         (.get_range (.-timeseries historical) ** :schema schema :path (str path)
+                                                     :dataset dataset :symbols (python/list symbol-list) :stype_in stype-in
+                                                     :start start :end end)
+                                         {"schema" schema "path" (.-name path) "bytes" (.-st_size (.stat path))
+                                          "sha256" (sha256-file path)}))
+                                     schema-list))]
+              (.mkdir (.-parent raw-final) ** :parents true :exist_ok true)
+              (.replace raw-staging raw-final)
+              (let [receipt {"schema_version" 1 "provider" "databento" "dataset" dataset
+                             "class" class-id "admission" admission "schemas" schema-list
+                             "stype_in" stype-in "symbols" symbol-list "started_at" start "ended_at" end
+                             "collected_at" (now-utc) "collector_revision" "event-collection-v2-basilisp"
+                             "raw_payloads" payloads "cost_preflight" preflight
+                             "archive_status" "unfinalized-until-explicit-recheck"
+                             "raw_run_dir" (str raw-final)}]
+                (.mkdir (.-parent manifest-path) ** :parents true :exist_ok true)
+                (spit (str manifest-path) (json-text receipt))
+                (assoc receipt "manifest_path" (str manifest-path))))
+            (catch python/Exception e
+              (let [failed (.joinpath (.-parent (.-parent canonical-raw-root)) "quarantine" "v1" "databento" dataset
+                                      (str "run=" run-id ".partial"))]
+                (.mkdir (.-parent failed) ** :parents true :exist_ok true)
+                (when (.exists raw-staging) (shutil/move (str raw-staging) (str failed)))
+                (throw e)))))))))

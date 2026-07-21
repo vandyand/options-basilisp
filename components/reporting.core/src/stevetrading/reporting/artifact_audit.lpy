@@ -1,0 +1,670 @@
+(ns stevetrading.reporting.artifact-audit
+  "Fail-closed audit for generated daily report validation artifacts."
+  (:import datetime glob hashlib json os os.path re)
+  (:require [basilisp.edn :as edn]
+            [stevetrading.reporting.core :as reporting]))
+
+(defn compact-date
+  [iso-date]
+  (.replace (str iso-date) "-" ""))
+
+(defn iso-date
+  [compact]
+  (str (subs compact 0 4) "-" (subs compact 4 6) "-" (subs compact 6 8)))
+
+(defn safe-iso-date
+  [compact]
+  (try
+    (let [d (iso-date compact)]
+      (datetime.date/fromisoformat d)
+      d)
+    (catch python/Exception _ nil)))
+
+(defn read-json
+  [path]
+  (json/loads (slurp path)))
+
+(defn utc-now-string
+  []
+  (.isoformat (.now (.-datetime datetime) (.-UTC datetime))))
+
+(defn parse-timestamp-seconds
+  [s]
+  (.timestamp
+   (datetime.datetime/fromisoformat
+    (.replace (str s) "Z" "+00:00"))))
+
+(defn artifact-sha256
+  [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh 1048576)]
+        (when (pos? (count chunk))
+          (.update h chunk)
+          (recur (.read fh 1048576)))))
+    (.hexdigest h)))
+
+(defn artifact-info
+  [path]
+  (when (and path (os.path/exists path))
+    {:path path
+     :sha256 (artifact-sha256 path)
+     :bytes (os.path/getsize path)}))
+
+(defn validation-path
+  [daily-dir date]
+  (os.path/join daily-dir (str (compact-date date) ".validation.json")))
+
+(defn html-path
+  [daily-dir date]
+  (os.path/join daily-dir (str (compact-date date) ".html")))
+
+(defn manifest-path
+  [daily-dir date]
+  (str (validation-path daily-dir date) ".manifest.edn"))
+
+(defn validation-files
+  [daily-dir]
+  (sort (glob/glob (os.path/join daily-dir "*.validation.json"))))
+
+(defn html-files
+  [daily-dir]
+  (sort (glob/glob (os.path/join daily-dir "*.html"))))
+
+(defn file-date
+  [path]
+  (let [name (os.path/basename path)]
+    (when (and (>= (count name) 8)
+               (.endswith name ".validation.json"))
+      (safe-iso-date (subs name 0 8)))))
+
+(defn html-file-date
+  [path]
+  (let [name (os.path/basename path)]
+    (when (and (>= (count name) 8)
+               (.endswith name ".html"))
+      (safe-iso-date (subs name 0 8)))))
+
+(defn- issue
+  [severity code message data]
+  (merge {:severity severity
+          :code code
+          :message message}
+         data))
+
+(defn- sha256-string?
+  [x]
+  (and (string? x)
+       (some? (re/fullmatch #"[0-9a-f]{64}" x))))
+
+(defn- validated-at-issue
+  [date path validated-at]
+  (try
+    (let [validated-seconds (parse-timestamp-seconds validated-at)
+          now-seconds (.timestamp
+                       (datetime.datetime/now datetime.timezone/utc))]
+      (when (> validated-seconds (+ now-seconds 60.0))
+        (issue :error
+               :report/daily-artifact-manifest-validated-at-in-future
+               "Daily report artifact manifest validated-at timestamp is in the future."
+               {:date date
+                :path path
+                :report/validated-at validated-at})))
+    (catch python/Exception e
+      (issue :error
+             :report/daily-artifact-manifest-validated-at-unparseable
+             "Daily report artifact manifest validated-at timestamp is not parseable."
+             {:date date
+              :path path
+              :report/validated-at validated-at
+              :error (str e)}))))
+
+(defn daily-artifact-manifest
+  [{:keys [daily-dir date validation-path html-path validation-result]}]
+  {:manifest/version 1
+   :manifest/kind :reporting/daily-report-artifacts-v1
+   :report/date date
+   :report/validated-at (utc-now-string)
+   :daily-dir daily-dir
+   :validation/artifact (artifact-info validation-path)
+   :validation/status (:status validation-result)
+   :validation/valid? (:valid? validation-result)
+   :validation/account-count (count (:account-results validation-result))
+   :html/artifact (artifact-info html-path)})
+
+(defn write-daily-artifact-manifest!
+  [{:keys [daily-dir date] :as opts}]
+  (let [path (manifest-path daily-dir date)
+        manifest (daily-artifact-manifest opts)]
+    (spit path (str (edn/write-string manifest) "\n"))
+    {:path path
+     :manifest manifest}))
+
+(defn read-manifest
+  [path]
+  (edn/read-string (slurp path)))
+
+(defn- expected-artifact
+  [path]
+  (artifact-info path))
+
+(defn- path-inside-dir?
+  [dir path]
+  (let [dir-real (os.path/realpath dir)
+        path-real (os.path/realpath path)]
+    (or (= dir-real path-real)
+        (.startswith path-real (str dir-real os/sep)))))
+
+(defn- artifact-containment-issues
+  [daily-dir date artifacts]
+  (vec
+   (keep (fn [[label path code]]
+           (when (and path
+                      (os.path/exists path)
+                      (not (path-inside-dir? daily-dir path)))
+             (issue :error
+                    code
+                    "Daily report artifact resolves outside the audited daily directory."
+                    {:date date
+                     :path path
+                     :artifact label
+                     :daily-dir daily-dir
+                     :realpath (os.path/realpath path)})))
+         artifacts)))
+
+(def ^:private daily-artifact-manifest-keys
+  #{:manifest/version
+    :manifest/kind
+    :report/date
+    :report/validated-at
+    :daily-dir
+    :validation/artifact
+    :validation/status
+    :validation/valid?
+    :validation/account-count
+    :html/artifact})
+
+(def ^:private daily-artifact-entry-keys
+  #{:path
+    :sha256
+    :bytes})
+
+(defn- artifact-entry-key-issues
+  [date path label artifact]
+  (let [artifact-keys (if (map? artifact) (set (keys artifact)) #{})
+        missing-keys (vec (sort (remove artifact-keys
+                                         daily-artifact-entry-keys)))
+        extra-keys (vec (sort (remove daily-artifact-entry-keys
+                                      artifact-keys)))]
+    (vec
+     (keep identity
+           [(when-not (map? artifact)
+              (issue :error
+                     :report/daily-artifact-manifest-artifact-invalid-shape
+                     "Daily report artifact manifest artifact entry must be an EDN map."
+                     {:date date
+                      :path path
+                      :artifact label
+                      :actual (str (type artifact))}))
+            (when (seq missing-keys)
+              (issue :error
+                     :report/daily-artifact-manifest-artifact-missing-keys
+                     "Daily report artifact manifest artifact entry is missing required keys."
+                     {:date date
+                      :path path
+                      :artifact label
+                      :keys missing-keys}))
+            (when (seq extra-keys)
+              (issue :error
+                     :report/daily-artifact-manifest-artifact-extra-keys
+                     "Daily report artifact manifest artifact entry contains unexpected keys."
+                     {:date date
+                      :path path
+                      :artifact label
+                      :keys extra-keys}))
+            (when (and (contains? artifact :sha256)
+                       (not (sha256-string? (:sha256 artifact))))
+              (issue :error
+                     :report/daily-artifact-manifest-artifact-sha256-invalid
+                     "Daily report artifact manifest artifact entry has a malformed SHA-256 digest."
+                     {:date date
+                      :path path
+                      :artifact label
+                      :sha256 (:sha256 artifact)}))]))))
+
+(defn manifest-issues
+  [{:keys [daily-dir date validation-path html-path validation-result require-manifest?]}]
+  (let [path (manifest-path daily-dir date)]
+    (cond
+      (and require-manifest? (not (os.path/exists path)))
+      [(issue :error
+              :report/missing-daily-artifact-manifest
+              "Daily report artifacts are missing a provenance manifest."
+              {:date date
+               :path path})]
+
+      (not (os.path/exists path))
+      []
+
+      :else
+      (try
+        (let [manifest (read-manifest path)
+              manifest-map? (map? manifest)
+              safe-manifest (if manifest-map? manifest {})
+              manifest-keys (if manifest-map? (set (keys manifest)) #{})
+              missing-keys (vec (sort (remove manifest-keys
+                                               daily-artifact-manifest-keys)))
+              extra-keys (vec (sort (remove daily-artifact-manifest-keys
+                                             manifest-keys)))
+              validation-artifact (:validation/artifact safe-manifest)
+              html-artifact (:html/artifact safe-manifest)
+              expected-validation (expected-artifact validation-path)
+              expected-html (expected-artifact html-path)
+              manifest-containment-issues
+              (artifact-containment-issues
+               daily-dir
+               date
+               [[:manifest/artifact path
+                 :report/daily-artifact-manifest-outside-daily-dir]])
+              expected-validation-result validation-result]
+          (vec
+           (concat
+            manifest-containment-issues
+            (artifact-entry-key-issues date path :validation/artifact validation-artifact)
+            (artifact-entry-key-issues date path :html/artifact html-artifact)
+            (keep identity
+                  [(when-not manifest-map?
+                     (issue :error
+                            :report/daily-artifact-manifest-invalid-shape
+                            "Daily report artifact manifest must be an EDN map."
+                            {:date date
+                             :path path}))
+                   (when (not= 1 (:manifest/version safe-manifest))
+                     (issue :error
+                            :report/invalid-daily-artifact-manifest-version
+                            "Daily report artifact manifest has the wrong version."
+                            {:date date
+                             :path path
+                             :manifest/version (:manifest/version safe-manifest)}))
+                   (when (seq missing-keys)
+                     (issue :error
+                            :report/daily-artifact-manifest-missing-keys
+                            "Daily report artifact manifest is missing required keys."
+                            {:date date
+                             :path path
+                             :keys missing-keys}))
+                   (when (seq extra-keys)
+                     (issue :error
+                            :report/daily-artifact-manifest-extra-keys
+                            "Daily report artifact manifest contains unexpected keys."
+                            {:date date
+                             :path path
+                             :keys extra-keys}))
+                   (when (not= :reporting/daily-report-artifacts-v1
+                               (:manifest/kind safe-manifest))
+                     (issue :error
+                            :report/invalid-daily-artifact-manifest
+                            "Daily report artifact manifest has the wrong kind."
+                            {:date date
+                             :path path
+                             :manifest/kind (:manifest/kind safe-manifest)}))
+                   (when (not= date (:report/date safe-manifest))
+                     (issue :error
+                            :report/daily-artifact-manifest-date-mismatch
+                            "Daily report artifact manifest date does not match the audited report date."
+                            {:date date
+                             :path path
+                             :manifest/date (:report/date safe-manifest)}))
+                   (validated-at-issue date path (:report/validated-at safe-manifest))
+                   (when (not= (os.path/realpath daily-dir)
+                               (os.path/realpath (str (:daily-dir safe-manifest))))
+                     (issue :error
+                            :report/daily-artifact-manifest-daily-dir-mismatch
+                            "Daily report artifact manifest daily directory does not match the audited daily directory."
+                            {:date date
+                             :path path
+                             :expected (os.path/realpath daily-dir)
+                             :actual (os.path/realpath (str (:daily-dir safe-manifest)))}))
+                   (when (not= (:status expected-validation-result)
+                               (:validation/status safe-manifest))
+                     (issue :error
+                            :report/daily-artifact-manifest-validation-status-mismatch
+                            "Daily report artifact manifest validation status does not match recomputed validation."
+                            {:date date
+                             :path path
+                             :expected (:status expected-validation-result)
+                             :actual (:validation/status safe-manifest)}))
+                   (when (not= (:valid? expected-validation-result)
+                               (:validation/valid? safe-manifest))
+                     (issue :error
+                            :report/daily-artifact-manifest-validation-result-mismatch
+                            "Daily report artifact manifest validation result does not match recomputed validation."
+                            {:date date
+                             :path path
+                             :expected (:valid? expected-validation-result)
+                             :actual (:validation/valid? safe-manifest)}))
+                   (when (not= (count (:account-results expected-validation-result))
+                               (:validation/account-count safe-manifest))
+                     (issue :error
+                            :report/daily-artifact-manifest-account-count-mismatch
+                            "Daily report artifact manifest account count does not match recomputed validation."
+                            {:date date
+                             :path path
+                             :expected (count (:account-results expected-validation-result))
+                             :actual (:validation/account-count safe-manifest)}))
+                   (when (not= (:path expected-validation)
+                               (:path validation-artifact))
+                     (issue :error
+                            :report/daily-validation-path-mismatch
+                            "Daily validation artifact path does not match its manifest."
+                            {:date date
+                             :path path
+                             :expected (:path expected-validation)
+                             :actual (:path validation-artifact)}))
+                   (when (not= (:sha256 expected-validation)
+                               (:sha256 validation-artifact))
+                     (issue :error
+                            :report/daily-validation-checksum-mismatch
+                            "Daily validation artifact checksum does not match its manifest."
+                            {:date date
+                             :path path
+                             :validation/path validation-path}))
+                   (when (not= (:bytes expected-validation)
+                               (:bytes validation-artifact))
+                     (issue :error
+                            :report/daily-validation-size-mismatch
+                            "Daily validation artifact size does not match its manifest."
+                            {:date date
+                             :path path
+                             :validation/path validation-path}))
+                   (when (not= (:path expected-html) (:path html-artifact))
+                     (issue :error
+                            :report/daily-html-path-mismatch
+                            "Daily HTML artifact path does not match its manifest."
+                            {:date date
+                             :path path
+                             :expected (:path expected-html)
+                             :actual (:path html-artifact)}))
+                   (when (not= (:sha256 expected-html) (:sha256 html-artifact))
+                     (issue :error
+                            :report/daily-html-checksum-mismatch
+                            "Daily HTML artifact checksum does not match its manifest."
+                            {:date date
+                             :path path
+                             :html/path html-path}))
+                   (when (not= (:bytes expected-html) (:bytes html-artifact))
+                     (issue :error
+                            :report/daily-html-size-mismatch
+                            "Daily HTML artifact size does not match its manifest."
+                            {:date date
+                             :path path
+                             :html/path html-path}))]))))
+        (catch python/Exception e
+          [(issue :error
+                  :report/unreadable-daily-artifact-manifest
+                  "Daily report artifact manifest could not be parsed or verified."
+                  {:date date
+                   :path path
+                   :error (str e)})])))))
+
+(defn validate-validation-file
+  [path]
+  (try
+    (let [file-date (file-date path)
+          payload (reporting/external->canonical (read-json path))
+          payload-date (:report/date payload)
+          broker-missing-active?
+          (boolean
+           (some (fn [account]
+                   (and (false? (:broker/equity-observed? account))
+                        (or (pos? (int (or (:trade/closed-count account) 0)))
+                            (pos? (int (or (:order/count account) 0)))
+                            (pos? (int (or (:positions/open-count account) 0))))))
+                 (:accounts payload)))
+          result (reporting/validate-report-day payload)
+          date-issues (vec
+                       (keep identity
+                             [(when (nil? file-date)
+                                (issue :error
+                                       :report/validation-filename-date-unparseable
+                                       "Daily validation artifact filename does not start with a parseable YYYYMMDD date."
+                                       {:path path}))
+                              (when (not= file-date payload-date)
+                                (issue :error
+                                       :report/validation-date-filename-mismatch
+                                       "Daily validation artifact filename date does not match payload report date."
+                                       {:path path
+                                        :file/date file-date
+                                        :report/date payload-date}))]))
+          issues (vec (concat date-issues (:issues result)))
+          has-error? (boolean (some #(= :error (:severity %)) issues))
+          has-warn? (boolean (some #(= :warn (:severity %)) issues))]
+      {:path path
+       :date payload-date
+       :file-date file-date
+       :broker-missing-active? broker-missing-active?
+       :valid? (not has-error?)
+       :status (cond has-error? :error
+                     has-warn? :warn
+                     :else :ok)
+       :issues issues})
+    (catch python/Exception e
+      {:path path
+       :date (file-date path)
+       :file-date (file-date path)
+       :broker-missing-active? false
+       :valid? false
+       :status :error
+       :issues [(issue :error
+                       :report/validation-artifact-unreadable
+                       "Daily validation artifact could not be parsed or validated."
+                       {:error (str e)})]})))
+
+(defn audit-daily-validations
+  "Audit generated daily report validation artifacts.
+
+  Options:
+  - :daily-dir directory containing YYYYMMDD.html and YYYYMMDD.validation.json
+  - :date ISO date to audit a single day
+  - :all? audit every validation artifact in :daily-dir
+  - :require-html? require matching HTML for every valid validation artifact
+  - :write-manifests? write/update provenance manifests for valid artifacts
+  - :require-manifests? require and verify provenance manifests
+
+  A trading-day :date must have a validation artifact. A non-trading-day :date
+  must not have validation or HTML artifacts."
+  [{:keys [daily-dir date all? require-html? write-manifests? require-manifests?]
+    :or {require-html? true}}]
+  (let [daily-dir (or daily-dir
+                      (os.path/join "report-viewer" "public" "reports" "daily"))
+        files (cond
+                all? (validation-files daily-dir)
+                date (let [p (validation-path daily-dir date)]
+                       (if (os.path/exists p) [p] []))
+                :else (validation-files daily-dir))
+        results (mapv validate-validation-file files)
+        target-issues
+        (vec
+         (keep identity
+               [(when (and date (reporting/trading-day? date) (empty? files))
+                  (issue :error
+                         :report/missing-daily-validation-artifact
+                         "Trading day is missing a daily validation artifact."
+                         {:date date
+                          :path (validation-path daily-dir date)}))
+                (when (and all? (empty? files))
+                  (issue :error
+                         :report/no-daily-validation-artifacts
+                         "All-mode daily validation audit found no validation artifacts."
+                         {:daily-dir daily-dir}))
+                (when (and date
+                           (not (reporting/trading-day? date))
+                           (os.path/exists (validation-path daily-dir date)))
+                  (issue :error
+                         :report/non-trading-day-validation-artifact
+                         "Non-trading day has a stale daily validation artifact."
+                         {:date date
+                          :path (validation-path daily-dir date)}))
+                (when (and date
+                           (not (reporting/trading-day? date))
+                           (os.path/exists (html-path daily-dir date)))
+                  (issue :error
+                         :report/non-trading-day-html-artifact
+                         "Non-trading day has a stale daily HTML report."
+                         {:date date
+                          :path (html-path daily-dir date)}))]))
+        orphan-html-issues
+        (vec
+         (keep identity
+               (when all?
+                 (map (fn [hp]
+                        (let [d (html-file-date hp)
+                              vp (when d (validation-path daily-dir d))]
+                          (when (and d (not (os.path/exists vp)))
+                            (issue :error
+                                   :report/orphan-daily-html-artifact
+                                   "Daily HTML report has no matching validation artifact."
+                                   {:date d
+                                    :path hp
+                                    :validation/path vp}))))
+                      (html-files daily-dir)))))
+        all-mode-non-trading-issues
+        (vec
+         (mapcat (fn [r]
+                   (let [d (:file-date r)
+                         hp (when d (html-path daily-dir d))]
+                     (when (and all?
+                                d
+                                (not (reporting/trading-day? d)))
+                       (vec
+                        (keep identity
+                              [(issue :error
+                                      :report/non-trading-day-validation-artifact
+                                      "Non-trading day has a stale daily validation artifact."
+                                      {:date d
+                                       :path (:path r)})
+                               (when (and hp (os.path/exists hp))
+                                 (issue :error
+                                        :report/non-trading-day-html-artifact
+                                        "Non-trading day has a stale daily HTML report."
+                                        {:date d
+                                         :path hp}))])))))
+                 results))
+        html-issues
+        (vec
+         (keep identity
+               (when require-html?
+                 (map (fn [r]
+                        (let [d (:date r)
+                              hp (when d (html-path daily-dir d))]
+                          (when (and (:valid? r)
+                                     hp
+                                     (not (os.path/exists hp)))
+                            (issue :error
+                                   :report/missing-daily-html-artifact
+                                   "Valid daily validation artifact has no matching HTML report."
+                                   {:date d
+                                    :path hp
+                                    :validation/path (:path r)}))))
+                      results))))
+        html-content-issues
+        (vec
+         (keep identity
+               (when require-html?
+                 (map (fn [r]
+                        (let [d (:date r)
+                              hp (when d (html-path daily-dir d))]
+                          (when (and (:valid? r)
+                                     (:broker-missing-active? r)
+                                     hp
+                                     (os.path/exists hp)
+                                     (re/search #"Broker equity P&amp;L</span><span>n/a</span>"
+                                                (slurp hp)))
+                            (issue :error
+                                   :report/daily-html-broker-equity-missing-renders-na-headline
+                                   "Daily HTML renders an n/a account headline when broker equity is missing despite trading activity; it must fall back to realized P&L and label broker equity unavailable."
+                                   {:date d
+                                    :path hp
+                                    :validation/path (:path r)}))))
+                      results))))
+        manifest-writes
+        (vec
+         (keep identity
+               (when write-manifests?
+	                 (map (fn [r]
+	                        (let [d (:date r)
+	                              hp (when d (html-path daily-dir d))
+	                              containment-issues
+	                              (when d
+	                                (artifact-containment-issues
+                                 daily-dir
+                                 d
+                                 [[:validation/artifact (:path r)
+                                   :report/daily-validation-artifact-outside-daily-dir]
+                                  [:html/artifact hp
+                                   :report/daily-html-artifact-outside-daily-dir]
+                                  [:manifest/artifact
+                                   (manifest-path daily-dir d)
+                                   :report/daily-artifact-manifest-outside-daily-dir]]))]
+	                          (when (and (:valid? r)
+	                                     d
+	                                     (empty? containment-issues)
+	                                     (or (not require-html?)
+	                                         (and hp (os.path/exists hp))))
+	                            (write-daily-artifact-manifest!
+                             {:daily-dir daily-dir
+                              :date d
+                              :validation-path (:path r)
+                              :html-path hp
+                              :validation-result r}))))
+                      results))))
+        manifest-issues
+        (vec
+         (mapcat (fn [r]
+                   (let [d (:date r)]
+                     (if (and (:valid? r) d)
+                       (manifest-issues
+                        {:daily-dir daily-dir
+                         :date d
+                         :validation-path (:path r)
+                         :html-path (html-path daily-dir d)
+                         :validation-result r
+                         :require-manifest? require-manifests?})
+                       [])))
+                 results))
+        validation-issues (vec (mapcat :issues results))
+        containment-issues
+        (vec
+         (mapcat (fn [r]
+                   (let [d (:date r)]
+                     (if d
+                       (artifact-containment-issues
+                        daily-dir
+                        d
+                        [[:validation/artifact (:path r)
+                          :report/daily-validation-artifact-outside-daily-dir]
+                         [:html/artifact (html-path daily-dir d)
+                          :report/daily-html-artifact-outside-daily-dir]])
+                       [])))
+                 results))
+        issues (vec (concat target-issues
+                            orphan-html-issues
+                            all-mode-non-trading-issues
+                            html-issues
+                            html-content-issues
+                            manifest-issues
+                            containment-issues
+                            validation-issues))
+        has-error? (boolean (some #(= :error (:severity %)) issues))
+        has-warn? (boolean (some #(= :warn (:severity %)) issues))]
+    {:valid? (not has-error?)
+     :status (cond has-error? :error
+                   has-warn? :warn
+                   :else :ok)
+     :daily-dir daily-dir
+     :date date
+     :all? (boolean all?)
+     :checked (count results)
+     :manifest-writes manifest-writes
+     :results results
+     :issues issues}))

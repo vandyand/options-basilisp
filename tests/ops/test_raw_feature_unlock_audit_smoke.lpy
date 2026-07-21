@@ -1,0 +1,291 @@
+(ns ops.test-raw-feature-unlock-audit-smoke
+  (:import json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]
+            [stevetrading.feature-parity.raw-unlock :as raw]))
+
+(def root (pathlib/Path (os/getcwd)))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp (str (resolve-basilisp)))
+
+(defn read-repo-file [rel]
+  (.read_text (.joinpath root rel)))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads [s] (json/loads s))
+(defn path [parent child] (.joinpath parent child))
+(defn write-json! [p x] (.write_text p (str (dumps x) "\n")))
+(defn read-json [p] (loads (.read_text p)))
+
+(defn run-basilisp-script [rel args]
+  (subprocess/run
+   (python/list (concat [basilisp "run" rel "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn write-neutralized-bundles! [ref features]
+  (doseq [account ["chestnut" "lynx" "moose"]]
+    (let [bundle (path (path ref "pipeline_data") (str "live_model_" account "_multihead_corrected"))]
+      (.mkdir bundle ** :parents true :exist_ok true)
+      (write-json! (path bundle "neutralize_features.json") features))))
+
+(defn write-feature-plan-bundles! [ref features neutralized]
+  (doseq [account ["chestnut" "lynx" "moose"]]
+    (let [bundle (path (path ref "pipeline_data") (str "live_model_" account "_multihead_corrected"))]
+      (.mkdir bundle ** :parents true :exist_ok true)
+      (write-json! (path bundle "feature_names.json") features)
+      (write-json! (path bundle "neutralize_features.json") neutralized))))
+
+(deftest recompute-raw-uses-native-basilisp-feature-replay
+  (let [source (read-repo-file "scripts/raw_feature_unlock_audit.lpy")]
+    (is (str/includes? source "grid-history (python/list (.__getitem__ grids (slice nil (inc i))))"))
+    (is (str/includes? source "(raw/compute-live-base-feature-map buffers)"))
+    (is (str/includes? source "(raw/compute-live-v2-feature-map grid-history buffers hmm-model)"))
+    (is (not (str/includes? source "scripts_5yr.live.feature_engine")))
+    (is (not (str/includes? source "_compute_v2_features")))
+    (is (not (str/includes? source "python/list (python/list")))))
+
+(deftest raw-feature-unlock-audit-supports-latest-row-sampling
+  (let [source (read-repo-file "scripts/raw_feature_unlock_audit.lpy")]
+    (is (str/includes? source "\"--max-rows\""))
+    (is (str/includes? source "Process at most the latest N capture rows"))
+    (is (str/includes? source "start-index (if (some? max-rows) (max 0 (- total-rows (int max-rows))) 0)"))
+    (is (str/includes? source "replayed_rows\" (count @rows)"))))
+
+(deftest raw-feature-unlock-audit-supports-source-scoped-fast-loops
+  (let [source (read-repo-file "scripts/raw_feature_unlock_audit.lpy")]
+    (is (str/includes? source "\"--include-sources\""))
+    (is (str/includes? source "\"--max-option-contracts\""))
+    (is (str/includes? source "\"--option-surface-prefixes\""))
+    (is (str/includes? source "Comma-separated source families to run: base,v2,spy-grid,option,option-chain,option-surface,greek,greek-grid,greek-reconstruction"))
+    (is (str/includes? source "(defn source-enabled?"))
+    (is (str/includes? source "(defn any-source-enabled?"))
+    (is (str/includes? source "(defn greek-grid-enabled?"))
+    (is (str/includes? source "(defn greek-reconstruction-enabled?"))
+    (is (str/includes? source "(defn limited-option-json"))
+    (is (str/includes? source "\"skip_option_formulas\" skip-option-formulas"))
+    (is (str/includes? source "\"max_option_contracts\" max-option-contracts"))
+    (is (str/includes? source "\"option_surface_prefixes\""))
+    (is (str/includes? source "\"skip_greek_reconstruction\" skip-greek-reconstruction"))
+    (is (str/includes? source "(or (greek-grid-enabled? include-sources)\n                        (and (not skip-greek-reconstruction)"))
+    (is (str/includes? source "\"include_sources\" (if (nil? include-sources) nil (vec (sort include-sources)))"))))
+
+(deftest raw-unlock-json-loader-rejects-duplicates-with-native-containers
+  (let [payload (raw/loads-json-value "{\"outer\":{\"x\":1},\"y\":2}")]
+    (is (python/isinstance payload python/dict))
+    (is (python/isinstance (.get payload "outer") python/dict))
+    (is (= 1 (.get (.get payload "outer") "x"))))
+  (try
+    (raw/loads-json-value "{\"a\":1,\"a\":2}")
+    (is false "expected duplicate JSON keys to fail")
+    (catch python/ValueError e
+      (is (str/includes? (str e) "duplicate JSON key: a")))))
+
+(deftest raw-unlock-fast-json-loader-is-diagnostic-only
+  (let [payload (raw/loads-json-value-fast "{\"a\":1,\"a\":2}")]
+    (is (python/isinstance payload python/dict))
+    (is (= 2 (.get payload "a"))))
+  (let [source (read-repo-file "scripts/raw_feature_unlock_audit.lpy")]
+    (is (str/includes? source "raw/loads-json-value-fast"))
+    (is (str/includes? source "max-option-contracts"))))
+
+(deftest raw-feature-unlock-audit-writes-explicit-unavailable-artifacts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [out (pathlib/Path tmp-dir)
+          result (run-basilisp-script
+                  "scripts/raw_feature_unlock_audit.lpy"
+                  ["--target-date" "2026-07-09"
+                   "--out-dir" (str out)
+                   "--write-unavailable"
+                   "--unavailable-reason" "capture missing"])
+          payload (read-json (path out "raw_feature_unlock_audit_20260709.json"))
+          summary (get payload "summary")]
+      (is (= 1 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+      (is (= "unavailable" (get summary "status")))
+      (is (= "capture missing" (get summary "unavailable_reason")))
+      (is (= 0 (get summary "candidate_count")))
+      (is (= [] (vec (read-json (path out "raw_feature_unlock_candidates_20260709.json")))))
+      (is (.exists (path out "raw_feature_unlock_audit_20260709.csv")))
+      (is (.exists (path out "raw_feature_unlock_audit_20260709.md"))))))
+
+(deftest raw-candidate-sources-include-formula-backed-v2-replay
+  (let [source (read-repo-file "scripts/raw_feature_unlock_audit.lpy")]
+    (doseq [snippet ["\"v2_grid_formula\""
+                     "\"v2_engine_replay\""
+                     "\"spy_greek_grid_formula\""
+                     "\"option_surface_formula\""
+                     "\"option_surface_greek_grid_formula\""]]
+      (is (str/includes? source snippet) snippet))
+    (is (not (str/includes? source "\"greek_reconstruction_candidate_formula\" \"v2_engine_replay\"")))))
+
+(deftest neutralized-unlock-plan-cli-help-compiles-without-python-planner-import
+  (let [result (run-basilisp-script "scripts/neutralized_feature_unlock_plan.lpy" ["--help"])]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (str/includes? (.-stdout result) "neutralized_feature_unlock_plan.lpy"))))
+
+(deftest neutralized-unlock-plan-target-date-defaults-output-label
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          ref (path tmp "Data-Preprocessor")
+          out (path tmp "analysis")
+          stamp "20260709"]
+      (write-feature-plan-bundles! ref ["SPY_price_close" "realized_vol_20"] ["SPY_price_close"])
+      (.mkdir out ** :parents true :exist_ok true)
+      (let [result (run-basilisp-script
+                    "scripts/neutralized_feature_unlock_plan.lpy"
+                    ["--ref-root" (str ref)
+                     "--out-dir" (str out)
+                     "--target-date" "2026-07-09"])
+            payload (read-json (path out (str "neutralized_feature_unlock_plan_" stamp ".json")))
+            features (vec (get payload "features"))]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (.exists (path out (str "neutralized_feature_unlock_plan_" stamp ".json"))))
+        (is (.exists (path out (str "neutralized_feature_unlock_plan_" stamp ".csv"))))
+        (is (.exists (path out (str "neutralized_feature_unlock_plan_" stamp ".md"))))
+        (is (= [] (vec (filter #(str/blank? (str (get % "blocker"))) features))))
+        (is (= [] (vec (filter #(str/blank? (str (get % "next_evidence"))) features))))
+        (is (not (.exists (path out "neutralized_feature_unlock_plan_current.json"))))))))
+
+(deftest apply-neutralization-candidates-dry-run-does-not-mutates-bundles
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          ref (path tmp "Data-Preprocessor")
+          candidates (path tmp "candidates.json")]
+      (write-neutralized-bundles! ref ["a" "b" "c"])
+      (write-json! candidates ["b" "missing"])
+      (let [result (run-basilisp-script "scripts/apply_neutralization_candidates.lpy"
+                                        ["--ref-root" (str ref)
+                                         "--candidates" (str candidates)])
+            payload (loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= false (get payload "applied")))
+        (is (= false (get payload "verified_by_audit")))
+        (is (= ["b" "missing"] (vec (get payload "candidate_features"))))
+        (is (= [1 1 1] (vec (map #(get % "removed") (get payload "results")))))
+        (is (= [1 1 1] (vec (map #(get % "missing") (get payload "results")))))
+        (doseq [account ["chestnut" "lynx" "moose"]]
+          (let [neutralize (path (path (path ref "pipeline_data")
+                                       (str "live_model_" account "_multihead_corrected"))
+                                 "neutralize_features.json")]
+            (is (= ["a" "b" "c"] (vec (read-json neutralize))))))))))
+
+(deftest apply-neutralization-candidates-can-use-audit-candidates-without-sidecar-file
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          ref (path tmp "Data-Preprocessor")
+          raw-audit (path tmp "raw_feature_unlock_audit_20260710_labeled.json")]
+      (write-neutralized-bundles! ref ["raw_candidate" "keep"])
+      (write-json! raw-audit {"summary" {"target_date" "2026-07-10"
+                                         "candidate_count" 1
+                                         "candidate_features" ["raw_candidate"]}
+                              "features" []})
+      (let [result (run-basilisp-script "scripts/apply_neutralization_candidates.lpy"
+                                        ["--ref-root" (str ref)
+                                         "--audit-json" (str raw-audit)
+                                         "--target-date" "2026-07-10"])
+            payload (loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= false (get payload "applied")))
+        (is (= true (get payload "verified_by_audit")))
+        (is (= ["raw_candidate"] (vec (get payload "candidate_features"))))
+        (is (= [1 1 1] (vec (map #(get % "removed") (get payload "results")))))))))
+
+(deftest apply-neutralization-candidates-unions-extra-audit-candidates
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          ref (path tmp "Data-Preprocessor")
+          candidates (path tmp "raw_feature_unlock_candidates_20260707.json")
+          raw-audit (path tmp "raw_feature_unlock_audit_20260707.json")
+          v3-audit (path tmp "v3_grid_unlock_audit_20260707.json")]
+      (write-neutralized-bundles! ref ["raw_candidate" "v3_candidate" "keep"])
+      (write-json! candidates ["raw_candidate"])
+      (write-json! raw-audit {"summary" {"target_date" "2026-07-07"
+                                         "candidate_count" 1
+                                         "candidate_features" ["raw_candidate"]}
+                              "features" []})
+      (write-json! v3-audit {"summary" {"target_date" "2026-07-07"
+                                        "recomputed_candidate_now" 1}
+                             "features" [{"feature" "v3_candidate" "candidate" true}
+                                         {"feature" "not_candidate" "candidate" false}]})
+      (let [result (run-basilisp-script "scripts/apply_neutralization_candidates.lpy"
+                                        ["--ref-root" (str ref)
+                                         "--candidates" (str candidates)
+                                         "--audit-json" (str raw-audit)
+                                         "--extra-audit-json" (str v3-audit)
+                                         "--target-date" "2026-07-07"])
+            payload (loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= false (get payload "applied")))
+        (is (= true (get payload "verified_by_audit")))
+        (is (= 2 (get payload "candidate_count")))
+        (is (= ["raw_candidate" "v3_candidate"] (vec (get payload "candidate_features"))))
+        (is (= [2 2 2] (vec (map #(get % "removed") (get payload "results")))))))))
+
+(deftest verify-neutralization-unmask-apply-cli-help-compiles
+  (let [result (run-basilisp-script "scripts/verify_neutralization_unmask_apply.lpy" ["--help"])]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (str/includes? (.-stdout result) "--apply-json APPLY_JSON"))
+    (is (str/includes? (.-stdout result) "--allow-missing"))))
+
+(deftest v3-grid-unlock-audit-uses-strict-feature-name-json-loader
+  (let [source (read-repo-file "scripts/v3_grid_unlock_audit.lpy")]
+    (is (not (str/includes? source "json/loads (slurp (os.path/join bundle \"feature_names.json\"))")))
+    (is (str/includes? source "load-json-value (os.path/join bundle \"feature_names.json\")"))))
+
+(deftest v3-grid-unlock-audit-fails-closed-when-prediction-delta-unavailable
+  (let [source (read-repo-file "scripts/v3_grid_unlock_audit.lpy")]
+    (is (str/includes? source "(defn disable-candidates"))
+    (is (str/includes? source "\"skipped-no-candidates\""))
+    (is (str/includes? source "\"prediction_delta_status\""))
+    (is (str/includes? source "\"prediction_delta_error\""))
+    (is (str/includes? source "\"fail_closed_rows\""))))
+
+(deftest v3-grid-unlock-audit-indexes-raw-v3-row-before-candidate-columns
+  (let [source (read-repo-file "scripts/v3_grid_unlock_audit.lpy")]
+    (is (str/includes? source "(.__getitem__ (.__getitem__ raw-v3 i) candidate-idx)"))))
+
+(deftest v3-grid-unlock-audit-writes-explicit-unavailable-artifacts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [out (pathlib/Path tmp-dir)
+          result (run-basilisp-script
+                  "scripts/v3_grid_unlock_audit.lpy"
+                  ["--target-date" "2026-07-09"
+                   "--out-dir" (str out)
+                   "--write-unavailable"
+                   "--unavailable-reason" "capture missing"])
+          payload (read-json (path out "v3_grid_unlock_audit_20260709.json"))
+          summary (get payload "summary")]
+      (is (= 1 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+      (is (= "unavailable" (get summary "status")))
+      (is (= "capture missing" (get summary "unavailable_reason")))
+      (is (= 0 (get summary "recomputed_candidate_now")))
+      (is (= [] (vec (get payload "features"))))
+      (is (.exists (path out "v3_grid_unlock_audit_20260709.csv")))
+      (is (.exists (path out "v3_grid_unlock_audit_20260709.md"))))))
+
+(deftest blocked-feature-provenance-audit-cli-help-documents-evidence-inputs
+  (let [result (run-basilisp-script "scripts/blocked_feature_provenance_audit.lpy" ["--help"])]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (doseq [snippet ["--plan-json PATH"
+                     "--feature-stats-npz PATH"
+                     "--replay-report PATH"
+                     "--rebucket-report PATH"
+                     "--source-root DIR"]]
+      (is (str/includes? (.-stdout result) snippet) snippet))))

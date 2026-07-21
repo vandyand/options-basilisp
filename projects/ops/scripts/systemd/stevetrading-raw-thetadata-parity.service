@@ -1,0 +1,14 @@
+[Unit]
+Description=Capture first-open raw ThetaData parity diagnostics
+Wants=network-online.target theta-terminal.service
+After=network-online.target theta-terminal.service
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+Environment=RAW_THETADATA_PARITY_LANDING_ROOT=/opt/stevetrading/shared/thetadata-parity-v1
+ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_raw_thetadata_parity.sh
+StandardOutput=append:/var/log/stevetrading/raw-thetadata-parity.log
+StandardError=append:/var/log/stevetrading/raw-thetadata-parity.log

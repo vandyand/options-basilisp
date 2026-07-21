@@ -1,0 +1,282 @@
+;; Bounded overnight acquisition for the parity-qualified ThetaData SPY option
+;; trade stream.  The scheduler first measures a complete representative month.
+;; Only a successful month promotes the same request contract to a two-year
+;; backfill.  It never broadens symbols, event classes, or response semantics.
+(import argparse datetime json os pathlib subprocess sys time traceback zoneinfo)
+
+(def eastern (zoneinfo/ZoneInfo "America/New_York"))
+(def default-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+(def default-progress-path
+  (pathlib/Path "D:\\SteveTradingData\\manifests\\v1\\overnight\\thetadata-spy-option-trades-20260719.json"))
+
+;; Explicit NYSE full closures in the authorized two-year interval.  Early
+;; closes remain sessions: asking ThetaData through 16:00 simply returns no
+;; events after the close.  The 2025-01-09 Carter mourning closure is included.
+(def market-holidays
+  #{"2024-09-02" "2024-11-28" "2024-12-25"
+    "2025-01-01" "2025-01-09" "2025-01-20" "2025-02-17"
+    "2025-04-18" "2025-05-26" "2025-06-19" "2025-07-04"
+    "2025-09-01" "2025-11-27" "2025-12-25"
+    "2026-01-01" "2026-01-19" "2026-02-16" "2026-04-03"
+    "2026-05-25" "2026-06-19" "2026-07-03"})
+
+(defn now-et [] (datetime.datetime/now eastern))
+(defn now-iso [] (.isoformat (now-et)))
+(defn date-text [value] (.isoformat value))
+
+(defn parse-date [value]
+  (datetime.date/fromisoformat (str value)))
+
+(defn sessions [start-text end-text]
+  (let [start (parse-date start-text)
+        end (parse-date end-text)]
+    (loop [day start out []]
+      (if (> day end)
+        out
+        (let [text (date-text day)
+              session? (and (< (.weekday day) 5) (not (contains? market-holidays text)))]
+          (recur (+ day (datetime/timedelta ** :days 1))
+                 (if session? (conj out text) out)))))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--reference-start" ** :default "2026-06-01")
+    (.add_argument parser "--reference-end" ** :default "2026-06-30")
+    (.add_argument parser "--history-start" ** :default "2024-07-18")
+    (.add_argument parser "--history-end" ** :default "2026-07-17")
+    (.add_argument parser "--cutoff-et" ** :default "2026-07-20T08:00:00-04:00")
+    (.add_argument parser "--max-workers" ** :type int :default 4)
+    (.add_argument parser "--max-reference-seconds" ** :type float :default 3600.0)
+    (.add_argument parser "--basilisp-exe" ** :default ".venv\\Scripts\\basilisp.exe")
+    (.add_argument parser "--collector" ** :default "scripts\\thetadata_event_collection.lpy")
+    (.add_argument parser "--manifest-root" ** :default (str default-manifest-root))
+    (.add_argument parser "--progress-path" ** :default (str default-progress-path))
+    (.add_argument parser "--dry-run" ** :action "store_true")
+    (.parse_args parser (python/list argv))))
+
+(defn atomic-json! [path payload]
+  (let [target (pathlib/Path path)
+        temp (.with_suffix target (str (.-suffix target) ".tmp"))]
+    (.mkdir (.-parent target) ** :parents true :exist_ok true)
+    (spit (str temp) (str (json/dumps payload ** :indent 2 :sort_keys true :default str) "\n"))
+    (os/replace (str temp) (str target))))
+
+(defn successful-receipt? [receipt]
+  (let [payloads (.get receipt "raw_payloads" (python/list))]
+    (and (= (.get receipt "provider") "thetadata")
+         (= (.get receipt "asset_class") "options")
+         (= (.get receipt "start_time_et") "09:30:00")
+         (= (.get receipt "end_time_et") "16:00:00")
+         (contains? (set (.get receipt "symbols" (python/list))) "SPY")
+         (= (set (.get receipt "event_classes" (python/list))) #{"trade"})
+         ;; Collector-v1 receipts predate the response_format field but used
+         ;; lossless NDJSON.  Treat those already-captured dates as covered.
+         (contains? #{nil "csv" "json" "ndjson"} (.get receipt "response_format"))
+         (pos? (count payloads))
+         (every? (fn [payload]
+                   (and (= (.get payload "available") true)
+                        (> (or (.get payload "bytes") 0) 0)))
+                 payloads))))
+
+(defn load-json [path]
+  (with-open [source (python/open (str path) "r" ** :encoding "utf-8")]
+    (json/load source)))
+
+(defn receipt-for [manifest-root class-id date]
+  (let [folder (.joinpath (pathlib/Path manifest-root)
+                          "thetadata" "OPRA" "hard" class-id
+                          (str "trade_date=" date))
+        paths (if (.exists folder) (vec (.glob folder "run=*.json")) [])]
+    (when (seq paths)
+      (let [path (last (sort-by str paths))
+            receipt (load-json path)]
+        {"path" (str path)
+         "receipt" receipt
+         "ok" (successful-receipt? receipt)
+         "bytes" (sum (map #(or (.get % "bytes") 0)
+                           (.get receipt "raw_payloads" (python/list))))}))))
+
+(defn discover-covered-dates [manifest-root]
+  (let [root (.joinpath (pathlib/Path manifest-root) "thetadata" "OPRA" "hard")]
+    (if-not (.exists root)
+      #{}
+      (reduce
+       (fn [covered path]
+         (try
+           (let [receipt (load-json path)
+                 date (.get receipt "date")]
+             (if (and date (successful-receipt? receipt)) (conj covered date) covered))
+           (catch python/Exception _ covered)))
+       #{}
+       (vec (.rglob root "run=*.json"))))))
+
+(defn collector-command [args class-id date]
+  (python/list
+   [(str (.resolve (pathlib/Path (.-basilisp_exe args))))
+    "run" (str (.resolve (pathlib/Path (.-collector args))))
+    "--asset-class" "options"
+    "--class-id" class-id
+    "--symbols" "SPY"
+    "--date" date
+    "--start-time" "09:30:00"
+    "--end-time" "16:00:00"
+    "--event-classes" "trade"
+    "--format" "csv"]))
+
+(defn launch! [args class-id date]
+  (let [started (time/monotonic)
+        process (subprocess/Popen
+                 (collector-command args class-id date)
+                 ** :cwd (str (.resolve (pathlib/Path ".")))
+                    :stdout subprocess/PIPE
+                    :stderr subprocess/PIPE
+                    :text true
+                    :creationflags (if (= (.-name os) "nt") subprocess/CREATE_NO_WINDOW 0))]
+    {"process" process "started_monotonic" started "started_at" (now-iso)}))
+
+(defn update-progress! [progress-path state stage pending running]
+  (.__setitem__ state "stage" stage)
+  (.__setitem__ state "updated_at" (now-iso))
+  (.__setitem__ state "pending_count" (count pending))
+  (.__setitem__ state "active_dates" (python/list (.keys running)))
+  (atomic-json! progress-path state))
+
+(defn run-stage! [args state stage class-id dates cutoff]
+  (let [pending (python/list dates)
+        running (python/dict)
+        results (python/list)
+        stopped (atom false)
+        stage-start (time/monotonic)
+        progress-path (.-progress_path args)]
+    (.__setitem__ state "stage_started_at" (now-iso))
+    (.__setitem__ state "stage_expected_sessions" (count dates))
+    (update-progress! progress-path state stage pending running)
+    (while (or (pos? (count pending)) (pos? (count running)))
+      ;; Fill all entitled request slots, but never launch at/after cutoff or
+      ;; after the first failure.
+      (while (and (pos? (count pending))
+                  (< (count running) (.-max_workers args))
+                  (not @stopped)
+                  (< (now-et) cutoff))
+        (let [date (.pop pending 0)
+              task (launch! args class-id date)]
+          (.__setitem__ running date task)
+          (println (str (now-iso) " launched " stage " " date))))
+
+      (when (and (>= (now-et) cutoff) (pos? (count pending)))
+        (reset! stopped true))
+
+      (doseq [[date task] (vec (.items running))]
+        (let [process (.get task "process")
+              return-code (.poll process)]
+          (when (not (nil? return-code))
+            (let [[stdout stderr] (.communicate process)
+                  receipt (receipt-for (.-manifest_root args) class-id date)
+                  ok (and (= return-code 0) receipt (get receipt "ok"))
+                  result (python/dict
+                          [#py ("date" date)
+                           #py ("stage" stage)
+                           #py ("ok" (boolean ok))
+                           #py ("return_code" return-code)
+                           #py ("started_at" (.get task "started_at"))
+                           #py ("finished_at" (now-iso))
+                           #py ("elapsed_seconds" (- (time/monotonic) (.get task "started_monotonic")))
+                           #py ("bytes" (if receipt (get receipt "bytes") 0))
+                           #py ("manifest" (if receipt (get receipt "path") nil))
+                           #py ("stderr_tail" (if (and stderr (pos? (count stderr)))
+                                                  (.__getitem__ stderr (slice (max 0 (- (count stderr) 4000)) nil))
+                                                  ""))])]
+              (.append results result)
+              (.append (.get state "completed_results") result)
+              (.__delitem__ running date)
+              (when-not ok (reset! stopped true))
+              (println (str (now-iso) " completed " stage " " date " ok=" ok
+                            " bytes=" (.get result "bytes")))))))
+
+      (update-progress! progress-path state stage pending running)
+      (when (and (or (pos? (count pending)) (pos? (count running)))
+                 (not (and @stopped (zero? (count running)))))
+        (time/sleep 1.0))
+      ;; A failure/cutoff prevents new work; discard the in-memory pending
+      ;; queue once already-running requests have settled.
+      (when (and @stopped (zero? (count running)))
+        (.clear pending)))
+    (let [elapsed (- (time/monotonic) stage-start)
+          complete (= (count results) (count dates))
+          ok (and complete (every? #(.get % "ok") results))]
+      (python/dict
+       [#py ("stage" stage) #py ("ok" (boolean ok)) #py ("complete" (boolean complete))
+        #py ("elapsed_seconds" elapsed) #py ("expected_sessions" (count dates))
+        #py ("completed_sessions" (count results))
+        #py ("bytes" (sum (map #(.get % "bytes") results)))
+        #py ("results" results) #py ("stopped" (boolean @stopped))]))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        _ (when (or (< (.-max_workers args) 1) (> (.-max_workers args) 4))
+            (throw (python/ValueError "--max-workers must be between 1 and ThetaData's entitled maximum of 4")))
+        reference-dates (sessions (.-reference_start args) (.-reference_end args))
+        history-dates (sessions (.-history_start args) (.-history_end args))
+        cutoff (datetime.datetime/fromisoformat (.-cutoff_et args))
+        reference-class "thetadata-spy-option-trades-reference-month-csv-202606"
+        backfill-class "thetadata-spy-option-trades-two-year-csv-backfill"
+        covered-before (discover-covered-dates (.-manifest_root args))
+        state (python/dict
+               [#py ("schema_version" 1)
+                #py ("job" "thetadata-spy-option-trades-overnight")
+                #py ("authorization" "operator-approved representative month followed conditionally by the same two-year request contract")
+                #py ("started_at" (now-iso))
+                #py ("cutoff_et" (.-cutoff_et args))
+                #py ("max_workers" (.-max_workers args))
+                #py ("response_format" "csv")
+                #py ("selection" "SPY option trades; full chain; full regular-session request; no strike, expiry, DTE, moneyness, or liquidity filter")
+                #py ("reference_sessions" (python/list reference-dates))
+                #py ("history_session_count" (count history-dates))
+                #py ("covered_before_count" (count covered-before))
+                #py ("completed_results" (python/list))])]
+    (if (.-dry_run args)
+      {"dry_run" true "reference_sessions" reference-dates
+       "reference_session_count" (count reference-dates)
+       "history_session_count" (count history-dates)
+       "covered_before" (sort covered-before)
+       "cutoff_et" (.-cutoff_et args)}
+      (do
+        (when (>= (now-et) cutoff)
+          (throw (python/RuntimeError "cutoff already passed; refusing to launch")))
+        ;; The reference month is intentionally fetched afresh under one class
+        ;; so its end-to-end wall time is auditable as a single experiment.
+        (let [reference-result (run-stage! args state "reference-month" reference-class reference-dates cutoff)
+              reference-pass (and (get reference-result "ok")
+                                  (<= (get reference-result "elapsed_seconds")
+                                      (.-max_reference_seconds args)))]
+          (.__setitem__ state "reference_result" reference-result)
+          (.__setitem__ state "reference_gate_pass" reference-pass)
+          (atomic-json! (.-progress_path args) state)
+          (if-not reference-pass
+            (do
+              (.__setitem__ state "final_status" "stopped-reference-gate-failed")
+              (.__setitem__ state "finished_at" (now-iso))
+              (atomic-json! (.-progress_path args) state)
+              state)
+            (let [covered-after (discover-covered-dates (.-manifest_root args))
+                  ;; Newest-first makes the most recent causal history useful
+                  ;; even if the morning cutoff interrupts the two-year span.
+                  backfill-dates (vec (reverse (filter #(not (contains? covered-after %)) history-dates)))
+                  backfill-result (run-stage! args state "two-year-backfill" backfill-class backfill-dates cutoff)
+                  final-status (cond
+                                 (get backfill-result "ok") "complete"
+                                 (>= (now-et) cutoff) "stopped-at-morning-cutoff"
+                                 :else "stopped-backfill-failure")]
+              (.__setitem__ state "backfill_result" backfill-result)
+              (.__setitem__ state "final_status" final-status)
+              (.__setitem__ state "finished_at" (now-iso))
+              (atomic-json! (.-progress_path args) state)
+              state)))))))
+
+(try
+  (println (json/dumps (run-main (vec *command-line-args*)) ** :indent 2 :sort_keys true :default str))
+  (python/exit 0)
+  (catch python/Exception error
+    (binding [*out* *err*]
+      (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

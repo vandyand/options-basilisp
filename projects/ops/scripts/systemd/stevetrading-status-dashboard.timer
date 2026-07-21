@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh SteveTrading status dashboard every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=false
+Unit=stevetrading-status-dashboard.service
+
+[Install]
+WantedBy=timers.target

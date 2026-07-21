@@ -9,6 +9,7 @@
 ;;      BROKER_TARGET=alpaca|sim|both (default alpaca). sim submits only
 ;;      to the durable local sim broker; both keeps Alpaca canonical and
 ;;      mirrors submissions into sim.
+;;      STEVE_OUT_SUFFIX=-sim-shadow append to live_runtime/steve-session-<date>
 ;;
 ;; Session clock (2026-06-11, operator-specified):
 ;; - 15:30 ET entry cutoff — no NEW entries (flips still close, never
@@ -20,8 +21,9 @@
 ;; v0 limitations (documented):
 ;; - bridge is NOT replay-safe (Python-side state; restart = re-prime)
 ;; - equity bots trade fixed qty 50 (production sized by $50k notional)
-(import datetime json os re time urllib.request zoneinfo)
-(require '[stevetrading.base.engine-live :as live]
+(import datetime json os re time urllib.parse urllib.request zoneinfo)
+(require '[basilisp.edn :as edn]
+         '[stevetrading.base.engine-live :as live]
          '[stevetrading.bridge.steve-v2 :as bridge]
          '[stevetrading.control-plane.file-store :as cpfs]
          '[stevetrading.domain.instruments :as ins]
@@ -33,6 +35,15 @@
                   "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"))
 (def terminal "http://127.0.0.1:25503")
 (def dry-run? (= "1" (os/getenv "STEVE_DRY_RUN")))
+(def stock-bar-source (.lower (or (os/getenv "STEVE_STOCK_BAR_SOURCE") "alpaca")))
+(when-not (contains? #{"alpaca" "thetadata"} stock-bar-source)
+  (println "FATAL: STEVE_STOCK_BAR_SOURCE must be alpaca or thetadata")
+  (python/exit 2))
+(def thetadata-stock-venue
+  (.lower (or (os/getenv "THETADATA_STOCK_VENUE") "nqb")))
+(when-not (contains? #{"nqb" "utp_cta"} thetadata-stock-venue)
+  (println "FATAL: THETADATA_STOCK_VENUE must be nqb or utp_cta")
+  (python/exit 2))
 (def session-date
   (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%d"))
 
@@ -46,10 +57,69 @@
 (def flatten-at (et->utc-str 15 45))
 (def until (et->utc-str 15 55))
 (def broker-target (keyword (or (os/getenv "BROKER_TARGET") "alpaca")))
-(def out-dir (str "live_runtime/steve-session-" session-date))
+(def out-suffix (or (os/getenv "STEVE_OUT_SUFFIX") ""))
+(def out-dir (str "live_runtime/steve-session-" session-date out-suffix))
+(os/makedirs out-dir ** :exist_ok true)
 
 (def bots [:chestnut :lynx :moose :parrot :oak :dolphin])
 (def stock-syms ["SPY" "HYG" "TLT" "VXX"])
+(def default-extra-option-symbols ["SPX" "SPXW" "VIX" "VIXW"])
+(defn- env-list [value]
+  (vec (filter seq
+               (map #(.strip %)
+                    (.split (or value "") ",")))))
+(def extra-option-symbols
+  (let [raw (os/getenv "STEVE_EXTRA_OPTION_SYMBOLS")]
+    (cond
+      (= "1" (os/getenv "STEVE_DISABLE_EXTRA_OPTION_SURFACES")) []
+      (nil? raw) default-extra-option-symbols
+      (contains? #{"0" "none" "NONE" "disabled" "DISABLED"} (.strip raw)) []
+      :else (env-list raw))))
+(def enrich-option-sidecars?
+  (not (= "0" (or (os/getenv "STEVE_FETCH_OPTION_SIDECARS") "1"))))
+(def chain-horizon-days
+  (try
+    (max 1 (python/int (or (os/getenv "STEVE_CHAIN_HORIZON_DAYS") "1")))
+    (catch python/Exception _
+      1)))
+(def chain-strike-range
+  (try
+    (let [value (python/int (or (os/getenv "STEVE_CHAIN_STRIKE_RANGE") "100"))]
+      (if (pos? value) value (throw (python/ValueError "must be positive"))))
+    (catch python/Exception _
+      (println "FATAL: STEVE_CHAIN_STRIKE_RANGE must be a positive integer")
+      (python/exit 2))))
+(def seed-bar-count
+  (try
+    (max 1 (python/int (or (os/getenv "STEVE_SEED_BAR_COUNT") "200")))
+    (catch python/Exception _
+      200)))
+(def min-seed-bars
+  (try
+    (max 1 (python/int (or (os/getenv "STEVE_MIN_SEED_BARS") "180")))
+    (catch python/Exception _
+      180)))
+(def seed-lookback-days
+  (try
+    (max 1 (python/int (or (os/getenv "STEVE_SEED_LOOKBACK_DAYS") "10")))
+    (catch python/Exception _
+      10)))
+(def extra-option-horizon-days
+  (try
+    (max 1 (python/int (or (os/getenv "STEVE_EXTRA_OPTION_HORIZON_DAYS") "30")))
+    (catch python/Exception _
+      30)))
+(def extra-option-refresh-seconds
+  (try
+    (max 0 (python/int (or (os/getenv "STEVE_EXTRA_OPTION_REFRESH_SECONDS") "300")))
+    (catch python/Exception _
+      300)))
+(println "extra option surfaces:"
+         (if (seq extra-option-symbols) extra-option-symbols "disabled")
+         "horizon-days:" extra-option-horizon-days
+         "spy-chain-strike-range:" chain-strike-range
+         "enriched-sidecars:" enrich-option-sidecars?
+         "refresh-seconds:" extra-option-refresh-seconds)
 
 ;; --- creds from REF/.env -----------------------------------------------------
 (def env-text (slurp (str ref-root "/.env")))
@@ -75,9 +145,197 @@
     (json/loads (.decode (.read (urllib.request/urlopen req ** :timeout 30))
                          "utf-8"))))
 
+(defn- try-http-json [url]
+  (try
+    (http-json url {})
+    (catch python/Exception e
+      (println "WARN optional ThetaData fetch failed:" url (str e))
+      {})))
+
+(defn- col-value [doc col i]
+  (let [xs (get doc col)]
+    (when (some? xs)
+      (.__getitem__ xs i))))
+
+(defn- col-double [doc col i default]
+  (let [v (col-value doc col i)]
+    (if (nil? v) default (double v))))
+
+(defn- opt-key [strike right exp]
+  [(str strike) (.upper (str right)) exp])
+
+(defn- option-surface-map [doc exp cols]
+  (let [strikes (get doc "strike")
+        rights (get doc "right")
+        n (if (some? strikes) (python/len strikes) 0)]
+    (into {}
+          (map (fn [i]
+                 [(opt-key (.__getitem__ strikes i)
+                           (.__getitem__ rights i)
+                           exp)
+                  (into {}
+                        (keep (fn [col]
+                                (let [v (col-value doc col i)]
+                                  (when (some? v)
+                                    [(keyword col) v])))
+                              cols))])
+               (range n)))))
+
+(defn- fetch-index-price [sym]
+  (let [doc (http-json (str terminal "/v3/index/snapshot/price?symbol=" sym "&format=json") {})
+        prices (get doc "price")]
+    (when (and (some? prices) (pos? (python/len prices)))
+      (double (.__getitem__ prices 0)))))
+
+(defn- option-underlying-symbol [sym]
+  (case sym
+    "SPXW" "SPX"
+    "VIXW" "VIX"
+    sym))
+
+(defn fetch-option-contracts
+  "All option contracts for one symbol/expiration horizon, enriched with quote size/OHLC/OI."
+  [sym max-days]
+  (let [date-cls (.-date datetime)
+        today (.today date-cls)
+        horizon (.fromordinal date-cls (+ (.toordinal today) max-days))
+        exps-doc (http-json (str terminal "/v3/option/list/expirations?symbol=" sym "&format=json") {})
+        exps (->> (get exps-doc "expiration")
+                  (map str)
+                  (filter (fn [e]
+                            (let [d (.fromisoformat date-cls e)]
+                              (and (>= (.toordinal d) (.toordinal today))
+                                   (<= (.toordinal d) (.toordinal horizon))))))
+                  distinct sort vec)]
+    (vec (mapcat
+          (fn [exp]
+            (let [compact (.replace exp "-" "")
+                  doc (http-json (str terminal "/v3/option/snapshot/quote?symbol=" sym "&expiration=" compact "&format=json") {})
+                  ohlc (if enrich-option-sidecars?
+                         (option-surface-map
+                          (try-http-json (str terminal "/v3/option/snapshot/ohlc?symbol=" sym "&expiration=" compact "&format=json"))
+                          exp
+                          ["open" "high" "low" "close" "volume" "count"])
+                         {})
+                  oi (if enrich-option-sidecars?
+                       (option-surface-map
+                        (try-http-json (str terminal "/v3/option/snapshot/open_interest?symbol=" sym "&expiration=" compact "&format=json"))
+                        exp
+                        ["open_interest" "oi"])
+                       {})
+                  strikes (get doc "strike")
+                  rights (get doc "right")
+                  bids (get doc "bid")
+                  asks (get doc "ask")
+                  bid-sizes (get doc "bid_size")
+                  ask-sizes (get doc "ask_size")
+                  n (python/len strikes)]
+              (map (fn [i]
+                     (let [strike (.__getitem__ strikes i)
+                           right (str (.__getitem__ rights i))
+                           k (opt-key strike right exp)
+                           extra (merge (get ohlc k {})
+                                        (get oi k {}))]
+                       (merge
+                        {:strike strike
+                         :right right
+                         :bid (let [b (.__getitem__ bids i)] (if (nil? b) 0.0 (double b)))
+                         :ask (let [a (.__getitem__ asks i)] (if (nil? a) 0.0 (double a)))
+                         :bid_size (let [s (when (some? bid-sizes) (.__getitem__ bid-sizes i))]
+                                     (when (some? s) (double s)))
+                         :ask_size (let [s (when (some? ask-sizes) (.__getitem__ ask-sizes i))]
+                                     (when (some? s) (double s)))
+                         :expiration exp}
+                        extra)))
+                   (range n))))
+          exps))))
+
+(defn- utc-param
+  [dt]
+  (urllib.parse/quote (.strftime dt "%Y-%m-%dT%H:%M:%SZ") ** :safe ""))
+
+(defn- yyyymmdd
+  [d]
+  (.strftime d "%Y%m%d"))
+
+(defn- parse-theta-time
+  [value target-date]
+  (let [dt-cls (.-datetime datetime)
+        text (str value)]
+    (cond
+      (and (= 8 (count text)) (.isdigit text))
+      (.replace (.fromisoformat dt-cls
+                 (str (.isoformat target-date) "T"
+                      (subs text 0 2) ":" (subs text 2 4) ":" (subs text 4 6)))
+                ** :tzinfo (zoneinfo/ZoneInfo "America/New_York"))
+
+      :else
+      (let [iso (if (.endswith text "Z")
+                  (str (subs text 0 (dec (count text))) "+00:00")
+                  text)
+            parsed (.fromisoformat dt-cls iso)]
+        (if (nil? (.-tzinfo parsed))
+          (.replace parsed ** :tzinfo (zoneinfo/ZoneInfo "America/New_York"))
+          parsed)))))
+
+(defn- theta-bar
+  [doc i target-date]
+  (let [close (col-double doc "close" i 0.0)
+        vwap (col-double doc "vwap" i close)]
+    {:time (parse-theta-time (col-value doc "timestamp" i) target-date)
+     :open (col-double doc "open" i close)
+     :high (col-double doc "high" i close)
+     :low (col-double doc "low" i close)
+     :close close
+     :volume (col-double doc "volume" i 0.0)
+     :vwap (if (pos? vwap) vwap close)
+     :trade-count (int (col-double doc "count" i 0.0))}))
+
+(defn- fetch-theta-bars-for-date
+  [sym d]
+  (try
+    (let [compact (yyyymmdd d)
+          doc (http-json (str terminal "/v3/stock/history/ohlc?"
+                              "symbol=" sym
+                              "&start_date=" compact
+                              "&end_date=" compact
+                              "&date=" compact
+                              "&interval=1m"
+                              "&start_time=04:00:00"
+                              "&end_time=20:00:00"
+                              "&format=json")
+                         {})
+          timestamps (get doc "timestamp")
+          n (if (some? timestamps) (python/len timestamps) 0)]
+      (vec (for [i (range n)
+                 :let [bar (theta-bar doc i d)]
+                 :when (pos? (:close bar))]
+             bar)))
+    (catch python/Exception e
+      (println "WARN ThetaData seed fetch failed:" sym (.isoformat d) (str e))
+      [])))
+
+(defn fetch-theta-bars
+  [sym n]
+  (let [date-cls (.-date datetime)
+        today (.date (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York")))]
+    (loop [offset 0
+           bars []]
+      (if (or (>= (count bars) n)
+              (>= offset seed-lookback-days))
+        (vec (take-last n bars))
+        (let [d (.fromordinal date-cls (- (.toordinal today) offset))
+              day-bars (fetch-theta-bars-for-date sym d)]
+          (recur (inc offset) (vec (concat day-bars bars))))))))
+
 (defn fetch-bars [sym n]
-  (let [url (str "https://data.alpaca.markets/v2/stocks/" sym
-                 "/bars?timeframe=1Min&feed=iex&limit=" n "&sort=desc")
+  (let [end (datetime.datetime/now (.-utc datetime/timezone))
+        start (- end (datetime/timedelta ** :days seed-lookback-days))
+        url (str "https://data.alpaca.markets/v2/stocks/" sym
+                 "/bars?timeframe=1Min&feed=iex&adjustment=raw&limit=" n
+                 "&sort=desc"
+                 "&start=" (utc-param start)
+                 "&end=" (utc-param end))
         doc (http-json url {"APCA-API-KEY-ID" (:key-id data-creds)
                             "APCA-API-SECRET-KEY" (:secret data-creds)})
         dt-cls (.-datetime datetime)]
@@ -88,10 +346,44 @@
                   :close (get b "c") :volume (get b "v")
                   :vwap (get b "vw" (get b "c"))
                   :trade-count (get b "n" 0)})
-               (get doc "bars"))))))
+               (or (get doc "bars") []))))))
+
+(defn fetch-seed-bars
+  [sym n]
+  (let [alpaca-bars (try
+                      (fetch-bars sym n)
+                      (catch python/Exception e
+                        (println "WARN Alpaca seed fetch failed:" sym (str e))
+                        []))]
+    (if (>= (count alpaca-bars) min-seed-bars)
+      alpaca-bars
+      (let [theta-bars (fetch-theta-bars sym n)]
+        (if (> (count theta-bars) (count alpaca-bars))
+          (do
+            (println "seed fallback: using ThetaData bars for" sym
+                     "alpaca-count" (count alpaca-bars)
+                     "theta-count" (count theta-bars))
+            theta-bars)
+          alpaca-bars)))))
+
+(defn validate-bars-seed!
+  [bars-seed]
+  (let [counts (into {} (map (fn [sym] [sym (count (get bars-seed sym []))])
+                             stock-syms))
+        cold (vec (filter (fn [sym] (< (get counts sym 0) min-seed-bars))
+                          stock-syms))]
+    (println "seed bar counts:" counts
+             "minimum-required:" min-seed-bars
+             "lookback-days:" seed-lookback-days)
+    (when (seq cold)
+      (println "FATAL: insufficient Steve V2 seed bars; refusing cold launch:"
+               (into {} (map (fn [sym] [sym (get counts sym 0)]) cold)))
+      (println "Hint: increase STEVE_SEED_LOOKBACK_DAYS or lower STEVE_MIN_SEED_BARS only for controlled diagnostics.")
+      (python/exit 1))))
 
 (defn fetch-chain-contracts
-  "All SPY contracts for expirations within max-days — bridge contract maps."
+  "Bounded SPY contracts for expirations within max-days — bridge contract maps.
+  `chain-strike-range` is part of the live/historical source contract."
   [max-days]
   (let [date-cls (.-date datetime)
         today (.today date-cls)
@@ -107,28 +399,102 @@
     (vec (mapcat
           (fn [exp]
             (let [compact (.replace exp "-" "")
-                  doc (http-json (str terminal "/v3/option/snapshot/quote?symbol=SPY&expiration=" compact "&format=json") {})
+                  doc (http-json (str terminal "/v3/option/snapshot/quote?symbol=SPY&expiration=" compact
+                                      "&strike_range=" chain-strike-range "&format=json") {})
+                  ohlc (if enrich-option-sidecars?
+                         (option-surface-map
+                          (try-http-json (str terminal "/v3/option/snapshot/ohlc?symbol=SPY&expiration=" compact "&format=json"))
+                          exp
+                          ["open" "high" "low" "close" "volume" "count"])
+                         {})
+                  oi (if enrich-option-sidecars?
+                       (option-surface-map
+                        (try-http-json (str terminal "/v3/option/snapshot/open_interest?symbol=SPY&expiration=" compact "&format=json"))
+                        exp
+                        ["open_interest" "oi"])
+                       {})
                   strikes (get doc "strike")
                   rights (get doc "right")
                   bids (get doc "bid")
                   asks (get doc "ask")
+                  bid-sizes (get doc "bid_size")
+                  ask-sizes (get doc "ask_size")
                   n (python/len strikes)]
               (map (fn [i]
-                     {:strike (.__getitem__ strikes i)
-                      :right (str (.__getitem__ rights i))
-                      :bid (let [b (.__getitem__ bids i)] (if (nil? b) 0.0 (double b)))
-                      :ask (let [a (.__getitem__ asks i)] (if (nil? a) 0.0 (double a)))
-                      :expiration exp})
+                     (let [strike (.__getitem__ strikes i)
+                           right (str (.__getitem__ rights i))
+                           k (opt-key strike right exp)
+                           extra (merge (get ohlc k {})
+                                        (get oi k {}))]
+                       (merge
+                        {:strike strike
+                         :right right
+                         :bid (let [b (.__getitem__ bids i)] (if (nil? b) 0.0 (double b)))
+                         :ask (let [a (.__getitem__ asks i)] (if (nil? a) 0.0 (double a)))
+                         :bid_size (let [s (when (some? bid-sizes) (.__getitem__ bid-sizes i))]
+                                     (when (some? s) (double s)))
+                         :ask_size (let [s (when (some? ask-sizes) (.__getitem__ ask-sizes i))]
+                                     (when (some? s) (double s)))
+                         :expiration exp}
+                        extra)))
                    (range n))))
           exps))))
+
+(defn- refresh-extra-option-surfaces! [bridge reason]
+  (doseq [opt-sym extra-option-symbols]
+    (let [observed-at (datetime.datetime/now
+                       (zoneinfo/ZoneInfo "America/New_York"))]
+      (try
+        (let [underlying-sym (option-underlying-symbol opt-sym)
+              underlying (fetch-index-price underlying-sym)
+              contracts (fetch-option-contracts opt-sym extra-option-horizon-days)
+              contract-count (count contracts)]
+          (println "extra option surface fetch:"
+                   reason
+                   opt-sym
+                   "underlying:" (if (some? underlying) "ok" "missing")
+                   "contracts:" contract-count)
+          (if (and (some? underlying) (seq contracts))
+            (let [result (bridge/on-option-surface!
+                          bridge
+                          {:prefix opt-sym
+                           :observed-at observed-at
+                           :underlying underlying
+                           :contracts contracts})]
+              (bridge/record-option-surface-status!
+               bridge
+               {:prefix opt-sym
+                :observed-at observed-at
+                :ok? true
+                :underlying underlying
+                :contracts contract-count
+                :n-gridded (:n-gridded result)
+                :n-features (:n-features result)})
+              (println "extra option surface stored:" result))
+            (bridge/record-option-surface-status!
+             bridge
+             {:prefix opt-sym
+              :observed-at observed-at
+              :ok? false
+              :reason (if (some? underlying) :no-contracts :missing-underlying)
+              :underlying underlying
+              :contracts contract-count})))
+      (catch python/Exception e
+        (bridge/record-option-surface-status!
+         bridge
+         {:prefix opt-sym
+          :observed-at observed-at
+          :ok? false
+          :reason :fetch-error
+          :error e})
+        (println "WARN option surface fetch failed:" reason opt-sym (str e)))))))
 
 ;; --- bridge ------------------------------------------------------------------
 (println "loading bridge (torch/xgboost bundles)...")
 ;; CLEAN-FEATURE-PARITY BUNDLES (2026-06-12, operator-approved): default
 ;; to the *_corrected copies (recovered raw feature stats + neutralized
-;; broken live sources — see deploy_corrected_bundles.py). Rollback:
-;; STEVE_BUNDLES=identity relaunches on the original bug-faithful
-;; bundles.
+;; broken live sources). Rollback: STEVE_BUNDLES=identity relaunches on the
+;; original bug-faithful bundles.
 (def bundle-suffix
   (if (= "identity" (os/getenv "STEVE_BUNDLES")) "" "_corrected"))
 (println "bundle variant:" (if (= "" bundle-suffix) "identity (legacy)" "corrected"))
@@ -141,26 +507,88 @@
     :calibrations {:chestnut (str ref-root "/pipeline_data/calibrations/dir_cal_chestnut_h3_v1/v0_legacy_freeze.json")
                    :lynx (str ref-root "/pipeline_data/calibrations/dir_cal_lynx_h3_v1/v0_legacy_freeze.json")
                    :moose (str ref-root "/pipeline_data/calibrations/dir_cal_moose_h3_v1/v0_legacy_freeze.json")}
-    ;; feature-parity capture (live side): per-bar 918-feature vectors
-    ;; land in live_runtime/feature-capture/live_features_<date>.npz
-    :capture-dir "live_runtime/feature-capture"
+    ;; feature-parity capture (live side): per-bar 918-feature vectors plus
+    ;; raw replay sidecars. Honor CAPTURE_DIR so live capture and market
+    ;; evidence collection read/write the same shared runtime directory.
+    :capture-dir (or (os/getenv "CAPTURE_DIR") "live_runtime/feature-capture")
+    ;; This is persisted with every tensor/sidecar row. The historical corpus
+    ;; gate rejects captures without provider and finalized-bar semantics.
+    :capture-provenance {"schema_version" 2
+                         "feature_contract" "steve-v2-canonical-input/v2"
+                         "stock" {"provider" stock-bar-source
+                                  "provider_family" (if (= stock-bar-source "thetadata")
+                                                      "thetadata-v3" "alpaca-v2")
+                                  "endpoint" (if (= stock-bar-source "thetadata")
+                                               "/v3/stock/history/ohlc" "/v2/stocks/{symbol}/bars")
+                                  "venue" (if (= stock-bar-source "thetadata")
+                                            thetadata-stock-venue "iex")
+                                  "timeframe" "1m"
+                                  "bar_status" "completed"
+                                  "bar_timestamp" "open-time"
+                                  "symbols" stock-syms}
+                         "options" {"provider" "thetadata-terminal"
+                                    "provider_family" "thetadata-v3"
+                                    "endpoint" "/v3/option/snapshot/quote"
+                                    "snapshot_kind" "last-nbbo"
+                                    "selection" "all-contracts-per-selected-expiration"
+                                    "strike_range" (str chain-strike-range)
+                                    "observed_at" "terminal-contract-timestamp-max"
+                                    "symbols" (vec (concat ["SPY"] extra-option-symbols))}
+                         "capture" {"sidecar_retention" "every-inference"
+                                    "feature_implementation" "basilisp/raw-unlock"
+                                    "greeks_policy" "bridge-local-bs-v1/rate-0.043/no-dividend"}}
     ;; DOLPHIN hysteresis lane: 1.5x (operator, 2026-06-12) — the legacy
     ;; 2.0x never reached conviction under honest z-scores
     :mult2-scale 1.5}))
 
 (println "priming bridge: bars x4 symbols + steady-state grid history...")
-(def bars-seed (into {} (map (fn [s] [s (fetch-bars s 200)]) stock-syms)))
+(def bars-seed (into {} (map (fn [s] [s (fetch-seed-bars s seed-bar-count)]) stock-syms)))
+(validate-bars-seed! bars-seed)
+(println "seed bars fetched")
 (def now-et (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York")))
 ;; GRID HOMOGENEITY (2026-06-11 churn root cause): the Mamba encoder
 ;; (lynx) sawtooths when the grid-history sequence mixes compositions —
 ;; different expiration horizons OR a filling deque (zero-pad ratio
 ;; changes every bar). Prime the history to FULL depth with the same
-;; 90d snapshot (production's steady state), and keep the in-loop
-;; horizon at the SAME 90d.
-(def seed-contracts (fetch-chain-contracts 90))
+;; homogeneous snapshot, and keep the in-loop horizon the same. The
+;; horizon is runtime-configurable because broad 90d startup chains can be
+;; too slow for incident recovery during market hours.
+(def seed-contracts (fetch-chain-contracts chain-horizon-days))
+(println "seed chain contracts fetched:" (count seed-contracts)
+         "horizon-days:" chain-horizon-days)
 (def chain-seed
   (vec (repeat 10 {:observed-at now-et :contracts seed-contracts})))
+
+(defn- dt->seed-str [dt]
+  (.isoformat dt))
+
+(defn- seed-bar-record [bar]
+  (assoc bar :time (dt->seed-str (:time bar))))
+
+(def bridge-seed-path (str out-dir "/bridge_seed.edn"))
+(spit bridge-seed-path
+      (edn/write-string
+       {:seed/version 1
+        :seed/generated-at (dt->seed-str now-et)
+        :seed/source :steve-v2-live-launcher
+        :seed/bar-count seed-bar-count
+        :seed/min-bar-count min-seed-bars
+        :seed/lookback-days seed-lookback-days
+        :seed/grid-history-count 10
+        :seed/chain-horizon-days chain-horizon-days
+        :seed/bars (into {}
+                         (map (fn [[sym bars]]
+                                [sym (mapv seed-bar-record bars)])
+                              bars-seed))
+        :seed/chains (mapv (fn [snap]
+                             (assoc snap :observed-at
+                                    (dt->seed-str (:observed-at snap))))
+                           chain-seed)}))
+(println "wrote bridge seed:" bridge-seed-path)
+
 (bridge/prime! br bars-seed chain-seed)
+(refresh-extra-option-surfaces! br "prime")
+(def extra-option-refresh-mono (atom (time/monotonic)))
 (def sig0 (bridge/signals br))
 (println "primed. signals now:"
          (select-keys sig0 [:chestnut :lynx :moose :oak :dolphin :parrot]))
@@ -185,8 +613,9 @@
                                 :low (python/float (:bar/low payload))
                                 :close (python/float (:bar/close payload))
                                 :volume (python/float (:bar/volume payload))
-                                :vwap (python/float (:bar/close payload))
-                                :trade-count 0})
+                                :vwap (python/float (or (:bar/vwap payload)
+                                                        (:bar/close payload)))
+                                :trade-count (python/int (or (:bar/trade-count payload) 0))})
             ;; production cadence: one greeks grid per WALL minute at the
             ;; SAME 90d horizon as prime (homogeneous grid composition —
             ;; the lynx churn root cause was horizon mixing). Throttled by
@@ -201,9 +630,15 @@
                   (try
                     (bridge/on-chain! br {:observed-at (datetime.datetime/now
                                                         (zoneinfo/ZoneInfo "America/New_York"))
-                                          :contracts (fetch-chain-contracts 90)})
+                                          :contracts (fetch-chain-contracts chain-horizon-days)})
                     (catch python/Exception e
-                      (println "WARN chain fetch failed:" (str e)))))))))
+                      (println "WARN chain fetch failed:" (str e))))
+                  (when (and (seq extra-option-symbols)
+                             (pos? extra-option-refresh-seconds)
+                             (>= (- now @extra-option-refresh-mono)
+                                 extra-option-refresh-seconds))
+                    (reset! extra-option-refresh-mono now)
+                    (refresh-extra-option-surfaces! br "refresh")))))))
         :else nil))))
 
 ;; --- manifest ----------------------------------------------------------------
@@ -261,22 +696,28 @@
 (def spot (python/float (bridge/spy-price br)))
 (def bar-srcs
   (vec (for [sym stock-syms]
-         (mda/make-alpaca-bars-source
-          {:symbol sym
-           :instrument-id (str "equity/NASDAQ/" sym)
-           :key-id (:key-id data-creds) :secret (:secret data-creds)
-           :warmup-bars 3 :block? false :poll-seconds 10
-           :until until}))))
+         (if (= stock-bar-source "thetadata")
+           (td/make-thetadata-stock-bars-source
+            {:symbol sym :instrument-id (str "equity/NASDAQ/" sym)
+             :base-url terminal :venue thetadata-stock-venue
+             :seed-latest? true :block? false :poll-seconds 15
+             :until until})
+           (mda/make-alpaca-bars-source
+            {:symbol sym
+             :instrument-id (str "equity/NASDAQ/" sym)
+             :key-id (:key-id data-creds) :secret (:secret data-creds)
+             :warmup-bars 3 :block? false :poll-seconds 1
+             :until until})))))
 (def chain-src
   (td/make-thetadata-chain-source
    {:symbol "SPY" :underlying-id "equity/NASDAQ/SPY"
     :expiration session-date
     :strike-range [(str (- (python/int spot) 25)) (str (+ (python/int spot) 25))]
-    :block? false :poll-seconds 55
+    :block? false :poll-seconds 15
     :until until}))
 (def source (mdc/make-composite-source
              {:sources (conj bar-srcs chain-src)
-              :poll-seconds 2 :until until}))
+              :poll-seconds 0.25 :until until}))
 
 ;; --- run ---------------------------------------------------------------------
 (def bridge-ctx

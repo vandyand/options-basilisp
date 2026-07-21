@@ -1,0 +1,373 @@
+;; Verify saved ThetaData capability-probe payload examples against Balli schemas.
+(import datetime glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.market-data.thetadata-schema :as ts])
+
+(defn usage []
+  (println "usage: basilisp run scripts/verify_thetadata_payload_examples.lpy -- [--payload-dir DIR|--examples-dir DIR] [--target-date YYYY-MM-DD] [--out result.json] [--out-dir DIR]"))
+
+(defn compact-date
+  [date-str]
+  (let [s (str date-str)]
+    (cond
+      (= 10 (count s))
+      (do
+        (datetime.date/fromisoformat s)
+        (.replace s "-" ""))
+
+      (and (> (count s) 10) (= "T" (subs s 10 11)))
+      (let [normalized (if (.endswith s "Z")
+                         (str (subs s 0 (- (count s) 1)) "+00:00")
+                         s)
+            dt (datetime.datetime/fromisoformat normalized)]
+        (.strftime dt "%Y%m%d"))
+
+      :else
+      (throw (python/ValueError (str "invalid date/timestamp: " s))))))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(defn now-utc
+  []
+  (.strftime (datetime.datetime/now datetime.timezone/utc)
+             "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn ensure-parent-dir!
+  [path]
+  (let [parent (os.path/dirname path)]
+    (when (pos? (count parent))
+      (os/makedirs parent ** :exist_ok true))))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:payload-dir (os.path/join repo-root "resources" "thetadata" "payload_examples")
+              :out-dir (os.path/join repo-root "live_runtime" "analysis")}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (or (= arg "--payload-dir") (= arg "--examples-dir"))
+          (recur (nnext remaining) (assoc out :payload-dir (option-value remaining arg)))
+
+          (= arg "--out")
+          (recur (nnext remaining) (assoc out :out (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining)
+                 (assoc out :target-date
+                        (cli-target-date (option-value remaining arg))))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple [(cond
+                                      (keyword? k) (name k)
+                                      :else (str k))
+                                    (jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable x))
+    (keyword? x) (name x)
+    :else x))
+
+(defn reject-duplicate-json-object
+  [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining)
+               (conj seen k)
+               (assoc out k v))))))
+
+(defn read-json
+  [path]
+  (json/loads (slurp path) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn path-date
+  [path]
+  (let [parent (os.path/basename (os.path/dirname path))]
+    (if (and (= 8 (count parent)) (.isdigit parent))
+      (try
+        (datetime.date/fromisoformat
+         (str (subs parent 0 4) "-" (subs parent 4 6) "-" (subs parent 6 8)))
+        parent
+        (catch python/Exception _ "invalid"))
+      "missing")))
+
+(defn inc-count
+  [m k]
+  (assoc m k (inc (int (get m k 0)))))
+
+(defn result-date-counts
+  [results]
+  (reduce (fn [acc result]
+            (inc-count acc (or (:example/generated_date result) "missing")))
+          {}
+          results))
+
+(defn result-target-date-counts
+  [results]
+  (reduce (fn [acc result]
+            (inc-count acc (or (:example/target_date_compact result) "missing")))
+          {}
+          results))
+
+(defn path-date-counts
+  [files]
+  (reduce (fn [acc path]
+            (inc-count acc (path-date path)))
+          {}
+          files))
+
+(defn path-inside-dir?
+  [dir path]
+  (let [dir-real (os.path/realpath dir)
+        path-real (os.path/realpath path)]
+    (or (= path-real dir-real)
+        (.startswith path-real (str dir-real os/sep)))))
+
+(defn payload-path-containment-issues
+  [payload-dir files]
+  (let [escaping (vec (sort (remove #(path-inside-dir? payload-dir %) files)))]
+    (if (seq escaping)
+      [{:severity :bad
+        :code :thetadata/payload-example-path-outside-payload-dir
+        :paths escaping
+        :detail "payload example paths must resolve inside payload-dir"}]
+      [])))
+
+(defn target-date-issues
+  [target-stamp total generated-counts target-date-counts path-counts]
+  (let [target-date-present (- total (int (get target-date-counts "missing" 0)))]
+    (cond-> []
+      (and target-stamp
+           (pos? target-date-present)
+           (not= target-date-present (int (get target-date-counts target-stamp 0))))
+      (conj {:severity :bad
+             :code :thetadata/payload-examples-target-date-mismatch
+             :target_date target-stamp
+             :detail "payload example target_date metadata does not all match target date"})
+
+      (and target-stamp
+           (not= total (int (get path-counts target-stamp 0))))
+      (conj {:severity :bad
+	             :code :thetadata/payload-examples-outside-target-date-directory
+	             :target_date target-stamp
+	             :detail "payload example paths are not all under the target-date directory"})
+
+      (and target-stamp
+           (pos? (int (get path-counts "invalid" 0))))
+      (conj {:severity :bad
+             :code :thetadata/payload-examples-invalid-date-directory
+             :target_date target-stamp
+             :detail "payload example paths include invalid YYYYMMDD date directories"}))))
+
+(defn generated-at-metadata-issues
+  [run-stamp results]
+  (let [checked (filter #(not= :skipped (:status %)) results)
+        missing (vec (sort (keep (fn [result]
+                                   (when (nil? (:example/generated_date result))
+                                     (:path result)))
+                                 checked)))
+        date-only (vec (sort (keep (fn [result]
+                                      (let [generated-at (:example/generated_at result)]
+                                        (when (and (some? generated-at)
+                                                   (= -1 (.find (str generated-at) "T")))
+                                          (:path result))))
+                                    checked)))
+        future (vec (sort (keep (fn [result]
+                                  (let [generated-date (:example/generated_date result)]
+                                    (when (and generated-date
+                                               (> (compare generated-date run-stamp) 0))
+                                      (:path result))))
+                                checked)))]
+    (vec
+     (concat
+      (when (seq missing)
+        [{:severity :bad
+          :code :thetadata/payload-examples-missing-generated-at
+          :paths missing
+          :detail "schema-backed payload examples must include parseable generated_at metadata"}])
+      (when (seq date-only)
+        [{:severity :bad
+          :code :thetadata/payload-examples-generated-at-not-timestamp
+          :paths date-only
+          :detail "schema-backed payload examples must include timestamp generated_at metadata, not date-only metadata"}])
+      (when (seq future)
+        [{:severity :bad
+          :code :thetadata/payload-examples-generated-in-future
+          :paths future
+          :generated_at_run_date run-stamp
+          :detail "payload example generated_at metadata cannot be later than verifier run date"}])))))
+
+(defn target-date-metadata-issues
+  [results]
+  (let [checked (filter #(not= :skipped (:status %)) results)
+        malformed (vec (sort (keep (fn [result]
+                                      (when (and (some? (:example/target_date result))
+                                                 (nil? (:example/target_date_compact result)))
+                                        (:path result)))
+                                    checked)))]
+    (if (seq malformed)
+      [{:severity :bad
+        :code :thetadata/payload-examples-malformed-target-date
+        :paths malformed
+        :detail "payload example target_date metadata must be a parseable date or timestamp when present"}]
+      [])))
+
+(defn timestamp-seconds
+  [value]
+  (try
+    (let [s (str value)]
+      (when (and (> (count s) 10) (= "T" (subs s 10 11)))
+        (.timestamp
+         (datetime.datetime/fromisoformat
+          (if (.endswith s "Z")
+            (str (subs s 0 (- (count s) 1)) "+00:00")
+            s)))))
+    (catch python/Exception _ nil)))
+
+(defn generated-at-timestamp-issues
+  [run-generated-at results]
+  (let [checked (filter #(not= :skipped (:status %)) results)
+        run-seconds (timestamp-seconds run-generated-at)
+        future (vec
+                (sort
+                 (keep (fn [result]
+                         (let [example-seconds (timestamp-seconds
+                                                (:example/generated_at result))]
+                           (when (and run-seconds
+                                      example-seconds
+                                      (> example-seconds (+ run-seconds 60.0)))
+                             (:path result))))
+                       checked)))]
+    (if (seq future)
+      [{:severity :bad
+        :code :thetadata/payload-examples-generated-at-after-verifier-run
+        :paths future
+        :generated_at_run run-generated-at
+        :detail "payload example generated_at timestamp cannot be later than the verifier run"}]
+      [])))
+
+(defn verify-file
+  [path]
+  (try
+    (ts/verify-payload-example path (read-json path))
+    (catch python/Exception e
+      {:path path
+       :status :error
+       :valid? false
+       :reason :thetadata/unreadable-payload-example
+       :error (str e)})))
+
+(defn verify-dir
+  [payload-dir generated-at target-date]
+  (let [files (sort (glob/glob (os.path/join payload-dir "**" "*.json")
+                               ** :recursive true))
+        results (mapv verify-file files)
+        checked (filter #(not= :skipped (:status %)) results)
+	        invalid (filter #(false? (:valid? %)) results)
+	        zero? (zero? (count results))
+	        target-stamp (when target-date (compact-date target-date))
+	        run-stamp (compact-date generated-at)
+	        generated-counts (result-date-counts results)
+	        target-date-counts (result-target-date-counts results)
+	        path-counts (path-date-counts files)
+        issues (vec (concat
+                     (if zero?
+                       [{:severity :bad
+                         :code :thetadata/no-payload-examples
+                         :detail "no ThetaData payload example JSON files found"}]
+                       [])
+                     (if zero?
+	                       []
+	                       (ts/payload-example-coverage-issues results))
+	                     (generated-at-metadata-issues run-stamp results)
+                         (generated-at-timestamp-issues generated-at results)
+                         (target-date-metadata-issues results)
+	                     (payload-path-containment-issues payload-dir files)
+	                     (target-date-issues target-stamp (count results) generated-counts target-date-counts path-counts)))]
+    {:generated_at generated-at
+     :target_date target-stamp
+     :valid? (and (not zero?) (empty? invalid) (empty? issues))
+     :status (if (and (not zero?) (empty? invalid) (empty? issues)) :ok :error)
+     :payload-dir payload-dir
+     :total (count results)
+     :checked (count checked)
+     :skipped (- (count results) (count checked))
+     :invalid (count invalid)
+     :example_generated_date_counts generated-counts
+     :example_target_date_counts target-date-counts
+     :example_path_date_counts path-counts
+     :issues issues
+     :results results}))
+
+(try
+  (let [{:keys [payload-dir out out-dir target-date]} (parse-args (vec *command-line-args*))
+        generated-at (now-utc)
+        out-stamp (if target-date
+                    (compact-date target-date)
+                    (compact-date generated-at))
+        result (verify-dir payload-dir generated-at target-date)
+        out (or out
+                (when out-dir
+                  (os.path/join out-dir
+                                (str "thetadata_payload_verification_"
+                                     out-stamp
+                                     ".json"))))
+        encoded (json/dumps (jsonable result) ** :indent 2 :sort_keys true)]
+    (when out
+      (ensure-parent-dir! out)
+      (spit out (str encoded "\n")))
+    (println encoded)
+    (python/exit (if (:valid? result) 0 1)))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

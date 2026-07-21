@@ -1,0 +1,751 @@
+(ns feature-parity.test-grid-feature-input-parity-cli
+  (:import json numpy os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/grid_feature_input_parity.lpy"))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn run-script [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn path [parent name] (.joinpath parent name))
+(defn read-json [p] (json/loads (.read_text p)))
+
+(defn grids [rows offset]
+  (let [arr (numpy/zeros (python/tuple [rows 6 21 8]) ** :dtype numpy/float32)]
+    (doseq [i (range rows)
+            gi (range 6)]
+      (.__setitem__ arr (python/tuple [i gi 10 3]) (+ offset i gi))
+      (.__setitem__ arr (python/tuple [i gi 11 4]) (+ offset (* 0.5 i) gi)))
+    arr))
+
+(defn value-grids [values]
+  (let [rows (count values)
+        arr (numpy/zeros (python/tuple [rows 6 21 8]) ** :dtype numpy/float32)]
+    (doseq [i (range rows)
+            gi (range 6)
+            strike (range 21)
+            expiry (range 8)]
+      (.__setitem__ arr
+                    (python/tuple [i gi strike expiry])
+                    (+ (nth values i)
+                       (* gi 0.17)
+                       (* strike 0.013)
+                       (* expiry 0.007))))
+    arr))
+
+(defn grid-history-json [grid-arr]
+  (numpy/array
+   (python/list
+    (for [i (range (first (.-shape grid-arr)))]
+      (json/dumps
+       (.tolist (.__getitem__ grid-arr (slice 0 (inc i)))))))
+   ** :dtype object))
+
+(defn padded-grid-histories [grid-arr history-len]
+  (let [rows (first (.-shape grid-arr))
+        out (numpy/zeros (python/tuple [rows history-len 6 21 8]) ** :dtype numpy/float32)]
+    (doseq [i (range rows)]
+      (let [n (min history-len (inc i))
+            start (- history-len n)
+            source-start (- (inc i) n)
+            history (.__getitem__ grid-arr (slice source-start (inc i)))]
+        (.__setitem__ out
+                      (python/tuple [i
+                                     (slice start nil)
+                                     (slice nil nil)
+                                     (slice nil nil)
+                                     (slice nil nil)])
+                      history)))
+    out))
+
+(deftest grid-feature-input-parity-help-exits-zero
+  (let [result (run-script "--help")]
+    (is (= 0 (.-returncode result)))
+    (is (str/includes? (.-stdout result) "--live-capture PATH"))
+    (is (str/includes? (.-stdout result) "--historical-npz PATH"))
+    (is (str/includes? (.-stdout result) "--historical-cohort-json PATH"))))
+
+(deftest grid-feature-input-parity-fails-closed-without-historical-grids
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :X (numpy/zeros #py (1 2) ** :dtype numpy/float32))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--min-rows" "1")
+            payload (read-json out)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (= "historical NPZ missing grids array" (.get payload "reason")))
+        (is (str/includes? (.get (.get payload "details") "hint") "writes :grids"))))))
+
+(deftest grid-feature-input-parity-preserves-existing-artifact-on-error
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          missing-hist (path tmp "missing_historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0))
+      (.write_text out "{\"ok\":true,\"status\":\"ok\",\"matched_rows\":99}\n")
+      (.write_text md "# previous good artifact\n")
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str missing-hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "1")
+            preserved (read-json out)
+            error-payload (read-json (path tmp "grid.json.error"))]
+        (is (= 1 (.-returncode result)))
+        (is (= true (.get preserved "ok")))
+        (is (= 99 (.get preserved "matched_rows")))
+        (is (= false (.get error-payload "ok")))
+        (is (= "historical NPZ missing" (.get error-payload "reason")))
+        (is (= (str out) (.get error-payload "preserved_existing_artifact")))
+        (is (str/includes? (.read_text (path tmp "grid.md.error")) "Preserved existing artifact"))))))
+
+(deftest grid-feature-input-parity-writes-explicit-unavailable-artifact
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out (path tmp "grid_feature_input_parity_20260709.json")
+          md (path tmp "grid_feature_input_parity_20260709.md")]
+      (let [result (run-script "--live-capture" (str (path tmp "missing_live.npz"))
+                               "--historical-npz" (str (path tmp "missing_hist.npz"))
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--write-unavailable"
+                               "--unavailable-reason" "historical tensor missing")
+            payload (read-json out)]
+        (is (= 1 (.-returncode result)))
+        (is (.exists out))
+        (is (.exists md))
+        (is (= false (.get payload "ok")))
+        (is (= false (.get payload "available")))
+        (is (= "unavailable" (.get payload "status")))
+        (is (= "2026-07-09" (.get payload "target_date")))
+        (is (= "historical tensor missing" (.get payload "reason")))
+        (is (= 0 (.get payload "matched_rows")))
+        (is (= [] (vec (.get payload "rows"))))
+        (is (str/includes? (.read_text md) "historical tensor missing"))))))
+
+(deftest grid-feature-input-parity-writes-aligned-greek-metrics
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          live-grid-arr (grids 3 1.0)]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:29:00Z"
+                                          "2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids live-grid-arr
+                     :grid_history_json (grid-history-json live-grid-arr))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"])
+                     :grids (grids 3 1.0))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            payload (read-json out)
+            rows (.get payload "rows")
+            iv-row (first rows)
+            best-lag (.get payload "best_sequence_lag")
+            tail (.get payload "live_grid_history_tail")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "ok")))
+        (is (= 2 (.get payload "matched_rows")))
+        (is (= "2026-07-09T13:30:00Z" (.get payload "matched_start")))
+        (is (= "iv" (.get iv-row "greek")))
+        (is (>= (.get iv-row "correlation") 0.99))
+        (is (= 7 (count (.get iv-row "lag_correlations"))))
+        (is (some? (.get iv-row "best_lag")))
+        (is (contains? iv-row "correlation_without_top_1pct_abs_dev"))
+        (is (some? (.get iv-row "p99_abs_deviation")))
+        (is (>= (.get iv-row "max_abs_deviation") 0.0))
+        (is (= "2026-07-09T13:30:00Z"
+               (.get (.get iv-row "max_abs_location") "time")))
+        (is (= 7 (count (.get payload "sequence_lag_summaries"))))
+        (is (some? (.get best-lag "lag_minutes")))
+        (is (>= (.get best-lag "min_correlation") 0.99))
+        (is (= 2 (.get tail "rows_with_grid_history")))
+        (is (= 0 (.get tail "tail_mismatch_rows")))
+        (is (= 0.0 (.get (.get tail "tail_abs_delta") "max")))
+        (is (str/includes? (.read_text md) "Grid Feature Input Parity"))))))
+
+(deftest grid-feature-input-parity-explains-contract-density-mismatch
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          cohort (path tmp "historical.json")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          chain-json (fn [n]
+                       (json/dumps
+                        (python/dict {"contracts" (python/list
+                                                   (for [i (range n)]
+                                                     (python/dict {"strike" (+ 700 i)
+                                                                   "right" "CALL"
+                                                                   "bid" 1.0
+                                                                   "ask" 1.1
+                                                                   "expiration" "2026-07-09"})))})))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0)
+                     :option_chain_json (numpy/array [(chain-json 800) (chain-json 760)] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0))
+      (.write_text cohort
+                   (str (json/dumps
+                         (python/dict {"target_date" "2026-07-09"
+                                       "chain_horizon_days" 1
+                                       "spy_strike_range" "3"
+                                       "spy_expirations" 2
+                                       "spy_chain_minutes" 2
+                                       "contract_field_coverage"
+                                       (python/dict {"SPY"
+                                                     (python/dict {"contracts" 144
+                                                                   "minutes_with_contracts" 2
+                                                                   "contracts_per_minute"
+                                                                   (python/dict {"min" 72
+                                                                                 "median" 72
+                                                                                 "max" 72})})})}))
+                        "\n"))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--historical-cohort-json" (str cohort)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            payload (read-json out)
+            density (.get payload "contract_density")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+	        (is (= "historical SPY option universe is materially narrower than live"
+	               (.get density "reason")))
+	        (is (< (.get density "historical_to_live_median_ratio") 0.2))
+	        (is (= 780.0 (.get (.get (.get density "live") "matched_contracts_per_minute") "median")))
+	        (is (str/includes? (.read_text md) "Contract Density"))))))
+
+(deftest grid-feature-input-parity-flags-missing-historical-expirations
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          cohort (path tmp "historical.json")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          chain-json (fn [expirations]
+                       (json/dumps
+                        (python/dict {"contracts" (python/list
+                                                   (for [expiration expirations]
+                                                     (python/dict {"strike" 700
+                                                                   "right" "CALL"
+                                                                   "bid" 1.0
+                                                                   "ask" 1.1
+                                                                   "expiration" expiration})))})))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0)
+                     :option_chain_json (numpy/array [(chain-json ["2026-07-09" "2026-07-10"])
+                                                      (chain-json ["2026-07-09" "2026-07-10"])]
+                                                     ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0))
+      (.write_text cohort
+                   (str (json/dumps
+                         (python/dict {"target_date" "2026-07-09"
+                                       "chain_horizon_days" 1
+                                       "spy_strike_range" "3"
+                                       "spy_expirations" 1
+                                       "spy_chain_minutes" 2
+                                       "contract_field_coverage"
+                                       (python/dict {"SPY"
+                                                     (python/dict {"contracts" 4
+                                                                   "minutes_with_contracts" 2
+                                                                   "expiration_counts"
+                                                                   (python/dict {"2026-07-09" 4})
+                                                                   "contracts_per_minute"
+                                                                   (python/dict {"min" 2
+                                                                                 "median" 2
+                                                                                 "max" 2})})})}))
+                        "\n"))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--historical-cohort-json" (str cohort)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            exp-dist (.get (.get (read-json out) "contract_density") "expiration_distribution")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "historical cohort is missing live SPY option expirations"
+               (.get exp-dist "reason")))
+	        (is (= ["2026-07-10"] (vec (.get exp-dist "missing_in_historical"))))
+	        (is (str/includes? (.read_text md) "Expiration Distribution"))))))
+
+(deftest grid-feature-input-parity-flags-undercovered-historical-expiration
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          cohort (path tmp "historical.json")
+          out (path tmp "grid.json")
+          chain-json (json/dumps
+                      (python/dict {"contracts" (python/list
+                                                 [(python/dict {"strike" 700 "right" "CALL" "expiration" "2026-07-09"})
+                                                  (python/dict {"strike" 701 "right" "CALL" "expiration" "2026-07-10"})])}))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0)
+                     :option_chain_json (numpy/array [chain-json chain-json] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0))
+      (.write_text cohort
+                   (str (json/dumps
+                         (python/dict {"target_date" "2026-07-09"
+                                       "contract_field_coverage"
+                                       (python/dict {"SPY"
+                                                     (python/dict {"contracts" 3
+                                                                   "minutes_with_contracts" 2
+                                                                   "expiration_counts"
+                                                                   (python/dict {"2026-07-09" 2
+                                                                                 "2026-07-10" 1})
+                                                                   "contracts_per_minute"
+                                                                   (python/dict {"min" 1.5
+                                                                                 "median" 1.5
+                                                                                 "max" 1.5})})})}))
+                        "\n"))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--historical-cohort-json" (str cohort)
+                               "--out-json" (str out)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            exp-dist (.get (.get (read-json out) "contract_density") "expiration_distribution")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "historical cohort is materially undercovered for some live SPY expirations"
+               (.get exp-dist "reason")))
+        (is (= ["2026-07-10"] (vec (.get exp-dist "undercovered_expirations"))))))))
+
+(deftest grid-feature-input-parity-flags-future-live-chain-observed-at
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          chain-json (fn [observed-at]
+                       (json/dumps
+                        (python/dict {"observed_at" observed-at
+                                      "contracts" (python/list
+                                                   [(python/dict {"strike" 700
+                                                                  "right" "CALL"
+                                                                  "bid" 1.0
+                                                                  "ask" 1.1
+                                                                  "expiration" "2026-07-09"})])})))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0)
+                     :option_chain_json (numpy/array [(chain-json "2026-07-09T13:35:00Z")
+                                                      (chain-json "2026-07-09T13:31:30Z")]
+                                                     ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids (grids 2 1.0))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            payload (read-json out)
+            deltas (.get payload "live_chain_observed_at_delta")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 2 (.get deltas "rows_with_observed_at")))
+        (is (= 1 (.get deltas "rows_over_180_seconds")))
+	        (is (= 1 (.get deltas "rows_future_over_180_seconds")))
+	        (is (= 165.0 (.get (.get deltas "signed_seconds") "median")))
+	        (is (str/includes? (.get deltas "reason") "materially after"))
+	        (is (str/includes? (.read_text md) "Live Chain Observed-At Delta"))))))
+
+(deftest grid-feature-input-parity-flags-same-day-observed-at-offset
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          chain-json (json/dumps
+                      (python/dict {"observed_at" "2026-07-09T13:31:00Z"
+                                    "contracts" (python/list
+                                                 [(python/dict {"strike" 700
+                                                                "right" "CALL"
+                                                                "bid" 1.0
+                                                                "ask" 1.1
+                                                                "expiration" "2026-07-09"})])}))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0)
+                     :option_chain_json (numpy/array [chain-json] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "1")
+            deltas (.get (read-json out) "live_chain_observed_at_delta")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 1 (.get deltas "rows_over_30_seconds")))
+        (is (= 0 (.get deltas "rows_over_180_seconds")))
+        (is (= 1 (.get deltas "same_day_contracts")))
+        (is (str/includes? (.get deltas "reason") "0DTE Greeks"))))))
+
+(deftest grid-feature-input-parity-reports-live-chain-grid-rebuild-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          chain-json (json/dumps
+                      (python/dict {"observed_at" "2026-07-09T13:30:00Z"
+                                    "underlying" 700.0
+                                    "contracts" (python/list
+                                                 [(python/dict {"strike" 700
+                                                                "right" "CALL"
+                                                                "bid" 1.0
+                                                                "ask" 1.1
+                                                                "expiration" "2026-07-09"})])}))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0)
+                     :option_chain_json (numpy/array [chain-json] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "1")
+            rebuild (.get (read-json out) "live_chain_grid_rebuild")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get rebuild "available")))
+        (is (= 1 (.get rebuild "sampled_rows")))
+        (is (= 0 (.get rebuild "malformed_or_unbuildable_rows")))
+        (is (= 1 (count (.get rebuild "rows"))))
+        (is (= 6 (count (.get rebuild "by_greek"))))
+        (is (some? (.get rebuild "max_abs_deviation")))
+        (is (str/includes? (.get rebuild "reason") "grid"))
+        (is (str/includes? (.read_text md) "Live Chain Grid Rebuild"))))))
+
+(deftest grid-feature-input-parity-identifies-best-historical-time-shift
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          shifted (value-grids [10.0 -50.0 125.0 5.0 80.0])]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"])
+                     :grids (.__getitem__ shifted (slice 0 3)))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"
+                                          "2026-07-09T13:33:00Z"])
+                     :grids (.__getitem__ shifted (slice 0 3)))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            payload (read-json out)
+            best (.get payload "best_historical_time_shift")
+            diagnosis (.get payload "alignment_diagnosis")
+            summaries (.get payload "historical_time_shift_summaries")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 7 (count summaries)))
+        (is (= 1 (.get best "historical_shift_minutes")))
+        (is (= 3 (.get best "matched_rows")))
+        (is (>= (.get best "min_correlation") 0.99))
+        (is (= "timestamp-bucket-shift" (.get diagnosis "category")))
+        (is (str/includes? (.get diagnosis "reason") "timestamp bucketing"))
+        (is (str/includes? (.read_text md) "Historical Time-Shift Diagnostic"))))))
+
+(deftest grid-feature-input-parity-classifies-rolling-window-sequence-lag
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          live-grid-arr (value-grids [10.0 -50.0 125.0 5.0 80.0])
+          hist-grid-arr (numpy/copy live-grid-arr)]
+      (doseq [i (range 0 4)]
+        (.__setitem__ hist-grid-arr
+                      (python/tuple [i (slice nil nil) (slice nil nil) (slice nil nil)])
+                      (.__getitem__ live-grid-arr
+                                    (python/tuple [(inc i) (slice nil nil) (slice nil nil) (slice nil nil)]))))
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:40:00Z"
+                                          "2026-07-09T13:50:00Z"
+                                          "2026-07-09T14:00:00Z"
+                                          "2026-07-09T14:10:00Z"])
+                     :grids live-grid-arr)
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:40:00Z"
+                                          "2026-07-09T13:50:00Z"
+                                          "2026-07-09T14:00:00Z"
+                                          "2026-07-09T14:10:00Z"])
+                     :grids hist-grid-arr)
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "4")
+            payload (read-json out)
+            diagnosis (.get payload "alignment_diagnosis")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "rolling-window-sequence-lag" (.get diagnosis "category")))
+        (is (= -1 (.get diagnosis "best_sequence_lag_minutes")))
+        (is (str/includes? (.get diagnosis "reason") "rolling grid-history"))
+        (is (str/includes? (.read_text md) "Alignment Diagnosis"))))))
+
+(deftest grid-feature-input-parity-uses-historical-row-provenance
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          cohort (path tmp "historical.json")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          grid-arr (value-grids [10.0 -50.0 125.0 5.0])]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"
+                                          "2026-07-09T13:33:00Z"])
+                     :grids grid-arr)
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"
+                                          "2026-07-09T13:33:00Z"])
+                     :grids grid-arr)
+      (.write_text cohort
+                   "{\"row_provenance_summary\":{\"rows\":4,\"grid_appended_rows\":3,\"carried_grid_rows\":1}}\n")
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--historical-cohort-json" (str cohort)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "4")
+            diagnosis (.get (read-json out) "alignment_diagnosis")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "historical-carried-grid" (.get diagnosis "category")))
+        (is (= 1 (.get diagnosis "historical_carried_grid_rows")))
+        (is (str/includes? (.get diagnosis "reason") "stale carried grids"))))))
+
+(deftest grid-feature-input-parity-flags-live-grid-history-tail-mismatch
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          grid-arr (grids 2 1.0)
+          bad-history (numpy/copy grid-arr)]
+      (.__setitem__ bad-history #py (1 0 10 3) 999.0)
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids grid-arr
+                     :grid_history_json (numpy/array
+                                         (python/list [(json/dumps (.tolist (.__getitem__ grid-arr (slice 0 1))))
+                                                       (json/dumps (.tolist bad-history))])
+                                         ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"])
+                     :grids grid-arr)
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "2")
+            tail (.get (read-json out) "live_grid_history_tail")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 2 (.get tail "rows_with_grid_history")))
+        (is (= 1 (.get tail "tail_mismatch_rows")))
+        (is (str/includes? (.get tail "reason") "differ"))))))
+
+(deftest grid-feature-input-parity-compares-live-and-historical-grid-history-sequences
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          grid-arr (grids 3 1.0)]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"])
+                     :grids grid-arr
+                     :grid_history_json (grid-history-json grid-arr))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"
+                                          "2026-07-09T13:31:00Z"
+                                          "2026-07-09T13:32:00Z"])
+                     :grids grid-arr
+                     :grid_histories (padded-grid-histories grid-arr 3))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "3")
+            seq-history (.get (read-json out) "grid_history_sequence")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get seq-history "available")))
+        (is (= 3 (.get seq-history "rows_compared")))
+        (is (= 0 (.get seq-history "sequence_mismatch_rows")))
+        (is (= 0.0 (.get (.get seq-history "sequence_abs_delta") "max")))
+        (is (str/includes? (.read_text md) "Grid-History Sequence"))))))
+
+(deftest grid-feature-input-parity-inferrs-historical-contract-density
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          cohort (path tmp "historical.json")
+          out (path tmp "grid.json")
+          chain-json (json/dumps
+                      (python/dict {"contracts" (python/list
+                                                 (for [i (range 100)]
+                                                   (python/dict {"strike" (+ 700 i)
+                                                                 "right" "CALL"})))}))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0)
+                     :option_chain_json (numpy/array [chain-json] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0))
+      (.write_text cohort
+                   (str (json/dumps
+                         (python/dict {"target_date" "2026-07-09"
+                                       "contract_field_coverage"
+                                       (python/dict {"SPY"
+                                                     (python/dict {"contracts" 50
+                                                                   "minutes_with_contracts" 1})})}))
+                        "\n"))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--historical-cohort-json" (str cohort)
+                               "--out-json" (str out)
+                               "--min-rows" "1")
+            density (.get (read-json out) "contract_density")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 0.5 (.get density "historical_to_live_median_ratio")))
+        (is (= 50.0 (.get (.get (.get density "historical") "contracts_per_minute") "median")))))))
+
+(deftest grid-feature-input-parity-compares-live-and-historical-chain-quotes
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          live (path tmp "live.npz")
+          hist (path tmp "historical.npz")
+          out (path tmp "grid.json")
+          md (path tmp "grid.md")
+          chain-json (fn [bid ask]
+                       (json/dumps
+                        (python/dict {"observed_at" "2026-07-09T13:30:00Z"
+                                      "contracts" (python/list
+                                                   [(python/dict {"strike" 700
+                                                                  "right" "CALL"
+                                                                  "expiration" "2026-07-09"
+                                                                  "bid" bid
+                                                                  "ask" ask})])})))]
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0)
+                     :option_chain_json (numpy/array [(chain-json 1.0 1.2)] ** :dtype object))
+      (numpy/savez hist
+                  ** :times (numpy/array ["2026-07-09T13:30:00Z"])
+                     :grids (grids 1 1.0)
+                     :option_chain_json (numpy/array [(chain-json 1.4 1.6)] ** :dtype object))
+      (let [result (run-script "--live-capture" (str live)
+                               "--historical-npz" (str hist)
+                               "--out-json" (str out)
+                               "--md-out" (str md)
+                               "--target-date" "2026-07-09"
+                               "--min-rows" "1")
+            quote-source (.get (read-json out) "chain_quote_source")]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get quote-source "available")))
+        (is (= 1 (.get quote-source "rows_compared")))
+        (is (= 1 (.get quote-source "shared_contracts")))
+        (is (= 0 (.get quote-source "missing_in_historical_contracts")))
+        (is (= 0 (.get quote-source "extra_in_historical_contracts")))
+        (is (< (abs (- 0.4 (.get (.get quote-source "bid_abs_deviation") "max_abs_deviation"))) 1.0e-9))
+        (is (< (abs (- 0.4 (.get (.get quote-source "ask_abs_deviation") "max_abs_deviation"))) 1.0e-9))
+        (is (< (abs (- 0.4 (.get (.get quote-source "mid_abs_deviation") "max_abs_deviation"))) 1.0e-9))
+        (is (str/includes? (.get quote-source "reason") "quote values differ"))
+        (is (str/includes? (.read_text md) "Chain Quote Source"))))))

@@ -75,8 +75,9 @@
   - :posture/enter-short -> BUY the ATM PUT (limit at mid)
   - :posture/flatten     -> one close intent per open option lot in the
     strategy view (FIFO slot order): side opposite the lot side, limit at
-    the contract's current mid, or a MARKET order when the contract is no
-    longer quoted two-sided in the chain
+    the contract's current bid/ask, penny sell limit when a non-forced long
+    option exit has no live quote, or MARKET when :execution/force-flatten?
+    is true
   - flip -> close every open option lot (slots 0..n-1) + open the new
     contract (slot n) in one plan
   - NO chain in the slice -> NO intents; plan-execution returns
@@ -214,12 +215,15 @@
   [{:keys [risk-approved-signal account-id legs policy quantity]}]
   (let [posture (:decision/posture risk-approved-signal)
         quantity (or quantity (:risk/approved-quantity risk-approved-signal))
+        limit-price (:decision/net-credit risk-approved-signal)
         base {:decision-id (:decision/id risk-approved-signal)
               :intent-slot 0
-              :order-type :order-type/limit
+              :order-type (if (some? limit-price)
+                            :order-type/limit
+                            :order-type/market)
               :tif :tif/day
               :quantity quantity
-              :limit-price (:decision/net-credit risk-approved-signal)
+              :limit-price limit-price
               :legs legs
               :account-id account-id}]
     (case posture
@@ -422,8 +426,9 @@
   the lot side. MARKETABLE limit (2026-06-11 fix — mid-priced limits
   rested unfilled across signal flips and the book accumulated outside
   the engine's model): selling a long lot prices at the BID, buying back
-  a short lot prices at the ASK; market order when the contract is no
-  longer quoted two-sided."
+  a short lot prices at the ASK. If a long-option close has no quote,
+  use a defensive 0.01 sell limit; Alpaca rejects no-quote option market
+  exits with 'please reenter with a limit'."
   [{:keys [decision-id account-id lots pxs force?]}]
   (vec
    (map-indexed
@@ -433,12 +438,15 @@
             closing-side (if (= :order-side/sell (:lot/side lot))
                            :order-side/buy
                            :order-side/sell)
-            ;; force? = mandatory session-close: ALWAYS market, never trust a
-            ;; (possibly stale) quote. Otherwise marketable limit at bid/ask.
-            limit (when (and (not force?) px)
-                    (if (= :order-side/buy closing-side)
-                      (:ask px)
-                      (:bid px)))]
+            long-option-sell? (= :order-side/sell closing-side)
+            ;; Forced session-close is a liquidation path: do not rest stale
+            ;; quote-derived limits that can leave 0DTE lots stranded.
+            limit (cond
+                    force? nil
+                    (and px (= :order-side/buy closing-side)) (:ask px)
+                    (and px long-option-sell?) (:bid px)
+                    long-option-sell? (decimal/Decimal "0.01")
+                    :else nil)]
         (order-intent {:decision-id decision-id
                        :intent-slot slot
                        :role :intent-role/exit

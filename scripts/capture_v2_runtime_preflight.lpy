@@ -1,0 +1,299 @@
+;; Static preflight for Steve V2 capture-version-2 runtime wiring.
+(import datetime glob json os os.path subprocess sys)
+
+(def bridge-rel "components/bridge.steve-v2/src/stevetrading/bridge/steve_v2.lpy")
+(def launcher-rel "scripts/launch_steve_six.lpy")
+
+(def bridge-markers
+  {"capture_version_2" ":capture_version (.array np (python/list [2]))"
+   "bar_buffers_json" ":bar_buffers_json"
+   "option_chain_json" ":option_chain_json"
+   "option_surfaces_json" ":option_surfaces_json"
+   "option_surface_status_json" ":option_surface_status_json"
+   "grid_history_json" ":grid_history_json"
+   "atomic_replace" "(os/replace tmp-path path)"
+   "capture_path" "\"/live_features_\""
+   "sidecar_every_default_one" "STEVE_CAPTURE_SIDECAR_EVERY"
+   "capture_provenance" ":capture-provenance"})
+
+(def launcher-markers
+  {"capture_dir_env" ":capture-dir (or (os/getenv \"CAPTURE_DIR\")"
+   "feature_capture_comment" "raw replay sidecars"
+   "default_spx_surface" "\"SPX\""
+   "default_spxw_surface" "\"SPXW\""
+   "default_vix_surface" "\"VIX\""
+   "default_vixw_surface" "\"VIXW\""
+   "extra_surface_refresh_prime" "(refresh-extra-option-surfaces! br \"prime\")"
+   "extra_surface_refresh_live" "(refresh-extra-option-surfaces! br \"refresh\")"
+   "extra_surface_ingest" "bridge/on-option-surface!"
+   "extra_surface_status" "bridge/record-option-surface-status!"
+   "canonical_source_contract_v2" "\"feature_contract\" \"steve-v2-canonical-input/v2\""
+   "stock_source_selector" "STEVE_STOCK_BAR_SOURCE"
+   "stock_venue_selector" "THETADATA_STOCK_VENUE"
+   "stock_source_endpoint" "\"/v3/stock/history/ohlc\""
+   "option_snapshot_endpoint" "\"/v3/option/snapshot/quote\""
+   "option_strike_range" "STEVE_CHAIN_STRIKE_RANGE"
+   "greeks_policy" "bridge-local-bs-v1/rate-0.043/no-dividend"})
+
+(def structural-issue-patterns
+  ["capture_version must be 2"
+   "capture_version array is empty"
+   "missing required arrays"
+   "times array is missing"
+   "blank timestamp rows"
+   "malformed timestamp rows"
+   "duplicate timestamp rows"
+   "non-object contract entries"
+   "sidecar dtype must be object"
+   "invalid JSON rows"
+   "row count"
+   "failed to read capture NPZ"
+   "filename stamp"])
+
+(defn repo-default []
+  (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+
+(defn basilisp-bin [repo]
+  (let [env-bin (os.environ/get "BASILISP_BIN")
+        repo-candidate (os.path/join repo ".venv/bin/basilisp")
+        shared-candidate "/opt/stevetrading/shared/Data-Preprocessor/.venv/bin/basilisp"]
+    (cond
+      (and env-bin (pos? (count env-bin))) env-bin
+      (os.path/exists repo-candidate) repo-candidate
+      (os.path/exists shared-candidate) shared-candidate
+      :else "basilisp")))
+
+(defn now-target-date [value]
+  (if (and value (pos? (count (str value))))
+    (do
+      (try
+        (datetime.date/fromisoformat value)
+        (catch python/Exception _
+          (throw (python/ValueError (str "target date must be YYYY-MM-DD: " value)))))
+      value)
+    (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%d")))
+
+(defn contains-substr? [s needle]
+  (>= (.find (str s) (str needle)) 0))
+
+(defn int-value [x]
+  (try (int (or x 0)) (catch python/Exception _ 0)))
+
+(defn structural-reasons [check]
+  (if (= "missing" (get check "status"))
+    []
+    (let [issues (map str (or (get check "issues") []))
+          reasons (atom [])]
+      (doseq [issue issues]
+        (when (some #(contains-substr? issue %) structural-issue-patterns)
+          (swap! reasons conj issue)))
+      (when (pos? (int-value (get check "duplicate_time_count")))
+        (swap! reasons conj "duplicate timestamp rows"))
+      (let [malformed (get check "sidecar_malformed_contracts")]
+        (when (and (map? malformed)
+                   (pos? (reduce + 0 (map int-value (vals malformed)))))
+          (swap! reasons conj "malformed non-object contract entries")))
+      (vec (sort (set @reasons))))))
+
+(defn marker-status [path markers]
+  (try
+    (let [text (slurp path)
+          statuses (into {} (map (fn [[k marker]]
+                                   [k (contains-substr? text marker)])
+                                 markers))
+          missing (vec (map first (filter (fn [[_ present]] (not present)) statuses)))]
+      [missing statuses])
+    (catch python/Exception _
+      [(vec (keys markers)) (into {} (map (fn [[k _]] [k false]) markers))])))
+
+(defn env-sidecar-every-status []
+  (let [raw (os.environ/get "STEVE_CAPTURE_SIDECAR_EVERY")
+        status (atom {"raw" raw
+                      "effective" (if (or (nil? raw) (= "" raw)) 1 nil)
+                      "ok" true
+                      "parity_evidence_complete" (if (or (nil? raw) (= "" raw)) true false)
+                      "live_safe_sparse" false})
+        issues (atom [])
+        warnings (atom [])]
+    (when (and raw (not= "" raw))
+      (try
+        (let [effective (int raw)]
+          (swap! status assoc "effective" effective)
+          (if (pos? effective)
+            (do
+              (swap! status assoc
+                     "parity_evidence_complete" (= effective 1)
+                     "live_safe_sparse" (> effective 1))
+              (when (> effective 1)
+                (swap! warnings conj
+                       (str "STEVE_CAPTURE_SIDECAR_EVERY is "
+                            effective
+                            "; live trading is sparse-sidecar mode, full per-row parity sidecars require setting it to 1 in the evidence collection environment"))))
+            (do
+              (swap! status assoc "ok" false
+                     "parity_evidence_complete" false
+                     "live_safe_sparse" false)
+              (swap! issues conj
+                     (str "STEVE_CAPTURE_SIDECAR_EVERY must be a positive integer; found "
+                          effective)))))
+        (catch python/Exception _
+          (swap! status assoc "ok" false)
+          (swap! issues conj
+                 (str "STEVE_CAPTURE_SIDECAR_EVERY must be a positive integer; found "
+                      (repr raw))))))
+    [@status @issues @warnings]))
+
+(defn validate-capture [repo capture target-date]
+  (let [cmd (python/list [(basilisp-bin repo) "run"
+	                          (os.path/join repo "scripts/capture_v2_sidecar_check.lpy")
+	                          "--" "--capture" capture
+	                          "--target-date" target-date
+	                          "--min-rows" "1"
+	                          "--sidecar-row-limit" "10"
+	                          "--fast-json"])
+        proc (subprocess/run cmd ** :cwd repo :text true
+                             :stdout subprocess/PIPE :stderr subprocess/PIPE)
+        stdout (str (.-stdout proc))]
+    (try
+      (json/loads stdout)
+      (catch python/Exception _
+        {"ok" false
+         "status" "fail"
+         "issues" [(str "failed to run capture-v2 sidecar check exit="
+                        (.-returncode proc)
+                        " stderr=" (.-stderr proc))]
+         "stdout" stdout}))))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:repo-root (repo-default)}]
+    (if remaining
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--repo-root")
+          (recur (nnext remaining) (assoc out :repo-root (option-value remaining arg)))
+
+          (= arg "--capture-dir")
+          (recur (nnext remaining) (assoc out :capture-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+
+          (= arg "--out-json")
+          (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do
+            (println "usage: basilisp run scripts/capture_v2_runtime_preflight.lpy -- [--repo-root DIR] [--capture-dir DIR] [--target-date YYYY-MM-DD] [--out-json PATH]")
+            (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg)))))
+      out)))
+
+(defn write-text! [path text]
+  (let [parent (os.path/dirname path)]
+    (when (pos? (count parent))
+      (os/makedirs parent ** :exist_ok true)))
+  (spit path text))
+
+(defn preflight [opts]
+  (let [repo (os.path/abspath (:repo-root opts))
+        bridge (os.path/join repo bridge-rel)
+        launcher (os.path/join repo launcher-rel)
+        capture-dir (:capture-dir opts)
+        capture-dir-abs (when capture-dir (os.path/abspath capture-dir))
+        run-date (now-target-date (:target-date opts))
+        issues (atom [])
+        warnings (atom [])
+        target-capture-check (atom nil)
+        target-capture-reasons (atom [])]
+    (when (not (os.path/exists bridge))
+      (swap! issues conj (str "missing Steve V2 bridge file: " bridge)))
+    (when (not (os.path/exists launcher))
+      (swap! issues conj (str "missing Steve six launcher file: " launcher)))
+    (let [[bridge-missing bridge-status] (marker-status bridge bridge-markers)
+          [launcher-missing launcher-status] (marker-status launcher launcher-markers)
+          [sidecar-every sidecar-issues sidecar-warnings] (env-sidecar-every-status)]
+      (when (seq bridge-missing)
+        (swap! issues conj (str "bridge is missing capture-v2 markers: "
+                                (.join ", " bridge-missing))))
+      (when (seq launcher-missing)
+        (swap! issues conj (str "launcher is missing capture-v2 markers: "
+                                (.join ", " launcher-missing))))
+      (swap! issues into sidecar-issues)
+      (swap! warnings into sidecar-warnings)
+      (when capture-dir-abs
+        (cond
+          (not (os.path/exists capture-dir-abs))
+          (let [parent (os.path/dirname capture-dir-abs)]
+            (if (not (os.path/exists parent))
+              (swap! issues conj (str "capture-dir parent does not exist: " parent))
+              (swap! warnings conj (str "capture-dir does not exist yet but parent is present: "
+                                        capture-dir-abs))))
+
+          (not (os.path/isdir capture-dir-abs))
+          (swap! issues conj (str "capture-dir exists but is not a directory: " capture-dir-abs))
+
+          :else
+          (let [target-capture (os.path/join capture-dir-abs
+                                             (str "live_features_"
+                                                  (.replace run-date "-" "")
+                                                  ".npz"))]
+            (when (not (seq (glob/glob (os.path/join capture-dir-abs "live_features_*.npz"))))
+              (swap! warnings conj (str "capture-dir has no existing live feature captures yet: "
+                                        capture-dir-abs)))
+            (when (os.path/exists target-capture)
+              (reset! target-capture-check (validate-capture repo target-capture run-date))
+              (reset! target-capture-reasons (structural-reasons @target-capture-check))
+              (when (seq @target-capture-reasons)
+                (swap! issues conj
+                       (str "target-date capture has structural defects requiring quarantine: "
+                            (.join "; " (vec (take 5 @target-capture-reasons))))))))))
+      {"ok" (empty? @issues)
+       "status" (if (empty? @issues) "ok" "fail")
+       "repo_root" repo
+       "target_date" run-date
+       "bridge" bridge
+       "launcher" launcher
+       "capture_dir" capture-dir-abs
+       "bridge_markers" bridge-status
+       "launcher_markers" launcher-status
+       "sidecar_every" sidecar-every
+       "target_capture_check" @target-capture-check
+       "target_capture_structural_reasons" @target-capture-reasons
+       "issues" @issues
+       "warnings" @warnings})))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple [(if (keyword? k) (name k) (str k))
+                                    (jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable (sort x)))
+    (nil? x) nil
+    :else x))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        payload (preflight opts)
+        text (json/dumps (jsonable payload) ** :indent 2 :sort_keys true)]
+    (when-let [out (:out-json opts)]
+      (write-text! out (str text "\n")))
+    (println text)
+    (python/exit (if (get payload "ok") 0 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

@@ -1,0 +1,14 @@
+[Unit]
+Description=Fetch and compare raw ThetaData historical parity evidence
+Wants=network-online.target theta-terminal.service
+After=network-online.target theta-terminal.service stevetrading-thetadata-stream-capture.service
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+Environment=THETADATA_STREAM_LANDING_ROOT=/opt/stevetrading/shared/thetadata-parity-v1
+ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_raw_history_parity.sh
+StandardOutput=append:/var/log/stevetrading/raw-history-parity.log
+StandardError=append:/var/log/stevetrading/raw-history-parity.log

@@ -229,6 +229,17 @@
       (is (= :risk/allow (get-in (second facts) [:fact/payload :risk/decision])))
       (is (= "0" (get-in (second facts) [:fact/payload :risk/approved-quantity]))))))
 
+(deftest parrot-decl-allows-spy-share-shorts
+  (let [parrot (load-decl "parrot-v2")
+        {:keys [facts]} (run-bridge parrot {:parrot :short})
+        [intent] (intent-payloads facts)]
+    (is (true? (get-in parrot [:strategy/execution :params :allow-short?])))
+    (is (= :posture/enter-short
+           (get-in (first facts) [:fact/payload :decision/posture])))
+    (is (= :order-side/sell (:order-intent/side intent)))
+    (is (= :position-effect/open (:order-intent/effect intent)))
+    (is (= :intent-role/entry (:order-intent/role intent)))))
+
 (def shortable-decl
   "Chestnut decl with shorting permitted — the shipped declarations set
   :allow-short? false (the six Alpaca paper accounts 403 short opens,

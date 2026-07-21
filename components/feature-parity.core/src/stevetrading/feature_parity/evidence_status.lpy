@@ -1,0 +1,111 @@
+(ns stevetrading.feature-parity.evidence-status
+  (:require [clojure.string :as str]))
+
+(defn markdown
+  [payload]
+  (let [status-label (if (get payload "ok?") "OK" "ERROR")
+        reasons (get payload "reasons" [])
+        reason-lines (if (seq reasons)
+                       (apply str (map #(str "- " % "\n") reasons))
+                       "- none\n")
+        dry-run-results (get-in payload ["manifest" "raw_unlock" "unmask_dry_run_results"] [])
+        dry-run-result-line (if (seq dry-run-results)
+                              (str/join
+                               ", "
+                               (map (fn [row]
+                                      (str (get row "account")
+                                           ": -"
+                                           (get row "removed")
+                                           " missing="
+                                           (get row "missing")
+                                           " after="
+                                           (subs (str (get row "planned_after_sha256" "")) 0 12)))
+                                    dry-run-results))
+                              "none")
+        historical (get-in payload ["manifest" "diagnostics" "historical_feature_cohort"] {})
+        matched (get-in payload ["manifest" "diagnostics" "matched_feature_parity"] {})
+        manifested-runtime (get-in payload ["manifest" "diagnostics" "capture_v2_runtime_preflight"] {})
+        direct-artifacts (get-in payload ["manifest" "direct_artifacts"] {})
+        direct-capture (get direct-artifacts "capture_v2_sidecars" {})
+        direct-runtime (get direct-artifacts "capture_v2_runtime_preflight" {})
+        direct-matched (get-in payload ["manifest" "direct_diagnostics" "matched_feature_parity"] {})
+        direct-probe (get direct-artifacts "thetadata_probe" {})
+        direct-payload (get direct-artifacts "thetadata_payload_verification" {})
+        direct-readiness (get direct-artifacts "readiness" {})]
+    (str "# Market Evidence Status\n\n"
+         "Target date: `" (get payload "target_date") "`\n\n"
+         "Status: `" status-label "`\n\n"
+         "Readiness: `" (get-in payload ["readiness" "verdict"]) "`\n\n"
+         "Unmask apply ready: `" (get payload "unmask_apply_ready?") "`\n\n"
+         "Manifest verified: `" (get-in payload ["manifest_verification" "valid?"]) "`\n\n"
+         "Payload examples: `" (get-in payload ["manifest" "payload_example_count"]) "`\n\n"
+         "Artifacts: `" (get-in payload ["manifest" "artifact_count"]) "`\n\n"
+         "Historical cohort: available=`" (get historical "available")
+         "` ok=`" (get historical "ok")
+         "` rows=`" (get historical "rows")
+         "` features=`" (get historical "features")
+         "` window=`" (get historical "start_time") "-" (get historical "end_time")
+         "` times=`" (get historical "first_time") ".." (get historical "last_time") "`\n\n"
+         "Matched parity: available=`" (get matched "available")
+         "` rows=`" (get matched "matched_rows")
+         "` features=`" (get matched "feature_count")
+         "` problems=`" (get matched "problem_feature_count")
+         "` window=`" (get matched "matched_start") ".." (get matched "matched_end")
+         "` max_abs_dev=`" (get matched "max_abs_deviation")
+         "` min_corr=`" (get matched "min_correlation") "`\n\n"
+         "Diagnostics: prediction_delta=`" (get-in payload ["manifest" "diagnostics" "prediction_delta" "available"])
+         "`, parity_gate=`" (get-in payload ["manifest" "diagnostics" "parity_gate" "available"])
+         "`, unlock_plan=`" (get-in payload ["manifest" "diagnostics" "unlock_plan" "available"])
+         "`, blocked_provenance=`" (get-in payload ["manifest" "diagnostics" "blocked_provenance" "available"])
+         "`, greek_reconstruction=`" (get-in payload ["manifest" "diagnostics" "greek_feature_reconstruction" "available"])
+         "`, greek_promotion=`" (get-in payload ["manifest" "diagnostics" "greek_reconstruction_promotion" "available"])
+         "`, v3_unlock=`" (get-in payload ["manifest" "diagnostics" "v3_unlock" "available"]) "`\n\n"
+         "Direct diagnostics: capture_v2=`" (get direct-capture "available")
+         "` ok=`" (get direct-capture "ok")
+         "` rows=`" (get direct-capture "row_count")
+         "` issues=`" (get direct-capture "issue_count")
+         "`, capture_preflight=`" (get direct-runtime "available")
+         "` ok=`" (get direct-runtime "ok")
+         "`, matched_parity=`" (get direct-matched "available")
+         "` rows=`" (get direct-matched "matched_rows")
+         "`, thetadata_probe=`" (get direct-probe "available")
+         "` usable=`" (get direct-probe "usable")
+         "`, payload_verification=`" (get direct-payload "available")
+         "` status=`" (get direct-payload "status")
+         "`, readiness=`" (get direct-readiness "available")
+         "` verdict=`" (get direct-readiness "verdict") "`\n\n"
+         "Runtime preflight: manifested=`" (get manifested-runtime "available")
+         "` ok=`" (get manifested-runtime "ok")
+         "` target_capture_ok=`" (get manifested-runtime "target_capture_ok")
+         "` sidecar_every=`" (get-in manifested-runtime ["sidecar_every" "effective"]) "`\n\n"
+         "Blocked formula provenance missing: `" (get-in payload ["manifest" "diagnostics" "blocked_provenance" "formula_provenance_missing"]) "`\n\n"
+         "Greek reconstruction candidates: `" (get-in payload ["manifest" "diagnostics" "greek_feature_reconstruction" "candidate_reconstructable"]) "`\n\n"
+         "Greek promotion coverage: `" (get-in payload ["manifest" "diagnostics" "greek_reconstruction_promotion" "coverage_ok"])
+         "` evaluated=`" (get-in payload ["manifest" "diagnostics" "greek_reconstruction_promotion" "evaluated_count"])
+         "` candidates=`" (get-in payload ["manifest" "diagnostics" "greek_reconstruction_promotion" "candidate_count"]) "`\n\n"
+         "V3 unlock candidates: `" (get-in payload ["manifest" "diagnostics" "v3_unlock" "recomputed_candidate_now"]) "`\n\n"
+         "Raw unlock candidates: `" (get-in payload ["manifest" "raw_unlock" "candidate_count"]) "`\n\n"
+         "Unmask dry-run candidates: `" (get-in payload ["manifest" "raw_unlock" "unmask_dry_run_candidate_count"]) "`\n\n"
+         "Unmask dry-run removed total: `" (get-in payload ["manifest" "raw_unlock" "unmask_dry_run_removed_total"]) "`\n\n"
+         "Unmask dry-run bundle changes: `" dry-run-result-line "`\n\n"
+         "Verified apply available: `" (get-in payload ["manifest" "raw_unlock" "verified_apply_available"]) "`\n\n"
+         "Verified apply validation: `" (get-in payload ["verified_apply_validation" "available"])
+         "` target_matches=`" (get-in payload ["verified_apply_validation" "target_matches_request"])
+         "` candidates=`" (get-in payload ["verified_apply_validation" "candidate_count"])
+         "` apply_safe=`" (get-in payload ["verified_apply_validation" "apply_safe"]) "`\n\n"
+         (when (get-in payload ["manifest" "raw_unlock" "verified_apply_available"])
+           (str "Verified apply command:\n\n```bash\n"
+                (get-in payload ["manifest" "raw_unlock" "verified_apply_command" "text"])
+                "\n```\n\n"))
+         "Raw unlock unsupported: `" (get-in payload ["manifest" "raw_unlock" "unsupported_neutralized"]) "`\n\n"
+         "## Reasons\n\n"
+         reason-lines "\n"
+         "## Paths\n\n"
+         "- Manifest: `" (get-in payload ["paths" "manifest"]) "`\n"
+         "- Status: `" (get-in payload ["paths" "status"]) "`\n"
+         "- Readiness: `" (get-in payload ["paths" "readiness"]) "`\n"
+         "- Probe: `" (get-in payload ["paths" "probe"]) "`\n"
+         "- Payload verification: `" (get-in payload ["paths" "payload_verification"]) "`\n"
+         "- Neutralization: `" (get-in payload ["paths" "neutralization"]) "`\n"
+         "- Capture runtime preflight: `" (get-in payload ["paths" "capture_runtime_preflight"]) "`\n"
+         "- Verified apply validation: `" (get-in payload ["paths" "verified_apply_validation"]) "`\n")))

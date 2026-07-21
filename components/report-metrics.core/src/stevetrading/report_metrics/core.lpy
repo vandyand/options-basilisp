@@ -1,0 +1,546 @@
+(ns stevetrading.report-metrics.core
+  "Pure report order-pairing and metric projections.
+
+  Basilisp port of scripts_5yr/live/reports/data.py pair_round_trips and
+  metrics.py. External Alpaca fetching stays outside this component; this
+  namespace works on canonical filled-order maps."
+  (:import datetime math statistics)
+  (:require [basilisp.string :as bstr]))
+
+(def starting-equity 100000.0)
+(def session-minutes 390.0)
+(def valid-sides #{"BUY" "SELL"})
+
+(defn option-symbol?
+  [symbol]
+  (and (>= (count (str symbol)) 15)
+       (contains? #{"C" "P"} (.upper (subs (str symbol) (- (count (str symbol)) 9)
+                                      (- (count (str symbol)) 8))))))
+
+(defn put-symbol?
+  [symbol]
+  (and (option-symbol? symbol)
+       (= "P" (.upper (subs (str symbol) (- (count (str symbol)) 9)
+                         (- (count (str symbol)) 8))))))
+
+(defn- ->float
+  [x]
+  (when (boolean? x)
+    (throw (python/ValueError (str "boolean report metric number: "
+                                   (pr-str x)))))
+  (let [n (python/float (or x 0.0))]
+    (when-not (math/isfinite n)
+      (throw (python/ValueError (str "non-finite report metric number: "
+                                     (pr-str x)))))
+    n))
+
+(defn- ->int
+  [x]
+  (when (boolean? x)
+    (throw (python/ValueError (str "boolean integer field: " (pr-str x)))))
+  (let [n (python/float (or x 0))]
+    (when-not (math/isfinite n)
+      (throw (python/ValueError (str "non-finite integer field: " (pr-str x)))))
+    (when-not (= n (math/floor n))
+      (throw (python/ValueError (str "integer field cannot be fractional: "
+                                     (pr-str x)))))
+    (python/int n)))
+
+(defn- normalize-side
+  [side]
+  (let [side' (.upper (str (or side "")))]
+    (when-not (contains? valid-sides side')
+      (throw (python/ValueError (str "invalid order side: " (pr-str side)))))
+    side'))
+
+(defn- nonblank-text
+  [label x]
+  (let [s (.strip (str (or x "")))]
+    (when (empty? s)
+      (throw (python/ValueError (str label " must be nonblank"))))
+    s))
+
+(defn- duplicate-order-id
+  [orders]
+  (first
+   (keep (fn [[order-id n]]
+           (when (and (some? order-id) (> n 1))
+             order-id))
+         (frequencies (map :order-id orders)))))
+
+(defn filled-order
+  [{:keys [account order-id symbol side filled-at filled-avg-price qty order-type]}]
+  (let [qty' (->int qty)]
+    (when-not (pos? qty')
+      (throw (python/ValueError (str "filled order quantity must be positive: "
+                                     (pr-str qty)))))
+    (when (nil? filled-at)
+      (throw (python/ValueError "filled order is missing filled-at timestamp")))
+    {:account (nonblank-text "filled order account" account)
+     :order-id (nonblank-text "filled order id" order-id)
+     :symbol (nonblank-text "filled order symbol" symbol)
+     :side (normalize-side side)
+     :filled-at filled-at
+     :filled-avg-price (->float filled-avg-price)
+     :qty qty'
+     :order-type order-type}))
+
+(defn- order-time
+  [o]
+  (:filled-at o))
+
+(defn- order-key
+  [o]
+  [(:account o) (:symbol o)])
+
+(defn- opposite-side?
+  [a b]
+  (not= (:side a) (:side b)))
+
+(defn- positive-qty?
+  [q]
+  (> (->int q) 0))
+
+(defn- hold-minutes
+  [open-order close-order]
+  (/ (- (.timestamp (:filled-at close-order))
+        (.timestamp (:filled-at open-order)))
+     60.0))
+
+(defn- round-trip
+  [open-order close-order]
+  (let [contract-long? (= "BUY" (:side open-order))
+        put? (put-symbol? (:symbol open-order))
+        market-long? (not= contract-long? put?)
+        multiplier (if (option-symbol? (:symbol open-order)) 100.0 1.0)
+        open-price (->float (:filled-avg-price open-order))
+        close-price (->float (:filled-avg-price close-order))
+        qty (->int (:qty open-order))
+        pnl (* (if contract-long?
+                 (- close-price open-price)
+                 (- open-price close-price))
+               multiplier
+               qty)]
+    {:account (:account open-order)
+     :symbol (:symbol open-order)
+     :open-time (:filled-at open-order)
+     :close-time (:filled-at close-order)
+     :is-long market-long?
+     :open-price open-price
+     :close-price close-price
+     :qty qty
+     :pnl-dollars pnl
+     :hold-minutes (hold-minutes open-order close-order)}))
+
+(defn- open-entry
+  [open-order]
+  (let [contract-long? (= "BUY" (:side open-order))
+        put? (put-symbol? (:symbol open-order))]
+    {:account (:account open-order)
+     :symbol (:symbol open-order)
+     :side (:side open-order)
+     :open-time (:filled-at open-order)
+     :open-price (->float (:filled-avg-price open-order))
+     :qty (->int (:qty open-order))
+     :is-long (not= contract-long? put?)
+     :is-option (option-symbol? (:symbol open-order))}))
+
+(defn pair-round-trips
+  "Pair open fills FIFO with opposite-side fills on the same account and symbol.
+
+  Returns {:round-trips [...] :open-entries [...] :unmatched-closes [...]}.
+  Unmatched option SELL fills are treated as prior-day carry-over closes, not
+  as phantom short opens."
+  [orders]
+  (let [orders (mapv filled-order orders)
+        duplicate-id (duplicate-order-id orders)
+        _ (when duplicate-id
+            (throw (python/ValueError (str "duplicate filled order id: "
+                                           duplicate-id))))
+        by-key (atom {})
+        rts (atom [])
+        unmatched (atom [])]
+    (doseq [o (sort-by order-time orders)]
+      (let [k (order-key o)
+            qty0 (->int (:qty o))]
+        (loop [qty-left qty0]
+          (let [opens (vec (get @by-key k []))
+                op (first opens)]
+            (if (and (positive-qty? qty-left)
+                     (seq opens)
+                     (opposite-side? op o))
+              (let [open-qty (->int (:qty op))
+                    matched (min open-qty qty-left)
+                    open-match (assoc op :qty matched)
+                    close-match (assoc o :qty matched)
+                    open-left (- open-qty matched)
+                    qty-left' (- qty-left matched)
+                    opens' (if (positive-qty? open-left)
+                             (vec (cons (assoc op :qty open-left)
+                                        (rest opens)))
+                             (vec (rest opens)))]
+                (swap! by-key assoc k opens')
+                (swap! rts conj (round-trip open-match close-match))
+                (recur qty-left'))
+              (when (positive-qty? qty-left)
+                (let [residual (assoc o :qty qty-left)
+                      opens (vec (get @by-key k []))]
+                  (if (and (empty? opens)
+                           (= "SELL" (:side residual))
+                           (option-symbol? (:symbol residual)))
+                    (swap! unmatched conj residual)
+                    (swap! by-key assoc k (conj opens residual))))))))))
+    (let [opens (->> (vals @by-key)
+                     (mapcat identity)
+                     (map open-entry)
+                     (sort-by :open-time)
+                     vec)]
+      {:round-trips @rts
+       :open-entries opens
+       :unmatched-closes @unmatched})))
+
+(defn trade-pnls [rts] (mapv :pnl-dollars rts))
+(defn total-pnl-dollars [rts] (reduce + 0.0 (trade-pnls rts)))
+(defn total-pnl-pct ([rts] (total-pnl-pct rts starting-equity))
+  ([rts starting] (if (or (empty? rts) (zero? starting)) 0.0 (* (/ (total-pnl-dollars rts) starting) 100.0))))
+(defn n-trades [rts] (count rts))
+(defn n-wins [rts] (count (filter #(> (:pnl-dollars %) 0.0) rts)))
+(defn n-losses [rts] (count (filter #(< (:pnl-dollars %) 0.0) rts)))
+(defn n-flat [rts] (count (filter #(zero? (:pnl-dollars %)) rts)))
+
+(defn mean
+  [xs]
+  (if (seq xs) (statistics/mean (python/list xs)) 0.0))
+
+(defn stdev
+  [xs]
+  (if (>= (count xs) 2) (statistics/stdev (python/list xs)) 0.0))
+
+(defn median
+  [xs]
+  (if (seq xs) (statistics/median (python/list xs)) 0.0))
+
+(defn sharpe-intraday
+  [rts]
+  (let [pnls (trade-pnls rts)]
+    (if (< (count pnls) 2)
+      0.0
+      (let [sd (stdev pnls)]
+        (if (zero? sd) 0.0 (* (/ (mean pnls) sd) (math/sqrt (count pnls))))))))
+
+(defn sortino-intraday
+  [rts]
+  (let [pnls (trade-pnls rts)
+        losses (filterv #(< % 0.0) pnls)]
+    (if (or (< (count pnls) 2) (< (count losses) 2))
+      0.0
+      (let [sd (stdev losses)]
+        (if (zero? sd) 0.0 (* (/ (mean pnls) sd) (math/sqrt (count pnls))))))))
+
+(defn avg-winner [rts] (mean (filterv #(> % 0.0) (trade-pnls rts))))
+(defn avg-loser [rts] (mean (filterv #(< % 0.0) (trade-pnls rts))))
+
+(defn profit-factor
+  [rts]
+  (let [wins (reduce + 0.0 (filter #(> % 0.0) (trade-pnls rts)))
+        losses (reduce + 0.0 (filter #(< % 0.0) (trade-pnls rts)))]
+    (if (zero? losses)
+      (if (> wins 0.0) (python/float "inf") 0.0)
+      (/ wins (math/fabs losses)))))
+
+(defn win-rate
+  [rts]
+  (let [nw (n-wins rts)
+        nl (n-losses rts)]
+    (if (zero? (+ nw nl)) 0.0 (/ nw (+ nw nl)))))
+
+(defn expectancy
+  [rts]
+  (let [nw (n-wins rts)
+        nl (n-losses rts)]
+    (if (zero? (+ nw nl))
+      0.0
+      (let [wr (/ nw (+ nw nl))]
+        (- (* wr (avg-winner rts))
+           (* (- 1 wr) (math/fabs (avg-loser rts))))))))
+
+(defn payoff-ratio
+  [rts]
+  (let [al (math/fabs (avg-loser rts))]
+    (if (zero? al)
+      (if (> (avg-winner rts) 0.0) (python/float "inf") 0.0)
+      (/ (avg-winner rts) al))))
+
+(defn kelly-fraction
+  [rts]
+  (let [nw (n-wins rts)
+        nl (n-losses rts)]
+    (if (zero? (+ nw nl))
+      0.0
+      (let [wr (/ nw (+ nw nl))
+            pr (payoff-ratio rts)]
+        (if (or (zero? pr) (= pr (python/float "inf")) (<= pr 0.0))
+          0.0
+          (max 0.0 (min 1.0 (- wr (/ (- 1 wr) pr)))))))))
+
+(defn max-drawdown-dollars
+  [rts]
+  (loop [remaining (seq (sort-by :close-time rts))
+         cum 0.0
+         peak 0.0
+         max-dd 0.0]
+    (if-not remaining
+      max-dd
+      (let [cum' (+ cum (:pnl-dollars (first remaining)))
+            peak' (max peak cum')
+            dd (- peak' cum')]
+        (recur (next remaining) cum' peak' (max max-dd dd))))))
+
+(defn calmar
+  [rts]
+  (let [dd (max-drawdown-dollars rts)]
+    (if (zero? dd)
+      (if (<= (total-pnl-dollars rts) 0.0) 0.0 (python/float "inf"))
+      (/ (total-pnl-dollars rts) dd))))
+
+(defn largest-winner [rts] (if (seq rts) (apply max (trade-pnls rts)) 0.0))
+(defn largest-loser [rts] (let [losses (filterv #(< % 0.0) (trade-pnls rts))] (if (seq losses) (apply min losses) 0.0)))
+(defn median-pnl [rts] (median (trade-pnls rts)))
+(defn std-pnl [rts] (stdev (trade-pnls rts)))
+
+(defn avg-hold-minutes [rts] (mean (mapv :hold-minutes rts)))
+(defn median-hold-minutes [rts] (median (mapv :hold-minutes rts)))
+(defn max-hold-minutes [rts] (if (seq rts) (apply max (map :hold-minutes rts)) 0.0))
+(defn pct-time-in-market ([rts] (pct-time-in-market rts session-minutes))
+  ([rts session] (min 100.0 (* (/ (reduce + 0.0 (map :hold-minutes rts)) session) 100.0))))
+(defn n-long [rts] (count (filter :is-long rts)))
+(defn n-short [rts] (count (remove :is-long rts)))
+(defn long-short-ratio [rts] (let [nl (n-long rts) ns (n-short rts)] (if (zero? ns) (if (> nl 0) (python/float "inf") 0.0) (/ nl ns))))
+(defn trades-per-hour ([rts] (trades-per-hour rts session-minutes))
+  ([rts session] (if (empty? rts) 0.0 (/ (count rts) (/ session 60.0)))))
+(defn first-trade-time [rts] (when (seq rts) (apply min (map :open-time rts))))
+(defn last-trade-time [rts] (when (seq rts) (apply max (map :close-time rts))))
+(defn hhmm [dt] (when dt (.strftime dt "%H:%M")))
+(defn iso [dt] (when dt (.isoformat dt)))
+
+(defn side-breakdown
+  [rts]
+  (into {}
+        (map (fn [[side side-rts]]
+               (let [total-hold (reduce + 0.0 (map :hold-minutes side-rts))
+                     n (n-trades side-rts)]
+                 [side {:side side
+                        :n-trades n
+                        :n-wins (n-wins side-rts)
+                        :n-losses (n-losses side-rts)
+                        :n-flat (n-flat side-rts)
+                        :win-rate (win-rate side-rts)
+                        :pnl-dollars (total-pnl-dollars side-rts)
+                        :avg-pnl (if (zero? n) 0.0 (/ (total-pnl-dollars side-rts) n))
+                        :avg-winner (avg-winner side-rts)
+                        :avg-loser (avg-loser side-rts)
+                        :profit-factor (profit-factor side-rts)
+                        :expectancy (expectancy side-rts)
+                        :avg-hold-minutes (avg-hold-minutes side-rts)
+                        :median-hold-minutes (median-hold-minutes side-rts)
+                        :max-hold-minutes (max-hold-minutes side-rts)
+                        :total-hold-minutes total-hold
+                        :pct-time-in-market (pct-time-in-market side-rts)
+                        :trades-per-hour (trades-per-hour side-rts)
+                        :pnl-per-market-minute (if (zero? total-hold) 0.0 (/ (total-pnl-dollars side-rts) total-hold))
+                        :first-open-time (hhmm (first-trade-time side-rts))
+                        :last-close-time (hhmm (last-trade-time side-rts))}]))
+             [["long" (filterv :is-long rts)]
+              ["short" (filterv #(not (:is-long %)) rts)]])))
+
+(defn compute-all-metrics
+  [rts]
+  {:total-pnl-dollars (total-pnl-dollars rts)
+   :total-pnl-pct (total-pnl-pct rts)
+   :n-trades (n-trades rts)
+   :n-wins (n-wins rts)
+   :n-losses (n-losses rts)
+   :n-flat (n-flat rts)
+   :sharpe-intraday (sharpe-intraday rts)
+   :sortino-intraday (sortino-intraday rts)
+   :profit-factor (profit-factor rts)
+   :expectancy (expectancy rts)
+   :payoff-ratio (payoff-ratio rts)
+   :kelly-fraction (kelly-fraction rts)
+   :max-drawdown-dollars (max-drawdown-dollars rts)
+   :calmar (calmar rts)
+   :win-rate (win-rate rts)
+   :avg-winner (avg-winner rts)
+   :avg-loser (avg-loser rts)
+   :largest-winner (largest-winner rts)
+   :largest-loser (largest-loser rts)
+   :median-pnl (median-pnl rts)
+   :std-pnl (std-pnl rts)
+   :avg-hold-minutes (avg-hold-minutes rts)
+   :median-hold-minutes (median-hold-minutes rts)
+   :max-hold-minutes (max-hold-minutes rts)
+   :pct-time-in-market (pct-time-in-market rts)
+   :n-long (n-long rts)
+   :n-short (n-short rts)
+   :long-short-ratio (long-short-ratio rts)
+   :trades-per-hour (trades-per-hour rts)
+   :first-trade-time (iso (first-trade-time rts))
+   :last-trade-time (iso (last-trade-time rts))
+   :side-breakdown (side-breakdown rts)})
+
+(def metric-key->python
+  {:total-pnl-dollars "total_pnl_dollars"
+   :total-pnl-pct "total_pnl_pct"
+   :n-trades "n_trades"
+   :n-wins "n_wins"
+   :n-losses "n_losses"
+   :n-flat "n_flat"
+   :sharpe-intraday "sharpe_intraday"
+   :sortino-intraday "sortino_intraday"
+   :profit-factor "profit_factor"
+   :expectancy "expectancy"
+   :payoff-ratio "payoff_ratio"
+   :kelly-fraction "kelly_fraction"
+   :max-drawdown-dollars "max_drawdown_dollars"
+   :calmar "calmar"
+   :win-rate "win_rate"
+   :avg-winner "avg_winner"
+   :avg-loser "avg_loser"
+   :largest-winner "largest_winner"
+   :largest-loser "largest_loser"
+   :median-pnl "median_pnl"
+   :std-pnl "std_pnl"
+   :avg-hold-minutes "avg_hold_minutes"
+   :median-hold-minutes "median_hold_minutes"
+   :max-hold-minutes "max_hold_minutes"
+   :pct-time-in-market "pct_time_in_market"
+   :n-long "n_long"
+   :n-short "n_short"
+   :long-short-ratio "long_short_ratio"
+   :trades-per-hour "trades_per_hour"
+   :first-trade-time "first_trade_time"
+   :last-trade-time "last_trade_time"
+   :side-breakdown "side_breakdown"
+   :side "side"
+   :pnl-dollars "pnl_dollars"
+   :avg-pnl "avg_pnl"
+   :total-hold-minutes "total_hold_minutes"
+   :pnl-per-market-minute "pnl_per_market_minute"
+   :first-open-time "first_open_time"
+   :last-close-time "last_close_time"
+   :n-opened "n_opened"
+   :n-still-open "n_still_open"
+   :open-exposure "open_exposure"
+   :open-unrealized "open_unrealized"
+   :has-open "has_open"
+   :open-age-minutes "open_age_minutes"
+   :open-time-in-market-minutes "open_time_in_market_minutes"
+   :open-pct-time-in-market "open_pct_time_in_market"
+   :open-age-unknown "open_age_unknown"
+   :symbols "symbols"})
+
+(defn- py-key
+  [k]
+  (cond
+    (keyword? k) (get metric-key->python k (name k))
+    :else k))
+
+(defn python-compatible
+  "Recursively convert report metric maps to Python report key names."
+  [x]
+  (cond
+    (map? x)
+    (into {} (map (fn [[k v]] [(py-key k) (python-compatible v)]) x))
+
+    (or (vector? x) (seq? x))
+    (mapv python-compatible x)
+
+    :else x))
+
+(defn compute-all-metrics-python
+  [rts]
+  (python-compatible (compute-all-metrics rts)))
+
+(defn- open-symbol-summary
+  [opens positions]
+  (let [symbols (vec (distinct (concat (or (:symbols positions) [])
+                                       (map :symbol opens))))]
+    (if (empty? symbols)
+      ""
+      (let [head (take 3 symbols)
+            extra (- (count symbols) 3)]
+        (if (> extra 0)
+          (str (bstr/join ", " head) " +" extra " more")
+          (bstr/join ", " head))))))
+
+(defn- blank-symbol?
+  [symbol]
+  (= "" (.strip (str (or symbol "")))))
+
+(defn open-activity
+  ([opens] (open-activity opens nil {}))
+  ([opens positions] (open-activity opens positions {}))
+  ([opens positions {:keys [as-of]}]
+   (let [n-opened (count opens)
+         n-still-open (if positions (->int (:n-positions positions)) n-opened)
+         open-exposure (if positions
+                         (math/fabs (->float (:market-value positions)))
+                         (reduce + 0.0
+                                 (map (fn [e]
+                                        (* (:open-price e) (:qty e)
+                                           (if (:is-option e) 100.0 1.0)))
+                                      opens)))
+         open-unrealized (when positions (->float (:unrealized-pl positions)))
+         position-symbols (vec (or (:symbols positions) []))
+         _ (cond
+             (and positions (neg? n-still-open))
+             (throw (python/ValueError
+                     "broker positions are inconsistent: negative position count"))
+
+             (and positions (some blank-symbol? position-symbols))
+             (throw (python/ValueError
+                     "broker positions are inconsistent: blank position symbol"))
+
+             (and positions
+                  (zero? n-still-open)
+                  (or (> n-opened 0)
+                      (> open-exposure 1e-9)
+                      (> (math/fabs (or open-unrealized 0.0)) 1e-9)
+                      (seq position-symbols)))
+             (throw (python/ValueError
+                     "broker positions are inconsistent: zero positions with open entries, exposure, unrealized P&L, or symbols"))
+
+             (and positions
+                  (pos? n-still-open)
+                  (empty? position-symbols))
+             (throw (python/ValueError
+                     "broker positions are inconsistent: positive position count without symbols")))
+         first-open (when (seq opens) (apply min (map :open-time opens)))
+         open-age (when (and as-of first-open)
+                    (/ (- (.timestamp as-of) (.timestamp first-open)) 60.0))
+         open-time-minutes (when (and as-of (seq opens))
+                             (reduce + 0.0
+                                     (map (fn [e]
+                                            (/ (- (.timestamp as-of)
+                                                  (.timestamp (:open-time e)))
+                                               60.0))
+                                          opens)))
+         open-age-unknown (and (> n-still-open 0)
+                               (nil? first-open))]
+     {:n-opened n-opened
+      :n-still-open n-still-open
+      :open-exposure open-exposure
+      :open-unrealized open-unrealized
+      :has-open (or (> n-opened 0) (> n-still-open 0))
+      :first-open-time (hhmm first-open)
+      :open-age-minutes open-age
+      :open-time-in-market-minutes open-time-minutes
+      :open-pct-time-in-market (when open-time-minutes
+                                 (min 100.0 (* (/ open-time-minutes session-minutes) 100.0)))
+      :open-age-unknown open-age-unknown
+      :symbols (open-symbol-summary opens positions)})))
+
+(defn open-activity-python
+  ([opens] (python-compatible (open-activity opens)))
+  ([opens positions] (python-compatible (open-activity opens positions)))
+  ([opens positions opts] (python-compatible (open-activity opens positions opts))))

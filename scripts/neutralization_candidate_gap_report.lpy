@@ -1,0 +1,199 @@
+;; Explain why neutralized features did or did not become unmask candidates.
+(import csv json os os.path sys)
+
+(require '[clojure.string :as str])
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/neutralization_candidate_gap_report.lpy -- "
+                "--raw-audit JSON --dry-run JSON --matched-csv CSV "
+                "[--greek-gate JSON] [--out-json PATH] [--sample-limit N]")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-int [value arg]
+  (try
+    (let [n (python/int value)]
+      (when (< n 0)
+        (throw (python/ValueError (str arg " must be >= 0"))))
+      n)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid integer for " arg ": " value))))))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:sample-limit 25}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--raw-audit") (recur (nnext remaining) (assoc out :raw-audit (option-value remaining arg)))
+          (= arg "--dry-run") (recur (nnext remaining) (assoc out :dry-run (option-value remaining arg)))
+          (= arg "--matched-csv") (recur (nnext remaining) (assoc out :matched-csv (option-value remaining arg)))
+          (= arg "--greek-gate") (recur (nnext remaining) (assoc out :greek-gate (option-value remaining arg)))
+          (= arg "--out-json") (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+          (= arg "--sample-limit") (recur (nnext remaining) (assoc out :sample-limit (parse-int (option-value remaining arg) arg)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn require-path [path label]
+  (when (or (nil? path) (not (os.path/exists path)))
+    (throw (python/ValueError (str label " does not exist: " path))))
+  path)
+
+(defn reject-duplicate-json-object [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}]
+    (if remaining
+      (let [pair (first remaining)
+            k (first pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining) (conj seen k)))
+      (python/dict pairs))))
+
+(defn read-json [path]
+  (json/loads (slurp path) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn py-dict? [x] (python/isinstance x python/dict))
+(defn py-list? [x] (python/isinstance x python/list))
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(if (keyword? k) (name k) (str k))
+                                                          (->jsonable v)])) x))
+    (set? x) (python/list (map ->jsonable (sort x)))
+    (or (vector? x) (seq? x)) (python/list (map ->jsonable x))
+    (py-dict? x) (python/dict (map (fn [k] (python/tuple [(str k) (->jsonable (get x k))])) (.keys x)))
+    (py-list? x) (python/list (map ->jsonable x))
+    :else x))
+
+(defn getv [m k default]
+  (if (and m (contains? m k)) (get m k) default))
+
+(defn inc-count [m k]
+  (update m (or k "missing") (fnil inc 0)))
+
+(defn group-count [rows key-fn]
+  (reduce (fn [acc row] (inc-count acc (key-fn row))) {} rows))
+
+(defn nested-count [rows & key-fns]
+  (reduce
+   (fn [acc row]
+     (let [keys (map #(% row) key-fns)]
+       (assoc-in acc keys (inc (or (get-in acc keys) 0)))))
+   {}
+   rows))
+
+(defn read-matched-csv [path]
+  (with-open [fh (python/open path "r" ** :newline "")]
+    (vec (for [row (iterator-seq (csv/DictReader fh))] row))))
+
+(defn source-key [prov]
+  (let [sources (get prov "sources")]
+    (if (py-list? sources)
+      (str/join "+" (map str (python/list sources)))
+      (str sources))))
+
+(defn raw-feature-map [raw]
+  (into {} (map (fn [row] [(get row "feature") row]) (get raw "features" []))))
+
+(defn maybe-load-json [path]
+  (when (and path (os.path/exists path))
+    (read-json path)))
+
+(defn run-main [opts]
+  (let [raw-path (require-path (:raw-audit opts) "--raw-audit")
+        dry-path (require-path (:dry-run opts) "--dry-run")
+        matched-path (require-path (:matched-csv opts) "--matched-csv")
+        raw (read-json raw-path)
+        dry (read-json dry-path)
+        greek-gate (maybe-load-json (:greek-gate opts))
+        matched (read-matched-csv matched-path)
+        raw-features (vec (get raw "features" []))
+        raw-by-feature (raw-feature-map raw)
+        dry-candidates (set (get dry "candidate_features" []))
+        raw-candidates (set (map #(get % "feature") (filter #(true? (get % "candidate")) raw-features)))
+        exact-neutralized (vec (for [row matched
+                                     :when (and (= "True" (get row "neutralized"))
+                                                (= "EXACT_MATCH" (get row "status")))]
+                                 (get row "feature")))
+        exact-candidate (filter dry-candidates exact-neutralized)
+        exact-not-candidate (vec (remove dry-candidates exact-neutralized))
+        exact-not-candidate-raw (vec (keep raw-by-feature exact-not-candidate))
+        supported-non-candidates (vec (filter #(not (contains? raw-candidates (get % "feature"))) raw-features))
+        greek-gate-features (vec (get greek-gate "features" []))
+        greek-gate-rejected (vec (filter #(not (true? (get % "candidate"))) greek-gate-features))
+        greek-gate-sane-rejected (vec (filter #(= "SANE" (get % "recomputed_status")) greek-gate-rejected))
+        sample-limit (:sample-limit opts)
+        payload {"raw_audit" raw-path
+                 "dry_run" dry-path
+                 "matched_csv" matched-path
+                 "target_date" (or (get-in raw ["summary" "target_date"])
+                                   (get dry "audit_target_date"))
+                 "neutralized_total" (get-in raw ["summary" "neutralized_total"])
+                 "supported_neutralized" (get-in raw ["summary" "supported_neutralized"])
+                 "unsupported_neutralized" (get-in raw ["summary" "unsupported_neutralized"])
+                 "unsupported_neutralized_by_family" (get-in raw ["summary" "unsupported_neutralized_by_family"])
+                 "raw_candidate_count" (get-in raw ["summary" "candidate_count"])
+                 "dry_run_candidate_count" (get dry "candidate_count")
+                 "dry_run_candidate_provenance_counts" (group-count (get dry "candidate_provenance" []) source-key)
+                 "extra_audits" (get dry "extra_audits" [])
+                 "greek_gate" (when greek-gate
+                                {"path" (:greek-gate opts)
+                                 "candidate_count" (count (filter #(true? (get % "candidate")) greek-gate-features))
+                                 "rejected_count" (count greek-gate-rejected)
+                                 "rejected_by_reasons" (group-count greek-gate-rejected #(get % "reasons"))
+                                 "sane_rejected_count" (count greek-gate-sane-rejected)
+                                 "sane_rejected_samples" (vec (take sample-limit
+                                                                    (map (fn [row]
+                                                                           {"feature" (get row "feature")
+                                                                            "family" (get row "family")
+                                                                            "reasons" (get row "reasons")
+                                                                            "z_mean" (get row "z_mean")
+                                                                            "z_std" (get row "z_std")
+                                                                            "model_gain" (get row "model_gain")
+                                                                            "model_split_count" (get row "model_split_count")})
+                                                                         greek-gate-sane-rejected)))})
+                 "raw_supported_status_counts" (get-in raw ["summary" "status_counts"])
+                 "raw_supported_source_counts" (get-in raw ["summary" "source_counts"])
+                 "supported_non_candidate_count" (count supported-non-candidates)
+                 "supported_non_candidate_by_status" (group-count supported-non-candidates #(get % "recomputed_status"))
+                 "supported_non_candidate_by_family" (group-count supported-non-candidates #(get % "family"))
+                 "supported_non_candidate_by_source" (group-count supported-non-candidates #(get % "source_note"))
+                 "supported_non_candidate_by_status_family" (nested-count supported-non-candidates
+                                                                           #(get % "recomputed_status")
+                                                                           #(get % "family"))
+                 "matched_exact_neutralized_count" (count exact-neutralized)
+                 "matched_exact_dry_run_candidate_count" (count exact-candidate)
+                 "matched_exact_not_candidate_count" (count exact-not-candidate)
+                 "matched_exact_not_candidate_by_raw_status" (group-count exact-not-candidate-raw #(get % "recomputed_status"))
+                 "matched_exact_not_candidate_by_family" (group-count exact-not-candidate-raw #(get % "family"))
+                 "matched_exact_not_candidate_samples" (vec (take sample-limit exact-not-candidate))
+                 "supported_non_candidate_samples" (vec (take sample-limit
+                                                               (map (fn [row]
+                                                                      {"feature" (get row "feature")
+                                                                       "family" (get row "family")
+                                                                       "source_note" (get row "source_note")
+                                                                       "recomputed_status" (get row "recomputed_status")
+                                                                       "baseline_status" (get row "baseline_status")
+                                                                       "model_gain" (get row "model_gain")
+                                                                       "model_split_count" (get row "model_split_count")})
+                                                                    supported-non-candidates)))}]
+    (when-let [out (:out-json opts)]
+      (os/makedirs (os.path/dirname out) ** :exist_ok true)
+      (spit out (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+    (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+    0))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

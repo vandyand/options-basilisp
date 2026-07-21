@@ -1,0 +1,433 @@
+(ns stevetrading.analysis.derived-greeks
+  "Derived option IV/Greek diagnostics from saved ThetaData quote examples.
+
+  This is intentionally an analysis layer, not live strategy plumbing. It
+  answers whether available quote/underlying surfaces are sufficient to
+  reconstruct first-order Greeks without native vendor Greek endpoints."
+  (:import datetime glob json math os os.path))
+
+(def default-risk-free-rate 0.045)
+(def default-dividend-yield 0.0)
+(def min-time-years (/ 60.0 (* 365.0 24.0 60.0 60.0)))
+(def max-solver-iv 5.0)
+
+(defn finite-number?
+  [x]
+  (try
+    (let [n (python/float x)]
+      (and (not (boolean? x)) (math/isfinite n)))
+    (catch python/Exception _ false)))
+
+(defn ->float
+  [x]
+  (when (finite-number? x)
+    (python/float x)))
+
+(defn norm-pdf
+  [x]
+  (/ (math/exp (* -0.5 x x)) (math/sqrt (* 2.0 math/pi))))
+
+(defn norm-cdf
+  [x]
+  (* 0.5 (+ 1.0 (math/erf (/ x (math/sqrt 2.0))))))
+
+(defn parse-date
+  [s]
+  (datetime.date/fromisoformat (str s)))
+
+(defn parse-local-datetime
+  [s]
+  (datetime.datetime/fromisoformat (str s)))
+
+(defn expiration-close
+  [expiration]
+  (let [d (parse-date expiration)]
+    (datetime/datetime (.-year d) (.-month d) (.-day d) 16 0 0)))
+
+(defn dte-years
+  [timestamp expiration]
+  (let [ts (parse-local-datetime timestamp)
+        exp (expiration-close expiration)
+        seconds (max min-time-years (/ (.total_seconds (- exp ts))
+                                       (* 365.0 24.0 60.0 60.0)))]
+    seconds))
+
+(defn d1
+  [s k t r q vol]
+  (/ (+ (math/log (/ s k))
+        (* (+ (- r q) (* 0.5 vol vol)) t))
+     (* vol (math/sqrt t))))
+
+(defn d2
+  [d1-value t vol]
+  (- d1-value (* vol (math/sqrt t))))
+
+(defn bs-price
+  [right s k t r q vol]
+  (let [d1v (d1 s k t r q vol)
+        d2v (d2 d1v t vol)
+        disc-r (math/exp (* (- r) t))
+        disc-q (math/exp (* (- q) t))]
+    (if (= right "CALL")
+      (- (* s disc-q (norm-cdf d1v))
+         (* k disc-r (norm-cdf d2v)))
+      (- (* k disc-r (norm-cdf (- d2v)))
+         (* s disc-q (norm-cdf (- d1v)))))))
+
+(defn intrinsic
+  [right s k]
+  (if (= right "CALL")
+    (max 0.0 (- s k))
+    (max 0.0 (- k s))))
+
+(defn implied-vol
+  [right s k t r q price]
+  (when (and (pos? s) (pos? k) (pos? t) (pos? price)
+             (>= (+ price 1.0e-8) (intrinsic right s k)))
+    (let [lo0 1.0e-6
+          hi0 max-solver-iv
+          hi-price (bs-price right s k t r q hi0)]
+      (when (>= (+ hi-price 1.0e-8) price)
+        (loop [lo lo0
+               hi hi0
+               i 0]
+          (let [mid (/ (+ lo hi) 2.0)
+                mid-price (bs-price right s k t r q mid)]
+            (if (>= i 80)
+              mid
+              (if (< mid-price price)
+                (recur mid hi (inc i))
+                (recur lo mid (inc i))))))))))
+
+(defn greeks
+  [right s k t r q vol]
+  (let [d1v (d1 s k t r q vol)
+        d2v (d2 d1v t vol)
+        pdf (norm-pdf d1v)
+        disc-r (math/exp (* (- r) t))
+        disc-q (math/exp (* (- q) t))
+        sqrt-t (math/sqrt t)
+        call? (= right "CALL")
+        delta (if call?
+                (* disc-q (norm-cdf d1v))
+                (* disc-q (- (norm-cdf d1v) 1.0)))
+        gamma (/ (* disc-q pdf) (* s vol sqrt-t))
+        vega (* s disc-q pdf sqrt-t)
+        theta-annual (if call?
+                       (- (- (/ (* s disc-q pdf vol) (* 2.0 sqrt-t)))
+                          (* r k disc-r (norm-cdf d2v))
+                          (- (* q s disc-q (norm-cdf d1v))))
+                       (+ (- (/ (* s disc-q pdf vol) (* 2.0 sqrt-t)))
+                          (* r k disc-r (norm-cdf (- d2v)))
+                          (- (* q s disc-q (norm-cdf (- d1v))))))
+        epsilon (if call?
+                  (- (* s t disc-q (norm-cdf d1v)))
+                  (* s t disc-q (norm-cdf (- d1v))))]
+    {"delta" delta
+     "gamma" gamma
+     "vega" vega
+     "theta_annual" theta-annual
+     "theta_daily" (/ theta-annual 365.0)
+     "rho" (if call?
+             (* k t disc-r (norm-cdf d2v))
+             (* (- k) t disc-r (norm-cdf (- d2v))))
+     "epsilon" epsilon
+     "lambda" (when (not (zero? (bs-price right s k t r q vol)))
+                (/ (* delta s) (bs-price right s k t r q vol))) }))
+
+(defn columnar-row-count
+  [payload]
+  (if (map? payload)
+    (let [lengths (map count (filter vector? (vals payload)))]
+      (if (seq lengths) (apply max lengths) 0))
+    0))
+
+(defn column-value
+  [payload column idx]
+  (let [v (get payload column)]
+    (when (and (vector? v) (< idx (count v)))
+      (nth v idx))))
+
+(defn rows
+  [payload]
+  (mapv (fn [idx]
+          (into {}
+                (keep (fn [[k v]]
+                        (when (and (vector? v) (< idx (count v)))
+                          [k (nth v idx)]))
+                      payload)))
+        (range (columnar-row-count payload))))
+
+(defn read-json
+  [path]
+  (letfn [(wire->data [x]
+            (cond
+              (map? x) (into {} (map (fn [[k v]] [k (wire->data v)]) x))
+              (isinstance x python/dict) (into {} (map (fn [[k v]] [k (wire->data v)])
+                                                      (.items x)))
+              (vector? x) (mapv wire->data x)
+              (isinstance x python/list) (mapv wire->data x)
+              :else x))]
+    (wire->data (json/loads (slurp path)))))
+
+(defn payload-examples
+  [payload-dir stamp]
+  (mapv (fn [path]
+          (assoc (read-json path) "__path" path))
+        (sort (glob/glob (os.path/join payload-dir stamp "*.json")))))
+
+(defn option-quote-example?
+  [item]
+  (= "option.snapshot.quote" (get item "probe")))
+
+(defn underlying-key
+  [symbol]
+  (cond
+    (contains? #{"SPX" "SPXW"} symbol) "SPX"
+    (contains? #{"VIX" "VIXW"} symbol) "VIX"
+    :else symbol))
+
+(defn market-price
+  [item]
+  (let [payload (get item "payload")
+        row (first (rows payload))]
+    (cond
+      (nil? row) nil
+      (some? (->float (get row "price"))) (->float (get row "price"))
+      (and (some? (->float (get row "bid")))
+           (some? (->float (get row "ask"))))
+      (/ (+ (->float (get row "bid")) (->float (get row "ask"))) 2.0)
+      (some? (->float (get row "last"))) (->float (get row "last"))
+      (some? (->float (get row "trade_price"))) (->float (get row "trade_price"))
+      :else nil)))
+
+(defn underlying-prices
+  [examples]
+  (reduce (fn [acc item]
+            (let [probe (get item "probe")
+                  symbol (get item "symbol")
+                  price (market-price item)]
+              (if (and symbol price
+                       (contains? #{"stock.snapshot.trade"
+                                    "stock.snapshot.quote"
+                                    "index.snapshot.price"} probe))
+                (assoc acc symbol price)
+                acc)))
+          {}
+          examples))
+
+(defn quote-mid
+  [bid ask]
+  (cond
+    (and bid ask (pos? ask) (>= ask bid))
+    (/ (+ bid ask) 2.0)
+
+    (and ask (pos? ask))
+    ask
+
+    (and bid (pos? bid))
+    bid
+
+    :else nil))
+
+(defn derive-row
+  [symbol underlying-price risk-free-rate dividend-yield row]
+  (let [right (get row "right")
+        strike (->float (get row "strike"))
+        bid (->float (get row "bid"))
+        ask (->float (get row "ask"))
+        expiration (get row "expiration")
+        timestamp (get row "timestamp")
+        mid (quote-mid bid ask)]
+    (when (and (#{"CALL" "PUT"} right) strike mid expiration timestamp
+               underlying-price (pos? underlying-price))
+      (let [t (dte-years timestamp expiration)
+            iv (implied-vol right underlying-price strike t
+                            risk-free-rate dividend-yield mid)]
+        (when iv
+          (merge {"symbol" symbol
+                  "underlying" (underlying-key symbol)
+                  "underlying_price" underlying-price
+                  "expiration" expiration
+                  "timestamp" timestamp
+                  "right" right
+                  "strike" strike
+                  "bid" bid
+                  "ask" ask
+                  "mid" mid
+                  "dte_years" t
+                  "iv" iv}
+                 (greeks right underlying-price strike t
+                         risk-free-rate dividend-yield iv)))))))
+
+(defn valid-derived-row?
+  [row]
+  (and row
+       (every? #(finite-number? (get row %))
+               ["underlying_price" "strike" "mid" "dte_years" "iv"
+                "delta" "gamma" "vega" "theta_annual" "theta_daily" "rho" "epsilon"])
+       (> (get row "iv") 0.0)
+       (<= (get row "iv") max-solver-iv)
+       (>= (get row "delta") -1.0)
+       (<= (get row "delta") 1.0)
+       (>= (get row "gamma") 0.0)
+       (>= (get row "vega") 0.0)))
+
+(defn quantile
+  [xs q]
+  (let [ys (vec (sort xs))
+        n (count ys)]
+    (when (pos? n)
+      (nth ys (int (min (dec n) (max 0 (math/floor (* q (dec n))))))))))
+
+(defn stats
+  [xs]
+  (let [ys (vec (filter finite-number? xs))
+        n (count ys)]
+    (if (zero? n)
+      {"count" 0}
+      {"count" n
+       "min" (apply min ys)
+       "p05" (quantile ys 0.05)
+       "median" (quantile ys 0.5)
+       "p95" (quantile ys 0.95)
+       "max" (apply max ys)})))
+
+(defn summarize-rows
+  [rows]
+  {"count" (count rows)
+   "by_symbol" (into {}
+                     (map (fn [symbol]
+                            [symbol (count (filter #(= symbol (get % "symbol")) rows))])
+                          (sort (set (map #(get % "symbol") rows)))))
+   "iv" (stats (map #(get % "iv") rows))
+   "delta" (stats (map #(get % "delta") rows))
+   "gamma" (stats (map #(get % "gamma") rows))
+   "vega" (stats (map #(get % "vega") rows))
+   "theta_daily" (stats (map #(get % "theta_daily") rows))
+   "rho" (stats (map #(get % "rho") rows))
+   "epsilon" (stats (map #(get % "epsilon") rows))})
+
+(defn derive-surfaces
+  [{:keys [payload-dir target-date risk-free-rate dividend-yield]}]
+  (let [stamp (.replace (str target-date) "-" "")
+        examples (payload-examples payload-dir stamp)
+        underlyings (underlying-prices examples)
+        quote-examples (filter option-quote-example? examples)
+        rows-by-example
+        (mapv (fn [item]
+                (let [symbol (get item "symbol")
+                      ukey (underlying-key symbol)
+                      underlying-price (get underlyings ukey)
+                      source-rows (rows (get item "payload"))
+                      derived (vec (keep #(derive-row symbol underlying-price
+                                                      risk-free-rate dividend-yield %)
+                                         source-rows))]
+                  {"path" (get item "__path")
+                   "symbol" symbol
+                   "underlying" ukey
+                   "underlying_price" underlying-price
+                   "source_rows" (count source-rows)
+                   "derived_rows" (count derived)
+                   "invalid_rows" (- (count source-rows) (count derived))
+                   "rows" derived}))
+              quote-examples)
+        all-rows (vec (mapcat #(get % "rows") rows-by-example))
+        valid (vec (filter valid-derived-row? all-rows))]
+    {"target_date" target-date
+     "risk_free_rate" risk-free-rate
+     "dividend_yield" dividend-yield
+     "underlying_prices" underlyings
+     "summary" {"option_quote_examples" (count quote-examples)
+                "source_rows" (reduce + 0 (map #(get % "source_rows") rows-by-example))
+                "derived_rows" (count all-rows)
+                "valid_rows" (count valid)
+                "invalid_derived_rows" (- (count all-rows) (count valid))
+                "symbols" (sort (set (map #(get % "symbol") rows-by-example)))
+                "stats" (summarize-rows valid)}
+     "examples" (mapv #(dissoc % "rows") rows-by-example)
+     "sample_rows" (vec (take 20 valid))}))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable x))
+    :else x))
+
+(defn md-table
+  [headers rows]
+  (str "| " (.join " | " headers) " |\n"
+       "| " (.join " | " (repeat (count headers) "---")) " |\n"
+       (.join "\n"
+              (map (fn [row]
+                     (str "| " (.join " | " (map str row)) " |"))
+                   rows))
+       "\n"))
+
+(defn fmt
+  [x digits]
+  (if (finite-number? x)
+    (format (str "%." digits "f") (python/float x))
+    "n/a"))
+
+(defn markdown
+  [payload]
+  (let [summary (get payload "summary")
+        stats (get summary "stats")
+        examples (get payload "examples")]
+    (str "# Derived Greeks Probe\n\n"
+         "- Target date: `" (get payload "target_date") "`\n"
+         "- Risk-free rate: `" (get payload "risk_free_rate") "`\n"
+         "- Dividend yield: `" (get payload "dividend_yield") "`\n"
+         "- Option quote examples: `" (get summary "option_quote_examples") "`\n"
+         "- Source rows: `" (get summary "source_rows") "`\n"
+         "- Derived rows: `" (get summary "derived_rows") "`\n"
+         "- Valid derived rows: `" (get summary "valid_rows") "`\n\n"
+         "## By Example\n\n"
+         (md-table ["Symbol" "Underlying" "Underlying Price" "Source Rows" "Derived Rows" "Invalid Rows"]
+                   (map (fn [e]
+                          [(get e "symbol")
+                           (get e "underlying")
+                           (fmt (get e "underlying_price") 4)
+                           (get e "source_rows")
+                           (get e "derived_rows")
+                           (get e "invalid_rows")])
+                        examples))
+         "\n## Sanity Ranges\n\n"
+         (md-table ["Field" "Count" "Min" "P05" "Median" "P95" "Max"]
+                   (map (fn [field]
+                          (let [s (get stats field)]
+                            [field
+                             (get s "count" 0)
+                             (fmt (get s "min") 6)
+                             (fmt (get s "p05") 6)
+                             (fmt (get s "median") 6)
+                             (fmt (get s "p95") 6)
+                             (fmt (get s "max") 6)]))
+                        ["iv" "delta" "gamma" "vega" "theta_daily" "rho" "epsilon"]))
+         "\n## Interpretation\n\n"
+         "First-order IV/Greeks are derivable when option quote mid, strike, right, expiration, timestamp, and an underlying price are present. "
+         "These are model-derived Black-Scholes values, not vendor-native Greeks, so production unmasking still needs parity checks against the original training/backtest feature builders.\n")))
+
+(defn ensure-parent-dir!
+  [path]
+  (let [parent (os.path/dirname (str path))]
+    (when (pos? (count parent))
+      (os/makedirs parent ** :exist_ok true))))
+
+(defn write-probe!
+  [{:keys [out-dir target-date] :as opts}]
+  (let [payload (derive-surfaces opts)
+        stamp (.replace (str target-date) "-" "")
+        base (os.path/join out-dir (str "derived_greeks_probe_" stamp))
+        json-path (str base ".json")
+        md-path (str base ".md")]
+    (ensure-parent-dir! json-path)
+    (spit json-path (json/dumps (jsonable payload) ** :indent 2 :sort_keys true :allow_nan false))
+    (spit md-path (markdown payload))
+    {"payload" payload
+     "json_path" json-path
+     "markdown_path" md-path}))

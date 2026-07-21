@@ -1,0 +1,332 @@
+;; Collect non-SPY option surfaces into a replay-compatible sidecar NPZ.
+;;
+;; This intentionally runs outside the trading loop. It gathers broad ThetaData
+;; surfaces for feature-parity evidence without slowing live Alpaca inference.
+(import argparse datetime json math os os.path sys urllib.parse urllib.request)
+(import numpy)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/market-data.thetadata-schema/src"))
+
+(require '[stevetrading.market-data.thetadata-schema :as ts])
+
+(def default-base-url "http://127.0.0.1:25503")
+(def default-analysis-dir "live_runtime/analysis")
+(def default-capture-dir "live_runtime/feature-capture")
+(def default-symbols "SPXW,VIXW,SPX,VIX")
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now (.-utc datetime/timezone)) "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn today-et []
+  (let [tz (datetime/timezone (datetime/timedelta ** :hours -4))]
+    (.isoformat (.date (datetime.datetime/now tz)))))
+
+(defn compact-date [s]
+  (.replace (str s) "-" ""))
+
+(defn split-csv [s]
+  (vec (filter #(pos? (count %))
+               (map #(.upper (.strip %)) (.split (or s "") ",")))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] [(str k) (jsonable v)]) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (nil? x) nil
+    :else x))
+
+(defn http-json [base-url path timeout-s]
+  (let [url (str (.rstrip base-url "/") path)
+        req (urllib.request/Request url ** :headers {"Accept" "application/json"})
+        started (.timestamp (datetime.datetime/now (.-utc datetime/timezone)))]
+    (try
+      (let [resp (urllib.request/urlopen req ** :timeout timeout-s)
+            body (.decode (.read resp) "utf-8" "replace")]
+        {"ok" true
+         "url" url
+         "elapsed_ms" (int (* 1000.0 (- (.timestamp (datetime.datetime/now (.-utc datetime/timezone))) started)))
+         "payload" (json/loads body)})
+      (catch python/Exception e
+        {"ok" false
+         "url" url
+         "elapsed_ms" (int (* 1000.0 (- (.timestamp (datetime.datetime/now (.-utc datetime/timezone))) started)))
+         "error" (str e)}))))
+
+(defn q [value]
+  (urllib.parse/quote (str value) ** :safe ""))
+
+(defn normalize [payload]
+  (ts/normalize-table payload))
+
+(defn col [table name]
+  (vec (get table name [])))
+
+(defn first-finite [values]
+  (first
+   (keep (fn [v]
+           (try
+             (let [n (float v)]
+               (when (math/isfinite n) n))
+             (catch python/Exception _ nil)))
+         values)))
+
+(defn row-count [table]
+  (if (seq table)
+    (apply max (map count (vals table)))
+    0))
+
+(defn cell [xs i]
+  (when (< i (count xs)) (nth xs i)))
+
+(defn right-code [x]
+  (case (.upper (str x))
+    ("CALL" "C") "CALL"
+    ("PUT" "P") "PUT"
+    nil))
+
+(defn row-key [strike right expiration]
+  (try
+    [(float strike) (right-code right) (str expiration)]
+    (catch python/Exception _ nil)))
+
+(defn rows-by-key [table]
+  (let [strikes (col table "strike")
+        rights (col table "right")
+        expirations (col table "expiration")
+        n (row-count table)
+        out (atom {})]
+    (doseq [i (range n)]
+      (let [k (row-key (cell strikes i) (cell rights i) (cell expirations i))]
+        (when k
+          (swap! out assoc k i))))
+    @out))
+
+(defn choose-expiration [base-url symbol target-date timeout-s supplied]
+  (if supplied
+    [supplied {"ok" true "source" "supplied"}]
+    (let [res (http-json base-url (str "/v3/option/list/expirations?symbol=" (q symbol) "&format=json") timeout-s)]
+      (if-not (get res "ok")
+        [nil res]
+        (let [table (normalize (get res "payload"))
+              target (str target-date)
+              exps (vec (sort (filter #(>= (compare (str %) target) 0)
+                                      (col table "expiration"))))]
+          (if (seq exps)
+            [(compact-date (first exps)) (assoc res "chosen_expiration" (first exps))]
+            [nil (assoc res "ok" false "error" (str "no expiration on/after " target-date))]))))))
+
+(defn index-symbol-for [symbol]
+  (cond
+    (.startswith symbol "SPX") "SPX"
+    (.startswith symbol "VIX") "VIX"
+    :else symbol))
+
+(defn fetch-underlying [base-url symbol timeout-s]
+  (let [index-symbol (index-symbol-for symbol)
+        paths [(str "/v3/index/snapshot/price?symbol=" (q index-symbol) "&format=json")
+               (str "/v3/index/snapshot/quote?symbol=" (q index-symbol) "&format=json")]
+        attempts (atom [])]
+    (loop [remaining paths]
+      (if-not remaining
+        [nil @attempts]
+        (let [res (http-json base-url (first remaining) timeout-s)
+              table (when (get res "ok") (normalize (get res "payload")))
+              price (when table
+                      (or (first-finite (col table "price"))
+                          (first-finite (col table "last"))
+                          (first-finite (col table "trade_price"))
+                          (let [bid (first-finite (col table "bid"))
+                                ask (first-finite (col table "ask"))]
+                            (when (and bid ask (> bid 0.0) (> ask 0.0))
+                              (/ (+ bid ask) 2.0)))))]
+          (swap! attempts conj (dissoc res "payload"))
+          (if (and price (> price 0.0))
+            [price @attempts]
+            (recur (next remaining))))))))
+
+(defn fetch-surface-payloads [base-url symbol expiration timeout-s]
+  (let [exp (compact-date expiration)
+        specs {"quote" (str "/v3/option/snapshot/quote?symbol=" (q symbol) "&expiration=" exp "&format=json")
+               "ohlc" (str "/v3/option/snapshot/ohlc?symbol=" (q symbol) "&expiration=" exp "&format=json")
+               "open_interest" (str "/v3/option/snapshot/open_interest?symbol=" (q symbol) "&expiration=" exp "&format=json")}]
+    (into {} (map (fn [[name path]]
+                    [name (http-json base-url path timeout-s)])
+                  specs))))
+
+(defn merge-surface [symbol underlying observed-at results max-contracts]
+  (let [quote-res (get results "quote")
+        quote-table (when (get quote-res "ok") (normalize (get quote-res "payload")))
+        ohlc-table (when (get-in results ["ohlc" "ok"]) (normalize (get-in results ["ohlc" "payload"])))
+        oi-table (when (get-in results ["open_interest" "ok"]) (normalize (get-in results ["open_interest" "payload"])))
+        ohlc-idx (if ohlc-table (rows-by-key ohlc-table) {})
+        oi-idx (if oi-table (rows-by-key oi-table) {})
+        n (if quote-table (row-count quote-table) 0)
+        q-strike (col quote-table "strike")
+        q-right (col quote-table "right")
+        q-bid (col quote-table "bid")
+        q-ask (col quote-table "ask")
+        q-bid-size (col quote-table "bid_size")
+        q-ask-size (col quote-table "ask_size")
+        q-exp (col quote-table "expiration")
+        o-volume (col ohlc-table "volume")
+        o-count (col ohlc-table "count")
+        oi-open (or (seq (col oi-table "open_interest")) (seq (col oi-table "oi")))
+        oi-open (vec (or oi-open []))
+        contracts (atom [])]
+    (doseq [i (range n)]
+      (let [strike (cell q-strike i)
+            right (right-code (cell q-right i))
+            expiration (cell q-exp i)
+            bid (first-finite [(cell q-bid i)])
+            ask (first-finite [(cell q-ask i)])
+            k (row-key strike right expiration)
+            oi-i (get oi-idx k)
+            ohlc-i (get ohlc-idx k)]
+        (when (and k right bid ask (> bid 0.0) (> ask 0.0))
+          (swap! contracts conj
+                 {"strike" (float strike)
+                  "right" right
+                  "expiration" (str expiration)
+                  "bid" bid
+                  "ask" ask
+                  "bid_size" (or (first-finite [(cell q-bid-size i)]) 0.0)
+                  "ask_size" (or (first-finite [(cell q-ask-size i)]) 0.0)
+                  "volume" (or (when ohlc-i (first-finite [(cell o-volume ohlc-i)])) 0.0)
+                  "count" (or (when ohlc-i (first-finite [(cell o-count ohlc-i)])) 0.0)
+                  "open_interest" (or (when oi-i (first-finite [(cell oi-open oi-i)])) 0.0)}))))
+    (let [limited (if (and max-contracts (> (count @contracts) max-contracts) (> underlying 0.0))
+                    (vec (map second
+                              (take max-contracts
+                                    (sort-by first
+                                             (map (fn [row]
+                                                    [(abs (- (float (get row "strike")) underlying)) row])
+                                                  @contracts)))))
+                    @contracts)]
+      {"symbol" symbol
+       "observed_at" observed-at
+       "underlying" underlying
+       "contracts" limited
+       "source" "thetadata-option-surface-sidecar"})))
+
+(defn latest-grid [capture-path]
+  (if (and capture-path (os.path/exists capture-path))
+    (try
+      (let [cap (numpy/load capture-path ** :allow_pickle true)
+            grids (.__getitem__ cap "grids")
+            n (len grids)]
+        (if (> n 0)
+          (numpy/array [(.__getitem__ grids (- n 1))])
+          (numpy/zeros #py (1 6 21 8) ** :dtype numpy/float64)))
+      (catch python/Exception _
+        (numpy/zeros #py (1 6 21 8) ** :dtype numpy/float64)))
+    (numpy/zeros #py (1 6 21 8) ** :dtype numpy/float64)))
+
+(defn append-npz! [path time-str grids surfaces-json]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (let [blank (numpy/array [""] ** :dtype object)
+        new-times (numpy/array [time-str] ** :dtype object)
+        new-surfaces (numpy/array [surfaces-json] ** :dtype object)]
+    (if (os.path/exists path)
+      (let [old (numpy/load path ** :allow_pickle true)
+            old-times (.__getitem__ old "times")
+            old-grids (.__getitem__ old "grids")
+            old-bars (.__getitem__ old "bar_buffers_json")
+            old-chain (.__getitem__ old "option_chain_json")
+            old-surfaces (.__getitem__ old "option_surfaces_json")]
+        (numpy/savez path
+                    ** :times (numpy/concatenate #py [old-times new-times])
+                    :grids (numpy/concatenate #py [old-grids grids])
+                    :bar_buffers_json (numpy/concatenate #py [old-bars blank])
+                    :option_chain_json (numpy/concatenate #py [old-chain blank])
+                    :option_surfaces_json (numpy/concatenate #py [old-surfaces new-surfaces])))
+      (numpy/savez path
+                  ** :times new-times
+                  :grids grids
+                  :bar_buffers_json blank
+                  :option_chain_json blank
+                  :option_surfaces_json new-surfaces))))
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--base-url" ** :default default-base-url)
+    (.add_argument parser "--symbols" ** :default default-symbols)
+    (.add_argument parser "--target-date" ** :default (today-et))
+    (.add_argument parser "--capture" ** :default nil)
+    (.add_argument parser "--out-npz" ** :default nil)
+    (.add_argument parser "--out-json" ** :default nil)
+    (.add_argument parser "--timeout-s" ** :type float :default 8.0)
+    (.add_argument parser "--max-contracts" ** :type int :default 600)
+    (.add_argument parser "--expiration" ** :default nil :help "Optional single expiration override for all symbols.")
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn run-main [args]
+  (let [target-date (python/getattr args "target_date")
+        stamp (compact-date target-date)
+        capture (or (python/getattr args "capture")
+                    (os.path/join default-capture-dir (str "live_features_" stamp ".npz")))
+        out-npz (or (python/getattr args "out_npz")
+                    (os.path/join default-analysis-dir (str "option_surface_sidecar_" stamp ".npz")))
+        out-json (or (python/getattr args "out_json")
+                     (os.path/join default-analysis-dir (str "option_surface_sidecar_" stamp ".json")))
+        observed-at (now-utc)
+        surfaces (atom {})
+        reports (atom [])]
+    (doseq [symbol (split-csv (python/getattr args "symbols"))]
+      (let [[expiration exp-report] (choose-expiration (python/getattr args "base_url")
+                                                       symbol
+                                                       target-date
+                                                       (python/getattr args "timeout_s")
+                                                       (python/getattr args "expiration"))
+            [underlying underlying-reports] (fetch-underlying (python/getattr args "base_url")
+                                                              symbol
+                                                              (python/getattr args "timeout_s"))]
+        (if (and expiration underlying)
+          (let [fetches (fetch-surface-payloads (python/getattr args "base_url")
+                                                symbol
+                                                expiration
+                                                (python/getattr args "timeout_s"))
+                surface (merge-surface symbol underlying observed-at fetches (python/getattr args "max_contracts"))
+                contracts (get surface "contracts")]
+            (when (seq contracts)
+              (swap! surfaces assoc symbol (json/dumps (jsonable surface) ** :sort_keys true)))
+            (swap! reports conj {"symbol" symbol
+                                 "ok" (boolean (seq contracts))
+                                 "expiration" expiration
+                                 "underlying" underlying
+                                 "contracts" (count contracts)
+                                 "fetches" (into {} (map (fn [[k v]] [k (dissoc v "payload")]) fetches))
+                                 "expiration_probe" (dissoc exp-report "payload")
+                                 "underlying_probes" underlying-reports}))
+          (swap! reports conj {"symbol" symbol
+                               "ok" false
+                               "expiration" expiration
+                               "underlying" underlying
+                               "expiration_probe" (dissoc exp-report "payload")
+                               "underlying_probes" underlying-reports}))))
+    (let [surface-json (json/dumps (jsonable @surfaces) ** :sort_keys true)
+          grids (latest-grid capture)
+          payload {"generated_at" observed-at
+                   "target_date" target-date
+                   "capture" capture
+                   "out_npz" out-npz
+                   "symbols" (split-csv (python/getattr args "symbols"))
+                   "surface_prefixes" (vec (sort (keys @surfaces)))
+                   "surface_contracts" (into {} (map (fn [[k v]]
+                                                       [k (count (get (json/loads v) "contracts"))])
+                                                     @surfaces))
+                   "reports" @reports}]
+      (append-npz! out-npz observed-at grids surface-json)
+      (os/makedirs (os.path/dirname out-json) ** :exist_ok true)
+      (spit out-json (json/dumps (jsonable payload) ** :indent 2 :sort_keys true))
+      (println (json/dumps (jsonable payload) ** :indent 2 :sort_keys true))
+      (if (seq @surfaces) 0 1))))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/SystemExit e
+    (throw e))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

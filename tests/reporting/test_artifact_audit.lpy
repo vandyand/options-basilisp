@@ -1,0 +1,606 @@
+(ns reporting.test-artifact-audit
+  (:import json os os.path tempfile)
+  (:require [basilisp.edn :as edn]
+            [basilisp.test :refer [deftest is]]
+            [stevetrading.reporting.artifact-audit :as audit]))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]] (python/tuple [k (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn write-json
+  [path payload]
+  (spit path (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn rewrite-edn
+  [path f]
+  (spit path (str (edn/write-string (f (edn/read-string (slurp path)))) "\n")))
+
+(defn valid-payload
+  [date]
+  {"report/date" date
+   "report/rendered?" true
+   "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                "report/date" date
+                "trade/closed-count" 1
+                "order/count" 2
+                "positions/open-count" 0
+                "positions/open" []
+                "pnl/equity-day" "25.00"
+                "pnl/realized" "25.00"
+                "pnl/unrealized" "0.00"
+                "pnl/closed-trades" "25.00"
+                "broker/equity-observed?" true
+                "report/explanations" []}]})
+
+(defn invalid-payload
+  [date]
+  {"report/date" date
+   "report/rendered?" true
+   "accounts" [{"account/id" "account/alpaca/oak-paper"
+                "report/date" date
+                "trade/closed-count" 3
+                "order/count" 6
+                "positions/open-count" 0
+                "positions/open" []
+                "pnl/equity-day" "-150.00"
+                "pnl/realized" "0.00"
+                "pnl/unrealized" "0.00"
+                "pnl/closed-trades" "-150.00"
+                "broker/equity-observed?" true
+                "report/explanations" []}]})
+
+(defn realized-without-closed-trades-payload
+  [date]
+  {"report/date" date
+   "report/rendered?" true
+   "accounts" [{"account/id" "account/alpaca/oak-paper"
+                "report/date" date
+                "trade/closed-count" 0
+                "order/count" 2
+                "positions/open-count" 0
+                "positions/open" []
+                "pnl/equity-day" "-150.00"
+                "pnl/realized" "-150.00"
+                "pnl/unrealized" "0.00"
+                "pnl/closed-trades" "0.00"
+                "broker/equity-observed?" true
+                "report/explanations" []}]})
+
+(defn broker-missing-active-payload
+  [date]
+  {"report/date" date
+   "report/rendered?" true
+   "accounts" [{"account/id" "account/alpaca/chestnut-paper"
+                "report/date" date
+                "trade/closed-count" 1
+                "order/count" 2
+                "positions/open-count" 0
+                "positions/open" []
+                "pnl/equity-day" "0.00"
+                "pnl/realized" "20.00"
+                "pnl/unrealized" "0.00"
+                "pnl/closed-trades" "20.00"
+                "broker/equity-observed?" false
+                "report/explanations" []}]})
+
+(deftest valid-trading-day-artifact-with-html-passes
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})]
+      (is (true? (:valid? result)))
+      (is (= :ok (:status result)))
+      (is (= 1 (:checked result)))
+      (is (empty? (:issues result))))))
+
+(deftest broker-missing-active-html-must-not-render-na-headline
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (broker-missing-active-payload "2026-07-02"))
+    (spit html "<html><div class=\"pnl neutral\">n/a</div><div class=\"stat-row\"><span class=\"k\">Broker equity P&amp;L</span><span>n/a</span></div></html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (contains? codes :report/daily-html-broker-equity-missing-renders-na-headline)))))
+
+(deftest broker-missing-active-html-realized-fallback-passes
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (broker-missing-active-payload "2026-07-02"))
+    (spit html "<html><div class=\"pnl positive\" title=\"Broker day P&amp;L was unavailable; headline falls back to realized closed-trade P&amp;L.\">$20.00</div><div class=\"stat-row\"><span class=\"k\">Broker equity P&amp;L</span><span>unavailable</span></div></html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})]
+      (is (true? (:valid? result))))))
+
+(deftest valid-trading-day-artifact-writes-and-verifies-manifest
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :write-manifests? true
+                                                 :require-manifests? true})]
+      (is (true? (:valid? result)))
+      (is (= :ok (:status result)))
+      (is (os.path/exists manifest))
+      (is (= 1 (count (:manifest-writes result))))
+      (is (empty? (:issues result))))))
+
+(deftest required-manifest-missing-fails
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (valid-payload "2026-07-02"))
+    (spit (os.path/join dir "20260702.html") "<html>ok</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/missing-daily-artifact-manifest (:code %))
+                (:issues result))))))
+
+(deftest validation-filename-date-must-match-payload-date
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (valid-payload "2026-07-01"))
+    (spit (os.path/join dir "20260702.html") "<html>wrong day</html>")
+    (spit (os.path/join dir "20260701.html") "<html>payload day</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :write-manifests? true
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (= 0 (count (:manifest-writes result))))
+      (is (some #(= :report/validation-date-filename-mismatch (:code %))
+                (:issues result))))))
+
+(deftest html-mutated-after-manifest-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (spit html "<html>mutated</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-html-checksum-mismatch (:code %))
+                (:issues result))))))
+
+(deftest validation-mutated-after-manifest-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (spit validation (str (slurp validation) "\n"))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-validation-checksum-mismatch (:code %))
+                (:issues result))))))
+
+(deftest validation-symlink-outside-daily-dir-fails
+  (let [dir (tempfile/mkdtemp)
+        outside (tempfile/mkdtemp)
+        external-validation (os.path/join outside "external.validation.json")
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json external-validation (valid-payload "2026-07-02"))
+    (os/symlink external-validation validation)
+    (spit html "<html>ok</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :write-manifests? true
+                                                 :require-manifests? true})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (contains? codes :report/daily-validation-artifact-outside-daily-dir))
+      (is (= 0 (count (:manifest-writes result)))))))
+
+(deftest html-symlink-outside-daily-dir-fails
+  (let [dir (tempfile/mkdtemp)
+        outside (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        external-html (os.path/join outside "external.html")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit external-html "<html>ok</html>")
+    (os/symlink external-html html)
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :write-manifests? true
+                                                 :require-manifests? true})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (contains? codes :report/daily-html-artifact-outside-daily-dir))
+      (is (= 0 (count (:manifest-writes result)))))))
+
+(deftest manifest-symlink-outside-daily-dir-fails
+  (let [dir (tempfile/mkdtemp)
+        outside (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        external-manifest (os.path/join outside "external.manifest.edn")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (spit external-manifest (slurp manifest))
+    (os/remove manifest)
+    (os/symlink external-manifest manifest)
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-artifact-manifest-outside-daily-dir
+                    (:code %))
+                (:issues result))))))
+
+(deftest manifest-write-does-not-follow-outside-symlink
+  (let [dir (tempfile/mkdtemp)
+        outside (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        external-manifest (os.path/join outside "external.manifest.edn")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (spit external-manifest "sentinel")
+    (os/symlink external-manifest manifest)
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :write-manifests? true
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (= "sentinel" (slurp external-manifest)))
+      (is (= 0 (count (:manifest-writes result))))
+      (is (some #(= :report/daily-artifact-manifest-outside-daily-dir
+                    (:code %))
+                (:issues result))))))
+
+(deftest validation-manifest-semantic-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest
+                 #(assoc %
+                         :validation/status :error
+                         :validation/valid? false
+                         :validation/account-count 999))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (contains? codes :report/daily-artifact-manifest-validation-status-mismatch))
+      (is (contains? codes :report/daily-artifact-manifest-validation-result-mismatch))
+      (is (contains? codes :report/daily-artifact-manifest-account-count-mismatch)))))
+
+(deftest validation-manifest-version-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest #(assoc % :manifest/version 999))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/invalid-daily-artifact-manifest-version (:code %))
+                (:issues result))))))
+
+(deftest validation-manifest-extra-key-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest #(assoc % :unexpected/artifact {:path "/tmp/fake"}))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-artifact-manifest-extra-keys (:code %))
+                (:issues result))))))
+
+(deftest validation-manifest-missing-key-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest #(dissoc % :html/artifact))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-artifact-manifest-missing-keys (:code %))
+                (:issues result))))))
+
+(deftest validation-manifest-artifact-extra-key-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest #(assoc-in %
+                                      [:validation/artifact :unexpected/checksum]
+                                      "fake"))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-artifact-manifest-artifact-extra-keys
+                    (:code %))
+                (:issues result))))))
+
+(deftest validation-manifest-artifact-missing-key-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest #(update % :html/artifact dissoc :sha256))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/daily-artifact-manifest-artifact-missing-keys
+                    (:code %))
+                (:issues result))))))
+
+(deftest validation-manifest-artifact-non-map-forgery-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")
+        manifest (str validation ".manifest.edn")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (audit/audit-daily-validations {:daily-dir dir
+                                    :date "2026-07-02"
+                                    :write-manifests? true
+                                    :require-manifests? true})
+    (rewrite-edn manifest #(assoc % :validation/artifact
+                                  [:path validation
+                                   :sha256 "not-a-map"]))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (contains? codes
+                     :report/daily-artifact-manifest-artifact-invalid-shape))
+      (is (contains? codes
+                     :report/daily-artifact-manifest-artifact-missing-keys)))))
+
+(deftest unreadable-manifest-fails
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (spit (str validation ".manifest.edn") "{not edn")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/unreadable-daily-artifact-manifest (:code %))
+                (:issues result))))))
+
+(deftest non-map-manifest-shape-fails-with-specific-issue
+  (let [dir (tempfile/mkdtemp)
+        validation (os.path/join dir "20260702.validation.json")
+        html (os.path/join dir "20260702.html")]
+    (write-json validation (valid-payload "2026-07-02"))
+    (spit html "<html>ok</html>")
+    (spit (str validation ".manifest.edn") "[:not :a :map]")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"
+                                                 :require-manifests? true})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (contains? codes :report/daily-artifact-manifest-invalid-shape))
+      (is (contains? codes :report/daily-artifact-manifest-missing-keys)))))
+
+(deftest missing-trading-day-validation-fails
+  (let [dir (tempfile/mkdtemp)
+        result (audit/audit-daily-validations {:daily-dir dir
+                                               :date "2026-07-02"})]
+    (is (false? (:valid? result)))
+    (is (some #(= :report/missing-daily-validation-artifact (:code %))
+              (:issues result)))))
+
+(deftest non-trading-day-stale-artifacts-fail
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260703.validation.json")
+                (valid-payload "2026-07-03"))
+    (spit (os.path/join dir "20260703.html") "<html>stale</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-03"})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/non-trading-day-validation-artifact (:code %))
+                (:issues result)))
+      (is (some #(= :report/non-trading-day-html-artifact (:code %))
+                (:issues result))))))
+
+(deftest valid-validation-with-missing-html-fails
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (valid-payload "2026-07-02"))
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/missing-daily-html-artifact (:code %))
+                (:issues result))))))
+
+(deftest invalid-validation-payload-fails
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (invalid-payload "2026-07-02"))
+    (spit (os.path/join dir "20260702.html") "<html>bad</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})]
+      (is (false? (:valid? result)))
+      (is (some #(= :pnl/realized-closed-trades-gap (:code %))
+                (:issues result))))))
+
+(deftest realized-pnl-with-zero-closed-trades-artifact-fails
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (realized-without-closed-trades-payload "2026-07-02"))
+    (spit (os.path/join dir "20260702.html") "<html>bad</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})]
+      (is (false? (:valid? result)))
+      (is (some #(= :pnl/realized-without-closed-trades (:code %))
+                (:issues result))))))
+
+(deftest malformed-validation-json-fails
+  (let [dir (tempfile/mkdtemp)]
+    (spit (os.path/join dir "20260702.validation.json") "{not json")
+    (spit (os.path/join dir "20260702.html") "<html>bad</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :date "2026-07-02"})]
+      (is (false? (:valid? result)))
+      (is (some #(= :report/validation-artifact-unreadable (:code %))
+                (:issues result))))))
+
+(deftest all-mode-audits-every-validation-artifact
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260701.validation.json")
+                (valid-payload "2026-07-01"))
+    (spit (os.path/join dir "20260701.html") "<html>ok</html>")
+    (write-json (os.path/join dir "20260702.validation.json")
+                (invalid-payload "2026-07-02"))
+    (spit (os.path/join dir "20260702.html") "<html>bad</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :all? true})]
+      (is (false? (:valid? result)))
+      (is (= 2 (:checked result)))
+      (is (some #(= :pnl/realized-closed-trades-gap (:code %))
+                (:issues result))))))
+
+(deftest all-mode-empty-directory-fails
+  (let [dir (tempfile/mkdtemp)
+        result (audit/audit-daily-validations {:daily-dir dir
+                                               :all? true})]
+    (is (false? (:valid? result)))
+    (is (= 0 (:checked result)))
+    (is (some #(= :report/no-daily-validation-artifacts (:code %))
+              (:issues result)))))
+
+(deftest all-mode-orphan-html-without-validation-fails
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (valid-payload "2026-07-02"))
+    (spit (os.path/join dir "20260702.html") "<html>ok</html>")
+    (spit (os.path/join dir "20260701.html") "<html>unchecked</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :all? true})]
+      (is (false? (:valid? result)))
+      (is (= 1 (:checked result)))
+      (is (some #(= :report/orphan-daily-html-artifact (:code %))
+                (:issues result))))))
+
+(deftest all-mode-non-trading-day-stale-artifacts-fail
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260703.validation.json")
+                (valid-payload "2026-07-03"))
+    (spit (os.path/join dir "20260703.html") "<html>stale holiday report</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :all? true})
+          codes (set (map :code (:issues result)))]
+      (is (false? (:valid? result)))
+      (is (= 1 (:checked result)))
+      (is (contains? codes :report/non-trading-day-validation-artifact))
+      (is (contains? codes :report/non-trading-day-html-artifact)))))
+
+(deftest all-mode-fails-validation-filename-date-drift
+  (let [dir (tempfile/mkdtemp)]
+    (write-json (os.path/join dir "20260702.validation.json")
+                (valid-payload "2026-07-01"))
+    (spit (os.path/join dir "20260702.html") "<html>wrong day</html>")
+    (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                 :all? true})]
+      (is (false? (:valid? result)))
+      (is (= 1 (:checked result)))
+      (is (some #(= :report/validation-date-filename-mismatch (:code %))
+                (:issues result))))))
+
+(deftest all-mode-deterministic-fuzz-malformed-validation-filenames-fail-cleanly
+  (let [prefixes ["abcdefgh"
+                  "20261301"
+                  "20260230"
+                  "00000000"
+                  "2026abcd"]]
+    (doseq [prefix prefixes]
+      (let [dir (tempfile/mkdtemp)
+            path (os.path/join dir (str prefix ".validation.json"))]
+        (write-json path (valid-payload "2026-07-02"))
+        (let [result (audit/audit-daily-validations {:daily-dir dir
+                                                     :all? true})
+              codes (set (map :code (:issues result)))]
+          (is (false? (:valid? result)))
+          (is (= 1 (:checked result)))
+          (is (contains? codes :report/validation-filename-date-unparseable))
+          (is (contains? codes :report/validation-date-filename-mismatch)))))))

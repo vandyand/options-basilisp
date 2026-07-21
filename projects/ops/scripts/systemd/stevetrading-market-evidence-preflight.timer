@@ -1,0 +1,11 @@
+[Unit]
+Description=Preflight SteveTrading market evidence capture before open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:10:00 America/New_York
+AccuracySec=1min
+Persistent=true
+Unit=stevetrading-market-evidence-preflight.service
+
+[Install]
+WantedBy=timers.target

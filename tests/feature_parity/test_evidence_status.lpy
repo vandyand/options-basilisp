@@ -1,0 +1,74 @@
+(ns feature-parity.test-evidence-status
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.feature-parity.evidence-status :as evidence-status]))
+
+(defn- contains?
+  [text needle]
+  (>= (.find text needle) 0))
+
+(deftest markdown-surfaces-historical-and-matched-parity-windows
+  (let [payload {"target_date" "2026-07-05"
+                 "ok?" true
+                 "unmask_apply_ready?" true
+                 "reasons" []
+                 "readiness" {"verdict" "PASS"}
+                 "manifest_verification" {"valid?" true}
+                 "manifest" {"payload_example_count" 12
+                             "artifact_count" 40
+                             "diagnostics" {"prediction_delta" {"available" true}
+                                            "parity_gate" {"available" true}
+                                            "unlock_plan" {"available" true}
+                                            "blocked_provenance" {"available" true
+                                                                  "formula_provenance_missing" 0}
+                                            "greek_feature_reconstruction" {"available" true
+                                                                            "candidate_reconstructable" 8}
+                                            "greek_reconstruction_promotion" {"available" true
+                                                                              "coverage_ok" true
+                                                                              "evaluated_count" 60
+                                                                              "candidate_count" 1}
+                                            "v3_unlock" {"available" true
+                                                         "recomputed_candidate_now" 2}
+                                            "historical_feature_cohort" {"available" true
+                                                                         "ok" true
+                                                                         "rows" 120
+                                                                         "features" 918
+                                                                         "start_time" "09:30:00"
+                                                                         "end_time" "10:40:00"
+                                                                         "first_time" "2026-07-05T13:30:00Z"
+                                                                         "last_time" "2026-07-05T14:40:00Z"}
+                                            "matched_feature_parity" {"available" true
+                                                                      "matched_rows" 120
+                                                                      "feature_count" 918
+                                                                      "problem_feature_count" 0
+                                                                      "matched_start" "2026-07-05T13:30:00Z"
+                                                                      "matched_end" "2026-07-05T14:40:00Z"
+                                                                      "max_abs_deviation" 0.0
+                                                                      "min_correlation" 1.0}}
+                             "raw_unlock" {"candidate_count" 4
+                                           "unmask_dry_run_candidate_count" 4
+                                           "unmask_dry_run_removed_total" 4
+                                           "unmask_dry_run_results" [{"account" "chestnut"
+                                                                      "removed" 4
+                                                                      "missing" 0
+                                                                      "planned_after_sha256" "after-chestnut-sha"}]
+                                           "verified_apply_available" false
+                                           "unsupported_neutralized" 0}}
+                 "verified_apply_validation" {"available" true
+                                              "target_matches_request" true
+                                              "candidate_count" 4
+                                              "apply_safe" true}
+                 "paths" {"manifest" "/tmp/manifest.json"
+                          "status" "/tmp/status.json"
+                          "readiness" "/tmp/readiness.json"
+                          "probe" "/tmp/probe.json"
+                          "payload_verification" "/tmp/payload.json"
+                          "neutralization" "/tmp/neutralization.json"
+                          "verified_apply_validation" "/tmp/verified.json"}}
+        markdown (evidence-status/markdown payload)]
+    (testing "operator-critical parity timing is visible without opening JSON"
+      (is (contains? markdown "Status: `OK`"))
+      (is (contains? markdown "Readiness: `PASS`"))
+      (is (contains? markdown
+                     "Historical cohort: available=`true` ok=`true` rows=`120` features=`918` window=`09:30:00-10:40:00` times=`2026-07-05T13:30:00Z..2026-07-05T14:40:00Z`"))
+      (is (contains? markdown
+                     "Matched parity: available=`true` rows=`120` features=`918` problems=`0` window=`2026-07-05T13:30:00Z..2026-07-05T14:40:00Z` max_abs_dev=`0.0` min_corr=`1.0`")))))

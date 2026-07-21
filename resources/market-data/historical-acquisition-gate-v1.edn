@@ -1,0 +1,98 @@
+;; Governing acquisition-throughput gate.  This phase chooses request contracts;
+;; it does not download a training corpus and does not select local compaction.
+{:schema-version 1
+ :id :historical-acquisition-gate-v1
+ :status :active
+ :trading-target {:instrument-class :spy-options
+                  :strategy-task-families [:directional :volatility :calendar :skew]}
+ :target {:history-months 24
+          :max-total-wall-clock-seconds 86400
+          :max-complete-corpus-seconds-per-month 3600
+          :max-corpus-bytes 4500000000000
+          :reference-month {:start "2026-06-01T00:00:00Z"
+                            :end "2026-07-01T00:00:00Z"
+                            :trading-sessions 21}
+          :derived-max-seconds-per-session 171.43}
+ :policy {:budget-scope :complete-selected-corpus-not-per-source
+          :bulk-downloads-before-gate :prohibited
+          :local-compaction-study :deferred
+          :metadata-only-estimation :allowed
+          :pilot-requirements [:bounded-payload-bytes
+                               :bounded-wall-clock
+                               :sanitized-receipt
+                               :no-automatic-expansion]
+          :acceptance "A complete representative month must finish within 3,600 seconds end-to-end; 24 such months must therefore fit within 24 hours."}
+
+ :databento-candidates
+ [{:id :glbx-futures-mbp1-trades
+   :dataset "GLBX.MDP3"
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :schemas ["mbp-1" "trades"]
+   :metadata-receipts
+   ["D:\\SteveTradingData\\manifests\\v1\\acquisition-feasibility\\2026-06-reference-month\\glbx-futures-mbp1.json"
+    "D:\\SteveTradingData\\manifests\\v1\\acquisition-feasibility\\2026-06-reference-month\\glbx-futures-trades.json"]
+   :calibration-glob "D:\\SteveTradingData\\manifests\\v1\\databento\\GLBX.MDP3\\hard\\databento-glbx-futures-full-universe-hour-*\\trade_date=*\\run=*.json"}
+
+  {:id :glbx-es-options-mbp1-trades
+   :dataset "GLBX.MDP3"
+   :symbols ["ES.OPT"]
+   :schemas ["mbp-1" "trades"]
+   :metadata-receipts
+   ["D:\\SteveTradingData\\manifests\\v1\\acquisition-feasibility\\2026-06-reference-month\\glbx-es-options-mbp1.json"
+    "D:\\SteveTradingData\\manifests\\v1\\acquisition-feasibility\\2026-06-reference-month\\glbx-es-options-trades.json"]
+   :calibration-glob "D:\\SteveTradingData\\manifests\\v1\\databento\\GLBX.MDP3\\hard\\databento-glbx-es-options-full-universe-hour-*\\trade_date=*\\run=*.json"}
+
+  {:id :equs-mini-mbp1-trades
+   :dataset "EQUS.MINI"
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN"
+             "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :schemas ["mbp-1" "trades"]
+   :metadata-receipts
+   ["D:\\SteveTradingData\\manifests\\v1\\acquisition-feasibility\\2026-06-reference-month\\equs-mini-mbp1.json"
+    "D:\\SteveTradingData\\manifests\\v1\\acquisition-feasibility\\2026-06-reference-month\\equs-mini-trades.json"]
+   :calibration-glob "D:\\SteveTradingData\\manifests\\v1\\databento\\EQUS.MINI\\hard\\databento-equs-mini-full-universe-hour-*\\trade_date=*\\run=*.json"}]
+
+ :thetadata-evidence
+ [{:id :thetadata-option-quote-trade-full-chain-tick
+   :status :fails-observed-throughput
+   :symbols ["SPY" "SPX" "SPXW" "VIX" "VIXW"]
+   :observed-market-window-seconds 900
+   :observed-wall-clock-seconds 5271.79
+   :observed-payload-bytes 20494740624
+   :note "The corrected receipt-derived runtime is 87.86 minutes, not 5.5 hours. Full-chain tick retrieval remains grossly outside the gate."}
+  {:id :thetadata-index-tick
+   :status :plausible-from-observed-throughput
+   :symbols ["NDX" "RUT" "RVX" "SPX" "TNX" "VIX" "VIXN"]
+   :observed-one-hour-wall-clock-seconds [6.38 6.89 7.53 5.79]
+   :note "VIXN was unavailable in the measured date and may not be silently counted as delivered."}
+  {:id :thetadata-spy-option-trades-csv
+   :status :passes-five-session-pilot-representative-month-pending
+   :symbols ["SPY"]
+   :event-class :trade
+   :format :csv
+   :format-equivalence {:window "2026-07-10T09:30:00-09:31:00 America/New_York"
+                        :events 8844
+                        :fields 14
+                        :mismatched-rows 0
+                        :ndjson-bytes 2393305
+                        :csv-bytes 872277
+                        :csv-byte-reduction-pct 63.55
+                        :http-gzip-honored false}
+   :concurrency-evidence {:maximum-entitled 4
+                          :fixed-window-sequential-seconds 60.88
+                          :fixed-window-four-way-seconds 41.01
+                          :observed-speedup 1.48
+                          :full-session-pair-seconds 163.83
+                          :effective-seconds-per-session 81.92}
+   :screening-estimate {:history-months 24
+                        :wire-gib 70.7
+                        :wall-clock-hours-range [11 18]}
+   :note "CSV is a lossless wire representation, not aggregation. A complete representative month must pass before a two-year bulk request."}]
+
+ :unestimated-vendor-side-candidates
+ [{:id :thetadata-spy-trade-quote
+   :reason "Event-driven trade records paired by the vendor with the last quote may bound volume, but live reconstruction parity and throughput are not yet qualified."}
+  {:id :thetadata-spy-interval-quote
+   :reason "Server-side quote intervals exist, but no interval is accepted before a bounded retrieval pilot and later SPY-options task evaluation."}
+  {:id :databento-batch-dbn-zstd
+   :reason "Metadata gives exact billable size; a no-expansion batch/parallel pilot must measure whether compressed delivery can meet the aggregate monthly wall-clock gate."}]}

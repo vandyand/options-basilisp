@@ -1,0 +1,59 @@
+;; Validate a canonical report-day projection from EDN or JSON.
+;;
+;; Usage:
+;;   .venv/bin/basilisp run scripts/validate_report_day.lpy -- report.edn
+;;   .venv/bin/basilisp run scripts/validate_report_day.lpy -- report.json
+;;
+;; Exit 0 only when status is :ok, 1 when validation finds errors or warnings,
+;; 2 for usage/input errors.
+(import glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[basilisp.edn :as edn]
+         '[stevetrading.reporting.core :as reporting])
+
+(defn- usage
+  []
+  (println "usage: basilisp run scripts/validate_report_day.lpy -- <report-day.edn|report-day.json>"))
+
+(defn- read-report
+  [path]
+  (let [text (if (= "-" path)
+               (.read (.-stdin sys))
+               (slurp path))]
+    (if (.endswith path ".json")
+      (reporting/external->canonical (json/loads text))
+      (edn/read-string text))))
+
+(let [argv (vec *command-line-args*)]
+  (cond
+    (and (= 1 (count argv))
+         (or (= "-h" (first argv)) (= "--help" (first argv))))
+    (do
+      (usage)
+      (python/exit 0))
+
+    (not= 1 (count argv))
+    (do
+      (usage)
+      (python/exit 2))
+
+    (.startswith (str (first argv)) "--")
+    (do
+      (binding [*out* *err*]
+        (println (str "unknown argument: " (first argv))))
+      (python/exit 2))
+
+    :else
+    (try
+      (let [result (reporting/validate-report-day (read-report (first argv)))]
+        (println (edn/write-string result))
+        (python/exit (if (= :ok (:status result)) 0 1)))
+      (catch python/Exception e
+        (binding [*out* *err*]
+          (println "FATAL" (str e)))
+        (python/exit 2)))))

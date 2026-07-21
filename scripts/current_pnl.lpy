@@ -1,0 +1,39 @@
+;; Basilisp current-day P&L entry point.
+;;
+;; Usage:
+;;   .venv/bin/basilisp run scripts/current_pnl.lpy -- all --markdown
+(import datetime glob os os.path sys zoneinfo)
+
+(defn default-repo-root []
+  (let [cwd (os/getcwd)
+        shared "/opt/stevetrading/shared"]
+    (cond
+      (os.environ/get "STEVE_REPO_ROOT") (os.environ/get "STEVE_REPO_ROOT")
+      (os.path/exists (os.path/join cwd "live_runtime")) cwd
+      (os.path/exists (os.path/join shared "live_runtime")) shared
+      :else cwd)))
+
+(def repo-root (default-repo-root))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.current-pnl.core :as pnl])
+
+(defn now-label
+  []
+  (.strftime (datetime.datetime/now (zoneinfo/ZoneInfo "America/New_York"))
+             "%Y-%m-%d %H:%M:%S %Z"))
+
+(try
+  (let [{:keys [groups output]} (pnl/parse-args (vec *command-line-args*))
+        rows (pnl/rows {:groups groups :repo-root repo-root})
+        rendered (case output
+                   :markdown (pnl/render-markdown rows (now-label))
+                   (pnl/render-markdown rows (now-label)))]
+    (println rendered)
+    (python/exit (if (seq rows) 0 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

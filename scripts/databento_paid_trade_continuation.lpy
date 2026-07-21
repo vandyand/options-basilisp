@@ -1,0 +1,175 @@
+;; Wait for the zero-cost Databento trade queue, then use a globally bounded
+;; sub-$10 research allowance on the two economically efficient admitted
+;; classes.  Requests are sequential so independent preflights cannot race the
+;; global budget.
+(import argparse datetime decimal json os pathlib subprocess time traceback zoneinfo)
+
+(def eastern (zoneinfo/ZoneInfo "America/New_York"))
+(def zero-progress
+  (pathlib/Path "D:\\SteveTradingData\\manifests\\v1\\overnight\\databento-hard-trades-20260720.json"))
+(def paid-progress
+  (pathlib/Path "D:\\SteveTradingData\\manifests\\v1\\overnight\\databento-paid-hard-trades-20260720.json"))
+(def manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+
+(def lanes
+  [{"zero_id" "databento-glbx-es-options-trades-backfill"
+    "paid_id" "databento-glbx-es-options-trades-paid-backfill"
+    "dataset" "GLBX.MDP3" "stype_in" "parent" "symbols" "ES.OPT"
+    "floor" "2010-06-07" "budget" (decimal/Decimal "3.75")}
+   {"zero_id" "databento-equs-mini-15-symbol-trades-backfill"
+    "paid_id" "databento-equs-mini-15-symbol-trades-paid-backfill"
+    "dataset" "EQUS.MINI" "stype_in" "raw_symbol"
+    "symbols" "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,AMZN,META,GOOGL,NFLX,AVGO,PLTR,XLF"
+    "floor" "2023-03-28" "budget" (decimal/Decimal "5.75")}])
+
+(defn now-et [] (datetime.datetime/now eastern))
+(defn now-iso [] (.isoformat (now-et)))
+(defn load-json [path]
+  (with-open [source (python/open (str path) "r" ** :encoding "utf-8")] (json/load source)))
+(defn atomic-json! [path payload]
+  (let [target (pathlib/Path path) temp (.with_suffix target (str (.-suffix target) ".tmp"))]
+    (.mkdir (.-parent target) ** :parents true :exist_ok true)
+    (spit (str temp) (str (json/dumps payload ** :indent 2 :sort_keys true :default str) "\n"))
+    (os/replace (str temp) (str target))))
+(defn parse-date [text] (datetime.date/fromisoformat (subs text 0 10)))
+(defn iso-z [date] (str (.isoformat date) "T00:00:00Z"))
+(defn prior-month-start [date]
+  (let [first (.replace date ** :day 1)]
+    (.replace (- first (datetime/timedelta ** :days 1)) ** :day 1)))
+
+(defn paid-tasks [lane blocked]
+  (let [floor (parse-date (get lane "floor"))
+        first-start (parse-date (.get blocked "start"))
+        first-end (parse-date (.get blocked "end"))]
+    (loop [start first-start end first-end out []]
+      (if (< start floor)
+        out
+        (let [actual-start (max start floor)
+              task (python/dict
+                    [#py ("class_id" (get lane "paid_id")) #py ("dataset" (get lane "dataset"))
+                     #py ("stype_in" (get lane "stype_in")) #py ("symbols" (get lane "symbols"))
+                     #py ("start" (iso-z actual-start)) #py ("end" (iso-z end))])]
+          (recur (prior-month-start start) start (conj out task)))))))
+
+(defn receipt-for [task]
+  (let [date (subs (.get task "start") 0 10)
+        folder (.joinpath manifest-root "databento" (.get task "dataset") "hard"
+                          (.get task "class_id") (str "trade_date=" date))
+        paths (if (.exists folder) (vec (.glob folder "run=*.json")) [])]
+    (when (seq paths)
+      (let [path (last (sort-by str paths)) receipt (load-json path)
+            payloads (.get receipt "raw_payloads" (python/list))
+            preflight (.get receipt "cost_preflight" (python/dict))]
+        {"path" (str path) "receipt" receipt
+         "ok" (and (= (.get receipt "started_at") (.get task "start"))
+                   (= (.get receipt "ended_at") (.get task "end"))
+                   (= (.get preflight "approved") true)
+                   (every? #(and (> (or (.get % "bytes") 0) 0) (.get % "sha256")) payloads))
+         "bytes" (sum (map #(or (.get % "bytes") 0) payloads))
+         "cost" (decimal/Decimal (str (.get preflight "quoted_total_cost_usd")))}))))
+
+(defn command [args task ceiling]
+  (python/list
+   [(str (.resolve (pathlib/Path (.-basilisp_exe args))))
+    "run" (str (.resolve (pathlib/Path (.-collector args))))
+    "--dataset" (.get task "dataset") "--class-id" (.get task "class_id")
+    "--admission" "hard" "--symbols" (.get task "symbols")
+    "--stype-in" (.get task "stype_in") "--schemas" "trades"
+    "--start" (.get task "start") "--end" (.get task "end")
+    "--max-total-cost-usd" (str ceiling)
+    "--max-total-billable-bytes" "4294967296"]))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--cutoff-et" ** :default "2026-07-20T08:00:00-04:00")
+    (.add_argument parser "--global-budget-usd" ** :default "9.50")
+    (.add_argument parser "--basilisp-exe" ** :default ".venv\\Scripts\\basilisp.exe")
+    (.add_argument parser "--collector" ** :default "scripts\\databento_event_collection.lpy")
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        cutoff (datetime.datetime/fromisoformat (.-cutoff_et args))
+        global-budget (decimal/Decimal (.-global_budget_usd args))
+        repo-root (.-parent (.-parent (.resolve (pathlib/Path (.-collector args)))))
+        state (python/dict
+               [#py ("schema_version" 1) #py ("job" "databento-paid-hard-trades-continuation")
+                #py ("started_at" (now-iso)) #py ("cutoff_et" (.-cutoff_et args))
+                #py ("global_budget_usd" (str global-budget)) #py ("spent_usd" "0")
+                #py ("status" "waiting-for-zero-cost-queue") #py ("completed_results" (python/list))])]
+    (when-not (os.environ/get "DATABENTO_API_KEY")
+      (throw (python/RuntimeError "missing DATABENTO_API_KEY")))
+    (atomic-json! paid-progress state)
+    (while (and (< (now-et) cutoff)
+                (or (not (.exists zero-progress))
+                    (not (.get (load-json zero-progress) "final_status"))))
+      (time/sleep 15.0))
+    (if (>= (now-et) cutoff)
+      (do (.__setitem__ state "status" "cutoff-before-paid-continuation")
+          (.__setitem__ state "finished_at" (now-iso)) (atomic-json! paid-progress state) state)
+      (let [zero-state (load-json zero-progress)
+            zero-results (.get zero-state "completed_results" (python/list))
+            lane-states (python/list)
+            spent (atom (decimal/Decimal "0"))]
+        (doseq [lane lanes]
+          (let [blocked (first (filter #(and (= (.get % "class_id") (get lane "zero_id"))
+                                             (= (.get % "status") "blocked-or-failed")) zero-results))]
+            (when blocked
+              (.append lane-states
+                       (python/dict [#py ("lane" (python/dict lane))
+                                     #py ("remaining" (get lane "budget"))
+                                     #py ("tasks" (python/list (paid-tasks lane blocked)))
+                                     #py ("active" true)])))))
+        (.__setitem__ state "status" "downloading-paid-continuation")
+        (.__setitem__ state "lane_count" (count lane-states))
+        (atomic-json! paid-progress state)
+        (while (and (< (now-et) cutoff)
+                    (< @spent global-budget)
+                    (some #(.get % "active") lane-states))
+          (doseq [lane-state lane-states
+                  :when (and (< (now-et) cutoff) (.get lane-state "active"))]
+            (let [tasks (.get lane-state "tasks")
+                  remaining (.get lane-state "remaining")
+                  global-remaining (- global-budget @spent)]
+              (if (or (zero? (count tasks)) (<= remaining (decimal/Decimal "0.01")))
+                (.__setitem__ lane-state "active" false)
+                (let [task (.pop tasks 0)
+                      ceiling (min remaining global-remaining)
+                      started (time/monotonic)
+                      completed (subprocess/run (command args task ceiling)
+                                                ** :cwd (str repo-root)
+                                                   :capture_output true :text true :timeout 1800
+                                                   :creationflags (if (= (.-name os) "nt") subprocess/CREATE_NO_WINDOW 0))
+                      receipt (receipt-for task)
+                      ok (and (= (.-returncode completed) 0) receipt (get receipt "ok"))
+                      cost (if ok (get receipt "cost") (decimal/Decimal "0"))
+                      result (python/dict
+                              [#py ("class_id" (.get task "class_id")) #py ("start" (.get task "start"))
+                               #py ("end" (.get task "end")) #py ("ok" (boolean ok))
+                               #py ("elapsed_seconds" (- (time/monotonic) started))
+                               #py ("quoted_cost_usd" (str cost))
+                               #py ("bytes" (if receipt (get receipt "bytes") 0))
+                               #py ("manifest" (if receipt (get receipt "path") nil))
+                               #py ("stderr_tail" (let [stderr (.-stderr completed)]
+                                                    (if (and stderr (pos? (count stderr)))
+                                                      (.__getitem__ stderr (slice (max 0 (- (count stderr) 4000)) nil)) "")))])]
+                  (.append (.get state "completed_results") result)
+                  (if ok
+                    (do (swap! spent + cost)
+                        (.__setitem__ lane-state "remaining" (- remaining cost)))
+                    (.__setitem__ lane-state "active" false))
+                  (.__setitem__ state "spent_usd" (str @spent))
+                  (.__setitem__ state "updated_at" (now-iso))
+                  (atomic-json! paid-progress state))))))
+        (.__setitem__ state "status" (if (>= (now-et) cutoff) "stopped-at-cutoff" "complete-or-budget-limited"))
+        (.__setitem__ state "spent_usd" (str @spent))
+        (.__setitem__ state "finished_at" (now-iso))
+        (atomic-json! paid-progress state)
+        state))))
+
+(try
+  (println (json/dumps (run-main (vec *command-line-args*)) ** :indent 2 :sort_keys true :default str))
+  (python/exit 0)
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

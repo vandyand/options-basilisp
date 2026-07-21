@@ -2,7 +2,7 @@
 Description=Build SteveTrading reports after market close
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 16:30:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:05:00 America/New_York
 Persistent=true
 Unit=stevetrading-reports-build.service
 

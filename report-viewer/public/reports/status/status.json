@@ -1,0 +1,231 @@
+{
+  "dependencies": [
+    {
+      "detail": "inactive on bot@167.233.141.61; market not open",
+      "expected": "active during market hours",
+      "name": "stevetrading-six.service",
+      "status": "idle",
+      "updated_at": "2026-07-03T23:56:35-04:00"
+    },
+    {
+      "detail": "active on bot@167.233.141.61",
+      "expected": "active always",
+      "name": "stevetrading-watchdog.timer",
+      "status": "ok",
+      "updated_at": "2026-07-03T23:56:37-04:00"
+    },
+    {
+      "detail": "active on bot@167.233.141.61",
+      "expected": "active always",
+      "name": "stevetrading-reports-build.timer",
+      "status": "ok",
+      "updated_at": "2026-07-03T23:56:40-04:00"
+    },
+    {
+      "detail": "active on bot@167.233.141.61",
+      "expected": "active always",
+      "name": "stevetrading-status-dashboard.timer",
+      "status": "ok",
+      "updated_at": "2026-07-03T23:56:42-04:00"
+    },
+    {
+      "detail": "not responding via bot@167.233.141.61 outside market hours",
+      "expected": "healthy during market hours; expected off outside market hours",
+      "name": "ThetaData Terminal",
+      "status": "idle",
+      "updated_at": "2026-07-03T23:56:44-04:00"
+    }
+  ],
+  "generated_at": "2026-07-03T23:56:35-04:00",
+  "initiatives": [
+    {
+      "detail": "Probe option quote/OHLC/open-interest/native-Greek/index/stock surfaces, map entitlement gaps, and only unmask features after fresh parity gates pass.",
+      "name": "ThetaData Feature Unlock",
+      "priority": "P0",
+      "status": "active"
+    },
+    {
+      "detail": "Keep Alpaca paper and local sim running; verify no stuck positions, stale facts, rejected exits, or report blind spots.",
+      "name": "Live Safety",
+      "priority": "P0",
+      "status": "active"
+    },
+    {
+      "detail": "Deploy/verify Lynx no-quote option close handling and Parrot SPY share shorting before the next full session.",
+      "name": "Execution Fixes",
+      "priority": "P0",
+      "status": "active"
+    },
+    {
+      "detail": "Export live tapes, replay tapes, fill alignment, and matched cohorts from facts DBs.",
+      "name": "Evidence Pipeline",
+      "priority": "P1",
+      "status": "active"
+    },
+    {
+      "detail": "Keep Steve V2 live-vs-replay feature parity on WATCH until exact replay behavior is generated and aligned.",
+      "name": "Feature/Behavior Parity",
+      "priority": "P1",
+      "status": "watch"
+    },
+    {
+      "detail": "Do not run performance significance tests until data, behavior, and execution parity gates are green.",
+      "name": "Same-Population Stats",
+      "priority": "P2",
+      "status": "blocked"
+    },
+    {
+      "detail": "Open or configure a Level-4 options paper account for naked puts/short-vol and other volatility bots Alpaca cannot support.",
+      "name": "L4 Options Paper Brokerage",
+      "priority": "P2",
+      "status": "needed"
+    }
+  ],
+  "overall": {
+    "bad": 0,
+    "idle": 10,
+    "ok": 3,
+    "status": "ok",
+    "unknown": 0,
+    "warn": 0
+  },
+  "session": {
+    "close_at": "2026-07-03T16:00-04:00",
+    "date": "2026-07-03",
+    "is_market_hours": false,
+    "is_trading_day": false,
+    "label": "market-closed-holiday-or-weekend",
+    "open_at": "2026-07-03T09:30-04:00"
+  },
+  "sources": [],
+  "strategy_rows": [
+    {
+      "account_id": "account/alpaca/chestnut-paper",
+      "age_minutes": null,
+      "detail": "no facts found in today's facts DBs",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "alpaca-paper",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "CHESTNUT",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "strategy/steve-v2/chestnut/v1"
+    },
+    {
+      "account_id": "account/alpaca/lynx-paper",
+      "age_minutes": null,
+      "detail": "no facts found in today's facts DBs",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "alpaca-paper",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "LYNX",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "strategy/steve-v2/lynx/v1"
+    },
+    {
+      "account_id": "account/alpaca/moose-paper",
+      "age_minutes": null,
+      "detail": "no facts found in today's facts DBs",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "alpaca-paper",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "MOOSE",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "strategy/steve-v2/moose/v1"
+    },
+    {
+      "account_id": "account/alpaca/oak-paper",
+      "age_minutes": null,
+      "detail": "no facts found in today's facts DBs",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "alpaca-paper",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "OAK",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "strategy/steve-v2/oak/v1"
+    },
+    {
+      "account_id": "account/alpaca/parrot-paper",
+      "age_minutes": null,
+      "detail": "no facts found in today's facts DBs",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "alpaca-paper",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "PARROT",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "strategy/steve-v2/parrot/v1"
+    },
+    {
+      "account_id": "account/alpaca/dolphin-paper",
+      "age_minutes": null,
+      "detail": "no facts found in today's facts DBs",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "alpaca-paper",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "DOLPHIN",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "strategy/steve-v2/dolphin/v1"
+    },
+    {
+      "account_id": "sim",
+      "age_minutes": null,
+      "detail": "no sim-local-fleet facts DB found for 2026-07-03",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "local-sim",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "Local Sim Fleet",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "sim-local-fleet"
+    },
+    {
+      "account_id": "sim",
+      "age_minutes": null,
+      "detail": "no sim-vt-session facts DB found for 2026-07-03",
+      "facts": 0,
+      "faults": 0,
+      "fills": 0,
+      "group": "local-sim",
+      "intents": 0,
+      "last_fact_at": null,
+      "name": "V2 Vol/Term Sim",
+      "rejects": 0,
+      "signals": 0,
+      "status": "idle",
+      "strategy_id": "sim-vt-session"
+    }
+  ]
+}

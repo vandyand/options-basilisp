@@ -1,0 +1,115 @@
+;; Authenticated static server for generated Tran reports.
+;;
+;; Environment:
+;;   REPORTS_HOST                default 0.0.0.0
+;;   REPORTS_PORT                default 8080
+;;   REPORTS_ROOT                default shared Data-Preprocessor public dir
+;;   REPORTS_USER                default stevetrading
+;;   REPORTS_PASSWORD_SHA256     empty disables auth
+(import base64 hashlib hmac http.server functools os os.path sys)
+
+(def public-paths #{"/reports/status/status.json"
+                    "/reports/status/status.validation.json"
+                    "/reports/status/status.publish.json"})
+
+(def required-startup-artifacts ["reports/status/status.json"
+                                 "reports/status/status.validation.json"
+                                 "reports/status/status.publish.json"
+                                 "reports/status/index.html"])
+
+(defn path-only
+  [self]
+  (nth (.split (.-path self) "?" 1) 0))
+
+(defn authorized?
+  [self]
+  (if (and (= "1" (os/getenv "REPORTS_PUBLIC_STATUS" ""))
+           (contains? public-paths (path-only self)))
+    true
+    (let [expected-user (os/getenv "REPORTS_USER" "stevetrading")
+          expected-hash (os/getenv "REPORTS_PASSWORD_SHA256" "")]
+      (if (= expected-hash "")
+        true
+        (let [auth (.get (.-headers self) "Authorization" "")]
+          (if-not (.startswith auth "Basic ")
+            false
+            (try
+              (let [decoded (.decode (base64/b64decode (subs auth 6) ** :validate true)
+                                     "utf-8")
+                    parts (.split decoded ":" 1)]
+                (if (not= 2 (count parts))
+                  false
+                  (let [user (nth parts 0)
+                        password (nth parts 1)
+                        got-hash (.hexdigest (hashlib/sha256 (.encode password "utf-8")))]
+                    (and (hmac/compare_digest user expected-user)
+                         (hmac/compare_digest got-hash expected-hash)))))
+              (catch python/Exception _
+                false))))))))
+
+(defn reject!
+  [self]
+  (.send_response self 401)
+  (.send_header self "WWW-Authenticate" "Basic realm=\"Tran Reports\"")
+  (.send_header self "Content-Type" "text/plain; charset=utf-8")
+  (.end_headers self)
+  (.write (.-wfile self) (.encode "authentication required\n" "utf-8")))
+
+(defn do-head
+  [self]
+  (if-not (authorized? self)
+    (reject! self)
+    ((.-do_HEAD http.server/SimpleHTTPRequestHandler) self)))
+
+(defn do-get
+  [self]
+  (if-not (authorized? self)
+    (reject! self)
+    ((.-do_GET http.server/SimpleHTTPRequestHandler) self)))
+
+(defn fail!
+  [message]
+  (binding [*out* *err*]
+    (println message))
+  (python/exit 2))
+
+(defn validate-startup!
+  [root]
+  (let [auth-hash (os/getenv "REPORTS_PASSWORD_SHA256" "")
+        allow-no-auth (= "1" (os/getenv "REPORTS_ALLOW_NO_AUTH" ""))]
+    (when (and (= auth-hash "") (not allow-no-auth))
+      (fail! "REPORTS_PASSWORD_SHA256 is required unless REPORTS_ALLOW_NO_AUTH=1"))
+    (when-not (os.path/isdir root)
+      (fail! (str "REPORTS_ROOT is not a directory: " root)))
+    (when-not (os.path/isdir (os.path/join root "reports"))
+      (fail! (str "REPORTS_ROOT does not contain generated reports/: " root)))
+    (doseq [artifact required-startup-artifacts]
+      (let [path (os.path/join root artifact)]
+        (when-not (os.path/isfile path)
+          (fail! (str "REPORTS_ROOT missing required artifact: " path)))))))
+
+(def Handler
+  (python/type
+   "AuthenticatedStaticHandler"
+   (python/tuple [http.server/SimpleHTTPRequestHandler])
+   (python/dict {"server_version" "SteveTradingReports/1.0"
+                 "_authorized" authorized?
+                 "_reject" reject!
+                 "do_HEAD" do-head
+                 "do_GET" do-get})))
+
+(defn main
+  []
+  (let [host (os/getenv "REPORTS_HOST" "0.0.0.0")
+        port (python/int (os/getenv "REPORTS_PORT" "8080"))
+        root (os/getenv "REPORTS_ROOT"
+                        "/opt/stevetrading/shared/Data-Preprocessor/report-viewer/public")
+        handler (functools/partial Handler ** :directory root)]
+    (validate-startup! root)
+    (let [httpd (http.server/ThreadingHTTPServer (python/tuple [host port]) handler)]
+      (try
+        (.serve_forever httpd)
+        (finally
+          (.server_close httpd))))))
+
+(main)

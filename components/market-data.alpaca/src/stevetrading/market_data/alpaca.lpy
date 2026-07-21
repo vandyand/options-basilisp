@@ -60,7 +60,7 @@
 
 (defn- parse-bars
   "Parse an Alpaca /v2/stocks/<sym>/bars JSON body into ascending
-  [{:t iso :o s :h s :l s :c s :v s} ...] with decimal-string numerics."
+  [{:t iso :o s :h s :l s :c s :v s :vw s :n s} ...] with decimal-string numerics."
   [body]
   (let [data (json/loads body ** :parse_float python/str)
         bars (or (get data "bars") [])]
@@ -75,7 +75,9 @@
               :h (str (get b "h"))
               :l (str (get b "l"))
               :c (str (get b "c"))
-              :v (str (get b "v"))})
+              :v (str (get b "v"))
+              :vw (str (or (get b "vw") (get b "c")))
+              :n (str (or (get b "n") 0))})
            bars)))))
 
 (defn- bars-url
@@ -99,6 +101,8 @@
                  :bar/low (:l bar)
                  :bar/close (:c bar)
                  :bar/volume (:v bar)
+                 :bar/vwap (:vw bar)
+                 :bar/trade-count (:n bar)
                  :data/provider provider
                  :data/provider-ref pref
                  :data/received-at (utc-now-str)

@@ -1,0 +1,145 @@
+;; Matched live-vs-historical feature parity report.
+(import glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/matched_feature_parity_report.lpy -- "
+                "--live-capture live_features_YYYYMMDD.npz "
+                "--historical-npz historical_features_YYYYMMDD.npz "
+                "--feature-names feature_names.json "
+                "[--live-array chestnut] [--historical-array X] "
+                "[--out-dir DIR] [--target-date YYYY-MM-DD] "
+                "[--min-rows N] [--write-unavailable-on-error] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn positive-int-option
+  [remaining arg]
+  (let [raw (option-value remaining arg)
+        value (try
+                (python/int raw)
+                (catch python/Exception _
+                  (throw (python/ValueError (str arg " must be a positive integer: " raw)))))]
+    (when (<= value 0)
+      (throw (python/ValueError (str arg " must be a positive integer: " raw))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:out-dir (os.path/join repo-root fp/default-analysis-dir)}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--live-capture")
+          (recur (nnext remaining) (assoc out :live-capture (option-value remaining arg)))
+
+          (= arg "--historical-npz")
+          (recur (nnext remaining) (assoc out :historical-npz (option-value remaining arg)))
+
+          (= arg "--feature-names")
+          (recur (nnext remaining) (assoc out :feature-names (option-value remaining arg)))
+
+          (= arg "--live-array")
+          (recur (nnext remaining) (assoc out :live-array (option-value remaining arg)))
+
+          (= arg "--historical-array")
+          (recur (nnext remaining) (assoc out :historical-array (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+
+          (= arg "--min-rows")
+          (recur (nnext remaining) (assoc out :min-rows (positive-int-option remaining arg)))
+
+          (= arg "--write-unavailable-on-error")
+          (recur (next remaining) (assoc out :write-unavailable-on-error true))
+
+          (= arg "--write-unavailable")
+          (recur (next remaining) (assoc out :write-unavailable true))
+
+          (= arg "--unavailable-reason")
+          (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))]
+    (if (:write-unavailable opts)
+      (do
+        (when-not (:target-date opts)
+          (throw (python/ValueError "missing required argument for --write-unavailable: --target-date")))
+        (let [{:keys [summary markdown-path csv-path json-path]}
+              (fp/write-matched-feature-parity-unavailable!
+               {:out-dir (:out-dir opts)
+                :target-date (:target-date opts)
+                :min-rows (:min-rows opts)
+                :reason (or (:unavailable-reason opts) "matched feature parity unavailable")
+                :details {"live_capture" (str (:live-capture opts))
+                          "historical_npz" (str (:historical-npz opts))
+                          "feature_names" (str (:feature-names opts))}})]
+          (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+          (println (str "wrote unavailable matched parity artifact " json-path))
+          (println (str "wrote " csv-path))
+          (println (str "wrote " markdown-path))
+          (python/exit 1)))
+      (do
+        (doseq [required [:live-capture :historical-npz :feature-names]]
+          (when-not (get opts required)
+            (throw (python/ValueError (str "missing required argument: --"
+                                           (.replace (name required) "_" "-"))))))
+        (let [{:keys [summary markdown-path csv-path json-path]}
+              (fp/write-matched-feature-parity! opts)]
+          (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+          (println (str "wrote " markdown-path))
+          (println (str "wrote " csv-path))
+          (println (str "wrote " json-path))))))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (let [opts (try
+                 (parse-args (vec *command-line-args*))
+                 (catch python/Exception _ nil))]
+      (when (and opts (:write-unavailable-on-error opts))
+        (let [{:keys [markdown-path csv-path json-path]}
+              (fp/write-matched-feature-parity-unavailable!
+               {:out-dir (:out-dir opts)
+                :target-date (:target-date opts)
+                :min-rows (:min-rows opts)
+                :reason (str e)
+                :details {"live_capture" (str (:live-capture opts))
+                          "historical_npz" (str (:historical-npz opts))
+                          "feature_names" (str (:feature-names opts))}})]
+          (binding [*out* *err*]
+            (println (str e))
+            (println (str "wrote unavailable matched parity artifact " json-path))
+            (println (str "wrote " csv-path))
+            (println (str "wrote " markdown-path)))
+          (python/exit 1))))
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

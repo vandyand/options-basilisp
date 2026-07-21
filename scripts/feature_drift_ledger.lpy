@@ -1,0 +1,157 @@
+;; Persist immutable per-feature feature-parity evidence for an analysis session.
+;; A same-day rerun archives the prior ledger rather than erasing observed drift.
+(import argparse collections csv datetime json os os.path sys)
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    (python/isinstance value python/dict) (python/dict (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ value k))])) (.keys value)))
+    (python/isinstance value python/list) (python/list (map ->jsonable value))
+    :else value))
+
+(def csv-columns
+  ["target_date" "feature" "feature_index" "blocked" "block_reasons"
+   "live_replay_status" "live_replay_max_abs_deviation" "live_replay_mean_abs_deviation"
+   "live_nonfinite_count" "replay_nonfinite_count" "finite_mismatch_count"
+   "live_zero_frac" "replay_zero_frac"
+   "matched_status" "matched_correlation" "matched_max_abs_deviation"
+   "matched_live_zero_frac" "matched_historical_zero_frac"])
+
+(defn parse-date [value]
+  (try
+    (datetime.date/fromisoformat value)
+    value
+    (catch python/Exception _
+      (throw (python/ValueError (str "target date must be YYYY-MM-DD: " value))))))
+
+(defn read-json [path]
+  (with-open [fh (python/open path)]
+    (json/load fh)))
+
+(defn read-csv-by-feature [path]
+  (if (and path (os.path/exists path))
+    (with-open [fh (python/open path ** :newline "")]
+      (into {} (for [row (python/list (csv/DictReader fh))] [(get row "feature") row])))
+    {}))
+
+(defn archive-existing! [path target-date]
+  (when (os.path/exists path)
+    (let [stamp (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y%m%dT%H%M%SZ")
+          archive-dir (os.path/join (os.path/dirname path) "feature_drift_ledger_history" (.replace target-date "-" "") stamp)]
+      (os/makedirs archive-dir ** :exist_ok true)
+      (os/replace path (os.path/join archive-dir (os.path/basename path))))))
+
+(defn csv-value [value]
+  (cond
+    (nil? value) ""
+    (python/isinstance value python/list) (.join ";" (map str value))
+    :else (str value)))
+
+(defn write-csv! [path rows]
+  (with-open [fh (python/open path "w" ** :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer (python/dict (map (fn [column]
+                                               (python/tuple [column (csv-value (get row column))]))
+                                             csv-columns)))))))
+
+(defn write-json! [path payload]
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn matched-blocker [matched]
+  (let [status (get matched "status")]
+    (cond
+      (nil? matched) "matched historical comparison unavailable"
+      (contains? #{"EXACT_MATCH" "MATCH"} status) nil
+      :else (str "matched historical status " (or status "missing")))))
+
+(defn ledger-row [target-date replay matched]
+  (let [replay-status (get replay "status" "MISSING")
+        reasons (vec (remove nil?
+                             [(when (not= replay-status "EXACT_MATCH")
+                                (str "live replay status " replay-status))
+                              (when (pos? (int (or (get replay "live_nonfinite_count") 0)))
+                                "live tensor contains non-finite values")
+                              (when (pos? (int (or (get replay "replay_nonfinite_count") 0)))
+                                "replayed tensor contains non-finite values")
+                              (when (pos? (int (or (get replay "finite_mismatch_count") 0)))
+                                "live and replay finite masks differ")
+                              (matched-blocker matched)]))]
+    {"target_date" target-date
+     "feature" (get replay "feature")
+     "feature_index" (get replay "feature_index")
+     "blocked" (boolean (seq reasons))
+     "block_reasons" reasons
+     "live_replay_status" replay-status
+     "live_replay_max_abs_deviation" (get replay "max_abs_deviation")
+     "live_replay_mean_abs_deviation" (get replay "mean_abs_deviation")
+     "live_nonfinite_count" (get replay "live_nonfinite_count" 0)
+     "replay_nonfinite_count" (get replay "replay_nonfinite_count" 0)
+     "finite_mismatch_count" (get replay "finite_mismatch_count" 0)
+     "live_zero_frac" (get replay "live_zero_frac")
+     "replay_zero_frac" (get replay "replay_zero_frac")
+     "matched_status" (or (get matched "status") "UNAVAILABLE")
+     "matched_correlation" (get matched "correlation")
+     "matched_max_abs_deviation" (get matched "max_abs_deviation")
+     "matched_live_zero_frac" (or (get matched "live_zero_frac") (get matched "live_zero_pct"))
+     "matched_historical_zero_frac" (or (get matched "historical_zero_frac") (get matched "historical_zero_pct"))}))
+
+(defn parser []
+  (let [p (argparse/ArgumentParser)]
+    (.add_argument p "--target-date" ** :required true)
+    (.add_argument p "--replay-json" ** :required true)
+    (.add_argument p "--matched-csv")
+    (.add_argument p "--out-dir" ** :required true)
+    (.add_argument p "--code-version")
+    (.add_argument p "--capture-sha256")
+    p))
+
+(defn main [& argv]
+  (let [argv0 (vec argv)
+        separator (first (keep-indexed (fn [idx value] (when (= value "--") idx)) argv0))
+        argv (if (some? separator) (subvec argv0 (inc separator)) argv0)
+        args (.parse_args (parser) (python/list argv))
+        target-date (parse-date (.-target_date args))
+        replay-path (.-replay_json args)
+        out-dir (.-out_dir args)]
+    (when-not (os.path/exists replay-path)
+      (throw (python/ValueError (str "replay JSON is missing: " replay-path))))
+    (let [replay-payload (read-json replay-path)
+          replay-rows (get replay-payload "feature_rows")]
+      (when-not (python/isinstance replay-rows python/list)
+        (throw (python/ValueError "replay JSON must contain feature_rows")))
+      (os/makedirs out-dir ** :exist_ok true)
+      (let [matched-by-feature (read-csv-by-feature (.-matched_csv args))
+            rows (vec (map #(ledger-row target-date % (get matched-by-feature (get % "feature"))) replay-rows))
+            stamp (.replace target-date "-" "")
+            json-path (os.path/join out-dir (str "feature_drift_ledger_" stamp ".json"))
+            csv-path (os.path/join out-dir (str "feature_drift_ledger_" stamp ".csv"))
+            by-replay (into {} (for [[status count] (frequencies (map #(get % "live_replay_status") rows))] [status count]))
+            by-matched (into {} (for [[status count] (frequencies (map #(get % "matched_status") rows))] [status count]))
+            payload {"status" "ok"
+                     "generated_at" (.isoformat (datetime.datetime/now datetime.timezone/utc))
+                     "target_date" target-date
+                     "replay_json" (os.path/abspath replay-path)
+                     "code_version" (.-code_version args)
+                     "capture_sha256" (.-capture_sha256 args)
+                     "matched_csv" (when (and (.-matched_csv args) (os.path/exists (.-matched_csv args))) (os.path/abspath (.-matched_csv args)))
+                     "summary" {"feature_count" (count rows)
+                                "blocked_feature_count" (count (filter #(get % "blocked") rows))
+                                "live_replay_status_counts" by-replay
+                                "matched_status_counts" by-matched}
+                     "features" rows}]
+        (archive-existing! json-path target-date)
+        (archive-existing! csv-path target-date)
+        (write-json! json-path payload)
+        (write-csv! csv-path rows)
+        (println (json/dumps (->jsonable (assoc (get payload "summary") "json_path" json-path "csv_path" csv-path)) ** :sort_keys true))))))
+
+(sys/exit
+ (try
+   (apply main (rest (.-argv sys)))
+   0
+   (catch python/Exception e
+     (binding [*out* *err*] (println (str e)))
+     1)))

@@ -1,0 +1,89 @@
+;; Verify a pulled raw-parity session is complete before downstream analysis uses it.
+(import argparse hashlib json os os.path pathlib sys)
+
+(defn py-list? [value] (python/isinstance value python/list))
+(defn jsonable [value]
+  (cond (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+        (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+        :else value))
+
+(defn sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read fh 1048576)))))
+    (.hexdigest digest)))
+
+(defn read-json [path]
+  (try (json/loads (slurp path)) (catch python/Exception _ nil)))
+
+(defn expected-event-path [root date receipt-path]
+  (let [run-id (.removesuffix (os.path/basename receipt-path) ".json")]
+    (os.path/join root "live" date "stream-events" run-id "events.ndjson")))
+
+(defn stream-evidence [root date]
+  (let [dir (os.path/join root "receipts" date "stream-events")
+        receipts (if (os.path/exists dir) (vec (sort (iterator-seq (.glob (pathlib/Path dir) "*.json")))) [])]
+    (vec (keep (fn [path]
+                 (let [receipt (read-json (str path)) event-path (expected-event-path root date (str path))]
+                   (when receipt
+                     {"receipt_path" (str path) "status" (.get receipt "status")
+                      "market_event_count" (.get (.get receipt "summary") "market_event_count" 0)
+                      "event_path" event-path "event_exists" (os.path/exists event-path)
+                      "event_sha_matches" (and (os.path/exists event-path)
+                                                (= (.get receipt "event_sha256") (sha256-file event-path)))})))
+               receipts))))
+
+(defn result-artifact-path [root result]
+  (let [index (.get result "request_index") venue (or (.get result "historical_venue") "canonical")]
+    (os.path/join root "historical" (str index "-" venue ".json"))))
+
+(defn analyze [root date]
+  (let [manifest-path (os.path/join root "manifests" date "raw-history-requests.json")
+        comparison-path (str manifest-path ".comparison.json")
+        manifest (when (os.path/exists manifest-path) (read-json manifest-path))
+        comparison (when (os.path/exists comparison-path) (read-json comparison-path))
+        streams (stream-evidence root date)
+        captured (vec (filter #(and (= "CAPTURED" (.get % "status"))
+                                    (pos? (.get % "market_event_count" 0))
+                                    (.get % "event_exists") (.get % "event_sha_matches")) streams))
+        results (if comparison (.get comparison "results") [])
+        summary (if comparison (.get comparison "summary") {})
+        missing-responses (vec (for [result results
+                                     :let [path (result-artifact-path root result)]
+                                     :when (not (os.path/exists path))] path))
+        observed-counts (frequencies (map #(get-in % ["comparison" "status"]) results))
+        complete? (and manifest comparison (seq captured) (py-list? results)
+                       (pos? (count results))
+                       (= (count results) (.get summary "requests"))
+                       (= (get observed-counts "PASS" 0) (.get summary "pass" 0))
+                       (= (get observed-counts "FAIL" 0) (.get summary "fail" 0))
+                       (= (get observed-counts "INCONCLUSIVE" 0) (.get summary "inconclusive" 0))
+                       (empty? missing-responses))]
+    {"schema_version" 1 "target_date" date "landing_root" root
+     "status" (if complete? "READY" "PENDING")
+     "manifest_path" manifest-path "comparison_path" comparison-path
+     "stream_receipts" streams "captured_stream_receipts" (count captured)
+     "comparison_summary" summary "comparison_result_count" (count results)
+     "missing_raw_responses" missing-responses}))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--landing-root" ** :required true)
+    (.add_argument parser "--target-date" ** :required true)
+    (.add_argument parser "--out")
+    (.parse_args parser (python/list argv))))
+
+(defn main [argv]
+  (let [args (parse-args argv) payload (analyze (.-landing_root args) (.-target_date args))
+        text (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n")]
+    (when (.-out args)
+      (os/makedirs (os.path/dirname (.-out args)) ** :exist_ok true)
+      (spit (.-out args) text))
+    (println (json/dumps (jsonable payload) ** :sort_keys true))
+    (if (= "READY" (.get payload "status")) 0 1)))
+
+(try (python/exit (main (vec *command-line-args*)))
+     (catch python/Exception e (binding [*out* *err*] (println (str e))) (python/exit 2)))

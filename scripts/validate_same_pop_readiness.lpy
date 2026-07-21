@@ -1,0 +1,67 @@
+(import os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(def analysis-src (os.path/join repo-root "components" "analysis.core" "src"))
+(when-not (contains? (set (python/list (.-path sys))) analysis-src)
+  (.insert (.-path sys) 0 analysis-src))
+
+(require '[basilisp.edn :as edn])
+(require '[stevetrading.analysis.core :as analysis])
+
+(defn usage!
+  []
+  (println
+   (str "usage: basilisp run scripts/validate_same_pop_readiness.lpy -- "
+        "--live-tape <live_tape.csv> "
+        "--replay-tape <replay_tape.csv> "
+        "--live-episodes <episodes_live.csv> "
+        "--replay-episodes <episodes_replay.csv> "
+        "--calibration <sim_fill_calibration.edn> "
+        "[--bucket-seconds 60] [--out <readiness.edn>]")))
+
+(def allowed-options
+  #{"--live-tape" "--replay-tape" "--live-episodes" "--replay-episodes"
+    "--calibration" "--bucket-seconds" "--out" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (usage!)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [{:keys [live-tape replay-tape live-episodes replay-episodes
+                  calibration bucket-seconds out]} (analysis/parse-args args)
+          bucket (analysis/parse-int-arg bucket-seconds 60)]
+      (when (or (nil? live-tape)
+                (nil? replay-tape)
+                (nil? live-episodes)
+                (nil? replay-episodes)
+                (nil? calibration))
+        (usage!)
+        (python/exit 2))
+      (let [result (analysis/same-pop-readiness
+                    {:live-tape live-tape
+                     :replay-tape replay-tape
+                     :live-episodes live-episodes
+                     :replay-episodes replay-episodes
+                     :calibration calibration
+                     :bucket-seconds bucket})
+            printable (dissoc result :alignment)]
+        (when out
+          (spit out (str (edn/write-string result) "\n")))
+        (println (edn/write-string printable))
+        (python/exit (if (:valid? result) 0 1))))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

@@ -1,0 +1,106 @@
+;; Raw market-data collection contract for the Windows external corpus volume.
+;; This is deliberately source-first: no feature, model, or production consumer
+;; may infer a data class from a pathname alone.
+{:schema-version 1
+ :purpose :raw-market-data-collection
+ :storage
+ {:root "D:\\SteveTradingData"
+  :volume {:drive-letter "D"
+           :label "Seagate Hub"
+           :filesystem "exFAT"
+           :require-volume-health :healthy
+           :require-physical-disk-health :healthy}
+  :layout
+  {:raw "raw/v1/<provider>/<dataset>/<admission>/<class>/trade_date=YYYY-MM-DD/run=<utc-run-id>/"
+   :manifests "manifests/v1/<provider>/<dataset>/<admission>/<class>/trade_date=YYYY-MM-DD/run=<utc-run-id>.json"
+   :derived "derived/v1/<feature-or-replay-contract>/"
+   :quarantine "quarantine/v1/<provider>/<dataset>/<class>/"}
+  :immutability "Raw payloads and their receipts are write-once. Derived data is always a separate tree."
+  :rollback "A probationary source is removed or retired only within its own admission/probationary subtree; qualified sources are never co-mingled with it."}
+
+ :required-receipt-fields
+ [:schema-version :provider :dataset :class :admission :schema :stype-in
+  :symbols :started-at :ended-at :collector-revision :raw-payloads
+  :sha256 :cost-preflight :archive-status]
+
+ :admission-states
+ {:qualified-hard "Use permitted only in its declared representation. The minimum shared-interior event match rate is 99.0%; exact comparisons and bounded, documented residuals at or above that threshold are hard parity. Restrictions and finalization rechecks remain binding."
+  :probationary "Collection permitted; excluded from training, backtest, and live feature construction until its promotion gate passes."
+  :quarantined "Retain evidence only; no model use."
+  :rejected "Do not collect further; preserve only the rejection receipt unless an explicit review supersedes it."}
+
+ :classes
+ [{:id :databento-glbx-es-nq-futures-options
+   :provider :databento
+   :dataset "GLBX.MDP3"
+   :admission :qualified-hard
+   :asset-class :options-on-futures
+   :symbols ["ES.OPT" "NQ.OPT"]
+   :stype-in :parent
+   :schemas ["definition" "mbp-1" "trades" "ohlcv-1s" "ohlcv-1m"]
+   :historical {:available true
+                :available-from "2010-06-07"
+                :request-policy :databento-cost-preflight-required
+                :default-max-cost-usd "0"
+                :default-max-billable-bytes 268435456}
+   :live {:available true
+          :verification "ES: 2026-07-17 four-window same-session study, 48,222 exact interior MBP-1 events across 96 activity-stratified contract-window checks and 108/108 ordinary option trades exact. NQ: owner-directed hard admission on 2026-07-20 after a live window exposed 532 active ordinary contracts and its sole observed ordinary trade matched historical exactly; finalized NQ MBP-1 and broader trade replication remain mandatory follow-up evidence, not prerequisites to this admission."}
+   :storage {:raw-format :dbn
+             :partition :trade-date-and-run
+             :contract-mapping :retain-definition-records}
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :boundary-policy :event-time-intersection}
+   :recheck-policy :repeat-on-each-new-seed-session}
+
+  {:id :databento-glbx-sr3-futures-options
+   :provider :databento
+   :dataset "GLBX.MDP3"
+   :admission :probationary
+   :asset-class :options-on-futures
+   :symbols ["SR3.OPT"]
+   :reason "Live MBP-1 was observed on 2026-07-20, but no finalized historical MBP-1 comparison exists and the first window contained zero ordinary SR3 option trades. Do not inherit ES/NQ qualification."
+   :rollback-scope "raw/v1/databento/GLBX.MDP3/probationary/databento-glbx-sr3-futures-options/"}
+
+  {:id :databento-glbx-unavailable-futures-option-parents
+   :provider :databento
+   :dataset "GLBX.MDP3"
+   :admission :rejected
+   :asset-class :options-on-futures
+   :symbols ["RTY.OPT" "ZN.OPT" "ZB.OPT"]
+   :reason "Reference-day historical inventory and isolated 2026-07-20 live definition probes returned zero contracts/events for all three parents."}
+
+  {:id :databento-glbx-futures
+   :provider :databento
+   :dataset "GLBX.MDP3"
+   :admission :qualified-hard
+   :asset-class :futures
+   :manifest-ref "resources/databento/raw-parity-v1.edn"}
+
+  {:id :databento-equs-mini-equities
+   :provider :databento
+   :dataset "EQUS.MINI"
+   :admission :qualified-hard
+   :asset-class :us-equities-etfs-derived-composite
+   :manifest-ref "resources/databento/raw-parity-v1.edn"}
+
+  {:id :thetadata-options
+   :provider :thetadata
+   :dataset :opra-options
+   :admission :qualified-hard
+   :asset-class :us-options
+   :manifest-ref "resources/thetadata/raw-parity-v1.edn"}
+
+  {:id :thetadata-indexes
+   :provider :thetadata
+   :dataset :us-indexes
+   :admission :qualified-hard
+   :asset-class :us-indexes
+   :manifest-ref "resources/thetadata/raw-parity-v1.edn"}
+
+  {:id :alpaca-iex-causal-quote-state
+   :provider :alpaca
+   :dataset :iex
+   :admission :qualified-hard-at-10ms-or-coarser
+   :asset-class :us-equities-etfs-single-exchange
+   :representation :causal-last-quote-state
+   :rule "Raw event multiset is not admitted; only the declared causal state representation is."}]}

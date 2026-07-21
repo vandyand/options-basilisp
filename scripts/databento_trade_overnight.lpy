@@ -1,0 +1,244 @@
+;; Bounded, zero-additional-cost overnight backfill for every Databento raw
+;; trade class currently admitted to the hard-parity corpus.  Work is divided
+;; into restartable month-sized requests and stops launching before market open.
+(import argparse datetime json os pathlib subprocess time traceback zoneinfo)
+
+(def eastern (zoneinfo/ZoneInfo "America/New_York"))
+(def default-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+(def default-progress
+  (pathlib/Path "D:\\SteveTradingData\\manifests\\v1\\overnight\\databento-hard-trades-20260720.json"))
+
+(def classes
+  [{"id" "databento-glbx-futures-six-root-trades-backfill"
+    "dataset" "GLBX.MDP3" "stype_in" "parent"
+    "symbols" "ES.FUT,NQ.FUT,RTY.FUT,ZN.FUT,ZB.FUT,SR3.FUT"
+    "available_from" "2010-06-07"}
+   {"id" "databento-glbx-es-options-trades-backfill"
+    "dataset" "GLBX.MDP3" "stype_in" "parent"
+    "symbols" "ES.OPT" "available_from" "2010-06-07"}
+   {"id" "databento-equs-mini-15-symbol-trades-backfill"
+    "dataset" "EQUS.MINI" "stype_in" "raw_symbol"
+    "symbols" "SPY,QQQ,IWM,AAPL,MSFT,NVDA,AMD,TSLA,AMZN,META,GOOGL,NFLX,AVGO,PLTR,XLF"
+    "available_from" "2023-03-28"}])
+
+(defn now-et [] (datetime.datetime/now eastern))
+(defn now-iso [] (.isoformat (now-et)))
+(defn parse-date [value] (datetime.date/fromisoformat value))
+(defn iso-z [date] (str (.isoformat date) "T00:00:00Z"))
+
+(defn first-of-month [date]
+  (.replace date ** :day 1))
+
+(defn prior-month [date]
+  (let [first (first-of-month date)]
+    (first-of-month (- first (datetime/timedelta ** :days 1)))))
+
+(defn monthly-segments [available-from end-exclusive]
+  (let [floor (parse-date available-from)
+        end (parse-date end-exclusive)]
+    (loop [cursor end out []]
+      (if (<= cursor floor)
+        out
+        (let [month-start (max floor (first-of-month (- cursor (datetime/timedelta ** :days 1))))
+              ;; The completed seed covers [2026-07-06, 2026-07-11). Split
+              ;; July around it so no event bytes are downloaded twice.
+              segments (cond
+                         (and (= month-start (parse-date "2026-07-01"))
+                              (> cursor (parse-date "2026-07-11")))
+                         [[(parse-date "2026-07-11") cursor]
+                          [month-start (parse-date "2026-07-06")]]
+                         :else [[month-start cursor]])]
+          (recur month-start
+                 (into out (filter (fn [[start finish]] (< start finish)) segments))))))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--end-exclusive" ** :default "2026-07-18")
+    (.add_argument parser "--cutoff-et" ** :default "2026-07-20T08:00:00-04:00")
+    (.add_argument parser "--max-workers" ** :type int :default 4)
+    (.add_argument parser "--max-cost-usd-per-request" ** :default "0")
+    (.add_argument parser "--max-billable-bytes-per-request" ** :type int :default 4294967296)
+    (.add_argument parser "--basilisp-exe" ** :default ".venv\\Scripts\\basilisp.exe")
+    (.add_argument parser "--collector" ** :default "scripts\\databento_event_collection.lpy")
+    (.add_argument parser "--manifest-root" ** :default (str default-manifest-root))
+    (.add_argument parser "--progress-path" ** :default (str default-progress))
+    (.add_argument parser "--dry-run" ** :action "store_true")
+    (.parse_args parser (python/list argv))))
+
+(defn atomic-json! [path payload]
+  (let [target (pathlib/Path path)
+        temp (.with_suffix target (str (.-suffix target) ".tmp"))]
+    (.mkdir (.-parent target) ** :parents true :exist_ok true)
+    (spit (str temp) (str (json/dumps payload ** :indent 2 :sort_keys true :default str) "\n"))
+    (os/replace (str temp) (str target))))
+
+(defn task-for [class start end]
+  (python/dict
+   [#py ("class_id" (get class "id")) #py ("dataset" (get class "dataset"))
+    #py ("stype_in" (get class "stype_in")) #py ("symbols" (get class "symbols"))
+    #py ("start" (iso-z start)) #py ("end" (iso-z end))]))
+
+(defn build-tasks [end-exclusive]
+  ;; Interleave source classes by month so a cutoff leaves recent coverage for
+  ;; every admitted class rather than exhausting one source first.
+  (let [lanes (vec (map (fn [class]
+                          (vec (map (fn [[start end]] (task-for class start end))
+                                    (monthly-segments (get class "available_from") end-exclusive))))
+                        classes))
+        max-length (apply max (map count lanes))]
+    (vec (mapcat (fn [index]
+                   (keep (fn [lane] (when (< index (count lane)) (nth lane index))) lanes))
+                 (range max-length)))))
+
+(defn load-json [path]
+  (with-open [source (python/open (str path) "r" ** :encoding "utf-8")]
+    (json/load source)))
+
+(defn receipt-for [manifest-root task]
+  (let [date (subs (.get task "start") 0 10)
+        folder (.joinpath (pathlib/Path manifest-root) "databento" (.get task "dataset") "hard"
+                          (.get task "class_id") (str "trade_date=" date))
+        paths (if (.exists folder) (vec (.glob folder "run=*.json")) [])]
+    (when (seq paths)
+      (let [path (last (sort-by str paths))
+            receipt (load-json path)
+            payloads (.get receipt "raw_payloads" (python/list))
+            preflight (.get receipt "cost_preflight" (python/dict))
+            ok (and (= (.get receipt "started_at") (.get task "start"))
+                    (= (.get receipt "ended_at") (.get task "end"))
+                    (= (set (.get receipt "schemas" (python/list))) #{"trades"})
+                    (= (.get preflight "approved") true)
+                    (pos? (count payloads))
+                    (every? #(and (> (or (.get % "bytes") 0) 0) (.get % "sha256")) payloads))]
+        {"path" (str path) "receipt" receipt "ok" ok
+         "bytes" (sum (map #(or (.get % "bytes") 0) payloads))
+         "quoted_cost_usd" (.get preflight "quoted_total_cost_usd")}))))
+
+(defn completed-task? [manifest-root task]
+  (let [receipt (receipt-for manifest-root task)]
+    (and receipt (get receipt "ok"))))
+
+(defn collector-command [args task]
+  (python/list
+   [(str (.resolve (pathlib/Path (.-basilisp_exe args))))
+    "run" (str (.resolve (pathlib/Path (.-collector args))))
+    "--dataset" (.get task "dataset")
+    "--class-id" (.get task "class_id")
+    "--admission" "hard"
+    "--symbols" (.get task "symbols")
+    "--stype-in" (.get task "stype_in")
+    "--schemas" "trades"
+    "--start" (.get task "start")
+    "--end" (.get task "end")
+    "--max-total-cost-usd" (.-max_cost_usd_per_request args)
+    "--max-total-billable-bytes" (str (.-max_billable_bytes_per_request args))]))
+
+(defn launch! [args task]
+  {"process" (subprocess/Popen
+               (collector-command args task)
+               ** :cwd (str (.resolve (pathlib/Path ".")))
+                  :stdout subprocess/PIPE :stderr subprocess/PIPE :text true
+                  :creationflags (if (= (.-name os) "nt") subprocess/CREATE_NO_WINDOW 0))
+   "task" task "started_at" (now-iso) "started_monotonic" (time/monotonic)})
+
+(defn update-progress! [path state pending running]
+  (.__setitem__ state "updated_at" (now-iso))
+  (.__setitem__ state "pending_count" (count pending))
+  (.__setitem__ state "active_tasks"
+                   (python/list
+                    (map (fn [[_ work]]
+                           (let [task (.get work "task")]
+                             (python/dict [#py ("class_id" (.get task "class_id"))
+                                           #py ("start" (.get task "start"))
+                                           #py ("end" (.get task "end"))])))
+                         (.items running))))
+  (atomic-json! path state))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        _ (when (or (< (.-max_workers args) 1) (> (.-max_workers args) 8))
+            (throw (python/ValueError "--max-workers must be between 1 and 8")))
+        _ (when-not (os.environ/get "DATABENTO_API_KEY")
+            (throw (python/RuntimeError "missing DATABENTO_API_KEY")))
+        all-tasks (build-tasks (.-end_exclusive args))
+        pending (python/list
+                 (remove #(completed-task? (.-manifest_root args) %) all-tasks))
+        cutoff (datetime.datetime/fromisoformat (.-cutoff_et args))
+        state (python/dict
+               [#py ("schema_version" 1) #py ("job" "databento-hard-trades-overnight")
+                #py ("started_at" (now-iso)) #py ("cutoff_et" (.-cutoff_et args))
+                #py ("max_workers" (.-max_workers args))
+                #py ("cost_policy" "fail closed: every request must quote at or below configured ceiling")
+                #py ("max_cost_usd_per_request" (.-max_cost_usd_per_request args))
+                #py ("total_declared_tasks" (count all-tasks))
+                #py ("skipped_completed_tasks" (- (count all-tasks) (count pending)))
+                #py ("completed_results" (python/list))])
+        running (python/dict)
+        blocked-classes (atom #{})]
+    (if (.-dry_run args)
+      (python/dict [#py ("dry_run" true) #py ("tasks" (python/list all-tasks))
+                    #py ("task_count" (count all-tasks)) #py ("pending_count" (count pending))])
+      (do
+        (when (>= (now-et) cutoff)
+          (throw (python/RuntimeError "cutoff already passed; refusing to launch")))
+        (update-progress! (.-progress_path args) state pending running)
+        (while (or (pos? (count pending)) (pos? (count running)))
+          (while (and (pos? (count pending))
+                      (< (count running) (.-max_workers args))
+                      (< (now-et) cutoff))
+            (let [task (.pop pending 0)
+                  class-id (.get task "class_id")]
+              (if (contains? @blocked-classes class-id)
+                (.append (.get state "completed_results")
+                         (python/dict [#py ("class_id" class-id) #py ("start" (.get task "start"))
+                                       #py ("end" (.get task "end")) #py ("ok" false)
+                                       #py ("status" "skipped-after-class-block")]))
+                (let [key (str class-id "|" (.get task "start"))]
+                  (.__setitem__ running key (launch! args task))
+                  (println (str (now-iso) " launched " key))))))
+
+          (doseq [[key work] (vec (.items running))]
+            (let [process (.get work "process")
+                  return-code (.poll process)]
+              (when (not (nil? return-code))
+                (let [[stdout stderr] (.communicate process)
+                      task (.get work "task")
+                      receipt (receipt-for (.-manifest_root args) task)
+                      ok (and (= return-code 0) receipt (get receipt "ok"))
+                      status (if ok "complete" "blocked-or-failed")
+                      result (python/dict
+                              [#py ("class_id" (.get task "class_id"))
+                               #py ("dataset" (.get task "dataset"))
+                               #py ("start" (.get task "start")) #py ("end" (.get task "end"))
+                               #py ("ok" (boolean ok)) #py ("status" status)
+                               #py ("return_code" return-code)
+                               #py ("elapsed_seconds" (- (time/monotonic) (.get work "started_monotonic")))
+                               #py ("bytes" (if receipt (get receipt "bytes") 0))
+                               #py ("quoted_cost_usd" (if receipt (get receipt "quoted_cost_usd") nil))
+                               #py ("manifest" (if receipt (get receipt "path") nil))
+                               #py ("stderr_tail" (if (and stderr (pos? (count stderr)))
+                                                      (.__getitem__ stderr (slice (max 0 (- (count stderr) 4000)) nil)) ""))])]
+                  (.append (.get state "completed_results") result)
+                  (.__delitem__ running key)
+                  (when-not ok (swap! blocked-classes conj (.get task "class_id")))
+                  (println (str (now-iso) " completed " key " ok=" ok
+                                " bytes=" (.get result "bytes")))))))
+
+          (update-progress! (.-progress_path args) state pending running)
+          (when (and (or (pos? (count pending)) (pos? (count running)))
+                     (or (< (now-et) cutoff) (pos? (count running))))
+            (time/sleep 1.0))
+          (when (and (>= (now-et) cutoff) (zero? (count running))) (.clear pending)))
+
+        (.__setitem__ state "blocked_classes" (python/list (sort @blocked-classes)))
+        (.__setitem__ state "finished_at" (now-iso))
+        (.__setitem__ state "final_status" (if (>= (now-et) cutoff) "stopped-at-cutoff" "complete-or-source-limited"))
+        (atomic-json! (.-progress_path args) state)
+        state))))
+
+(try
+  (println (json/dumps (run-main (vec *command-line-args*)) ** :indent 2 :sort_keys true :default str))
+  (python/exit 0)
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

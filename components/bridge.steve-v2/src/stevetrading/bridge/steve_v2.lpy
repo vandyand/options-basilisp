@@ -1,32 +1,30 @@
 (ns stevetrading.bridge.steve-v2
   "Bridge to the six PROVEN Python production strategy brains
   (CHESTNUT/LYNX/MOOSE H3 direction bots + OAK/DOLPHIN/PARROT 2-of-3
-  consensus) living in the Python reference repo (Data-Preprocessor).
+  consensus) trained from the reference Data-Preprocessor artifacts.
 
   ⚠ NOT REPLAY-SAFE (v0): this component holds mutable Python-side state
   (bar deques, greeks-grid history, torch/xgboost model objects). It is a
   stateful adapter, not a fold. Restart = re-prime from history via
   `prime!`. Do NOT wire this into the deterministic replay path until the
-  feature/inference layers are ported natively.
+  model-inference layer is ported natively.
 
   Runtime requirements (NOT needed to load this namespace — everything
   heavy is imported lazily inside `make-bridge` via importlib):
     - torch, xgboost, numpy, scipy, pandas (the REF .venv has them)
     - the REF repo on disk (`:ref-root`), providing:
-        scripts_5yr.live.feature_engine   FeatureEngine (918-feature vector)
-        scripts_5yr.live.model_inference  MultiHeadLiveInference (3 XGB heads)
-        scripts_5yr.live.greeks_grid      GreeksGridBuilder ((6,21,8) grids)
-        scripts_5yr.live.options_fetcher  implied_vol / bs_greeks / time_to_expiry
-          (imported with `alpaca` stub modules injected when the alpaca SDK
-           is absent — we only use its pure Black-Scholes functions)
+        encoder architecture modules under REF/models
+      Feature vectors and option quote → Black-Scholes → Greeks-grid
+      reconstruction are native Basilisp in
+      `stevetrading.feature-parity.raw-unlock`.
 
   Verified Python reference behavior this bridge mirrors:
     - bar_buffers: dict sym→deque of bar dicts for SPY/HYG/TLT/VXX plus
       DERIVED index proxies (data_fetcher.py): SPX = SPY×10, VIX = VXX copy,
       TNX = TLT copy. Production never fetches real SPX/TNX/VIX bars.
     - greeks grids: option chain (strike/right/bid/ask/expiration) →
-      BS implied vol + greeks at r=0.043 → (6,21,8) grid (greeks_grid.py).
-    - preds: FeatureEngine (918,) + grid history → per-bot bundle →
+      BS implied vol + greeks at r=0.043 → (6,21,8) grid (Basilisp).
+    - preds: native Basilisp 918-feature vector + grid history → per-bot bundle →
       (p_long, p_gen, p_short).
     - signal: z = pred / final_target_std (mean anchored at 0), AND-gated
       entry, OR-gated exit hysteresis, per multihead_signal_generator.py /
@@ -74,6 +72,8 @@
     strategy.registry's bridge pipeline path reads its bot's kind from
     the returned map. Tests inject a plain stub
     {:signals-fn (fn [] {:chestnut :long ...})} — no torch needed."
+  (:require [stevetrading.bridge.steve-v2.inference :as inference]
+            [stevetrading.feature-parity.raw-unlock :as raw-unlock])
   (:import collections
            datetime
            importlib
@@ -257,9 +257,9 @@
 (def bots [:chestnut :lynx :moose])
 
 (defn- ensure-alpaca-stub!
-  "options_fetcher.py imports the alpaca SDK at module top but we only use
-  its pure Black-Scholes functions. When alpaca isn't installed (the REF
-  .venv lacks it), inject empty stub modules so the import succeeds."
+  "Some remaining legacy reference modules import the alpaca SDK at module top.
+  When alpaca isn't installed (the REF .venv lacks it), inject empty stub
+  modules so those imports succeed."
   []
   (try
     (importlib/import-module "alpaca")
@@ -285,14 +285,15 @@
         nil))))
 
 (defn- ensure-ref-paths! [ref-root]
-  (let [spath (.-path sys)]
-    (doseq [p [ref-root (str ref-root "/src")]]
+  (let [spath (.-path sys)
+        repo-root (or (os/getenv "STEVE_REPO_ROOT")
+                      (os/getcwd))]
+    (doseq [p [repo-root ref-root (str ref-root "/src")]]
       (when-not (.__contains__ spath p)
         (.insert spath 0 p)))))
 
 (defn- load-npz-dict
-  "np.load an .npz and project the given keys into a python dict
-  (FeatureEngine wants plain dicts for hmm_model / dictionary_atoms)."
+  "np.load an .npz and project the given keys into a python dict."
   [np path keys*]
   (let [npz (.load np path)
         d (python/dict)]
@@ -312,6 +313,76 @@
     (when (:bid bar) (.__setitem__ d "bid" (double (:bid bar))))
     (when (:ask bar) (.__setitem__ d "ask" (double (:ask bar))))
     d))
+
+(defn- maybe-set-double! [d k v]
+  (when (some? v)
+    (.__setitem__ d k (double v))))
+
+(defn- maybe-set-int! [d k v]
+  (when (some? v)
+    (.__setitem__ d k (python/int v))))
+
+(defn- contract->py
+  "Convert Basilisp/Python contract maps into JSON-native dicts.
+
+  json.dumps falls back to stringifying Basilisp maps; that produced sidecars
+  whose contract rows looked populated but were unusable for formula replay.
+  Keep this explicit so capture sidecars are real JSON objects."
+  [c]
+  (let [d (python/dict)
+        right (or (:right c) (get c "right"))
+        expiration (or (:expiration c) (get c "expiration"))]
+    (maybe-set-double! d "strike" (or (:strike c) (get c "strike")))
+    (when (some? right)
+      (.__setitem__ d "right" (str right)))
+    (maybe-set-double! d "bid" (or (:bid c) (get c "bid")))
+    (maybe-set-double! d "ask" (or (:ask c) (get c "ask")))
+    (maybe-set-double! d "bid_size" (or (:bid_size c) (:bid-size c)
+                                        (get c "bid_size") (get c "bid-size")))
+    (maybe-set-double! d "ask_size" (or (:ask_size c) (:ask-size c)
+                                        (get c "ask_size") (get c "ask-size")))
+    (when (some? expiration)
+      (.__setitem__ d "expiration" (str expiration)))
+    (maybe-set-double! d "open" (or (:open c) (get c "open")))
+    (maybe-set-double! d "high" (or (:high c) (get c "high")))
+    (maybe-set-double! d "low" (or (:low c) (get c "low")))
+    (maybe-set-double! d "close" (or (:close c) (get c "close")))
+    (maybe-set-double! d "volume" (or (:volume c) (get c "volume")))
+    (maybe-set-int! d "count" (or (:count c) (get c "count")))
+    (maybe-set-double! d "open_interest" (or (:open_interest c)
+                                             (:open-interest c)
+                                             (get c "open_interest")
+                                             (get c "open-interest")))
+    (maybe-set-double! d "oi" (or (:oi c) (get c "oi")))
+    d))
+
+(defn- contracts->py-list [contracts]
+  (python/list (map contract->py contracts)))
+
+(defn- normalize-capture-time-text
+  "Canonicalize timezone-aware capture timestamps for stable restart de-dupe.
+
+  Naive strings are left untouched because assuming UTC for an ambiguous local
+  wall-clock string would be worse than preserving the caller's exact key."
+  [value]
+  (let [raw (.strip (str (or value "")))]
+    (if (zero? (count raw))
+      raw
+      (try
+        (let [unwrapped (if (and (.startswith raw "#inst \"")
+                                 (.endswith raw "\""))
+                          (subs raw 7 (dec (count raw)))
+                          raw)
+              iso (if (.endswith unwrapped "Z")
+                    (str (subs unwrapped 0 (- (count unwrapped) 1)) "+00:00")
+                    unwrapped)
+              parsed (datetime.datetime/fromisoformat iso)]
+          (if (some? (.-tzinfo parsed))
+            (.strftime (.astimezone parsed (.-utc datetime/timezone))
+                       "%Y-%m-%dT%H:%M:%SZ")
+            raw))
+        (catch python/Exception _
+          raw)))))
 
 (defn- rebuild-proxies!
   "Mirror data_fetcher._update_proxies: SPX = SPY×10 (o/h/l/c/vwap),
@@ -357,29 +428,28 @@
                        <capture-dir>/live_features_<utc-date>.npz
                        (full rewrite per bar, ~MBs) — the live side of
                        the train/serve feature-parity check
+    :capture-provenance — immutable source/semantics map written alongside
+                       every captured model input. A capture without this is
+                       replayable, but is not eligible to certify a new
+                       train/serve data lineage.
 
-  Loads torch/xgboost models eagerly — requires the REF venv."
+  Loads torch/xgboost model inference eagerly — requires the REF venv."
   [{:keys [ref-root bundle-dirs calibrations risk-free-rate max-bars
-           grid-history calibration-correction capture-dir mult2-scale]
+           grid-history calibration-correction capture-dir capture-provenance mult2-scale]
     :or {risk-free-rate 0.043 max-bars 200 grid-history 10
          calibration-correction :seed-pred-std mult2-scale 2.0}}]
   (ensure-ref-paths! ref-root)
   (ensure-alpaca-stub!)
   (let [np (importlib/import-module "numpy")
-        fe-mod (importlib/import-module "scripts_5yr.live.feature_engine")
-        mi-mod (importlib/import-module "scripts_5yr.live.model_inference")
-        gg-mod (importlib/import-module "scripts_5yr.live.greeks_grid")
-        of-mod (importlib/import-module "scripts_5yr.live.options_fetcher")
         deque (.-deque collections)
         buffers (python/dict)
         _ (doseq [sym ["SPY" "HYG" "TLT" "VXX" "SPX" "TNX" "VIX"]]
-            (.__setitem__ buffers sym (deque ** :maxlen max-bars)))
+    (.__setitem__ buffers sym (deque ** :maxlen max-bars)))
         load-bot (fn [bot]
                    (let [bdir (str (get bundle-dirs bot))
-                         engine ((.-FeatureEngine fe-mod)
-                                 (str bdir "/feature_stats.npz")
-                                 (str bdir "/feature_names.json"))
-                         inference ((.-MultiHeadLiveInference mi-mod) bdir)
+                         feat-names (json/loads (slurp (str bdir "/feature_names.json")))
+                         name->idx (into {} (map-indexed (fn [i n] [n i]) feat-names))
+                         inference (inference/make-multihead-inference ref-root bdir)
                          hmm (load-npz-dict np (str bdir "/hmm_model.npz")
                                             ["means" "covars" "transmat"
                                              "startprob"])
@@ -424,27 +494,33 @@
                          (let [path (str bdir "/neutralize_features.json")]
                            (when (os.path/exists path)
                              (let [names* (json/loads (slurp path))
-                                   feat-names (json/loads (slurp (str bdir "/feature_names.json")))
-                                   name->idx (into {} (map-indexed (fn [i n] [n i]) feat-names))
                                    idxs (vec (keep #(get name->idx %) names*))]
                                {:indices (.array np (python/list idxs)
                                                  ** :dtype (.-int64 np))
                                 :means (.take (.__getitem__ (.load np (str bdir "/feature_stats.npz")) "mean")
                                               (.array np (python/list idxs) ** :dtype (.-int64 np)))
                                 :n (count idxs)})))]
-                     {:engine engine :inference inference :hmm hmm
-                      :atoms atoms :cal cal :neutralize neutralize}))]
+                     {:feature-names feat-names
+                      :inference inference :hmm hmm
+                      :atoms atoms :cal cal :neutralize neutralize
+                      :name->idx name->idx}))]
     {:np np
-     :greeks-fns {:implied-vol (.-implied_vol of-mod)
-                  :bs-greeks (.-bs_greeks of-mod)
-                  :time-to-expiry (.-time_to_expiry of-mod)}
-     :grid-builder ((.-GreeksGridBuilder gg-mod))
+     :option-feature-fn raw-unlock/compute-spy-option-features
+     :generic-option-feature-fn raw-unlock/compute-option-features
+     :v2-grid-feature-fn raw-unlock/compute-v2-grid-features
+     :spy-greek-grid-feature-fn raw-unlock/compute-spy-greek-grid-features
+     :generic-greek-grid-feature-fn raw-unlock/compute-greek-grid-features
      :risk-free-rate risk-free-rate
      :buffers buffers
      :grid-history (deque ** :maxlen grid-history)
      :bots (into {} (map (fn [b] [b (load-bot b)]) bots))
      :capture-dir (when capture-dir (str capture-dir))
+     :capture-provenance (or capture-provenance {})
      :capture (atom [])
+     :last-chain-json (atom nil)
+     :last-option-surfaces-json (atom (python/dict))
+     :last-option-surface-status-json (atom (python/dict))
+     :last-option-features (atom (python/dict))
      :mult2-scale (double mult2-scale)
      :state (atom {:mult1 (zipmap bots (repeat default-direction-state))
                    :mult2 (zipmap bots (repeat default-direction-state))
@@ -468,9 +544,8 @@
 
 (defn on-chain!
   "Convert one option-chain snapshot into a (6,21,8) greeks grid and append
-  it to the grid history. Mirrors options_fetcher._fetch_snapshots'
-  Black-Scholes fallback path (the path production actually uses —
-  USE_ALPACA_NATIVE_GREEKS=False) + greeks_grid.build_grid.
+  it to the grid history. Uses native Basilisp Black-Scholes fallback math and
+  grid aggregation matching the legacy production path.
 
   snapshot: {:observed-at tz-aware-datetime (default now ET)
              :contracts [{:strike 600.0 :right \"CALL\"|\"PUT\" :bid f :ask f
@@ -482,42 +557,82 @@
             (throw (ex-info "on-chain! requires a primed SPY bar buffer" {})))
         et (zoneinfo/ZoneInfo "America/New_York")
         now (or observed-at (.now (.-datetime datetime) ** :tz et))
-        r (:risk-free-rate bridge)
-        {:keys [implied-vol bs-greeks time-to-expiry]} (:greeks-fns bridge)
-        date-cls (.-date datetime)
-        converted
-        (reduce
-         (fn [acc c]
-           (let [k (double (:strike c))
-                 bid (double (:bid c 0.0))
-                 ask (double (:ask c 0.0))
-                 mid (when (and (pos? bid) (pos? ask)) (/ (+ bid ask) 2.0))
-                 ;; production strike filter: ±12% of underlying
-                 in-range (< (/ (abs (- k s)) s) 0.12)
-                 opt-type (if (= (str (:right c)) "PUT") "put" "call")
-                 exp (.fromisoformat date-cls (str (:expiration c)))
-                 t (when (and mid in-range) (time-to-expiry exp now))]
-             (if (and t (pos? t))
-               (let [iv (implied-vol mid s k t r opt-type)]
-                 (if (pos? iv)
-                   (let [g (bs-greeks s k t r iv opt-type)]
-                     (conj acc
-                           #py {"strike" k
-                                "expiration" exp
-                                "option_type" opt-type
-                                "iv" iv
-                                "delta" (.get g "delta")
-                                "vega" (.get g "vega")
-                                "theta" (.get g "theta")
-                                "rho" (.get g "rho")}))
-                   acc))
-               acc)))
-         []
-         contracts)
-        grid (.build_grid (:grid-builder bridge)
-                          (python/list converted) s now)]
-    (.append (:grid-history bridge) grid)
-    {:n-input (count contracts) :n-gridded (count converted) :spy-price s}))
+        chain-json (.dumps json
+                           (python/dict {"observed_at" (.isoformat now)
+                                         "spy" s
+                                         "contracts" (contracts->py-list contracts)})
+                           ** :default str)
+        grid (raw-unlock/build-option-greeks-grid chain-json nil nil nil nil (:risk-free-rate bridge))
+        n-gridded (if grid (count contracts) 0)]
+    (reset! (:last-chain-json bridge)
+            chain-json)
+	    (reset! (:last-option-features bridge)
+	            ((:option-feature-fn bridge) chain-json))
+		    (when grid
+		      (.append (:grid-history bridge) grid))
+		    {:n-input (count contracts) :n-gridded n-gridded :spy-price s}))
+
+(defn on-option-surface!
+  "Store formula-backed option aggregate features for non-grid sidecar symbols.
+
+  This is intentionally separate from on-chain!: SPY still drives the greeks
+  grid used by the sequence models, while SPX/VIX/VIXW option aggregates are
+  overlaid only when neutralization/audit later proves them safe."
+  [bridge {:keys [prefix observed-at underlying contracts]}]
+  (let [et (zoneinfo/ZoneInfo "America/New_York")
+        now (or observed-at (.now (.-datetime datetime) ** :tz et))
+        chain-json (.dumps json
+                           (python/dict {"observed_at" (.isoformat now)
+                                         "underlying" (double underlying)
+                                         "contracts" (contracts->py-list contracts)})
+                           ** :default str)
+        features ((:generic-option-feature-fn bridge) (name prefix) chain-json)
+        grid (raw-unlock/build-option-greeks-grid chain-json nil nil nil nil (:risk-free-rate bridge))
+        greek-features (if grid
+                         ((:generic-greek-grid-feature-fn bridge) (name prefix) grid)
+                         (python/dict))]
+    (swap! (:last-option-surfaces-json bridge)
+           (fn [m]
+             (doto (python/dict m)
+               (.__setitem__ (name prefix) chain-json))))
+    (swap! (:last-option-features bridge)
+           (fn [m]
+             (let [merged (python/dict m)]
+               (doseq [[k v] (.items features)]
+                 (.__setitem__ merged k v))
+               (doseq [[k v] (.items greek-features)]
+                 (.__setitem__ merged k v))
+               merged)))
+    {:prefix prefix
+     :n-input (count contracts)
+     :n-gridded (if grid (count contracts) 0)
+     :n-features (+ (python/len features) (python/len greek-features))}))
+
+(defn record-option-surface-status!
+  "Persist the latest non-SPY option-surface refresh status for capture
+  diagnostics. This is deliberately side-effect-only and never influences
+  trading decisions."
+  [bridge {:keys [prefix observed-at ok? reason error underlying contracts n-input n-gridded n-features]}]
+  (when-let [status-atom (:last-option-surface-status-json bridge)]
+    (let [et (zoneinfo/ZoneInfo "America/New_York")
+          now (or observed-at (.now (.-datetime datetime) ** :tz et))
+          payload (python/dict)]
+      (.__setitem__ payload "observed_at" (.isoformat now))
+      (.__setitem__ payload "ok" (boolean ok?))
+      (when (some? reason)
+        (.__setitem__ payload "reason" (name reason)))
+      (when (some? error)
+        (.__setitem__ payload "error" (str error)))
+      (when (some? underlying)
+        (.__setitem__ payload "underlying" (double underlying)))
+      (.__setitem__ payload "contracts" (int (or contracts n-input 0)))
+      (.__setitem__ payload "n_gridded" (int (or n-gridded 0)))
+      (.__setitem__ payload "n_features" (int (or n-features 0)))
+      (swap! status-atom
+             (fn [m]
+               (doto (python/dict m)
+                 (.__setitem__ (name prefix) (.dumps json payload ** :default str)))))
+      nil)))
 
 (defn prime!
   "Seed the bridge from history. bars-seed: {sym [bar-maps...]} for the four
@@ -554,19 +669,26 @@
                     (.zeros np #py (1 6 21 8) ** :dtype (.-float32 np)))]
     (into
      {}
-     (map (fn [[bot {:keys [engine inference hmm atoms neutralize]}]]
-            (let [feats (.compute_all_features
-                         engine
-                         ** :bar_buffers buffers
-                         :greeks_grids_history grids
-                         :hmm_model hmm
-                         :dictionary_atoms atoms)
+     (map (fn [[bot {:keys [feature-names inference hmm atoms neutralize name->idx]}]]
+            (let [feats (raw-unlock/compute-live-feature-vector feature-names buffers grids hmm atoms)
+                  ;; Formula-backed SPY option-chain aggregate features.
+                  ;; Existing neutralization still pins them to train mean
+                  ;; until the raw-source parity gate approves unmasking.
+                  _ (doseq [[name value] (.items @(:last-option-features bridge))]
+                      (when-let [idx (get name->idx name)]
+                        (.__setitem__ feats idx (python/float value))))
+                  _ (doseq [[name value] (.items ((:v2-grid-feature-fn bridge) grids))]
+                      (when-let [idx (get name->idx name)]
+                        (.__setitem__ feats idx (python/float value))))
+                  _ (doseq [[name value] (.items ((:spy-greek-grid-feature-fn bridge) grids))]
+                      (when-let [idx (get name->idx name)]
+                        (.__setitem__ feats idx (python/float value))))
                   ;; pin known-bad live sources to their train mean
                   ;; (z=0) — see load-bot neutralize docstring
                   _ (when neutralize
                       (.__setitem__ feats (:indices neutralize)
                                     (:means neutralize)))
-                  pred (.predict inference feats grids-seq)]
+                  pred (inference/predict inference feats grids-seq)]
               [bot {:pred (vec (map double pred))
                     :feats feats
                     :n-features (python/len feats)
@@ -576,38 +698,195 @@
 
 (defn- capture-features!
   "Feature-parity capture (live side): append this bar's per-bot
-  918-feature vectors + latest greeks grid + SPY price to the capture
-  log and rewrite <capture-dir>/live_features_<utc-date>.npz. Full
-  rewrite per bar (390 bars x 3 bots x 918 f32 + grids — a few MB) is
-  crash-safe enough for a diagnostic capture. Never throws (a capture
-  failure must not take down the trading session)."
+  918-feature vectors + latest greeks grid + SPY price + raw bar buffers to the capture
+  log and atomically rewrite <capture-dir>/live_features_<utc-date>.npz.
+  Full rewrite per bar (390 bars x 3 bots x 918 f32 + grids — a few MB)
+  is acceptable for a diagnostic capture. Never throws (a capture failure
+  must not take down the trading session)."
   [bridge bar-time preds]
   (when-let [cdir (:capture-dir bridge)]
-    (try
-      (let [np (:np bridge)
+    (let [time-text (normalize-capture-time-text bar-time)]
+      (when (pos? (count time-text))
+        (try
+          (let [np (:np bridge)
             grids (python/list (:grid-history bridge))
             grid (if (pos? (count grids))
                    (.__getitem__ grids -1)
                    (.zeros np #py (6 21 8) ** :dtype (.-float32 np)))
-            entry {:time (str bar-time)
-                   :spy (python/float (or (spy-price bridge) 0.0))
-                   :grid grid
-                   :feats (into {} (map (fn [[b m]] [b (:feats m)]) preds))}
-            entries (swap! (:capture bridge) conj entry)
-            stamp (.strftime (datetime.datetime/now (.-utc datetime/timezone))
-                             "%Y%m%d")
-            path (str cdir "/live_features_" stamp ".npz")]
-        (os/makedirs cdir ** :exist_ok true)
-        (.savez_compressed
-         np path
-         ** :times (.array np (python/list (map :time entries)))
-         :spy (.array np (python/list (map :spy entries)))
-         :grids (.stack np (python/list (map :grid entries)))
-         :chestnut (.stack np (python/list (map #(get-in % [:feats :chestnut]) entries)))
-         :lynx (.stack np (python/list (map #(get-in % [:feats :lynx]) entries)))
-         :moose (.stack np (python/list (map #(get-in % [:feats :moose]) entries)))))
-      (catch python/Exception e
-        (println "WARN feature capture failed:" (str e))))))
+            grid-history (if (pos? (count grids))
+                           (.stack np grids)
+                           (.zeros np #py (1 6 21 8) ** :dtype (.-float32 np)))
+            raw-buffers (python/dict)
+            _ (doseq [sym ["SPY" "HYG" "TLT" "VXX" "SPX" "TNX" "VIX"]]
+                (let [buf (.get (:buffers bridge) sym)]
+                  (.__setitem__ raw-buffers sym
+                                (if buf (python/list buf) (python/list)))))
+            capture-count (inc (count @(:capture bridge)))
+                            sidecar-every (try
+                            (max 1 (python/int (or (os/getenv "STEVE_CAPTURE_SIDECAR_EVERY")
+                                                   "1")))
+                            (catch python/Exception _
+                              1))
+            include-sidecars? (and (not (= "1" (os/getenv "STEVE_CAPTURE_DISABLE_SIDECARS")))
+                                   (or (= sidecar-every 1)
+                                       (= capture-count 1)
+                                       (zero? (mod capture-count sidecar-every))))
+	            entry {:time time-text
+	                   :spy (python/float (or (spy-price bridge) 0.0))
+	                   ;; Source identity and completed-bar semantics are part of
+	                   ;; the model input contract, not deployment metadata.
+	                   :provenance-json (.dumps json
+	                                           (letfn [(jsonable [value]
+	                                                     (cond
+	                                                       (map? value) (python/dict
+	                                                                     (map (fn [[k v]]
+	                                                                            (python/tuple [(str k) (jsonable v)]))
+	                                                                          value))
+	                                                       (or (vector? value) (seq? value) (set? value))
+	                                                       (python/list (map jsonable value))
+	                                                       :else value))]
+	                                             (jsonable (or (:capture-provenance bridge) {})))
+	                                           ** :sort_keys true :default str)
+	                   :grid grid
+                   :bar-buffers-json (if include-sidecars?
+                                       (.dumps json raw-buffers ** :default str)
+                                       "")
+                   :option-chain-json (if include-sidecars?
+                                        (if-let [chain-atom (:last-chain-json bridge)]
+                                          (or @chain-atom "")
+                                          "")
+                                        "")
+                   :option-surfaces-json (if include-sidecars?
+                                           (.dumps json
+                                                   (if-let [surfaces-atom (:last-option-surfaces-json bridge)]
+                                                     (or @surfaces-atom (python/dict))
+                                                     (python/dict))
+                                                   ** :default str)
+                                           "{}")
+                   :option-surface-status-json (if include-sidecars?
+                                                 (.dumps json
+                                                         (if-let [status-atom (:last-option-surface-status-json bridge)]
+                                                           (or @status-atom (python/dict))
+                                                           (python/dict))
+                                                         ** :default str)
+                                                 "{}")
+	                   :grid-history-json (if include-sidecars?
+	                                        (.dumps json (.tolist grid-history) ** :default str)
+	                                        "[]")
+	                   :feats (into {} (map (fn [[b m]] [b (:feats m)]) preds))}
+	            stamp (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+	                             "%Y%m%d")
+	            path (str cdir "/live_features_" stamp ".npz")
+	            tmp-path (str path ".tmp.npz")
+            existing (when (os.path/exists path)
+                       (.load np path ** :allow_pickle true))
+            existing-files (when existing (set (vec (.-files existing))))
+            existing-rows (if (and existing (contains? existing-files "times"))
+                            (python/len (.__getitem__ existing "times"))
+                            0)
+            existing-times (if (and existing (contains? existing-files "times"))
+                             (set (map normalize-capture-time-text
+                                       (vec (.__getitem__ existing "times"))))
+                             (set []))
+	            ;; A restart resets the in-memory capture atom, so prefix-length
+	            ;; logic can append the restarted process's old rows repeatedly.
+	            ;; Timestamp de-dupe is stable across restarts and normal appends.
+	            ;; Keep only the current row in memory. Large option sidecars make
+	            ;; failed-write backlogs dangerous: one bad write should not cause
+	            ;; the next bar to reserialize every previous sidecar and OOM.
+	            pending-entries (if (contains? existing-times (:time entry))
+	                              []
+	                              [entry])
+	            _ (reset! (:capture bridge) (vec pending-entries))
+	            object-array (fn [xs]
+	                           (.array np (python/list xs) ** :dtype (.-object_ np)))
+	            as-object-array (fn [arr]
+	                              (.astype arr (.-object_ np) ** :copy false))
+	            new-times (.array np (python/list (map :time pending-entries)))
+	            new-spy (.array np (python/list (map :spy pending-entries)))
+	            new-provenance (object-array (map :provenance-json pending-entries))
+	            new-bar-buffers (object-array (map :bar-buffers-json pending-entries))
+	            new-option-chain (object-array (map :option-chain-json pending-entries))
+	            new-option-surfaces (object-array (map :option-surfaces-json pending-entries))
+	            new-option-surface-status (object-array (map :option-surface-status-json pending-entries))
+	            new-grid-history-json (object-array (map :grid-history-json pending-entries))
+	            feature-width (python/len (get-in entry [:feats :chestnut]))
+	            new-grids (if (seq pending-entries)
+	                        (.stack np (python/list (map :grid pending-entries)))
+	                        (.zeros np #py (0 6 21 8) ** :dtype (.-float32 np)))
+	            empty-features (.zeros np (python/tuple [0 feature-width]) ** :dtype (.-float32 np))
+	            new-chestnut (if (seq pending-entries)
+	                           (.stack np (python/list (map #(get-in % [:feats :chestnut]) pending-entries)))
+	                           empty-features)
+	            new-lynx (if (seq pending-entries)
+	                        (.stack np (python/list (map #(get-in % [:feats :lynx]) pending-entries)))
+	                        empty-features)
+	            new-moose (if (seq pending-entries)
+	                         (.stack np (python/list (map #(get-in % [:feats :moose]) pending-entries)))
+	                         empty-features)
+            append-arr (fn [key new-arr]
+                         (if (and existing (contains? existing-files key))
+                           (.concatenate np (python/list [(.__getitem__ existing key) new-arr]))
+                           new-arr))
+	            append-json-arr (fn [key new-arr]
+	                              (if existing
+	                                (let [old (if (contains? existing-files key)
+	                                            (as-object-array (.__getitem__ existing key))
+	                                            (object-array (repeat existing-rows "")))]
+	                                  (.concatenate np (python/list [old new-arr])))
+	                                new-arr))
+	            append-option-chain-arr (fn [new-arr]
+	                                      (if existing
+	                                        (let [old (if (contains? existing-files "option_chain_json")
+	                                                    (as-object-array (.__getitem__ existing "option_chain_json"))
+	                                                    (object-array (repeat existing-rows "")))]
+	                                          (.concatenate np (python/list [old new-arr])))
+	                                        new-arr))
+	            append-option-surfaces-arr (fn [new-arr]
+	                                         (if existing
+	                                           (let [old (if (contains? existing-files "option_surfaces_json")
+	                                                       (as-object-array (.__getitem__ existing "option_surfaces_json"))
+	                                                       (object-array (repeat existing-rows "{}")))]
+	                                             (.concatenate np (python/list [old new-arr])))
+	                                           new-arr))
+	            append-option-surface-status-arr (fn [new-arr]
+	                                              (if existing
+	                                                (let [old (if (contains? existing-files "option_surface_status_json")
+	                                                            (as-object-array (.__getitem__ existing "option_surface_status_json"))
+	                                                            (object-array (repeat existing-rows "{}")))]
+	                                                  (.concatenate np (python/list [old new-arr])))
+	                                                new-arr))
+	            append-grid-history-arr (fn [new-arr]
+	                                      (if existing
+	                                        (let [old (if (contains? existing-files "grid_history_json")
+	                                                    (as-object-array (.__getitem__ existing "grid_history_json"))
+	                                                    (object-array (repeat existing-rows "[]")))]
+	                                          (.concatenate np (python/list [old new-arr])))
+	                                           new-arr))]
+	        (when (seq pending-entries)
+	          (os/makedirs cdir ** :exist_ok true)
+	          (when (os.path/exists tmp-path)
+	            (os/remove tmp-path))
+	          ;; Use a real .npz temp path; numpy appends .npz for non-file handles
+	          ;; whose names do not already end with it.
+	          (.savez_compressed
+	           np tmp-path
+	           ** :capture_version (.array np (python/list [2]))
+	           :times (append-arr "times" new-times)
+	           :spy (append-arr "spy" new-spy)
+	           :provenance_json (append-json-arr "provenance_json" new-provenance)
+	           :bar_buffers_json (append-json-arr "bar_buffers_json" new-bar-buffers)
+	           :option_chain_json (append-option-chain-arr new-option-chain)
+	           :option_surfaces_json (append-option-surfaces-arr new-option-surfaces)
+	           :option_surface_status_json (append-option-surface-status-arr new-option-surface-status)
+	           :grid_history_json (append-grid-history-arr new-grid-history-json)
+	           :grids (append-arr "grids" new-grids)
+	           :chestnut (append-arr "chestnut" new-chestnut)
+	          :lynx (append-arr "lynx" new-lynx)
+	          :moose (append-arr "moose" new-moose))
+	          (os/replace tmp-path path)))
+          (catch python/Exception e
+            (println "WARN feature capture failed:" (str e))))))))
 
 (defn- last-spy-bar-time
   "The last ingested SPY bar's time object (the `signals` memoization
@@ -616,6 +895,90 @@
   (let [spy (.__getitem__ (:buffers bridge) "SPY")]
     (when (pos? (python/len spy))
       (.get (.__getitem__ spy -1) "time"))))
+
+(def required-stock-symbols ["SPY" "HYG" "TLT" "VXX"])
+
+(defn- stock-bar-coherence
+  "Require a coherent multi-symbol minute before inference. The engine may
+  deliver SPY before its companion bars; using that mixed buffer silently
+  changes rolling model inputs versus historical completed-minute features."
+  [bridge]
+  (let [buffers (:buffers bridge)
+        spy-time (last-spy-bar-time bridge)
+        rows (vec (for [symbol required-stock-symbols]
+                    (let [buffer (.get buffers symbol)]
+                      [symbol (when (and buffer (pos? (python/len buffer)))
+                                (.get (.__getitem__ buffer -1) "time"))])))
+        missing (vec (for [[symbol time] rows :when (nil? time)] symbol))
+        lagging (vec (for [[symbol time] rows
+                           :when (and time spy-time (not= time spy-time))]
+                       {"symbol" symbol "bar_time" (str time)}))]
+    {:ok? (and spy-time (empty? missing) (empty? lagging))
+     :spy-time spy-time
+     :missing missing
+     :lagging lagging}))
+
+(defn- max-signal-lag-seconds []
+  (try
+    (double (or (os/getenv "STEVE_MAX_SIGNAL_LAG_SECONDS") "180"))
+    (catch python/Exception _ 180.0)))
+
+(defn- parse-signal-time [value]
+  (cond
+    (nil? value) nil
+    (python/isinstance value (.-datetime datetime)) value
+    :else
+    (let [text0 (.strip (str value))
+          text1 (if (and (.startswith text0 "#inst \"") (.endswith text0 "\""))
+                  (subs text0 7 (dec (count text0)))
+                  text0)
+          text (if (.endswith text1 "Z")
+                 (str (subs text1 0 (dec (count text1))) "+00:00")
+                 text1)]
+      (try
+        (.fromisoformat (.-datetime datetime) text)
+        (catch python/Exception _ nil)))))
+
+(defn- signal-lag-seconds [bar-time]
+  (when-let [parsed (parse-signal-time bar-time)]
+    (let [utc (.-utc datetime/timezone)
+          t (if (nil? (.-tzinfo parsed))
+              (.replace parsed ** :tzinfo utc)
+              (.astimezone parsed utc))
+          now (.now (.-datetime datetime) utc)]
+      (- (.timestamp now) (.timestamp t)))))
+
+(defn- stale-signal? [bar-time]
+  (let [max-lag (max-signal-lag-seconds)
+        lag (signal-lag-seconds bar-time)]
+    (and lag (> max-lag 0.0) (> lag max-lag))))
+
+(defn- flat-stale-result [bar-time]
+  {:chestnut :flat
+   :lynx :flat
+   :moose :flat
+   :oak :flat
+   :dolphin :flat
+   :parrot :flat
+   :votes {:mult1 [:flat :flat :flat] :mult2 [:flat :flat :flat]}
+   :preds {}
+   :feature-stats {}
+   :zs {}
+   :fault :stale-spy-bar
+   :bar-time (str bar-time)
+   :bar-lag-seconds (signal-lag-seconds bar-time)
+   :max-lag-seconds (max-signal-lag-seconds)})
+
+(defn- flat-incoherent-result [coherence]
+  {:chestnut :flat :lynx :flat :moose :flat :oak :flat :dolphin :flat :parrot :flat
+   :votes {:mult1 [:flat :flat :flat] :mult2 [:flat :flat :flat]}
+   :preds {}
+   :feature-stats {}
+   :zs {}
+   :fault :incoherent-stock-bars
+   :bar-time (str (:spy-time coherence))
+   :missing-symbols (:missing coherence)
+   :lagging-symbols (:lagging coherence)})
 
 (defn- signals!*
   "Compute the six bots' signals for the CURRENT bar and ADVANCE
@@ -686,9 +1049,28 @@
            :zs {bot {:long z :gen z :short z}}}"
   [bridge]
   (let [bar-time (last-spy-bar-time bridge)
-        st @(:state bridge)]
-    (if (and (some? bar-time)
-             (some? (:last-result st))
-             (= bar-time (:last-bar-time st)))
+        st @(:state bridge)
+        coherence (stock-bar-coherence bridge)]
+    (cond
+      (and (some? bar-time)
+           (some? (:last-result st))
+           (= bar-time (:last-bar-time st)))
       (:last-result st)
+
+      (stale-signal? bar-time)
+      (let [result (flat-stale-result bar-time)]
+        (println "WARN stale SPY bar; forcing flat signals:" result)
+        (reset! (:state bridge)
+                (assoc st
+                       :oak :flat
+                       :dolphin :flat
+                       :parrot :flat
+                       :last-bar-time bar-time
+                       :last-result result))
+        result)
+
+      (not (:ok? coherence))
+      (flat-incoherent-result coherence)
+
+      :else
       (signals!* bridge bar-time))))

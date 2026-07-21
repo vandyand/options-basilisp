@@ -1,0 +1,824 @@
+(ns ops.test-live-systemd-units
+  (:import json os pathlib subprocess tempfile time)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+
+(defn read-file [rel]
+  (.read_text (.joinpath root rel)))
+
+(defn path [parent child] (.joinpath parent child))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads [s] (json/loads s))
+(defn read-json [p] (loads (.read_text p)))
+(defn write-json! [p x] (.write_text p (str (dumps x) "\n")))
+(defn write-text! [p text] (.write_text p text))
+(defn chmod-exec! [p] (.chmod p 493))
+
+(defn py-env [m]
+  (doto (.copy os/environ)
+    (.update (jsonable m))))
+
+(defn run-command [args env]
+  (subprocess/run
+   (python/list args)
+   ** :cwd (str root)
+      :env (py-env env)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn basilisp-bin []
+  (or (os.environ/get "BASILISP_BIN")
+      (let [repo-candidate (.joinpath root ".venv/bin/basilisp")]
+        (if (.exists repo-candidate)
+          (str repo-candidate)
+          "basilisp"))))
+
+(defn contains-all? [text snippets]
+  (doseq [snippet snippets]
+    (is (str/includes? text snippet) snippet)))
+
+(deftest six-timer-starts-before-market-open
+  (let [timer (read-file "projects/ops/scripts/systemd/stevetrading-six.timer")]
+    (contains-all? timer ["OnCalendar=Mon..Fri *-*-* 09:20:00 America/New_York"
+                          "Unit=stevetrading-six.service"
+                          "WantedBy=timers.target"])))
+
+(deftest reports-build-timer-runs-shortly-after-market-close
+  (let [timer (read-file "projects/ops/scripts/systemd/stevetrading-reports-build.timer")
+        service (read-file "projects/ops/scripts/systemd/stevetrading-reports-build.service")]
+    (contains-all? timer ["OnCalendar=Mon..Fri *-*-* 16:05:00 America/New_York"
+                          "Unit=stevetrading-reports-build.service"
+                          "Persistent=true"])
+    (contains-all? service ["StartLimitBurst=8"
+                            "Restart=on-failure"
+                            "RestartSec=5min"])))
+
+(deftest theta-terminal-restarts-only-on-real-failure
+  (let [service (read-file "projects/ops/scripts/systemd/theta-terminal.service")]
+    (contains-all? service ["Restart=on-failure"
+                            "SuccessExitStatus=143 SIGTERM"
+                            "ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_theta_terminal.sh"])))
+
+(deftest raw-history-wrapper-rejects-a-stream-receipt-without-market-events
+  (let [wrapper (read-file "projects/ops/scripts/run_raw_history_parity.sh")]
+    (contains-all? wrapper [".status == \"CAPTURED\""
+                            ".summary.market_event_count"
+                            "stream receipt has no captured market events"])))
+
+(deftest raw-snapshot-wrapper-includes-daily-open-interest-parity
+  (let [wrapper (read-file "projects/ops/scripts/run_raw_thetadata_parity.sh")]
+    (contains-all? wrapper ["RAW_THETADATA_PARITY_OPEN_INTEREST_SYMBOLS"
+                            "--class option-open-interest"])))
+
+(deftest parity-pull-retries-until-the-complete-evidence-artifact-arrives
+  (let [pull (read-file "projects/ops/scripts/pull_thetadata_parity.sh")]
+    (contains-all? pull ["THETADATA_PARITY_PULL_ATTEMPTS:-15"
+                         "verify_raw_parity_evidence.lpy"
+                         "raw parity evidence pending"
+                         "raw parity evidence incomplete"])))
+
+(deftest reports-runner-rejects-public-login-redirects
+  (let [script (read-file "projects/ops/scripts/run_reports.sh")]
+    (contains-all? script ["curl -fsS --max-redirs 0 \"$daily_url\""
+                           "/reports/daily/${compact_date}.html"
+                           "/reports/daily/"
+                           "! grep -qi '<title>Login'"
+                           "! grep -qi 'name=\"password\"'"
+                           "grep -Eq \"(Daily Report|Per-Account Detail|${TODAY}|${compact_date})\""
+                           "Public report verification diagnostic:"
+                           "curl -fsS -I \"$daily_url\""])))
+
+(deftest reports-runner-retries-artifact-build-before-publication
+  (let [script (read-file "projects/ops/scripts/run_reports.sh")]
+    (contains-all? script ["BUILD_ATTEMPTS=\"${REPORTS_BUILD_ATTEMPTS:-3}\""
+                           "BUILD_RETRY_SECONDS=\"${REPORTS_BUILD_RETRY_SECONDS:-300}\""
+                           "Report artifact build attempt $build_attempt/$BUILD_ATTEMPTS"
+                           "Retrying report artifact build in ${BUILD_RETRY_SECONDS}s"
+                           "RESULT: FAILED report artifact build exit=$build_rc"])))
+
+(deftest deploy-installs-and-preserves-live-timers-by-default
+  (let [deploy (read-file "projects/ops/scripts/deploy_live_vps.sh")]
+    (contains-all?
+     deploy
+     ["stevetrading-six.timer"
+      "stevetrading-market-evidence-preflight.timer"
+      "stevetrading-market-evidence-capture-smoke.timer"
+      "stevetrading-market-evidence-collect.timer"
+      "stevetrading-raw-thetadata-parity.timer"
+      "DISABLE_LIVE_AFTER_DEPLOY"
+      "leaving live timer/service enablement unchanged"
+      "sudo systemctl enable --now stevetrading-six.timer stevetrading-watchdog.timer stevetrading-reports-build.timer stevetrading-status-dashboard.timer stevetrading-market-evidence-preflight.timer stevetrading-market-evidence-capture-smoke.timer stevetrading-market-evidence-collect.timer stevetrading-raw-thetadata-parity.timer"
+      "sudo mkdir -p /var/log/stevetrading"
+      "sudo chown bot:bot /var/log/stevetrading"
+      "STEVETRADING_BASILISP_ROOT=$REMOTE_ROOT/current"
+      "REPORTS_PASSWORD_SHA256 must be set in /etc/stevetrading/reports.env"
+      "REPORTS_ALLOW_NO_AUTH=1 is not allowed"
+      "sed -i \\\"/^PYTHON_BIN=/d\\\""
+      "upsert STEVE_REPO_ROOT \\\"$REMOTE_ROOT/current\\\""
+      "upsert STEVETRADING_BASILISP_ROOT \\\"$REMOTE_ROOT/current\\\""
+      "upsert BASILISP_BIN \\\"$REMOTE_REF/.venv/bin/basilisp\\\""
+      "ANALYSIS_DIR=$REMOTE_ROOT/shared/live_runtime/analysis"
+      "CAPTURE_DIR=$REMOTE_ROOT/shared/live_runtime/feature-capture"
+      "PAYLOAD_DIR=$REMOTE_ROOT/shared/payload_examples"
+      "STEVE_EXTRA_OPTION_SYMBOLS="
+      "STEVE_FETCH_OPTION_SIDECARS=0"
+      "STEVE_EXTRA_OPTION_HORIZON_DAYS=30"
+      "STEVE_CAPTURE_SIDECAR_EVERY=10"
+      "STEVE_MAX_SIGNAL_LAG_SECONDS=180"
+      "upsert ANALYSIS_DIR \\\"$REMOTE_ROOT/shared/live_runtime/analysis\\\""
+      "upsert CAPTURE_DIR \\\"$REMOTE_ROOT/shared/live_runtime/feature-capture\\\""
+      "upsert PAYLOAD_DIR \\\"$REMOTE_ROOT/shared/payload_examples\\\""
+      "upsert STEVE_EXTRA_OPTION_SYMBOLS \\\"\\\""
+      "upsert STEVE_FETCH_OPTION_SIDECARS \\\"0\\\""
+      "upsert STEVE_EXTRA_OPTION_HORIZON_DAYS \\\"30\\\""
+      "upsert STEVE_CAPTURE_SIDECAR_EVERY \\\"10\\\""
+      "upsert STEVE_MAX_SIGNAL_LAG_SECONDS \\\"180\\\""])))
+
+(deftest deploy-prepares-market-evidence-runtime-and-runs-preflight
+  (let [deploy (read-file "projects/ops/scripts/deploy_live_vps.sh")]
+    (contains-all? deploy ["$REMOTE_ROOT/shared/live_runtime/analysis"
+                           "$REMOTE_ROOT/shared/live_runtime/feature-capture"
+                           "$REMOTE_ROOT/shared/payload_examples"
+                           "$REMOTE_ROOT/shared/thetadata-parity-v1"
+                           "ln -sfn '$REMOTE_ROOT/shared/payload_examples'"
+                           "running market evidence wrapper preflight after promotion"
+                           "MARKET_EVIDENCE_MODE=preflight"
+                           "MARKET_EVIDENCE_SKIP_NON_TRADING_DAYS=0"
+                           "projects/ops/scripts/run_market_evidence.sh"])))
+
+(deftest market-evidence-timers-are-scheduled-around-market-open
+  (let [six-timer (read-file "projects/ops/scripts/systemd/stevetrading-six.timer")
+        preflight-timer (read-file "projects/ops/scripts/systemd/stevetrading-market-evidence-preflight.timer")
+        smoke-timer (read-file "projects/ops/scripts/systemd/stevetrading-market-evidence-capture-smoke.timer")
+        collect-timer (read-file "projects/ops/scripts/systemd/stevetrading-market-evidence-collect.timer")
+        raw-parity-timer (read-file "projects/ops/scripts/systemd/stevetrading-raw-thetadata-parity.timer")]
+    (contains-all? six-timer ["OnCalendar=Mon..Fri *-*-* 09:20:00 America/New_York"
+                              "Unit=stevetrading-six.service"
+                              "Persistent=true"])
+    (contains-all? preflight-timer ["OnCalendar=Mon..Fri *-*-* 09:10:00 America/New_York"
+                                    "Unit=stevetrading-market-evidence-preflight.service"
+                                    "Persistent=true"])
+    (contains-all? smoke-timer ["OnCalendar=Mon..Fri *-*-* 09:45:00 America/New_York"
+                                "Unit=stevetrading-market-evidence-capture-smoke.service"
+                                "Persistent=true"])
+    (contains-all? collect-timer ["OnCalendar=Mon..Fri *-*-* 10:45:00 America/New_York"
+                                  "Unit=stevetrading-market-evidence-collect.service"
+                                  "Persistent=true"])
+    (contains-all? raw-parity-timer ["OnCalendar=Mon..Fri *-*-* 09:31:00 America/New_York"
+                                     "Unit=stevetrading-raw-thetadata-parity.service"
+                                     "Persistent=true"])))
+
+(deftest market-evidence-services-use-shared-wrapper-and-modes
+  (let [preflight (read-file "projects/ops/scripts/systemd/stevetrading-market-evidence-preflight.service")
+        smoke (read-file "projects/ops/scripts/systemd/stevetrading-market-evidence-capture-smoke.service")
+        collect (read-file "projects/ops/scripts/systemd/stevetrading-market-evidence-collect.service")
+        raw-parity (read-file "projects/ops/scripts/systemd/stevetrading-raw-thetadata-parity.service")
+        theta (read-file "projects/ops/scripts/systemd/theta-terminal.service")]
+    (contains-all? preflight ["EnvironmentFile=/etc/stevetrading/env"
+                              "Environment=MARKET_EVIDENCE_MODE=preflight"
+                              "Environment=HISTORICAL_FEATURE_JOBS=4"
+                              "ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_market_evidence.sh"])
+    (contains-all? smoke ["Wants=network-online.target theta-terminal.service"
+                          "Environment=MARKET_EVIDENCE_MODE=capture-smoke"
+                          "After=network-online.target theta-terminal.service stevetrading-six.service"
+                          "ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_market_evidence.sh"])
+    (contains-all? collect ["Wants=network-online.target theta-terminal.service"
+                            "Environment=MARKET_EVIDENCE_MODE=collect"
+                            "Environment=MARKET_EVIDENCE_TIMEOUT_SECONDS=3600"
+                            "Environment=HISTORICAL_FEATURE_JOBS=4"
+                            "After=network-online.target theta-terminal.service stevetrading-six.service"
+                            "ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_market_evidence.sh"])
+    (contains-all? raw-parity ["Wants=network-online.target theta-terminal.service"
+                               "Environment=RAW_THETADATA_PARITY_LANDING_ROOT=/opt/stevetrading/shared/thetadata-parity-v1"
+                               "ExecStart=/opt/stevetrading/current/projects/ops/scripts/run_raw_thetadata_parity.sh"])
+    (contains-all? theta ["Restart=on-failure"
+                          "SuccessExitStatus=143 SIGTERM"])))
+
+(deftest steve-six-session-prepares-capture-before-terminal-start
+  (let [script (read-file "scripts/steve_six_session.sh")]
+    (contains-all? script ["scripts/prepare_capture_v2_session.lpy"
+                           "TZ=America/New_York date"
+                           "STEVE_SIX_NOW_ET"
+                           "outside recoverable market session window"
+                           "STEVE_SIX_SKIP_SESSION_WINDOW"
+                           "--capture-dir \"$CAPTURE_DIR\""
+                           "--target-date \"$ET_TODAY\""
+                           "prepare_capture_v2_session_${ET_TODAY//-/}.json"
+                           "capture-v2 session preparation failed"])
+    (is (< (.index script "prepare_capture_v2_session.lpy")
+           (.index script "starting theta terminal")))))
+
+(deftest live-vps-rollout-documents-current-reports-and-evidence-units
+  (let [doc (read-file "projects/ops/docs/live-vps-rollout.md")]
+    (contains-all? doc ["REPORTS_PASSWORD_SHA256=<sha256>"
+                        "REPORTS_ALLOW_NO_AUTH=0"
+                        "ANALYSIS_DIR=/opt/stevetrading/shared/live_runtime/analysis"
+                        "CAPTURE_DIR=/opt/stevetrading/shared/live_runtime/feature-capture"
+                        "PAYLOAD_DIR=/opt/stevetrading/shared/payload_examples"
+                        "stevetrading-reports-build.timer"
+                        "stevetrading-status-dashboard.timer"
+                        "stevetrading-market-evidence-preflight.timer"
+                        "stevetrading-market-evidence-capture-smoke.timer"
+                        "stevetrading-market-evidence-collect.timer"
+                        "stevetrading-raw-thetadata-parity.timer"
+                        "stevetrading-reports-web.service"
+                        "audit_status_publication.lpy"
+                        "audit_daily_report_validations.lpy"
+                        "market_evidence_manifest.lpy"
+                        "unmask_apply_ready?"
+                        "run_verified_unmask_apply.sh"
+                        "verify_neutralization_unmask_apply.lpy"
+                        "neutralization_unmask_apply_verification_$STAMP.json"
+                        "market-evidence-apply.log"])))
+
+(deftest market-evidence-wrapper-targets-new-york-date-and-collector-modes
+  (let [wrapper (read-file "projects/ops/scripts/run_market_evidence.sh")
+        preflight-validator (read-file "scripts/check_market_evidence_preflight.lpy")]
+    (contains-all? wrapper ["TZ=America/New_York date +%F"
+                            "MARKET_EVIDENCE_TARGET_DATE:-${MARKET_EVIDENCE_DATE"
+                            "MARKET_EVIDENCE_MODE:-collect"
+                            "MARKET_EVIDENCE_CAPTURE_SMOKE_MIN_ROWS:-5"
+                            "MARKET_EVIDENCE_CAPTURE_SMOKE_JSON:-$ANALYSIS_DIR/capture_v2_sidecar_smoke_${TARGET_DATE//-/}.json"
+                            "MARKET_EVIDENCE_SKIP_NON_TRADING_DAYS:-1"
+                            "MARKET_EVIDENCE_REQUIRE_PREFLIGHT:-1"
+                            "MARKET_EVIDENCE_REQUIRE_THETADATA_HEALTH:-1"
+                            "wait_for_thetadata_health"
+                            "scripts/wait_thetadata_health.lpy"
+                            "does not accept CLI args"
+                            "MARKET_EVIDENCE_COLLECT_SCRIPT:-scripts/collect_market_evidence.sh"
+                            "require_preflight_status_ok"
+                            "missing same-day preflight status"
+                            "scripts/check_market_evidence_preflight.lpy"
+                            "scripts/is_trading_day.lpy"
+                            "DEFAULT_RUNTIME_ROOT=/opt/stevetrading/shared"
+                            "STEVE_REF_ROOT=\"${STEVE_REF_ROOT:-$DEFAULT_RUNTIME_ROOT/Data-Preprocessor}\""
+                            "export STEVE_REPO_ROOT=\"$ROOT\""
+                            "export STEVE_REF_ROOT"
+                            "\"$STEVE_REF_ROOT/.venv/bin/basilisp\""
+                            "ANALYSIS_DIR=\"${ANALYSIS_DIR:-$DEFAULT_RUNTIME_ROOT/live_runtime/analysis}\""
+                            "CAPTURE_DIR=\"${CAPTURE_DIR:-$DEFAULT_RUNTIME_ROOT/live_runtime/feature-capture}\""
+                            "PAYLOAD_DIR=\"${PAYLOAD_DIR:-$DEFAULT_RUNTIME_ROOT/payload_examples}\""
+                            "RESULT: SKIPPED - non-trading day"
+                            "--preflight"
+                            "capture-smoke)"
+                            "scripts/capture_v2_sidecar_check.lpy"
+                            "--min-rows \"$CAPTURE_SMOKE_MIN_ROWS\""
+                            "--dry-run"
+                            "--target-date \"$TARGET_DATE\""
+                            "unknown MARKET_EVIDENCE_MODE"])
+    (contains-all? preflight-validator ["duplicate JSON key"
+                                        "preflight status mode"
+                                        "preflight status target_stamp"
+                                        "preflight status generated_at ET date"])))
+
+(deftest collect-market-evidence-defaults-to-shared-runtime-on-hetzner-only
+  (let [script (read-file "scripts/collect_market_evidence.sh")]
+    (contains-all? script ["if [[ -z \"${STEVE_REF_ROOT:-}\" && -d /opt/stevetrading/shared/Data-Preprocessor ]]; then"
+                           "DEFAULT_REF=\"/opt/stevetrading/shared/Data-Preprocessor\""
+                           "if [[ -d /opt/stevetrading/shared ]]; then"
+                           "DEFAULT_RUNTIME_ROOT=\"/opt/stevetrading/shared\""
+                           "DEFAULT_PAYLOAD_DIR=\"$DEFAULT_RUNTIME_ROOT/payload_examples\""
+                           "DEFAULT_RUNTIME_ROOT=\"$REPO\""
+                           "DEFAULT_PAYLOAD_DIR=\"$REPO/resources/thetadata/payload_examples\""
+                           "ANALYSIS_DIR=\"${ANALYSIS_DIR:-$DEFAULT_RUNTIME_ROOT/live_runtime/analysis}\""
+                           "CAPTURE_DIR=\"${CAPTURE_DIR:-$DEFAULT_RUNTIME_ROOT/live_runtime/feature-capture}\""
+                           "PAYLOAD_DIR=\"${PAYLOAD_DIR:-$DEFAULT_PAYLOAD_DIR}\""])))
+
+(deftest steve-six-launcher-honors-shared-capture-dir-env
+  (let [launcher (read-file "scripts/launch_steve_six.lpy")]
+    (is (str/includes? launcher ":capture-dir (or (os/getenv \"CAPTURE_DIR\") \"live_runtime/feature-capture\")"))))
+
+(deftest is-trading-day-helper-identifies-holiday-and-trading-day
+  (let [trading (subprocess/run
+                 (python/list [(basilisp-bin) "run" "scripts/is_trading_day.lpy" "--" "2026-07-02"])
+                 ** :cwd (str root) :text true :capture_output true :check false)
+        holiday (subprocess/run
+                 (python/list [(basilisp-bin) "run" "scripts/is_trading_day.lpy" "--" "2026-07-03"])
+                 ** :cwd (str root) :text true :capture_output true :check false)]
+    (is (= 0 (.-returncode trading)))
+    (is (str/includes? (.-stdout trading) "trading-day"))
+    (is (= 1 (.-returncode holiday)))
+    (is (str/includes? (.-stdout holiday) "non-trading-day"))))
+
+(deftest market-evidence-health-accepts-column-oriented-thetadata-json
+  (let [health-script (read-file "scripts/wait_thetadata_health.lpy")]
+    (contains-all? health-script ["urllib.request/urlopen"
+                                  "(usable-body? (:body result))"
+                                  "ThetaData terminal healthy after "
+                                  "unexpected response status="
+                                  "unusable response body"])))
+
+(deftest watchdog-restarts-systemd-six-unit-not-orphan-child
+  (let [watchdog (read-file "scripts/steve_watchdog.sh")]
+    (contains-all? watchdog ["SYSTEMD_SIX_UNIT"
+                             "service_active()"
+                             "session_alive()"
+                             "systemctl is-active --quiet \"$SYSTEMD_SIX_UNIT\""
+                             "sudo -n systemctl restart \"$SYSTEMD_SIX_UNIT\""
+                             "watchdog Type=oneshot must not own the background child process directly"
+                             "relaunch verified alive"
+                             "if ! session_alive; then"])))
+
+(defn write-aligned-corrected-ref! [tmp]
+  (let [ref (path tmp "Data-Preprocessor")]
+    (doseq [account ["chestnut" "lynx" "moose"]]
+      (let [bundle (.joinpath ref "pipeline_data" (str "live_model_" account "_multihead_corrected"))]
+        (.mkdir bundle ** :parents true)
+        (write-text! (path bundle "feature_names.json") "[\"a\",\"b\"]\n")
+        (write-text! (path bundle "neutralize_features.json") "[\"b\"]\n")))
+    ref))
+
+(defn run-market-evidence [env]
+  (run-command [(str (.joinpath root "projects/ops/scripts/run_market_evidence.sh"))] env))
+
+(defn write-fake-collect-runners! [tmp]
+  (let [fake-python (path tmp "fake-python")
+        fake-basilisp (path tmp "fake-basilisp")
+        calls (path tmp "calls.txt")
+        real-basilisp (basilisp-bin)]
+    (write-text! fake-python
+                 (str "#!/usr/bin/env bash\n"
+                      "set -euo pipefail\n"
+                      "printf 'PY %s\\n' \"$*\" >> " calls "\n"
+                      "if [[ \"$1\" == \"-\" ]]; then exec python3 \"$@\"; fi\n"
+                      "exit 0\n"))
+    (write-text! fake-basilisp
+                 (str "#!/usr/bin/env bash\n"
+                      "set -euo pipefail\n"
+                      "printf 'BASILISP %s\\n' \"$*\" >> " calls "\n"
+                      "REAL_BASILISP='" real-basilisp "'\n"
+                      "case \"$*\" in\n"
+                      "  *scripts/check_market_evidence_preflight.lpy*|*scripts/wait_thetadata_health.lpy*)\n"
+                      "    exec \"$REAL_BASILISP\" \"$@\"\n"
+                      "    ;;\n"
+                      "esac\n"
+                      "exit 0\n"))
+    (chmod-exec! fake-python)
+    (chmod-exec! fake-basilisp)
+    [fake-python fake-basilisp calls]))
+
+(defn write-fake-collect-script! [tmp calls]
+  (let [fake-collect (path tmp "fake-collect-market-evidence")]
+    (write-text! fake-collect
+                 (str "#!/usr/bin/env bash\n"
+                      "set -euo pipefail\n"
+                      "printf 'COLLECT %s\\n' \"$*\" >> " calls "\n"
+                      "exit 0\n"))
+    (chmod-exec! fake-collect)
+    fake-collect))
+
+(defn preflight-status [generated-at status returncode & {:keys [detail]
+                                                          :or {detail nil}}]
+  (let [base {"generated_at" generated-at
+              "target_date" "2026-07-02"
+              "target_stamp" "20260702"
+              "mode" "preflight"
+              "status" status
+              "returncode" returncode}]
+    (if detail (assoc base "detail" detail) base)))
+
+(deftest steve-six-session-after-hours-guard-exits-before-preflight
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          calls (path tmp "calls.log")
+          fake-basilisp (path tmp "fake-basilisp")
+          fake-python (path tmp "fake-python")
+          fake-lifecycle (path tmp "fake-lifecycle")]
+      (doseq [script [fake-basilisp fake-python fake-lifecycle]]
+        (write-text! script (str "#!/usr/bin/env bash\n"
+                                 "echo unexpected \"$0 $*\" >> " calls "\n"
+                                 "exit 99\n"))
+        (chmod-exec! script))
+      (let [result (run-command [(str (.joinpath root "scripts/steve_six_session.sh"))]
+                                {"BASILISP_BIN" (str fake-basilisp)
+                                 "STEVE_THETADATA_LIFECYCLE" (str fake-lifecycle)
+                                 "STEVE_SIX_NOW_ET" "2026-07-08 08:59:00"
+                                 "CAPTURE_DIR" (str (path tmp "captures"))
+                                 "ANALYSIS_DIR" (str (path tmp "analysis"))})]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (str/includes? (.-stdout result) "outside recoverable market session window"))
+        (is (not (.exists calls)))))))
+
+(deftest steve-six-session-market-window-prepares-capture-before-terminal
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          calls (path tmp "calls.log")
+          fake-basilisp (path tmp "fake-basilisp")
+          fake-python (path tmp "fake-python")
+          fake-lifecycle (path tmp "fake-lifecycle")
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")]
+      (write-text! fake-basilisp
+                   (str "#!/usr/bin/env bash\n"
+                        "set -euo pipefail\n"
+                        "echo BASILISP \"$*\" >> " calls "\n"
+                        "case \"$*\" in\n"
+                        "  *prepare_capture_v2_session.lpy*)\n"
+                        "    out=''\n"
+                        "    while [ \"$#\" -gt 0 ]; do\n"
+                        "      if [ \"$1\" = '--out-json' ]; then out=\"$2\"; shift 2; else shift; fi\n"
+                        "    done\n"
+                        "    if [ -n \"$out\" ]; then mkdir -p \"$(dirname \"$out\")\"; printf '{\"status\":\"ok\"}\\n' > \"$out\"; fi\n"
+                        "    ;;\n"
+                        "esac\n"
+                        "exit 0\n"))
+      (write-text! fake-python
+                   (str "#!/usr/bin/env bash\n"
+                        "echo PY \"$*\" >> " calls "\n"
+                        "out=''\n"
+                        "while [ \"$#\" -gt 0 ]; do\n"
+                        "  if [ \"$1\" = '--out-json' ]; then out=\"$2\"; shift 2; else shift; fi\n"
+                        "done\n"
+                        "if [ -n \"$out\" ]; then mkdir -p \"$(dirname \"$out\")\"; printf '{\"status\":\"ok\"}\\n' > \"$out\"; fi\n"
+                        "exit 0\n"))
+      (write-text! fake-lifecycle
+                   (str "#!/usr/bin/env bash\n"
+                        "echo LIFECYCLE \"$*\" >> " calls "\n"
+                        "exit 0\n"))
+      (doseq [script [fake-basilisp fake-python fake-lifecycle]] (chmod-exec! script))
+      (let [result (run-command [(str (.joinpath root "scripts/steve_six_session.sh"))]
+                                {"BASILISP_BIN" (str fake-basilisp)
+                                 "STEVE_THETADATA_LIFECYCLE" (str fake-lifecycle)
+                                 "STEVE_SIX_NOW_ET" "2026-07-08 09:30:00"
+                                 "CAPTURE_DIR" (str captures)
+                                 "ANALYSIS_DIR" (str analysis)})
+            text (.read_text calls)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (contains-all? text ["preflight_live_imports.lpy"
+                             "prepare_capture_v2_session.lpy"
+                             (str "--capture-dir " captures)
+                             "--target-date 2026-07-08"
+                             "LIFECYCLE start"
+                             "launch_steve_six.lpy"])
+        (is (.exists (path analysis "prepare_capture_v2_session_20260708.json")))
+        (is (< (.index text "prepare_capture_v2_session.lpy") (.index text "LIFECYCLE start")))
+        (is (< (.index text "LIFECYCLE start") (.index text "launch_steve_six.lpy")))))))
+
+(deftest market-evidence-wrapper-skips-non-trading-day-by-default
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "dry-run"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-03"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str tmp)})
+          log (.read_text (path tmp "market-evidence.log"))]
+      (is (= 0 (.-returncode result)) (.-stderr result))
+      (is (str/includes? log "RESULT: SKIPPED - non-trading day 2026-07-03"))
+      (is (not (str/includes? log "thetadata_capability_probe.lpy"))))))
+
+(deftest market-evidence-wrapper-rejects-unexpected-cli-args
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          result (subprocess/run
+                  (python/list [(str (.joinpath root "projects/ops/scripts/run_market_evidence.sh")) "--dry-run"])
+                  ** :cwd (str root)
+                     :env (py-env {"MARKET_EVIDENCE_LOG_DIR" (str tmp)})
+                     :text true
+                     :capture_output true
+                     :check false)]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? (.-stderr result) "does not accept CLI args"))
+      (is (not (.exists (path tmp "market-evidence.log")))))))
+
+(deftest market-evidence-wrapper-allows-non-trading-day-override
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "dry-run"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-03"
+                                       "MARKET_EVIDENCE_SKIP_NON_TRADING_DAYS" "0"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str tmp)})
+          log (.read_text (path tmp "market-evidence.log"))]
+      (is (= 0 (.-returncode result)) (.-stderr result))
+      (is (not (str/includes? log "RESULT: SKIPPED")))
+      (is (str/includes? log "thetadata_capability_probe.lpy")))))
+
+(deftest market-evidence-wrapper-writes-preflight-status-success
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")
+          payloads (path tmp "payloads")
+          ref (write-aligned-corrected-ref! (path tmp "shared"))
+          fake-python (path tmp "fake-python")
+          fake-basilisp (path tmp "fake-basilisp")
+          calls (path tmp "basilisp-calls.txt")]
+      (write-text! fake-python "#!/usr/bin/env bash\nexit 0\n")
+      (write-text! fake-basilisp (str "#!/usr/bin/env bash\n"
+                                      "printf '%s\\n' \"$*\" >> " calls "\n"
+                                      "exit 0\n"))
+      (doseq [p [fake-python fake-basilisp]] (chmod-exec! p))
+      (doseq [p [analysis captures payloads]] (.mkdir p))
+      (let [result (run-market-evidence {"MARKET_EVIDENCE_MODE" "preflight"
+                                         "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                         "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                         "BASILISP_BIN" (str fake-basilisp)
+                                         "ANALYSIS_DIR" (str analysis)
+                                         "CAPTURE_DIR" (str captures)
+                                         "PAYLOAD_DIR" (str payloads)
+                                         "STEVE_REF_ROOT" (str ref)})
+            status (read-json (path analysis "market_evidence_preflight_20260702.json"))
+            log (.read_text (.joinpath tmp "logs" "market-evidence.log"))
+            call-text (.read_text calls)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "2026-07-02" (.get status "target_date")))
+        (is (= "20260702" (.get status "target_stamp")))
+        (is (= "ok" (.get status "status")))
+        (is (= 0 (.get status "returncode")))
+        (contains-all? call-text ["run scripts/is_trading_day.lpy -- 2026-07-02"])
+        (contains-all? log ["Market evidence preflight"
+                            "target_date=2026-07-02"
+                            "+ "
+                            "scripts/thetadata_capability_probe.lpy"
+                            "scripts/market_evidence_status.lpy"])))))
+
+(deftest market-evidence-wrapper-writes-preflight-status-for-missing-basilisp
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")]
+      (let [result (run-market-evidence {"MARKET_EVIDENCE_MODE" "preflight"
+                                         "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                         "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                         "BASILISP_BIN" (str (path tmp "missing-basilisp"))
+                                         "ANALYSIS_DIR" (str analysis)})
+            status (read-json (path analysis "market_evidence_preflight_20260702.json"))]
+        (is (= 2 (.-returncode result)))
+        (is (= "error" (.get status "status")))
+        (is (= 2 (.get status "returncode")))
+        (is (str/includes? (.get status "detail") "Basilisp runner not executable"))))))
+
+(deftest market-evidence-collect-refuses-missing-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          _ (.mkdir analysis)
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "MARKET_EVIDENCE_PREFLIGHT_WAIT_SECONDS" "0"})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))
+          call-text (if (.exists calls) (.read_text calls) "")]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? log "missing same-day preflight status"))
+      (is (not (str/includes? log "collect_market_evidence.sh --target-date")))
+      (is (not (str/includes? call-text "PY "))))))
+
+(deftest market-evidence-collect-waits-for-recovered-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")
+          payloads (path tmp "payloads")
+          _ (doseq [p [analysis captures payloads]] (.mkdir p))
+          status (path analysis "market_evidence_preflight_20260702.json")
+          _ (write-json! status (preflight-status "2026-07-02T04:16:27Z" "ok" 0 :detail "too early to satisfy scheduled preflight"))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          fake-collect (write-fake-collect-script! tmp calls)
+          env (py-env {"MARKET_EVIDENCE_MODE" "collect"
+                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                       "BASILISP_BIN" (str fake-basilisp)
+                       "ANALYSIS_DIR" (str analysis)
+                       "CAPTURE_DIR" (str captures)
+                       "PAYLOAD_DIR" (str payloads)
+                       "MARKET_EVIDENCE_REQUIRE_THETADATA_HEALTH" "0"
+                       "MARKET_EVIDENCE_COLLECT_SCRIPT" (str fake-collect)
+                       "MARKET_EVIDENCE_PREFLIGHT_WAIT_SECONDS" "5"
+                       "MARKET_EVIDENCE_PREFLIGHT_POLL_SECONDS" "0.1"})
+          proc (subprocess/Popen
+                (python/list [(str (.joinpath root "projects/ops/scripts/run_market_evidence.sh"))])
+                ** :cwd (str root)
+                   :env env
+                   :text true
+                   :stdout subprocess/PIPE
+                   :stderr subprocess/PIPE)]
+      (time/sleep 0.3)
+      (write-json! status (preflight-status "2026-07-02T13:10:00Z" "ok" 0 :detail "recovered preflight passed"))
+      (let [[stdout stderr] (.communicate proc ** :timeout 10)
+            log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+        (is (= 0 (.-returncode proc)) (str stdout stderr log))
+        (is (str/includes? log "OK: same-day preflight status passed"))
+        (is (str/includes? (.read_text calls) "COLLECT --target-date 2026-07-02"))))))
+
+(deftest market-evidence-collect-requires-ok-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          _ (.mkdir analysis)
+          status (path analysis "market_evidence_preflight_20260702.json")
+          _ (write-json! status (preflight-status "2026-07-02T13:10:00Z" "error" 1))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "MARKET_EVIDENCE_PREFLIGHT_WAIT_SECONDS" "0"})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? log "preflight status is not ok"))
+      (is (not (str/includes? log "collect_market_evidence.sh --target-date")))
+      (is (str/includes? (.read_text calls) "BASILISP ")))))
+
+(deftest market-evidence-collect-rejects-duplicate-preflight-status-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          _ (.mkdir analysis)
+          status (path analysis "market_evidence_preflight_20260702.json")
+          _ (write-text! status "{\n  \"generated_at\": \"2026-07-02T13:10:00Z\",\n  \"target_date\": \"2026-07-02\",\n  \"target_stamp\": \"20260702\",\n  \"mode\": \"preflight\",\n  \"status\": \"ok\",\n  \"returncode\": 0,\n  \"returncode\": 1\n}\n")
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "MARKET_EVIDENCE_PREFLIGHT_WAIT_SECONDS" "0"})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? log "duplicate JSON key: returncode"))
+      (is (not (str/includes? log "collect_market_evidence.sh --target-date")))
+      (is (str/includes? (.read_text calls) "BASILISP ")))))
+
+(deftest market-evidence-collect-runs-after-ok-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")
+          payloads (path tmp "payloads")
+          _ (doseq [p [analysis captures payloads]] (.mkdir p))
+          _ (write-json! (path analysis "market_evidence_preflight_20260702.json")
+                         (preflight-status "2026-07-02T13:10:00Z" "ok" 0 :detail "preflight passed"))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          fake-collect (write-fake-collect-script! tmp calls)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "CAPTURE_DIR" (str captures)
+                                       "PAYLOAD_DIR" (str payloads)
+                                       "MARKET_EVIDENCE_REQUIRE_THETADATA_HEALTH" "0"
+                                       "MARKET_EVIDENCE_COLLECT_SCRIPT" (str fake-collect)})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 0 (.-returncode result)) (.-stderr result))
+      (is (str/includes? log "OK: same-day preflight status passed"))
+      (is (str/includes? (.read_text calls) "COLLECT --target-date 2026-07-02"))
+      (is (str/includes? log "RESULT: SUCCESS")))))
+
+(deftest market-evidence-collect-accepts-preflight-generated-late-utc-same-et-session
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")
+          payloads (path tmp "payloads")
+          _ (doseq [p [analysis captures payloads]] (.mkdir p))
+          _ (write-json! (path analysis "market_evidence_preflight_20260702.json")
+                         (preflight-status "2026-07-03T01:30:00Z" "ok" 0 :detail "manual late preflight still same ET session"))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          fake-collect (write-fake-collect-script! tmp calls)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "CAPTURE_DIR" (str captures)
+                                       "PAYLOAD_DIR" (str payloads)
+                                       "MARKET_EVIDENCE_REQUIRE_THETADATA_HEALTH" "0"
+                                       "MARKET_EVIDENCE_COLLECT_SCRIPT" (str fake-collect)})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 0 (.-returncode result)) (.-stderr result))
+      (is (str/includes? log "OK: same-day preflight status passed"))
+      (is (not (str/includes? log "generated_at date")))
+      (is (str/includes? (.read_text calls) "COLLECT --target-date 2026-07-02")))))
+
+(deftest market-evidence-capture-smoke-runs-sidecar-check-after-ok-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")
+          payloads (path tmp "payloads")
+          _ (doseq [p [analysis captures payloads]] (.mkdir p))
+          _ (write-text! (path captures "live_features_20260702.npz") "placeholder\n")
+          _ (write-json! (path analysis "market_evidence_preflight_20260702.json")
+                         (preflight-status "2026-07-02T13:10:00Z" "ok" 0 :detail "preflight passed"))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)]
+      (write-text! fake-basilisp
+                   (str "#!/usr/bin/env bash\n"
+                        "set -euo pipefail\n"
+                        "echo \"BASILISP $*\" >> " calls "\n"
+                        "REAL_BASILISP='" (basilisp-bin) "'\n"
+                        "case \"$*\" in\n"
+                        "  *scripts/check_market_evidence_preflight.lpy*|*scripts/wait_thetadata_health.lpy*)\n"
+                        "    exec \"$REAL_BASILISP\" \"$@\"\n"
+                        "    ;;\n"
+                        "  *capture_v2_sidecar_check.lpy*)\n"
+                        "    out=\"\"\n"
+                        "    while [[ $# -gt 0 ]]; do\n"
+                        "      if [[ \"$1\" == \"--out-json\" ]]; then out=\"$2\"; break; fi\n"
+                        "      shift\n"
+                        "    done\n"
+                        "    mkdir -p \"$(dirname \"$out\")\"\n"
+                        "    printf '{\"ok\":true,\"status\":\"ok\"}\\n' > \"$out\"\n"
+                        "    ;;\n"
+                        "esac\n"))
+      (chmod-exec! fake-basilisp)
+      (let [result (run-market-evidence {"MARKET_EVIDENCE_MODE" "capture-smoke"
+                                         "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                         "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                         "MARKET_EVIDENCE_CAPTURE_SMOKE_MIN_ROWS" "3"
+                                         "BASILISP_BIN" (str fake-basilisp)
+                                         "ANALYSIS_DIR" (str analysis)
+                                         "CAPTURE_DIR" (str captures)
+                                         "PAYLOAD_DIR" (str payloads)
+                                         "MARKET_EVIDENCE_REQUIRE_THETADATA_HEALTH" "0"})
+            log (.read_text (.joinpath tmp "logs" "market-evidence.log"))
+            call-text (.read_text calls)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (str/includes? log "OK: same-day preflight status passed"))
+        (contains-all? call-text ["capture_v2_sidecar_check.lpy"
+                                  "--capture "
+                                  "live_features_20260702.npz"
+                                  "--min-rows 3"])
+        (is (.exists (path analysis "capture_v2_sidecar_smoke_20260702.json")))
+        (is (str/includes? log "RESULT: SUCCESS"))))))
+
+(deftest market-evidence-collect-refuses-unhealthy-thetadata-after-ok-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          captures (path tmp "captures")
+          payloads (path tmp "payloads")
+          _ (doseq [p [analysis captures payloads]] (.mkdir p))
+          _ (write-json! (path analysis "market_evidence_preflight_20260702.json")
+                         (preflight-status "2026-07-02T13:10:00Z" "ok" 0 :detail "preflight passed"))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          fake-collect (write-fake-collect-script! tmp calls)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "MARKET_EVIDENCE_THETADATA_HEALTH_URL" "http://127.0.0.1:9/v3/option/list/expirations?symbol=SPY"
+                                       "MARKET_EVIDENCE_THETADATA_HEALTH_TIMEOUT_SECONDS" "0"
+                                       "MARKET_EVIDENCE_THETADATA_HEALTH_POLL_SECONDS" "0.01"
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "CAPTURE_DIR" (str captures)
+                                       "PAYLOAD_DIR" (str payloads)
+                                       "MARKET_EVIDENCE_COLLECT_SCRIPT" (str fake-collect)})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? log "OK: same-day preflight status passed"))
+      (is (str/includes? log "ThetaData terminal not healthy"))
+      (is (not (str/includes? (.read_text calls) "COLLECT --target-date 2026-07-02"))))))
+
+(deftest market-evidence-collect-rejects-stale-preflight-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          _ (.mkdir analysis)
+          _ (write-json! (path analysis "market_evidence_preflight_20260702.json")
+                         (preflight-status "2026-07-01T13:10:00Z" "ok" 0))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "MARKET_EVIDENCE_PREFLIGHT_WAIT_SECONDS" "0"})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? log "preflight status generated_at ET date"))
+      (is (not (str/includes? log "collect_market_evidence.sh --target-date")))
+      (is (str/includes? (.read_text calls) "BASILISP ")))))
+
+(deftest market-evidence-collect-rejects-preflight-before-scheduled-time
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          _ (.mkdir analysis)
+          _ (write-json! (path analysis "market_evidence_preflight_20260702.json")
+                         (preflight-status "2026-07-02T04:16:27Z" "ok" 0))
+          [fake-python fake-basilisp calls] (write-fake-collect-runners! tmp)
+          result (run-market-evidence {"MARKET_EVIDENCE_MODE" "collect"
+                                       "MARKET_EVIDENCE_DATE" "2026-07-02"
+                                       "MARKET_EVIDENCE_LOG_DIR" (str (path tmp "logs"))
+                                       "BASILISP_BIN" (str fake-basilisp)
+                                       "ANALYSIS_DIR" (str analysis)
+                                       "MARKET_EVIDENCE_PREFLIGHT_WAIT_SECONDS" "0"})
+          log (.read_text (.joinpath tmp "logs" "market-evidence.log"))]
+      (is (= 2 (.-returncode result)))
+      (is (str/includes? log "predates scheduled preflight"))
+      (is (not (str/includes? log "collect_market_evidence.sh --target-date")))
+      (is (str/includes? (.read_text calls) "BASILISP ")))))

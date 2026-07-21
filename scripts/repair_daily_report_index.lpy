@@ -1,0 +1,160 @@
+;; Repair report-viewer/public/reports/daily/index.html so a validated daily
+;; report artifact is discoverable from the calendar index.
+(import datetime json os os.path re sys)
+
+(defn usage []
+  (println
+   (str "usage: basilisp run scripts/repair_daily_report_index.lpy -- "
+        "--daily-dir DIR --date YYYY-MM-DD")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--daily-dir")
+          (recur (nnext remaining) (assoc out :daily-dir (option-value remaining arg)))
+
+          (= arg "--date")
+          (recur (nnext remaining) (assoc out :date (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn compact-date [iso-date]
+  (.replace (str iso-date) "-" ""))
+
+(defn parse-date [iso-date]
+  (datetime.date/fromisoformat (str iso-date)))
+
+(defn money [value]
+  (let [n (python/float (or value 0.0))
+        body (.format "${:,.2f}" (abs n))]
+    (cond
+      (neg? n) (str "-" body)
+      :else body)))
+
+(defn pnl-class [value]
+  (let [n (python/float (or value 0.0))]
+    (cond
+      (pos? n) "positive"
+      (neg? n) "negative"
+      :else "neutral")))
+
+(defn read-json [path]
+  (json/loads (slurp path)))
+
+(defn account-number [acct key]
+  (python/float (or (.get acct key 0.0) 0.0)))
+
+(defn day-summary [validation]
+  (let [accounts (.get validation "accounts" [])
+        pnl (reduce + 0.0 (map #(account-number % "pnl/equity-day") accounts))
+        trades (reduce + 0 (map #(python/int (or (.get % "trade/closed-count" 0) 0)) accounts))]
+    {:pnl pnl
+     :trades trades}))
+
+(defn day-link-html [iso-date summary]
+  (let [d (parse-date iso-date)
+        stamp (compact-date iso-date)
+        label (str (.strftime d "%b") " " (.-day d))
+        pnl (:pnl summary)
+        trades (:trades summary)]
+    (str "        <a class=\"calendar-day has-report\" href=\"" stamp ".html\">\n"
+         "          <div class=\"cd-num\">" label "</div>\n"
+         "          <div class=\"cd-pnl " (pnl-class pnl) "\">" (money pnl) "</div>\n"
+         "          <div class=\"cd-meta\">" trades " trades &middot; WR n/a</div>\n"
+         "        </a>")))
+
+(defn repair-index-text [index-text iso-date summary]
+  (let [d (parse-date iso-date)
+        stamp (compact-date iso-date)
+        label (str (.strftime d "%b") " " (.-day d))
+        existing-link (str "href=\"" stamp ".html\"")]
+    (if (not= -1 (.find index-text existing-link))
+      {:changed? false
+       :text index-text}
+      (let [pattern (str "(?s)<div class=\"calendar-day empty\">\\s*"
+                         "<div class=\"cd-num\">" (re/escape label) "</div>\\s*"
+                         "</div>")
+            replacement (day-link-html iso-date summary)
+            repaired-pair (re/subn pattern replacement index-text ** :count 1)
+            repaired (first repaired-pair)
+            replacements (second repaired-pair)]
+        (when (zero? replacements)
+          (throw (python/ValueError
+                  (str "daily index does not contain an empty calendar cell for " label))))
+        (let [report-count (python/len (re/findall "class=\"calendar-day has-report\"" repaired))
+              repaired (re/sub "Calendar\\s+.\\s+\\d+\\s+reports"
+                               (str "Calendar — " report-count " reports")
+                               repaired
+                               ** :count 1)]
+          {:changed? true
+           :text repaired})))))
+
+(defn repair! [{:keys [daily-dir date]}]
+  (when-not daily-dir
+    (throw (python/ValueError "--daily-dir is required")))
+  (when-not date
+    (throw (python/ValueError "--date is required")))
+  (let [stamp (compact-date date)
+        index-path (os.path/join daily-dir "index.html")
+        html-path (os.path/join daily-dir (str stamp ".html"))
+        validation-path (os.path/join daily-dir (str stamp ".validation.json"))]
+    (when-not (os.path/exists index-path)
+      (throw (python/FileNotFoundError index-path)))
+    (when-not (os.path/exists html-path)
+      (throw (python/FileNotFoundError html-path)))
+    (when-not (os.path/exists validation-path)
+      (throw (python/FileNotFoundError validation-path)))
+    (let [validation (read-json validation-path)
+          rendered? (.get validation "report/rendered?" false)]
+      (when-not rendered?
+        (throw (python/ValueError (str validation-path " is not rendered"))))
+      (let [actual-date (.get validation "report/date" date)]
+        (when-not (= actual-date date)
+          (throw (python/ValueError
+                  (str validation-path " report/date " actual-date
+                       " does not match requested " date)))))
+      (let [result (repair-index-text (slurp index-path)
+                                      date
+                                      (day-summary validation))]
+        (when (:changed? result)
+          (spit index-path (:text result)))
+        {:changed? (:changed? result)
+         :index-path index-path
+         :html-path html-path
+         :validation-path validation-path}))))
+
+(try
+  (let [result (repair! (parse-args (vec *command-line-args*)))]
+    (println (json/dumps (python/dict {"changed" (:changed? result)
+                                       "index_path" (:index-path result)
+                                       "html_path" (:html-path result)
+                                       "validation_path" (:validation-path result)})
+                         ** :indent 2 :sort_keys true))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/FileNotFoundError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

@@ -1,0 +1,162 @@
+;; Basilisp implementation of the Steve-v2 neutralization audit.
+(import datetime glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def default-option-cache
+  (os.path/join (os.path/expanduser "~")
+                "contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"
+                "pipeline_data/sim/option_bars_cache.jsonl"))
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/neutralization_audit.lpy -- "
+                "[--baseline-csv PATH] [--usage-csv PATH] [--out-dir DIR] "
+                "[--option-cache PATH] [--capture-dir DIR] "
+                "[--target-date YYYY-MM-DD] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:out-dir (os.path/join repo-root fp/default-analysis-dir)
+              :capture-dir (os.path/join repo-root fp/default-capture-dir)
+              :option-cache default-option-cache}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--baseline-csv")
+          (recur (nnext remaining) (assoc out :baseline-csv (option-value remaining arg)))
+
+          (= arg "--usage-csv")
+          (recur (nnext remaining) (assoc out :usage-csv (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--option-cache")
+          (recur (nnext remaining) (assoc out :option-cache (option-value remaining arg)))
+
+          (= arg "--capture-dir")
+          (recur (nnext remaining) (assoc out :capture-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining)
+                 (assoc out :target-date
+                        (cli-target-date (option-value remaining arg))))
+
+          (= arg "--write-unavailable")
+          (recur (next remaining) (assoc out :write-unavailable true))
+
+          (= arg "--unavailable-reason")
+          (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn compact-date [date]
+  (.replace (str date) "-" ""))
+
+(defn write-csv-header! [path]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (apply str (interpose "," fp/neutralization-audit-csv-columns)) "\n")))
+
+(defn write-unavailable! [opts]
+  (let [target-date (:target-date opts)]
+    (when-not target-date
+      (throw (python/ValueError "missing required --target-date for --write-unavailable")))
+    (let [analysis-dir (:out-dir opts)
+          reason (or (:unavailable-reason opts) "neutralization audit unavailable")
+          generated-at (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                  "%Y-%m-%dT%H:%M:%SZ")
+          stamp (compact-date target-date)
+          out-base (os.path/join (str analysis-dir) (str "neutralization_audit_" stamp))
+          csv-path (str out-base ".csv")
+          json-path (str out-base ".json")
+          md-path (str out-base ".md")
+          summary {"generated_at" generated-at
+                   "target_date" target-date
+                   "status" "unavailable"
+                   "available" false
+                   "ok" false
+                   "unavailable_reason" reason
+                   "baseline_csv" (str (or (:baseline-csv opts) ""))
+                   "usage_csv" (str (or (:usage-csv opts) ""))
+                   "total_features" 0
+                   "neutralized_features" 0
+                   "candidate_now" 0
+                   "review_count" 0
+                   "blocked_count" 0
+                   "neutralized_model_gain" 0.0
+                   "neutralized_model_gain_pct" 0.0
+                   "by_family" {}
+                   "by_recoverability" {}}]
+      (os/makedirs (str analysis-dir) ** :exist_ok true)
+      (write-csv-header! csv-path)
+      (spit json-path (json/dumps (fp/->jsonable {"summary" summary
+                                                  "features" []})
+                                  ** :indent 2 :sort_keys true))
+      (spit md-path (str "# Neutralization Audit\n\n"
+                         "- Target date: `" target-date "`\n"
+                         "- Status: `unavailable`\n"
+                         "- Reason: `" reason "`\n"
+                         "- Candidate now: `0`\n"
+                         "- Blocked: `0`\n"))
+      {:summary summary
+       :rows []
+       :csv-path csv-path
+       :json-path json-path
+       :markdown-path md-path})))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        {:keys [summary markdown-path csv-path json-path]}
+        (if (:write-unavailable opts)
+          (write-unavailable! opts)
+          (fp/write-neutralization-audit! opts))]
+    (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote " markdown-path))
+    (println (str "wrote " csv-path))
+    (println (str "wrote " json-path))
+    (when (:write-unavailable opts)
+      (python/exit 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

@@ -1,0 +1,1696 @@
+;; Write or verify a checksum manifest for a market-evidence artifact bundle.
+(import datetime glob hashlib json math os os.path re sys)
+(require '[clojure.set :as set])
+
+(defn usage []
+  (println "usage: basilisp run scripts/market_evidence_manifest.lpy -- --target-date YYYY-MM-DD [--analysis-dir DIR] [--payload-dir DIR] [--out manifest.json] [--verify manifest.json]"))
+
+(defn compact-date
+  [date-str]
+  (let [s (str date-str)]
+    (cond
+      (and (= 8 (count s)) (.isdigit s))
+      (let [iso (str (subs s 0 4) "-" (subs s 4 6) "-" (subs s 6 8))]
+        (datetime.date/fromisoformat iso)
+        s)
+
+      (= 10 (count s))
+      (do
+        (datetime.date/fromisoformat s)
+        (.replace s "-" ""))
+
+      :else
+      (throw (python/ValueError (str "invalid date: " s))))))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:analysis-dir (os.path/join repo-root "live_runtime" "analysis")
+              :payload-dir (os.path/join repo-root "resources" "thetadata" "payload_examples")}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+	        (cond
+	          (= arg "--target-date")
+	          (recur (nnext remaining)
+                   (assoc out :target-date
+                          (cli-target-date (option-value remaining arg))))
+
+	          (= arg "--analysis-dir")
+	          (recur (nnext remaining) (assoc out :analysis-dir (option-value remaining arg)))
+
+	          (= arg "--payload-dir")
+	          (recur (nnext remaining) (assoc out :payload-dir (option-value remaining arg)))
+
+	          (= arg "--out")
+	          (recur (nnext remaining) (assoc out :out (option-value remaining arg)))
+
+	          (= arg "--verify")
+	          (recur (nnext remaining) (assoc out :verify (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+	          :else
+	          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(def artifact-names
+  ["thetadata_capability_probe"
+   "thetadata_payload_verification"
+   "live_feature_parity_baseline"
+   "live_feature_model_usage"
+   "neutralization_audit"
+   "market_evidence_readiness"])
+
+(def optional-artifact-names
+  ["live_feature_prediction_delta_aggregate"
+   "live_feature_parity_gate"
+   "neutralized_feature_unlock_plan"
+   "neutralized_feature_evidence_report"
+   "blocked_feature_provenance_audit"
+   "legacy_greek_formula_search"
+   "greek_feature_reconstruction_audit"
+   "raw_feature_unlock_audit"
+   "raw_feature_unlock_candidates"
+   "v3_grid_unlock_audit"
+   "greek_reconstruction_promotion_gate"
+   "neutralization_unmask_dry_run"
+   "capture_v2_runtime_preflight"
+   "capture_v2_sidecar_check"
+   "option_surface_sidecar"
+   "option_surface_sidecar_check"
+   "replayed_feature_cohort"
+   "historical_feature_cohort"
+   "grid_feature_input_parity"
+   "matched_feature_parity"
+   "matched_feature_parity_summary"])
+
+(def expected-unmask-accounts
+  ["chestnut" "lynx" "moose"])
+
+(def expected-unmask-account-set
+  (set expected-unmask-accounts))
+
+(def artifact-extensions
+  {"thetadata_capability_probe" [".json" ".md"]
+   "thetadata_payload_verification" [".json"]
+   "live_feature_parity_baseline" [".json" ".csv" ".md"]
+   "live_feature_model_usage" [".json" ".csv" ".md"]
+   "neutralization_audit" [".json" ".csv" ".md"]
+   "neutralized_feature_unlock_plan" [".json" ".csv" ".md"]
+   "neutralized_feature_evidence_report" [".json" ".csv" ".md"]
+   "blocked_feature_provenance_audit" [".json" ".csv" ".md"]
+   "legacy_greek_formula_search" [".json" ".csv" ".md"]
+   "greek_feature_reconstruction_audit" [".json" ".csv" ".md"]
+   "raw_feature_unlock_audit" [".json" ".csv" ".md"]
+   "raw_feature_unlock_candidates" [".json"]
+   "v3_grid_unlock_audit" [".json" ".csv" ".md"]
+   "greek_reconstruction_promotion_gate" [".json" ".csv" ".md"]
+   "neutralization_unmask_dry_run" [".json"]
+   "capture_v2_runtime_preflight" [".json"]
+   "capture_v2_sidecar_check" [".json"]
+   "option_surface_sidecar" [".json" ".npz"]
+   "option_surface_sidecar_check" [".json"]
+   "replayed_feature_cohort" [".json" ".npz"]
+   "historical_feature_cohort" [".json"]
+   "historical_features" [".npz"]
+   "grid_feature_input_parity" [".json" ".md"]
+   "matched_feature_parity" [".json" ".csv" ".md"]
+   "matched_feature_parity_summary" [".json" ".md"]
+   "market_evidence_readiness" [".json" ".md"]
+   "live_feature_prediction_delta_aggregate" [".json" ".csv" ".md"]
+   "live_feature_parity_gate" [".json" ".md"]})
+
+(defn sha256-file
+  [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh 1048576)]
+        (when (pos? (count chunk))
+          (.update h chunk)
+          (recur (.read fh 1048576)))))
+    (.hexdigest h)))
+
+(defn artifact-entry
+  [path]
+  (if (os.path/exists path)
+    {"path" path
+     "exists" true
+     "bytes" (os.path/getsize path)
+     "sha256" (sha256-file path)}
+    {"path" path
+     "exists" false}))
+
+(defn artifact-paths-for
+  [analysis-dir stamp names]
+  (into {}
+        (mapcat (fn [name]
+                  (map (fn [ext]
+                         [(str name ext)
+                          (os.path/join analysis-dir (str name "_" stamp ext))])
+                       (get artifact-extensions name)))
+                names)))
+
+(defn historical-cohort-artifact-paths
+  [analysis-dir stamp]
+  {"historical_feature_cohort.json" (os.path/join analysis-dir
+                                                  (str "historical_feature_cohort_" stamp ".json"))
+   "historical_features.npz" (os.path/join analysis-dir
+                                           (str "historical_features_" stamp ".npz"))})
+
+(defn supplemental-raw-unlock-artifact-paths
+  [analysis-dir stamp]
+  (into {}
+        (map (fn [path]
+               (let [basename (os.path/basename path)
+                     prefix (str "raw_feature_unlock_audit_" stamp "_")
+                     label-ext (subs basename (count prefix))]
+                 [(str "raw_feature_unlock_audit_" label-ext) path]))
+             (sort
+              (glob/glob
+               (os.path/join analysis-dir
+                             (str "raw_feature_unlock_audit_" stamp "_*.json")))))))
+
+(def parity-proof-artifact-keys
+  ["capture_v2_sidecar_check.json"
+   "historical_feature_cohort.json"
+   "historical_features.npz"
+   "matched_feature_parity.json"
+   "matched_feature_parity.csv"
+   "matched_feature_parity.md"])
+
+(defn artifact-paths
+  [analysis-dir stamp]
+  (artifact-paths-for analysis-dir stamp artifact-names))
+
+(defn optional-artifact-paths
+  [analysis-dir stamp]
+  (merge (artifact-paths-for analysis-dir stamp optional-artifact-names)
+         (historical-cohort-artifact-paths analysis-dir stamp)
+         (supplemental-raw-unlock-artifact-paths analysis-dir stamp)))
+
+(defn missing-parity-proof-artifacts
+  [analysis-dir stamp]
+  (let [paths (optional-artifact-paths analysis-dir stamp)]
+    (vec
+     (sort
+      (for [key parity-proof-artifact-keys
+            :let [path (get paths key)]
+            :when (or (nil? path)
+                      (not (os.path/exists path)))]
+        key)))))
+
+(defn required-artifact-keys
+  []
+  (set (map first (artifact-paths "" "YYYYMMDD"))))
+
+(defn payload-example-dir
+  [payload-dir stamp]
+  (os.path/join payload-dir stamp))
+
+(defn payload-example-paths
+  [payload-dir stamp]
+  (sort (glob/glob (os.path/join (payload-example-dir payload-dir stamp) "**" "*.json")
+                   ** :recursive true)))
+
+(defn payload-example-artifacts
+  [payload-dir stamp]
+  (let [root (payload-example-dir payload-dir stamp)]
+    (into {}
+          (map (fn [path]
+                 (let [rel (os.path/relpath path root)]
+                   [(str "payload_examples/" rel) (artifact-entry path)]))
+               (payload-example-paths payload-dir stamp)))))
+
+(defn now-utc
+  []
+  (.strftime (datetime.datetime/now datetime.timezone/utc)
+             "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn parse-timestamp-seconds
+  [s]
+  (.timestamp
+   (datetime.datetime/fromisoformat
+    (.replace (str s) "Z" "+00:00"))))
+
+(defn generated-at-issues
+  [m]
+  (if-not (contains? m "generated_at")
+    []
+    (try
+      (let [generated-at (get m "generated_at")
+            generated-seconds (parse-timestamp-seconds generated-at)
+            now-seconds (.timestamp
+                         (datetime.datetime/now datetime.timezone/utc))]
+        (if (> generated-seconds (+ now-seconds 60.0))
+          [{"severity" "bad"
+            "code" "market-evidence/manifest-generated-at-in-future"
+            "generated_at" generated-at}]
+          []))
+      (catch python/Exception e
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-generated-at-unparseable"
+          "generated_at" (get m "generated_at")
+          "error" (str e)}]))))
+
+(defn reject-duplicate-json-object
+  [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining)
+               (conj seen k)
+               (assoc out k v))))))
+
+(defn read-json
+  [path]
+  (json/loads (slurp path) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn read-json-safe
+  [path]
+  (try
+    (read-json path)
+    (catch python/Exception _ nil)))
+
+(defn json-object?
+  [x]
+  (or (map? x) (python/isinstance x python/dict)))
+
+(defn json-object-keys
+  [x]
+  (if (map? x) (keys x) (.keys x)))
+
+(defn json-object-items
+  [x]
+  (if (map? x) x (.items x)))
+
+(defn json-array?
+  [x]
+  (or (vector? x) (python/isinstance x python/list)))
+
+(defn bool-value?
+  [x]
+  (or (= true x) (= false x)))
+
+(defn int-value
+  [x]
+  (try
+    (when (or (true? x) (false? x))
+      (throw (python/ValueError "boolean is not an integer")))
+    (int x)
+    (catch python/Exception _ 0)))
+
+(defn nonnegative-int-value
+  [x]
+    (try
+    (cond
+      (nil? x) nil
+      (or (true? x) (false? x)) nil
+      (string? x)
+      (let [s (.strip x)]
+        (when (and (not= "" s) (.isdigit s))
+          (int s)))
+      :else
+      (let [f (float x)
+            i (int x)]
+        (when (and (math/isfinite f)
+                   (not (< i 0))
+                   (= f (float i)))
+          i)))
+    (catch python/Exception _ nil)))
+
+(defn nonnegative-int-field-issue
+  [code label x]
+  (when (nil? (nonnegative-int-value x))
+    {"severity" "bad"
+     "code" code
+     "field" label
+     "value" x}))
+
+(defn sha256-string?
+  [x]
+  (and (string? x)
+       (some? (re/fullmatch #"[0-9a-f]{64}" x))))
+
+(defn nonblank-string?
+  [x]
+  (and (string? x)
+       (not= "" (.strip x))))
+
+(defn realpath-under-prefix?
+  [path prefix]
+  (.startswith (str (os.path/realpath path) "/") prefix))
+
+(defn payload-realpath-escape-artifacts
+  [payload-artifacts payload-dir stamp]
+  (let [prefix (str (os.path/abspath (payload-example-dir payload-dir stamp)) "/")]
+    (vec
+     (sort
+      (for [[name entry] (.items payload-artifacts)
+            :when (not (realpath-under-prefix? (get entry "path" "") prefix))]
+        name)))))
+
+(defn fixed-realpath-mismatch-artifacts
+  [fixed-artifacts]
+  (vec
+   (sort
+    (for [[name entry] (.items fixed-artifacts)
+          :when (and (get entry "exists")
+                     (not= (os.path/realpath (get entry "path" ""))
+                           (os.path/abspath (get entry "path" ""))))]
+      name))))
+
+(defn readiness-verdict
+  [artifacts]
+  (let [entry (get artifacts "market_evidence_readiness.json")]
+    (when (and (get entry "exists") (get entry "path"))
+      (try
+        (or (get (read-json (get entry "path")) "verdict") "INVALID")
+        (catch python/Exception _ "UNREADABLE")))))
+
+(defn readiness-reasons
+  [artifacts]
+  (let [entry (get artifacts "market_evidence_readiness.json")]
+    (when (and (get entry "exists") (get entry "path"))
+      (try
+        (get (read-json (get entry "path")) "reasons" [])
+        (catch python/Exception _ [])))))
+
+(defn artifact-json
+  [artifacts name]
+  (let [entry (get artifacts name)]
+    (when (and (get entry "exists") (get entry "path"))
+      (read-json-safe (get entry "path")))))
+
+(defn artifact-path
+  [artifacts name]
+  (let [entry (get artifacts name)]
+    (when (and (get entry "exists") (get entry "path"))
+      (get entry "path"))))
+
+(defn string-array-values
+  [x]
+  (if (and (json-array? x) (every? string? x))
+    (vec x)
+    []))
+
+(defn audit-candidate-features
+  [audit]
+  (let [summary (get audit "summary" {})
+        summary-candidates (get summary "candidate_features")
+        features (get audit "features")]
+    (cond
+      (json-array? summary-candidates)
+      (string-array-values summary-candidates)
+
+      (json-array? features)
+      (vec
+       (keep (fn [row]
+               (when (and (json-object? row)
+                          (= true (get row "candidate"))
+                          (string? (get row "feature")))
+                 (get row "feature")))
+             features))
+
+      :else
+      [])))
+
+(defn sorted-set-diff
+  [left right]
+  (vec (sort (seq (set/difference (set left) (set right))))))
+
+(defn candidate-union
+  [& lists]
+  (vec (distinct (apply concat lists))))
+
+(defn compare-count-issue
+  [code expected actual]
+  (let [expected-int (nonnegative-int-value expected)
+        actual-int (nonnegative-int-value actual)]
+    (cond
+      (nil? expected-int)
+      {"severity" "bad"
+       "code" (str code "-expected-invalid")
+       "expected" expected
+       "actual" actual}
+
+      (nil? actual-int)
+      {"severity" "bad"
+       "code" (str code "-actual-invalid")
+       "expected" expected
+       "actual" actual}
+
+      (not= expected-int actual-int)
+      {"severity" "bad"
+       "code" code
+       "expected" expected-int
+       "actual" actual-int})))
+
+(defn- result-seq
+  [m]
+  (let [results (get m "results" [])]
+    (if (or (vector? results) (seq? results) (python/isinstance results python/list))
+      results
+      [])))
+
+(defn- feature-seq
+  [m]
+  (let [features (get m "features" [])]
+    (if (or (vector? features) (seq? features) (python/isinstance features python/list))
+      features
+      [])))
+
+(defn- nonblank?
+  [x]
+  (and (string? x)
+       (not= "" (.strip x))))
+
+(defn- nonblank-text
+  [x]
+  (let [s (.strip (str (or x "")))]
+    (when (not= "" s) s)))
+
+(defn- duplicate-values
+  [xs]
+  (vec (sort (map first (filter (fn [[_ n]] (> n 1)) (frequencies xs))))))
+
+(defn- realpath-text
+  [x]
+  (when (nonblank? x)
+    (try
+      (os.path/realpath x)
+      (catch python/Exception _
+        (nonblank-text x)))))
+
+(defn- payload-reference-identity
+  [x]
+  (when (nonblank? x)
+    (let [text (nonblank-text x)]
+      (if (os.path/isabs text)
+        (os.path/basename text)
+        (realpath-text text)))))
+
+(defn probe-result-counts
+  [probe]
+  (let [results (result-seq probe)
+        total (count results)
+        ok (count (filter #(= true (get % "ok")) results))
+        usable (count (filter #(= true (get % "usable")) results))
+        payload-examples (count (filter #(nonblank? (get % "payload_example")) results))]
+    {"total" total
+     "ok" ok
+     "usable" usable
+     "failed" (- total ok)
+     "payload_examples" payload-examples}))
+
+(defn payload-verification-result-counts
+  [verification]
+  (let [results (result-seq verification)
+        total (count results)
+        skipped (count (filter #(= "skipped" (get % "status")) results))
+        checked (- total skipped)
+        invalid (count (filter #(= false (get % "valid?")) results))]
+    {"total" total
+     "checked" checked
+     "skipped" skipped
+     "invalid" invalid}))
+
+(defn payload-verification-probe-coverage-issues
+  [probe verification]
+  (let [expected (vec
+                  (keep (fn [row]
+                          (when (and (json-object? row)
+                                     (nonblank? (get row "payload_example")))
+                            (payload-reference-identity (get row "payload_example"))))
+                        (result-seq probe)))
+        actual (vec
+                (keep (fn [row]
+                        (when (and (json-object? row)
+                                   (not= "skipped" (str (get row "status"))))
+                          (payload-reference-identity (get row "path"))))
+                      (result-seq verification)))
+        expected-set (set expected)
+        actual-set (set actual)
+        missing (vec (sort (remove actual-set expected-set)))
+        unexpected (vec (sort (remove expected-set actual-set)))
+        duplicate-expected (duplicate-values expected)
+        duplicate-actual (duplicate-values actual)]
+    (vec
+     (keep identity
+           [(when (seq duplicate-expected)
+              {"severity" "bad"
+               "code" "market-evidence/probe-payload-example-duplicate-identities"
+               "probes" duplicate-expected})
+            (when (seq duplicate-actual)
+              {"severity" "bad"
+               "code" "market-evidence/payload-verification-duplicate-checked-probes"
+               "probes" duplicate-actual})
+            (when (seq missing)
+              {"severity" "bad"
+               "code" "market-evidence/payload-verification-missing-checked-probes"
+               "probes" missing})
+            (when (seq unexpected)
+              {"severity" "bad"
+               "code" "market-evidence/payload-verification-unexpected-checked-probes"
+               "probes" unexpected})]))))
+
+(defn payload-artifact-realpaths
+  [artifacts]
+  (set
+   (keep (fn [[name entry]]
+           (when (and (.startswith name "payload_examples/")
+                      (json-object? entry)
+                      (get entry "exists")
+                      (get entry "path"))
+             (try
+               (os.path/realpath (get entry "path"))
+               (catch python/Exception _ nil))))
+         (json-object-items artifacts))))
+
+(defn payload-artifact-basenames
+  [artifacts]
+  (set
+   (keep (fn [[name entry]]
+           (when (and (.startswith name "payload_examples/")
+                      (json-object? entry)
+                      (get entry "exists")
+                      (get entry "path"))
+             (let [basename (os.path/basename (get entry "path"))]
+               (when (nonblank? basename)
+                 basename))))
+         (json-object-items artifacts))))
+
+(defn payload-example-covered?
+  [payload-realpaths payload-basenames payload-example realpath]
+  (or (contains? payload-realpaths realpath)
+      ;; Probe artifacts generated on Hetzner store absolute /opt/... paths.
+      ;; Local audits may point --payload-dir at an rsynced bundle instead; in
+      ;; that case the safe identity is the saved payload filename under the
+      ;; already-scanned payload_examples/YYYYMMDD tree.
+      (and (os.path/isabs payload-example)
+           (contains? payload-basenames (os.path/basename payload-example)))))
+
+(defn probe-payload-example-reference-issues
+  [artifacts probe]
+  (let [payload-realpaths (payload-artifact-realpaths artifacts)
+        payload-basenames (payload-artifact-basenames artifacts)]
+    (vec
+     (keep-indexed
+      (fn [idx row]
+        (let [payload-example (get row "payload_example")]
+          (when (nonblank? payload-example)
+            (let [realpath (try
+                             (os.path/realpath payload-example)
+                             (catch python/Exception _ nil))]
+              (when-not (payload-example-covered? payload-realpaths payload-basenames payload-example realpath)
+                {"severity" "bad"
+                 "code" "market-evidence/probe-payload-example-not-covered"
+                 "row" idx
+                 "payload_example" payload-example
+                 "realpath" realpath})))))
+      (result-seq probe)))))
+
+(defn probe-result-usability-issues
+  [probe]
+  (vec
+   (mapcat
+    (fn [idx row]
+      (let [usable? (= true (get row "usable"))
+            summary (get row "summary")
+            summary-map? (json-object? summary)
+            required-ok (when summary-map? (get summary "required_ok"))
+            row-width-valid (when summary-map? (get summary "row_width_valid"))]
+        (concat
+         (when (and usable? (not summary-map?))
+           [{"severity" "bad"
+             "code" "market-evidence/probe-usable-summary-missing"
+             "row" idx
+             "name" (get row "name")}])
+         (when (and usable? summary-map? (not= true required-ok))
+           [{"severity" "bad"
+             "code" "market-evidence/probe-usable-required-ok-mismatch"
+             "row" idx
+             "name" (get row "name")
+             "required_ok" required-ok}])
+         (when (and usable? summary-map? (= false row-width-valid))
+           [{"severity" "bad"
+             "code" "market-evidence/probe-usable-row-width-invalid"
+             "row" idx
+             "name" (get row "name")}]))))
+    (range)
+    (result-seq probe))))
+
+(defn computed-count-issues
+  [prefix expected actual fields]
+  (vec
+   (keep (fn [field]
+           (compare-count-issue (str "market-evidence/" prefix "-" field "-mismatch")
+                                (get expected field)
+                                (get actual field)))
+         fields)))
+
+(defn readiness-legacy-greek-expected-summary
+  [summary]
+  {"candidate_formula_hits" (get summary "candidate_formula_hits")
+   "legacy_formula_provenance_hits" (get summary "legacy_formula_provenance_hits"
+                                         (get summary "candidate_formula_hits"))
+   "candidate_reconstruction_hits" (get summary "candidate_reconstruction_hits" 0)
+   "manifest_reference_count" (get summary "manifest_reference_count")
+   "manifest_impl_classes_missing" (get summary "manifest_impl_classes_missing")})
+
+(defn semantic-count-type-issues
+  [label prefix m fields]
+  (vec
+   (keep (fn [field]
+           (nonnegative-int-field-issue
+            (str "market-evidence/" prefix "-" field "-invalid")
+            (str label "." field)
+            (get m field)))
+         fields)))
+
+(defn greek-promotion-artifact-issues
+  [audit]
+  (let [summary (get audit "summary" {})
+        features (feature-seq audit)
+        candidate-features-value (get summary "candidate_features")
+        candidate-features (string-array-values candidate-features-value)
+        candidate-features-from-rows (vec
+                                      (sort
+                                       (keep (fn [row]
+                                               (when (and (json-object? row)
+                                                          (= true (get row "candidate"))
+                                                          (string? (get row "feature")))
+                                                 (get row "feature")))
+                                             features)))
+        evaluated-count (nonnegative-int-value (get summary "evaluated_count"))
+        min-evaluated-count (nonnegative-int-value (get summary "min_evaluated_count"))
+        coverage-reasons (get summary "coverage_reasons")]
+    (vec
+     (filter
+      identity
+      (concat
+       (semantic-count-type-issues
+        "Greek reconstruction promotion gate"
+        "greek-promotion"
+        summary
+        ["evaluated_count" "candidate_count" "min_evaluated_count"
+         "raw_guarded_greek_reconstruction_count"])
+       [(when-not (= true (get summary "coverage_ok"))
+          {"severity" "bad"
+           "code" "market-evidence/greek-promotion-coverage-not-ok"
+           "coverage_ok" (get summary "coverage_ok")})
+        (when-not (json-array? coverage-reasons)
+          {"severity" "bad"
+           "code" "market-evidence/greek-promotion-coverage-reasons-invalid"
+           "value" coverage-reasons})
+        (when (and (json-array? coverage-reasons)
+                   (seq coverage-reasons))
+          {"severity" "bad"
+           "code" "market-evidence/greek-promotion-coverage-reasons-present"
+           "coverage_reasons" coverage-reasons})
+        (when-not (json-array? candidate-features-value)
+          {"severity" "bad"
+           "code" "market-evidence/greek-promotion-candidate-features-invalid"
+           "value" candidate-features-value})
+        (compare-count-issue "market-evidence/greek-promotion-candidate-count-mismatch"
+                             (count candidate-features)
+                             (get summary "candidate_count"))
+        (compare-count-issue "market-evidence/greek-promotion-evaluated-count-mismatch"
+                             (count features)
+                             (get summary "evaluated_count"))
+        (when (and (some? evaluated-count)
+                   (some? min-evaluated-count)
+                   (< evaluated-count min-evaluated-count))
+          {"severity" "bad"
+           "code" "market-evidence/greek-promotion-evaluated-below-minimum"
+           "evaluated_count" evaluated-count
+           "min_evaluated_count" min-evaluated-count})
+        (when (and (json-array? candidate-features-value)
+                   (not= (set candidate-features)
+                         (set candidate-features-from-rows)))
+          {"severity" "bad"
+           "code" "market-evidence/greek-promotion-candidate-features-mismatch"
+           "missing_from_summary" (sorted-set-diff candidate-features-from-rows candidate-features)
+           "extra_in_summary" (sorted-set-diff candidate-features candidate-features-from-rows)})])))))
+
+(defn semantic-artifact-issues
+  [artifacts target-date]
+  (let [readiness (artifact-json artifacts "market_evidence_readiness.json")
+        readiness-path (artifact-path artifacts "market_evidence_readiness.json")
+        unmask-dry-run (artifact-json artifacts "neutralization_unmask_dry_run.json")
+        unmask-entry (get artifacts "neutralization_unmask_dry_run.json")
+        raw-unlock-audit (artifact-json artifacts "raw_feature_unlock_audit.json")
+        supplemental-raw-unlock-audits (vec
+                                        (keep (fn [[name _entry]]
+                                                (when (and (.startswith name "raw_feature_unlock_audit_")
+                                                           (.endswith name ".json"))
+                                                  (artifact-json artifacts name)))
+                                              (json-object-items artifacts)))
+        raw-candidates-file (artifact-json artifacts "raw_feature_unlock_candidates.json")
+        v3-unlock-audit (artifact-json artifacts "v3_grid_unlock_audit.json")
+        greek-promotion-audit (artifact-json artifacts "greek_reconstruction_promotion_gate.json")
+        legacy-greek-search (artifact-json artifacts "legacy_greek_formula_search.json")
+        primary-raw-candidate-features (audit-candidate-features raw-unlock-audit)
+        raw-candidate-features (apply candidate-union
+                                      primary-raw-candidate-features
+                                      (map audit-candidate-features supplemental-raw-unlock-audits))
+        v3-candidate-features (audit-candidate-features v3-unlock-audit)
+        greek-candidate-features (audit-candidate-features greek-promotion-audit)
+        audited-candidate-features (candidate-union raw-candidate-features
+                                                   v3-candidate-features
+                                                   greek-candidate-features)
+        unmask-candidate-features (string-array-values (get unmask-dry-run "candidate_features"))
+        unmask-candidate-count (nonnegative-int-value (get unmask-dry-run "candidate_count"))
+        unmask-results (get unmask-dry-run "results")
+        unmask-result-rows (if (json-array? unmask-results) (vec unmask-results) [])
+        unmask-result-accounts (vec (keep (fn [row]
+                                            (when (json-object? row)
+                                              (get row "account")))
+                                          unmask-result-rows))
+        unmask-result-account-set (set unmask-result-accounts)
+        unmask-result-account-values-valid? (and (every? #(and (string? %)
+                                                               (not= "" (.strip %)))
+                                                         unmask-result-accounts)
+                                                 (= (count unmask-result-accounts)
+                                                    (count unmask-result-rows)))
+        unmask-result-account-duplicates? (not= (count unmask-result-accounts)
+                                                (count unmask-result-account-set))
+        unmask-result-coverage-issues (vec (for [row unmask-result-rows
+                                                 :when (json-object? row)
+                                                 :let [account (get row "account")
+                                                       removed (nonnegative-int-value (get row "removed"))
+                                                       missing (nonnegative-int-value (get row "missing"))]
+                                                 :when (or (not= 0 missing)
+                                                           (not= unmask-candidate-count removed))]
+                                             {"account" account
+                                              "removed" (get row "removed")
+                                              "missing" (get row "missing")
+                                              "expected_removed" unmask-candidate-count
+                                              "expected_missing" 0}))
+        legacy-greek-search-summary (get legacy-greek-search "summary" {})
+        readiness-legacy-greek (get readiness "legacy_greek_formula_search" {})
+        expected-readiness-legacy-greek (readiness-legacy-greek-expected-summary legacy-greek-search-summary)
+        probe (artifact-json artifacts "thetadata_capability_probe.json")
+        verification (artifact-json artifacts "thetadata_payload_verification.json")
+        probe-summary (get probe "summary" {})
+        verification-status (get verification "status")
+        verification-valid (get verification "valid?")
+        verification-skipped (nonnegative-int-value (get verification "skipped"))
+        verification-invalid (nonnegative-int-value (get verification "invalid"))
+        readiness-probe (get readiness "thetadata_probe" {})
+        readiness-verification (get readiness "thetadata_payload_verification" {})
+        readiness-probe-result-counts (get readiness-probe "result_counts" {})
+        readiness-verification-result-counts (get readiness-verification "result_counts" {})
+        computed-probe-result-counts (probe-result-counts probe)
+        computed-verification-result-counts (payload-verification-result-counts verification)
+        effective-probe-payload-examples (if (and (zero? (nonnegative-int-value
+                                                          (get probe-summary "payload_examples")))
+                                                  (pos? (nonnegative-int-value
+                                                         (get verification "checked"))))
+                                           (get verification "checked")
+                                           (get probe-summary "payload_examples"))
+        effective-readiness-result-payload-examples
+        (if (and (zero? (nonnegative-int-value
+                         (get readiness-probe-result-counts "payload_examples")))
+                 (pos? (nonnegative-int-value
+                        (get readiness-verification "checked"))))
+          (get readiness-verification "checked")
+          (get readiness-probe-result-counts "payload_examples"))]
+    (vec
+     (filter
+      identity
+      (concat
+       (when probe
+         (semantic-count-type-issues
+          "ThetaData probe summary"
+          "probe-summary"
+          probe-summary
+          ["total" "ok" "usable" "failed" "payload_examples"]))
+       (when verification
+         (semantic-count-type-issues
+          "ThetaData payload verification"
+          "payload-verification"
+          verification
+          ["total" "checked" "skipped" "invalid"]))
+	       (when probe
+	         (computed-count-issues
+	          "probe-summary-results"
+	          probe-summary
+	          computed-probe-result-counts
+	          ["total" "ok" "usable" "failed" "payload_examples"]))
+       (when (and probe
+                  (pos? (nonnegative-int-value
+                         (get computed-probe-result-counts "payload_examples"))))
+         (probe-payload-example-reference-issues artifacts probe))
+       (when probe
+         (probe-result-usability-issues probe))
+	       (when verification
+	         (computed-count-issues
+	          "payload-verification-results"
+          verification
+          computed-verification-result-counts
+          ["total" "checked" "skipped" "invalid"]))
+       (when (and probe verification
+                  (pos? (nonnegative-int-value
+                         (get computed-probe-result-counts "payload_examples"))))
+         (payload-verification-probe-coverage-issues probe verification))
+       (when readiness
+         (semantic-count-type-issues
+          "readiness ThetaData probe"
+          "readiness-probe"
+          readiness-probe
+          ["total" "usable" "failed" "payload_examples"]))
+       (when readiness
+         (semantic-count-type-issues
+          "readiness ThetaData probe result_counts"
+          "readiness-probe-result-counts"
+          readiness-probe-result-counts
+          ["total" "ok" "usable" "failed" "payload_examples"]))
+       (when readiness
+         (semantic-count-type-issues
+          "readiness payload verification"
+          "readiness-payload-verification"
+          readiness-verification
+          ["total" "checked" "skipped" "invalid"]))
+       (when readiness
+         (semantic-count-type-issues
+          "readiness payload verification result_counts"
+          "readiness-payload-verification-result-counts"
+          readiness-verification-result-counts
+          ["total" "checked" "skipped" "invalid"]))
+       (when readiness
+         (semantic-count-type-issues
+          "readiness legacy Greek formula search"
+          "readiness-legacy-greek"
+          readiness-legacy-greek
+          ["candidate_formula_hits"
+           "legacy_formula_provenance_hits"
+           "candidate_reconstruction_hits"
+           "manifest_reference_count"
+           "manifest_impl_classes_missing"]))
+       (when greek-promotion-audit
+         (greek-promotion-artifact-issues greek-promotion-audit))
+       [(when-not readiness
+          {"severity" "bad"
+           "code" "market-evidence/readiness-json-unreadable"})
+        (when-not probe
+          {"severity" "bad"
+           "code" "market-evidence/probe-json-unreadable"})
+        (when-not verification
+          {"severity" "bad"
+           "code" "market-evidence/payload-verification-json-unreadable"})
+        (when (and verification
+                   (not= "ok" verification-status))
+          {"severity" "bad"
+           "code" "market-evidence/payload-verification-status-not-ok"
+           "status" verification-status})
+        (when (and verification
+                   (not= true verification-valid))
+          {"severity" "bad"
+           "code" "market-evidence/payload-verification-recorded-invalid"
+           "valid?" verification-valid})
+        (when (and verification
+                   (some? verification-skipped)
+                   (pos? verification-skipped))
+          {"severity" "bad"
+           "code" "market-evidence/payload-verification-skipped-examples"
+           "skipped" verification-skipped})
+        (when (and verification
+                   (some? verification-invalid)
+                   (pos? verification-invalid))
+          {"severity" "bad"
+           "code" "market-evidence/payload-verification-invalid-examples"
+           "invalid" verification-invalid})
+        (when (and readiness target-date
+                   (not= target-date (get readiness "target_date")))
+          {"severity" "bad"
+           "code" "market-evidence/readiness-target-date-mismatch"
+           "expected" target-date
+           "actual" (get readiness "target_date")})
+        (when (and (get unmask-entry "exists") (nil? unmask-dry-run))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-json-unreadable"})
+        (when (and unmask-dry-run
+                   (not= false (get unmask-dry-run "applied")))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-recorded-apply"
+           "applied" (get unmask-dry-run "applied")})
+        (when (and unmask-dry-run
+                   (not= true (get unmask-dry-run "readiness_available")))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-readiness-unavailable"
+           "readiness_available" (get unmask-dry-run "readiness_available")})
+        (when (and unmask-dry-run
+                   (some? (get unmask-dry-run "readiness_error")))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-readiness-error"
+           "error" (get unmask-dry-run "readiness_error")})
+        (when (and readiness unmask-dry-run
+                   (not= (get readiness "verdict")
+                         (get unmask-dry-run "readiness_verdict")))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-readiness-verdict-mismatch"
+           "expected" (get readiness "verdict")
+           "actual" (get unmask-dry-run "readiness_verdict")})
+        (when (and readiness unmask-dry-run
+                   (not= (get readiness "target_date")
+                         (get unmask-dry-run "readiness_target_date")))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-readiness-target-date-mismatch"
+           "expected" (get readiness "target_date")
+           "actual" (get unmask-dry-run "readiness_target_date")})
+        (when (and unmask-dry-run
+                   (not= true (get unmask-dry-run "readiness_target_matches")))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-readiness-target-match-false"
+           "readiness_target_matches" (get unmask-dry-run "readiness_target_matches")})
+        (when (and readiness-path unmask-dry-run
+                   (nonblank-string? (get unmask-dry-run "readiness_json"))
+                   (not= (os.path/abspath readiness-path)
+                         (os.path/abspath (get unmask-dry-run "readiness_json"))))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-readiness-path-mismatch"
+           "expected" (os.path/abspath readiness-path)
+           "actual" (os.path/abspath (get unmask-dry-run "readiness_json"))})
+        (when (and unmask-dry-run
+                   (json-array? (get unmask-dry-run "candidate_features"))
+                   (not= (count (get unmask-dry-run "candidate_features"))
+                         (int-value (get unmask-dry-run "candidate_count"))))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-candidate-count-mismatch"
+           "expected" (count (get unmask-dry-run "candidate_features"))
+           "actual" (get unmask-dry-run "candidate_count")})
+        (when (and unmask-dry-run
+                   (not (json-array? unmask-results)))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-results-invalid"
+           "value" unmask-results})
+        (when (and unmask-dry-run
+                   (json-array? unmask-results)
+                   (not (pos? (count unmask-result-rows))))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-results-empty"})
+        (when (and unmask-dry-run
+                   (json-array? unmask-results)
+                   (some #(not (json-object? %)) unmask-result-rows))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-result-row-invalid"})
+        (when (and unmask-dry-run
+                   (json-array? unmask-results)
+                   (seq unmask-result-rows)
+                   (not unmask-result-account-values-valid?))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-result-accounts-invalid"
+           "accounts" unmask-result-accounts})
+        (when (and unmask-dry-run
+                   (json-array? unmask-results)
+                   unmask-result-account-duplicates?)
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-result-accounts-duplicate"
+           "accounts" unmask-result-accounts})
+        (when (and unmask-dry-run
+                   (json-array? unmask-results)
+                   unmask-result-account-values-valid?
+                   (not= expected-unmask-account-set unmask-result-account-set))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-result-accounts-mismatch"
+           "expected" expected-unmask-accounts
+           "actual" unmask-result-accounts
+           "missing" (sorted-set-diff expected-unmask-accounts unmask-result-accounts)
+           "extra" (sorted-set-diff unmask-result-accounts expected-unmask-accounts)})
+        (when (and unmask-dry-run
+                   (json-array? unmask-results)
+                   (seq unmask-result-coverage-issues))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-result-coverage-incomplete"
+           "results" unmask-result-coverage-issues})
+        (when (and raw-unlock-audit raw-candidates-file
+                   (not= (set primary-raw-candidate-features)
+                         (set (string-array-values raw-candidates-file))))
+          {"severity" "bad"
+           "code" "market-evidence/raw-unlock-candidates-file-mismatch"
+           "missing_from_file" (sorted-set-diff primary-raw-candidate-features raw-candidates-file)
+           "extra_in_file" (sorted-set-diff raw-candidates-file primary-raw-candidate-features)})
+        (when (and unmask-dry-run
+                   (not (json-array? (get unmask-dry-run "candidate_features"))))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-candidate-features-invalid"
+           "value" (get unmask-dry-run "candidate_features")})
+        (when (and unmask-dry-run
+                   (not= (set audited-candidate-features)
+                         (set unmask-candidate-features)))
+          {"severity" "bad"
+           "code" "market-evidence/unmask-dry-run-audit-candidate-union-mismatch"
+           "missing_from_dry_run" (sorted-set-diff audited-candidate-features unmask-candidate-features)
+           "extra_in_dry_run" (sorted-set-diff unmask-candidate-features audited-candidate-features)})
+        (when (and probe target-date
+                   (not= target-date (get probe "target_date")))
+          {"severity" "bad"
+           "code" "market-evidence/probe-target-date-mismatch"
+           "expected" target-date
+           "actual" (get probe "target_date")})
+        (when (and verification
+                   (not (contains? #{(compact-date target-date) target-date}
+                                   (get verification "target_date"))))
+          {"severity" "bad"
+           "code" "market-evidence/payload-verification-target-date-mismatch"
+           "expected" target-date
+           "actual" (get verification "target_date")})
+        (when (and readiness (not (contains? readiness "thetadata_probe")))
+          {"severity" "bad"
+           "code" "market-evidence/readiness-thetadata-probe-summary-missing"})
+        (when (and readiness (not (contains? readiness "thetadata_payload_verification")))
+          {"severity" "bad"
+           "code" "market-evidence/readiness-payload-verification-summary-missing"})
+        (when (and readiness (not (contains? readiness "legacy_greek_formula_search")))
+          {"severity" "bad"
+           "code" "market-evidence/readiness-legacy-greek-summary-missing"})
+        (when (and verification
+                   (not= verification-status (get readiness-verification "status")))
+          {"severity" "bad"
+           "code" "market-evidence/readiness-payload-verification-status-mismatch"
+           "expected" verification-status
+           "actual" (get readiness-verification "status")})
+        (when (and verification
+                   (not= verification-valid (get readiness-verification "valid")))
+          {"severity" "bad"
+           "code" "market-evidence/readiness-payload-verification-valid-mismatch"
+           "expected" verification-valid
+           "actual" (get readiness-verification "valid")})]
+       (when (and readiness probe)
+         [(compare-count-issue "market-evidence/readiness-probe-total-mismatch"
+                               (get probe-summary "total")
+                               (get readiness-probe "total"))
+          (compare-count-issue "market-evidence/readiness-probe-usable-mismatch"
+                               (get probe-summary "usable")
+                               (get readiness-probe "usable"))
+          (compare-count-issue "market-evidence/readiness-probe-failed-mismatch"
+                               (get probe-summary "failed")
+                               (get readiness-probe "failed"))
+          (compare-count-issue "market-evidence/readiness-probe-payload-examples-mismatch"
+                               effective-probe-payload-examples
+                               (get readiness-probe "payload_examples"))
+          (compare-count-issue "market-evidence/readiness-probe-result-total-mismatch"
+                               (get probe-summary "total")
+                               (get readiness-probe-result-counts "total"))
+          (compare-count-issue "market-evidence/readiness-probe-result-usable-mismatch"
+                               (get probe-summary "usable")
+                               (get readiness-probe-result-counts "usable"))
+          (compare-count-issue "market-evidence/readiness-probe-result-failed-mismatch"
+                               (get probe-summary "failed")
+                               (get readiness-probe-result-counts "failed"))
+          (compare-count-issue "market-evidence/readiness-probe-result-payload-examples-mismatch"
+                               effective-probe-payload-examples
+                               effective-readiness-result-payload-examples)])
+       (when (and readiness verification)
+         [(compare-count-issue "market-evidence/readiness-payload-verification-total-mismatch"
+                               (get verification "total")
+                               (get readiness-verification "total"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-checked-mismatch"
+                               (get verification "checked")
+                               (get readiness-verification "checked"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-skipped-mismatch"
+                               (get verification "skipped")
+                               (get readiness-verification "skipped"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-invalid-mismatch"
+                               (get verification "invalid")
+                               (get readiness-verification "invalid"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-result-total-mismatch"
+                               (get verification "total")
+                               (get readiness-verification-result-counts "total"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-result-checked-mismatch"
+                               (get verification "checked")
+                               (get readiness-verification-result-counts "checked"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-result-skipped-mismatch"
+                               (get verification "skipped")
+                               (get readiness-verification-result-counts "skipped"))
+          (compare-count-issue "market-evidence/readiness-payload-verification-result-invalid-mismatch"
+                               (get verification "invalid")
+                               (get readiness-verification-result-counts "invalid"))])
+       (when (and readiness legacy-greek-search)
+         (computed-count-issues
+          "readiness-legacy-greek"
+          expected-readiness-legacy-greek
+          readiness-legacy-greek
+          ["candidate_formula_hits"
+           "legacy_formula_provenance_hits"
+           "candidate_reconstruction_hits"
+           "manifest_reference_count"
+           "manifest_impl_classes_missing"])))))))
+
+(defn manifest
+  [target-date analysis-dir payload-dir]
+  (let [stamp (compact-date target-date)
+        paths (artifact-paths analysis-dir stamp)
+        optional-paths (optional-artifact-paths analysis-dir stamp)
+        fixed-artifacts (into {} (map (fn [[k path]] [k (artifact-entry path)]) paths))
+        optional-fixed-artifacts (into {}
+                                       (keep (fn [[k path]]
+                                               (let [entry (artifact-entry path)]
+                                                 (when (get entry "exists")
+                                                   [k entry])))
+                                             optional-paths))
+        payload-artifacts (payload-example-artifacts payload-dir stamp)
+        artifacts (merge fixed-artifacts optional-fixed-artifacts payload-artifacts)
+        missing (vec (sort (map first (filter (fn [[_ entry]]
+                                                (not (get entry "exists")))
+                                              artifacts))))
+        payload-count (count payload-artifacts)
+        readiness (readiness-verdict artifacts)
+        bad-payload-paths (payload-realpath-escape-artifacts payload-artifacts payload-dir stamp)
+        bad-fixed-paths (fixed-realpath-mismatch-artifacts (merge fixed-artifacts
+                                                                  optional-fixed-artifacts))
+        semantic-issues (semantic-artifact-issues artifacts target-date)
+        missing-parity-proof (when (= "PASS" readiness)
+                               (missing-parity-proof-artifacts analysis-dir stamp))
+        issues (vec (concat
+                     (when (seq missing)
+                       [{"severity" "bad"
+                         "code" "market-evidence/missing-artifacts"
+                         "artifacts" missing}])
+                     (when (seq missing-parity-proof)
+                       [{"severity" "bad"
+                         "code" "market-evidence/missing-parity-proof-artifacts"
+                         "artifacts" missing-parity-proof}])
+                     semantic-issues
+                     (when (zero? payload-count)
+                       [{"severity" "bad"
+                         "code" "market-evidence/no-payload-examples"
+                         "payload_example_dir" (payload-example-dir payload-dir stamp)}])
+                     (when (not= "PASS" readiness)
+                       [{"severity" "bad"
+                         "code" "market-evidence/readiness-not-pass"
+                         "verdict" readiness
+                         "reasons" (readiness-reasons artifacts)}])
+                     (when (seq bad-payload-paths)
+                       [{"severity" "bad"
+                         "code" "market-evidence/payload-artifact-path-outside-target-dir"
+                         "artifacts" bad-payload-paths}])
+                     (when (seq bad-fixed-paths)
+                       [{"severity" "bad"
+                         "code" "market-evidence/artifact-realpath-mismatch"
+                         "artifacts" bad-fixed-paths}])))
+        valid? (empty? issues)]
+    {"manifest_version" 1
+     "kind" "market-evidence-artifacts-v1"
+     "generated_at" (now-utc)
+     "target_date" target-date
+     "target_stamp" stamp
+     "analysis_dir" analysis-dir
+     "payload_dir" payload-dir
+     "payload_example_dir" (payload-example-dir payload-dir stamp)
+     "payload_example_count" payload-count
+     "readiness_verdict" readiness
+     "readiness_reasons" (readiness-reasons artifacts)
+     "valid?" valid?
+     "status" (if valid? "ok" "error")
+     "issues" issues
+     "artifacts" artifacts}))
+
+(defn artifact-verify-issues
+  [name entry]
+  (if-not (json-object? entry)
+    [{"severity" "bad"
+      "code" "market-evidence/manifest-artifact-entry-invalid-shape"
+      "artifact" name}]
+    (let [artifact-path (get entry "path")]
+    (cond
+      (not (get entry "exists"))
+      [{"severity" "bad"
+        "code" "market-evidence/artifact-recorded-missing"
+        "artifact" name
+        "path" artifact-path}]
+
+      (not (os.path/exists artifact-path))
+      [{"severity" "bad"
+        "code" "market-evidence/artifact-missing"
+        "artifact" name
+        "path" artifact-path}]
+
+      :else
+      (let [actual-sha (sha256-file artifact-path)
+            actual-bytes (os.path/getsize artifact-path)]
+        (vec
+         (filter identity
+                 [(when-not (= actual-sha (get entry "sha256"))
+                    {"severity" "bad"
+                     "code" "market-evidence/artifact-checksum-mismatch"
+                     "artifact" name
+                     "path" artifact-path})
+	                  (when-not (= actual-bytes (get entry "bytes"))
+	                    {"severity" "bad"
+	                     "code" "market-evidence/artifact-size-mismatch"
+	                     "artifact" name
+	                     "path" artifact-path})])))))))
+
+(defn expected-fixed-paths
+  [m]
+  (when (and (get m "analysis_dir") (get m "target_stamp"))
+    (artifact-paths (get m "analysis_dir") (get m "target_stamp"))))
+
+(defn expected-payload-prefix
+  [m]
+  (when (and (get m "payload_dir") (get m "target_stamp"))
+    (str (os.path/abspath (payload-example-dir (get m "payload_dir")
+                                               (get m "target_stamp")))
+         "/")))
+
+(defn expected-payload-dir
+  [m]
+  (when (and (get m "payload_dir") (get m "target_stamp"))
+    (os.path/abspath (payload-example-dir (get m "payload_dir")
+                                          (get m "target_stamp")))))
+
+(defn target-date-stamp
+  [m]
+  (try
+    (when (get m "target_date")
+      (compact-date (get m "target_date")))
+    (catch python/Exception _ nil)))
+
+(defn path-under-prefix?
+  [path prefix]
+  (realpath-under-prefix? path prefix))
+
+(defn expected-payload-artifact-keys
+  [payload-dir stamp]
+  (if (and payload-dir stamp)
+    (set (.keys (payload-example-artifacts payload-dir stamp)))
+    #{}))
+
+(defn manifest-readiness-verdict
+  [m]
+  (readiness-verdict (if (json-object? m) (get m "artifacts" {}) {})))
+
+(defn top-level-field-type-issues
+  [m]
+  (vec
+   (filter
+    identity
+    [(when (and (contains? m "target_date")
+                (or (not (nonblank-string? (get m "target_date")))
+                    (nil? (target-date-stamp m))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-target-date-invalid"
+        "value" (get m "target_date")})
+     (when (and (contains? m "target_stamp")
+                (or (not (nonblank-string? (get m "target_stamp")))
+                    (try
+                      (compact-date (get m "target_stamp"))
+                      false
+                      (catch python/Exception _ true))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-target-stamp-invalid"
+        "value" (get m "target_stamp")})
+     (when (and (contains? m "analysis_dir")
+                (not (nonblank-string? (get m "analysis_dir"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-analysis-dir-invalid"
+        "value" (get m "analysis_dir")})
+     (when (and (contains? m "payload_dir")
+                (not (nonblank-string? (get m "payload_dir"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-payload-dir-invalid"
+        "value" (get m "payload_dir")})
+     (when (and (contains? m "payload_example_dir")
+                (not (nonblank-string? (get m "payload_example_dir"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-payload-example-dir-invalid"
+        "value" (get m "payload_example_dir")})
+     (when (and (contains? m "readiness_verdict")
+                (not (nonblank-string? (get m "readiness_verdict"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-readiness-verdict-invalid"
+        "value" (get m "readiness_verdict")})
+     (when (and (contains? m "readiness_reasons")
+                (not (json-array? (get m "readiness_reasons"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-readiness-reasons-invalid"
+        "value" (get m "readiness_reasons")})
+     (when (and (contains? m "valid?")
+                (not (bool-value? (get m "valid?"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-valid-invalid"
+        "value" (get m "valid?")})
+     (when (and (contains? m "status")
+                (not (nonblank-string? (get m "status"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-status-invalid"
+        "value" (get m "status")})
+     (when (and (contains? m "issues")
+                (not (json-array? (get m "issues"))))
+       {"severity" "bad"
+        "code" "market-evidence/manifest-issues-invalid"
+        "value" (get m "issues")})])))
+
+(defn artifact-entry-shape-issues
+  [name entry]
+  (if-not (json-object? entry)
+    [{"severity" "bad"
+      "code" "market-evidence/manifest-artifact-entry-invalid-shape"
+      "artifact" name}]
+    (let [entry-keys (set (json-object-keys entry))
+          exists (get entry "exists")
+          expected-keys (if (= true (get entry "exists"))
+                          #{"path" "exists" "bytes" "sha256"}
+                          #{"path" "exists"})
+          missing-keys (vec (sort (remove entry-keys expected-keys)))
+          extra-keys (vec (sort (remove expected-keys entry-keys)))]
+      (vec
+       (concat
+        (when (seq missing-keys)
+          [{"severity" "bad"
+            "code" "market-evidence/manifest-artifact-entry-fields-missing"
+            "artifact" name
+            "fields" missing-keys}])
+        (when (seq extra-keys)
+          [{"severity" "bad"
+            "code" "market-evidence/manifest-artifact-entry-fields-extra"
+            "artifact" name
+            "fields" extra-keys}])
+        (when-not (or (= true exists) (= false exists))
+          [{"severity" "bad"
+            "code" "market-evidence/manifest-artifact-entry-exists-invalid"
+            "artifact" name
+            "value" exists}])
+        (when-not (nonblank-string? (get entry "path"))
+          [{"severity" "bad"
+            "code" "market-evidence/manifest-artifact-entry-path-invalid"
+            "artifact" name
+            "value" (get entry "path")}])
+        (when (= true exists)
+          (keep identity
+                [(nonnegative-int-field-issue
+                  "market-evidence/manifest-artifact-entry-bytes-invalid"
+                  (str name ".bytes")
+                  (get entry "bytes"))
+                 (when-not (sha256-string? (get entry "sha256"))
+                   {"severity" "bad"
+                    "code" "market-evidence/manifest-artifact-entry-sha256-invalid"
+                    "artifact" name
+                    "value" (get entry "sha256")})])))))))
+
+(defn manifest-schema-issues
+  [path m expected-analysis-dir expected-payload-dir expected-target-date]
+  (let [manifest-object? (json-object? m)
+        safe-m (if manifest-object? m {})
+        raw-artifacts (when manifest-object? (get safe-m "artifacts" {}))
+        artifacts-object? (json-object? raw-artifacts)
+        artifacts (if artifacts-object? raw-artifacts {})
+        required (required-artifact-keys)
+        present (set (json-object-keys artifacts))
+        missing-required (vec (sort (remove present required)))
+        payload-count (nonnegative-int-value (get safe-m "payload_example_count"))
+        usable-payload-count (or payload-count 0)
+        listed-payload-count (count (filter #(.startswith % "payload_examples/") present))
+        manifest-stamp (when (nonblank-string? (get safe-m "target_stamp"))
+                         (get safe-m "target_stamp"))
+        expected-payload-keys (expected-payload-artifact-keys expected-payload-dir
+                                                               manifest-stamp)
+        listed-payload-keys (set (filter #(.startswith % "payload_examples/") present))
+        missing-payload-keys (vec (sort (remove listed-payload-keys expected-payload-keys)))
+        extra-payload-keys (vec (sort (remove expected-payload-keys listed-payload-keys)))
+        expected-paths (when manifest-stamp
+                         (merge (artifact-paths expected-analysis-dir
+                                                manifest-stamp)
+                                (optional-artifact-paths expected-analysis-dir
+                                                         manifest-stamp)))
+        expected-payload-prefix-value (when manifest-stamp
+                                        (str (os.path/abspath
+                                              (payload-example-dir expected-payload-dir
+                                                                   manifest-stamp))
+                                             "/"))
+        expected-payload-dir-value (when manifest-stamp
+                                     (os.path/abspath
+                                      (payload-example-dir expected-payload-dir
+                                                           manifest-stamp)))
+        date-stamp (target-date-stamp safe-m)
+        expected-target-stamp (when expected-target-date
+                                (compact-date expected-target-date))
+        readiness (manifest-readiness-verdict safe-m)
+        semantic-issues (semantic-artifact-issues artifacts expected-target-date)
+        required-top-level ["manifest_version" "kind" "generated_at" "target_date"
+                            "target_stamp" "analysis_dir" "payload_dir"
+                            "payload_example_dir" "payload_example_count"
+                            "readiness_verdict" "readiness_reasons"
+                            "valid?" "status" "issues" "artifacts"]
+        top-level-keys (if manifest-object? (set (json-object-keys safe-m)) #{})
+        missing-top-level (vec (sort (remove top-level-keys required-top-level)))
+        extra-top-level (vec (sort (remove (set required-top-level) top-level-keys)))
+        recorded-issues (get safe-m "issues" [])
+        artifact-entry-issues (vec (mapcat (fn [[name entry]]
+                                             (artifact-entry-shape-issues name entry))
+                                           (json-object-items artifacts)))
+        bad-fixed-paths (if expected-paths
+                          (vec
+                           (sort
+                            (for [[name entry] (json-object-items artifacts)
+                                  :when (and (json-object? entry)
+                                             (contains? expected-paths name)
+                                             (or (not= (os.path/abspath (get expected-paths name))
+                                                       (os.path/abspath (get entry "path" "")))
+                                                 (not= (os.path/abspath (get expected-paths name))
+                                                       (os.path/realpath (get expected-paths name)))
+                                                 (not= (os.path/realpath (get expected-paths name))
+                                                       (os.path/realpath (get entry "path" "")))))]
+                              name)))
+                          [])
+        bad-payload-paths (if expected-payload-prefix-value
+                            (vec
+                             (sort
+                              (for [[name entry] (json-object-items artifacts)
+                                    :when (and (json-object? entry)
+                                               (.startswith name "payload_examples/")
+                                               (not (path-under-prefix? (get entry "path" "")
+                                                                        expected-payload-prefix-value)))]
+                                name)))
+                            [])]
+    (vec
+     (concat
+      (when-not manifest-object?
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-invalid-shape"
+          "path" path}])
+      (when-not artifacts-object?
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-artifacts-invalid-shape"
+          "path" path}])
+      artifact-entry-issues
+      (when-not (= 1 (get safe-m "manifest_version"))
+        [{"severity" "bad"
+          "code" "market-evidence/invalid-manifest-version"
+          "path" path}])
+      (when-not (= "market-evidence-artifacts-v1" (get safe-m "kind"))
+        [{"severity" "bad"
+          "code" "market-evidence/invalid-manifest-kind"
+          "path" path}])
+      (when (seq missing-top-level)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-required-fields-missing"
+          "fields" missing-top-level}])
+      (when (seq extra-top-level)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-fields-extra"
+          "fields" extra-top-level}])
+      (top-level-field-type-issues safe-m)
+      (generated-at-issues safe-m)
+      semantic-issues
+      (when (nil? payload-count)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-payload-example-count-invalid"
+          "value" (get safe-m "payload_example_count")}])
+      (when (and (nonblank-string? (get safe-m "analysis_dir"))
+                 (not= (os.path/abspath expected-analysis-dir)
+                       (os.path/abspath (get safe-m "analysis_dir"))))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-analysis-dir-mismatch"
+          "expected" expected-analysis-dir
+          "actual" (get safe-m "analysis_dir")}])
+      (when (and (nonblank-string? (get safe-m "payload_dir"))
+                 (not= (os.path/abspath expected-payload-dir)
+                       (os.path/abspath (get safe-m "payload_dir"))))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-payload-dir-mismatch"
+          "expected" expected-payload-dir
+          "actual" (get safe-m "payload_dir")}])
+      (when (not (get safe-m "target_date"))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-target-date-missing"
+          "path" path}])
+      (when (not (get safe-m "target_stamp"))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-target-stamp-missing"
+          "path" path}])
+      (when (and (get safe-m "target_date") (get safe-m "target_stamp")
+                 (not= date-stamp (get safe-m "target_stamp")))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-target-date-stamp-mismatch"
+          "target_date" (get safe-m "target_date")
+          "target_stamp" (get safe-m "target_stamp")}])
+      (when (and expected-target-stamp
+                 (or (not= expected-target-stamp (get safe-m "target_stamp"))
+                     (not= expected-target-stamp (target-date-stamp safe-m))))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-target-date-mismatch"
+          "expected_target_date" expected-target-date
+          "expected_target_stamp" expected-target-stamp
+          "manifest_target_date" (get safe-m "target_date")
+          "manifest_target_stamp" (get safe-m "target_stamp")}])
+      (when (and expected-payload-dir-value
+                 (nonblank-string? (get safe-m "payload_example_dir"))
+                 (not= expected-payload-dir-value
+                       (os.path/abspath (get safe-m "payload_example_dir" ""))))
+        [{"severity" "bad"
+          "code" "market-evidence/payload-example-dir-mismatch"
+          "expected" expected-payload-dir-value
+          "actual" (get safe-m "payload_example_dir")}])
+      (when (or (not= true (get safe-m "valid?"))
+                (not= "ok" (get safe-m "status")))
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-recorded-invalid"
+          "valid?" (get safe-m "valid?")
+          "status" (get safe-m "status")}])
+      (when (seq recorded-issues)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-recorded-issues-present"
+          "issues" recorded-issues}])
+      (when (seq missing-required)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-required-artifacts-missing"
+          "artifacts" missing-required}])
+      (when (zero? usable-payload-count)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-payload-examples-missing"}])
+      (when (not= usable-payload-count listed-payload-count)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-payload-example-count-mismatch"
+          "expected" usable-payload-count
+          "actual" listed-payload-count}])
+      (when (seq missing-payload-keys)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-payload-artifacts-missing"
+          "artifacts" missing-payload-keys}])
+      (when (seq extra-payload-keys)
+        [{"severity" "bad"
+          "code" "market-evidence/manifest-payload-artifacts-extra"
+          "artifacts" extra-payload-keys}])
+      (when (seq bad-fixed-paths)
+        [{"severity" "bad"
+          "code" "market-evidence/artifact-path-target-stamp-mismatch"
+          "artifacts" bad-fixed-paths}])
+      (when (seq bad-payload-paths)
+        [{"severity" "bad"
+          "code" "market-evidence/payload-artifact-path-outside-target-dir"
+          "artifacts" bad-payload-paths}])
+      (when (not= readiness (get safe-m "readiness_verdict"))
+        [{"severity" "bad"
+          "code" "market-evidence/readiness-verdict-mismatch"
+          "manifest_verdict" (get safe-m "readiness_verdict")
+          "artifact_verdict" readiness}])
+      (when (not= "PASS" readiness)
+        [{"severity" "bad"
+          "code" "market-evidence/readiness-not-pass"
+          "verdict" readiness}])))))
+
+(defn verify-manifest
+  [path expected-analysis-dir expected-payload-dir expected-target-date]
+  (let [m (read-json path)
+        raw-artifacts (when (json-object? m) (get m "artifacts" {}))
+        artifacts (if (json-object? raw-artifacts) raw-artifacts {})
+        schema-issues (manifest-schema-issues path m expected-analysis-dir expected-payload-dir expected-target-date)
+        artifact-issues (vec (mapcat (fn [[name entry]]
+                                       (artifact-verify-issues name entry))
+                                     (json-object-items artifacts)))
+        issues (vec (concat schema-issues artifact-issues))
+        valid? (empty? issues)]
+    {"manifest" path
+     "valid?" valid?
+     "status" (if valid? "ok" "error")
+     "issues" issues}))
+
+(defn json-out
+  [x]
+  (letfn [(jsonable [v]
+            (cond
+              (map? v) (python/dict
+                        (map (fn [[k vv]]
+                               (python/tuple [(str k) (jsonable vv)]))
+                             v))
+              (python/isinstance v python/dict) (python/dict
+                                                 (map (fn [[k vv]]
+                                                        (python/tuple [(str k) (jsonable vv)]))
+                                                      (.items v)))
+              (python/isinstance v python/list) (python/list (map jsonable v))
+              (or (vector? v) (seq? v) (set? v)) (python/list (map jsonable v))
+              :else v))]
+    (json/dumps (jsonable x) ** :indent 2 :sort_keys true)))
+
+(try
+  (let [{:keys [target-date analysis-dir payload-dir out verify]} (parse-args (vec *command-line-args*))]
+    (cond
+	      verify
+        (if (nil? target-date)
+          (do
+            (usage)
+            (python/exit 2))
+          (let [result (verify-manifest verify analysis-dir payload-dir target-date)
+            encoded (json-out result)]
+            (when out
+              (spit out (str encoded "\n")))
+            (println encoded)
+            (python/exit (if (get result "valid?") 0 1))))
+
+      (nil? target-date)
+      (do
+        (usage)
+        (python/exit 2))
+
+      :else
+      (let [result (manifest target-date analysis-dir payload-dir)
+            out (or out
+                    (os.path/join analysis-dir
+                                  (str "market_evidence_manifest_"
+                                       (get result "target_stamp")
+                                       ".json")))
+            encoded (json-out result)]
+        (os/makedirs (os.path/dirname out) ** :exist_ok true)
+        (spit out (str encoded "\n"))
+        (println encoded)
+        (python/exit (if (get result "valid?") 0 1)))))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

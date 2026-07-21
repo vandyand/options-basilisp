@@ -1,0 +1,698 @@
+(ns reporting.test-core
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.reporting.core :as reporting]))
+
+(defn- valid-account
+  [id]
+  {:account/id id
+   :report/date "2026-07-02"
+   :pnl/equity-day "25.00"
+   :pnl/realized "25.00"
+   :pnl/unrealized "0.00"
+   :pnl/closed-trades "25.00"
+   :trade/closed-count 1
+   :order/count 2
+   :positions/open-count 0
+   :positions/open []
+   :broker/equity-observed? true})
+
+(defn- issue-codes
+  [result]
+  (set (map :code (:issues result))))
+
+(deftest trading-calendar-identifies-observed-holiday
+  (is (true? (reporting/trading-day? "2026-07-02")))
+  (is (false? (reporting/trading-day? "2026-07-03")))
+  (is (false? (reporting/trading-day? "2026-07-04"))))
+
+(deftest trading-calendar-covers-published-nyse-2026-2028-sessions
+  (doseq [d ["2026-01-01" "2026-04-03" "2026-06-19" "2026-07-03"
+             "2027-01-01" "2027-03-26" "2027-06-18" "2027-07-05" "2027-12-24"
+             "2028-04-14" "2028-07-04" "2028-12-25"]]
+    (let [session (reporting/market-session d)]
+      (is (false? (:trading-day? session)))
+      (is (= :closed (:market/session session)))))
+  (doseq [d ["2026-11-27" "2026-12-24" "2027-11-26" "2028-07-03" "2028-11-24"]]
+    (let [session (reporting/market-session d)]
+      (is (true? (:trading-day? session)))
+      (is (= :early-close (:market/session session)))
+      (is (= "13:00:00" (str (:market/close-time session))))))
+  (let [regular-session (reporting/market-session "2026-07-02")]
+    (is (true? (:trading-day? regular-session)))
+    (is (= :regular (:market/session regular-session)))
+    (is (= "16:00:00" (str (:market/close-time regular-session))))))
+
+(deftest generated-trading-calendar-fallback-covers-future-rule-based-holidays
+  (let [good-friday (reporting/market-session "2029-03-30")
+        day-after-thanksgiving (reporting/market-session "2029-11-23")]
+    (is (false? (:trading-day? good-friday)))
+    (is (= "Good Friday" (:market/reason good-friday)))
+    (is (true? (:trading-day? day-after-thanksgiving)))
+    (is (= :early-close (:market/session day-after-thanksgiving)))))
+
+(deftest trading-calendar-rejects-invalid-date-without-throwing
+  (doseq [date ["2026-02-31" "not-a-date" nil]]
+    (let [session (reporting/market-session date)]
+      (is (false? (:trading-day? session)))
+      (is (= :invalid (:market/session session)))
+      (is (= "invalid or missing date" (:market/reason session))))))
+
+(deftest non-trading-report-is-invalid
+  (let [result (reporting/validate-report-day
+                {:report/date "2026-07-03"
+                 :report/rendered? true
+                 :accounts [{:account/id "account/alpaca/lynx-paper"}]})]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (some #(= :report/non-trading-day-rendered (:code %))
+              (:issues result)))))
+
+(deftest report-day-requires-at-least-one-account
+  (let [result (reporting/validate-report-day
+                {:report/date "2026-07-02"
+                 :report/rendered? true
+                 :accounts []})]
+    (is (false? (:valid? result)))
+    (is (some #(= :report/no-accounts (:code %))
+              (:issues result)))))
+
+(deftest deterministic-fuzz-report-day-rejects-malformed-account-containers
+  (let [cases ["not-a-vector" 42 true {:account/id "not-a-list"} nil]]
+    (doseq [accounts cases]
+      (let [result (reporting/validate-report-day
+                    {:report/date "2026-07-02"
+                     :report/rendered? true
+                     :accounts accounts})
+            codes (issue-codes result)]
+        (is (false? (:valid? result)))
+        (is (contains? codes :report/invalid-report-day-shape))))))
+
+(deftest report-day-rejects-account-date-drift
+  (let [result (reporting/validate-report-day
+                {:report/date "2026-07-02"
+                 :report/rendered? true
+                 :accounts [{:account/id "account/alpaca/parrot-paper"
+                             :report/date "2026-07-01"
+                             :pnl/equity-day "0.00"
+                             :pnl/realized "0.00"
+                             :pnl/unrealized "0.00"
+                             :pnl/closed-trades "0.00"
+                             :trade/closed-count 0
+                             :order/count 0
+                             :positions/open-count 0
+                             :broker/equity-observed? true}]})]
+    (is (false? (:valid? result)))
+    (is (some #(= :report/account-date-mismatch (:code %))
+              (:issues result)))))
+
+(deftest report-day-reconciles-aggregate-pnl-to-account-sums
+  (let [accounts [(valid-account "account/alpaca/parrot-paper")
+                  (assoc (valid-account "account/alpaca/oak-paper")
+                         :pnl/equity-day "-10.00"
+                         :pnl/realized "-10.00"
+                         :pnl/closed-trades "-10.00")]
+        valid (reporting/validate-report-day
+               {:report/date "2026-07-02"
+                :report/rendered? true
+                :pnl/equity-day "15.00"
+                :pnl/realized "15.00"
+                :pnl/unrealized "0.00"
+                :pnl/closed-trades "15.00"
+                :accounts accounts})
+        invalid (reporting/validate-report-day
+                 {:report/date "2026-07-02"
+                  :report/rendered? true
+                  :pnl/equity-day "999.00"
+                  :pnl/realized "15.00"
+                  :pnl/unrealized "5.00"
+                  :pnl/closed-trades "15.00"
+                  :accounts accounts})]
+    (is (true? (:valid? valid)))
+    (is (false? (:valid? invalid)))
+    (is (some #(= :pnl/report-equity-total-mismatch (:code %))
+              (:issues invalid)))
+    (is (some #(= :pnl/report-unrealized-total-mismatch (:code %))
+              (:issues invalid)))))
+
+(deftest report-day-rejects-duplicate-account-projections
+  (let [account (valid-account "account/alpaca/parrot-paper")
+        result (reporting/validate-report-day
+                {:report/date "2026-07-02"
+                 :report/rendered? true
+                 :pnl/equity-day "50.00"
+                 :pnl/realized "50.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "50.00"
+                 :accounts [account account]})]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (contains? (issue-codes result) :report/duplicate-account-id))))
+
+(deftest adversarial-account-day-mutations-fail-closed
+  (let [base (valid-account "account/alpaca/fuzz-paper")
+        cases [["missing economic field"
+                #(dissoc % :pnl/closed-trades)
+                :report/missing-economic-fields]
+               ["negative order count"
+                #(assoc % :order/count -1)
+                :report/invalid-account-day-shape]
+               ["nan realized pnl"
+                #(assoc % :pnl/realized "NaN")
+                :report/invalid-account-day-shape]
+               ["open count without detail"
+                #(assoc % :order/count 1
+                          :trade/closed-count 0
+                          :pnl/equity-day "0.00"
+                          :pnl/realized "0.00"
+                          :pnl/closed-trades "0.00"
+                          :positions/open-count 1
+                          :positions/open [])
+                :positions/open-count-without-position-detail]
+               ["open count detail mismatch"
+                #(assoc % :positions/open-count 2
+                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                            :position/quantity "100"}])
+                :positions/open-count-detail-mismatch]
+               ["open position missing instrument"
+                #(assoc % :positions/open-count 1
+                          :positions/open [{:position/quantity "100"}])
+                :positions/open-position-missing-instrument]
+               ["open position blank instrument"
+                #(assoc % :positions/open-count 1
+                          :positions/open [{:instrument/id " "
+                                            :position/quantity "100"}])
+                :positions/open-position-missing-instrument]
+               ["open position missing quantity"
+                #(assoc % :positions/open-count 1
+                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"}])
+                :positions/open-position-invalid-quantity]
+	               ["open position zero quantity"
+	                #(assoc % :positions/open-count 1
+	                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+	                                            :position/quantity "0"}])
+	                :positions/open-position-invalid-quantity]
+	               ["open position unknown side"
+	                #(assoc % :positions/open-count 1
+	                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+	                                            :position/side "sideways"
+	                                            :position/quantity "100"}])
+	                :positions/open-position-invalid-side]
+	               ["long open position with negative quantity"
+	                #(assoc % :positions/open-count 1
+	                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+	                                            :position/side "long"
+	                                            :position/quantity "-100"}])
+	                :positions/open-position-side-quantity-conflict]
+	               ["short open position with positive quantity"
+	                #(assoc % :positions/open-count 1
+	                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+	                                            :position/side "short"
+	                                            :position/quantity "100"}])
+	                :positions/open-position-side-quantity-conflict]
+	               ["unrealized pnl without open position"
+	                #(assoc % :pnl/equity-day "32.00"
+	                          :pnl/unrealized "7.00"
+	                          :positions/open-count 0
+                          :positions/open [])
+                :pnl/unrealized-without-open-position]
+               ["open unrealized missing position detail"
+                #(assoc % :pnl/equity-day "32.00"
+                          :pnl/realized "25.00"
+                          :pnl/unrealized "7.00"
+                          :positions/open-count 1
+                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                            :position/quantity "100"}])
+                :positions/open-unrealized-missing]
+               ["open unrealized malformed position detail"
+                #(assoc % :pnl/equity-day "32.00"
+                          :pnl/realized "25.00"
+                          :pnl/unrealized "7.00"
+                          :positions/open-count 1
+                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                            :position/quantity "100"
+                                            :position/unrealized-pnl "lol"}])
+                :report/invalid-account-day-shape]
+               ["open unrealized position sum mismatch"
+                #(assoc % :pnl/equity-day "32.00"
+                          :pnl/realized "25.00"
+                          :pnl/unrealized "7.00"
+                          :positions/open-count 1
+                          :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                            :position/quantity "100"
+                                            :position/unrealized-pnl "6.98"}])
+                :positions/open-unrealized-total-mismatch]
+               ["closed pnl without closed trades"
+                #(assoc % :trade/closed-count 0
+                          :order/count 2
+                          :pnl/equity-day "5.00"
+                          :pnl/realized "5.00"
+                          :pnl/closed-trades "5.00")
+                :pnl/closed-pnl-without-closed-trades]
+               ["realized closed pnl gap"
+                #(assoc % :pnl/equity-day "10.00"
+                          :pnl/realized "10.00"
+                          :pnl/closed-trades "8.00")
+                :pnl/realized-closed-trades-gap]
+               ["realized pnl without closed trades"
+                #(assoc % :trade/closed-count 0
+                          :order/count 2
+                          :pnl/equity-day "5.00"
+                          :pnl/realized "5.00"
+                          :pnl/unrealized "0.00"
+                          :pnl/closed-trades "0.00")
+                :pnl/realized-without-closed-trades]
+               ["closed trades without orders"
+                #(assoc % :trade/closed-count 1
+                          :order/count 0
+                          :pnl/equity-day "5.00"
+                          :pnl/realized "5.00"
+                          :pnl/unrealized "0.00"
+                          :pnl/closed-trades "5.00")
+                :trade/closed-trades-without-orders]]]
+    (doseq [[label mutate expected-code] cases]
+      (testing label
+        (let [result (reporting/validate-account-day (mutate base))]
+          (is (false? (:valid? result)))
+          (is (= :error (:status result)))
+          (is (contains? (issue-codes result) expected-code)))))))
+
+(deftest report-day-total-reconciliation-fails-cleanly-on-malformed-values
+  (let [account (assoc (valid-account "account/alpaca/bad-paper")
+                       :pnl/equity-day "lol")
+        result (reporting/validate-report-day
+                {:report/date "2026-07-02"
+                 :report/rendered? true
+                 :pnl/equity-day "25.00"
+                 :pnl/realized "25.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "25.00"
+                 :accounts [account]})]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (contains? (issue-codes result) :report/invalid-account-day-shape))
+    (is (contains? (issue-codes result) :pnl/report-total-unparseable))))
+
+(deftest adversarial-report-day-aggregate-mutants-fail-closed
+  (let [accounts [(assoc (valid-account "account/alpaca/parrot-paper")
+                         :pnl/equity-day "25.00"
+                         :pnl/realized "25.00"
+                         :pnl/unrealized "0.00"
+                         :pnl/closed-trades "25.00")
+                  (assoc (valid-account "account/alpaca/oak-paper")
+                         :pnl/equity-day "-10.00"
+                         :pnl/realized "-10.00"
+                         :pnl/unrealized "0.00"
+                         :pnl/closed-trades "-10.00")]
+        base {:report/date "2026-07-02"
+              :report/rendered? true
+              :pnl/equity-day "15.00"
+              :pnl/realized "15.00"
+              :pnl/unrealized "0.00"
+              :pnl/closed-trades "15.00"
+              :accounts accounts}
+        cases [[:pnl/equity-day "14.98" :pnl/report-equity-total-mismatch]
+               [:pnl/realized "14.98" :pnl/report-realized-total-mismatch]
+               [:pnl/unrealized "0.02" :pnl/report-unrealized-total-mismatch]
+               [:pnl/closed-trades "14.98" :pnl/report-closed-trades-total-mismatch]]]
+    (is (true? (:valid? (reporting/validate-report-day base))))
+    (doseq [[field bad-value expected-code] cases]
+      (testing (str field)
+        (let [result (reporting/validate-report-day (assoc base field bad-value))]
+          (is (false? (:valid? result)))
+          (is (= :error (:status result)))
+          (is (contains? (issue-codes result) expected-code)))))))
+
+(deftest material-pnl-without-activity-is-invalid
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/chestnut-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-207.40"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "-207.40"
+                 :trade/closed-count 0
+                 :order/count 0
+                 :positions/open-count 0
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :pnl/material-pnl-without-activity (:code %))
+              (:issues result)))
+    (is (some #(= :pnl/unrealized-without-open-position (:code %))
+              (:issues result)))))
+
+(deftest string-keyed-json-shape-is-normalized
+  (let [result (reporting/validate-report-day
+                {"report/date" "2026-07-03"
+                 "report/rendered?" true
+                 "accounts" [{"account/id" "account/alpaca/oak-paper"
+                              "pnl/equity-day" "-151.32"}]})]
+    (is (false? (:valid? result)))
+    (is (some #(= :report/non-trading-day-rendered (:code %))
+              (:issues result)))))
+
+(deftest string-explanation-values-are-normalized
+  (let [result (reporting/validate-account-day
+                {"account/id" "account/alpaca/test-paper"
+                 "report/date" "2026-07-02"
+                 "pnl/equity-day" "-10.00"
+                 "pnl/realized" "0.00"
+                 "pnl/unrealized" "0.00"
+                 "pnl/closed-trades" "0.00"
+                 "trade/closed-count" 0
+                 "order/count" 0
+                 "positions/open-count" 0
+                 "positions/open" []
+                 "report/explanations" ["explanation/manual-adjustment"]
+                 "broker/equity-observed?" true})]
+    (is (true? (:valid? result)))
+    (is (= :ok (:status result)))))
+
+(deftest unknown-report-explanations-are-invalid
+  (let [base {"account/id" "account/alpaca/test-paper"
+              "report/date" "2026-07-02"
+              "pnl/equity-day" "0.00"
+              "pnl/realized" "0.00"
+              "pnl/unrealized" "0.00"
+              "pnl/closed-trades" "0.00"
+              "trade/closed-count" 0
+              "order/count" 0
+              "positions/open-count" 0
+              "positions/open" []
+              "broker/equity-observed?" true}
+        cases [["single unknown"
+                (assoc base "report/explanations" ["explanation/pretend-ok"])]
+               ["mixed known and unknown"
+                (assoc base "report/explanations" ["explanation/manual-adjustment"
+                                                   "explanation/pretend-ok"])]
+               ["multiple unknowns"
+                (assoc base "report/explanations" ["explanation/foo"
+                                                   "explanation/bar"])]]]
+    (doseq [[label account] cases]
+      (testing label
+        (let [result (reporting/validate-account-day account)]
+          (is (false? (:valid? result)))
+          (is (= :error (:status result)))
+          (is (contains? (issue-codes result) :report/unknown-explanation)))))))
+
+(deftest open-position-carryover-explains-unrealized-pnl
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/lynx-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-192.02"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "-192.02"
+                 :pnl/closed-trades "0.00"
+                 :trade/closed-count 0
+                 :order/count 0
+                 :positions/open-count 1
+                 :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                   :position/quantity "100"
+                                   :position/unrealized-pnl "-192.02"}]
+                 :report/explanations #{:explanation/open-position-carryover}
+                 :broker/equity-observed? true})]
+    (is (true? (:valid? result)))
+    (is (= :ok (:status result)))))
+
+(deftest material-open-unrealized-requires-position-pnl-reconciliation
+  (let [missing (reporting/validate-account-day
+                 {:account/id "account/alpaca/lynx-paper"
+                  :report/date "2026-07-02"
+                  :pnl/equity-day "-192.02"
+                  :pnl/realized "0.00"
+                  :pnl/unrealized "-192.02"
+                  :pnl/closed-trades "0.00"
+                  :trade/closed-count 0
+                  :order/count 0
+                  :positions/open-count 1
+                  :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                    :position/quantity "100"}]
+                  :report/explanations #{:explanation/open-position-carryover}
+                  :broker/equity-observed? true})
+        mismatch (reporting/validate-account-day
+                  {:account/id "account/alpaca/lynx-paper"
+                   :report/date "2026-07-02"
+                   :pnl/equity-day "-192.02"
+                   :pnl/realized "0.00"
+                   :pnl/unrealized "-192.02"
+                   :pnl/closed-trades "0.00"
+                   :trade/closed-count 0
+                   :order/count 0
+                   :positions/open-count 2
+                   :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                     :position/quantity "100"
+                                     :position/unrealized-pnl "-100.00"}
+                                    {:instrument/id "equity/NASDAQ/QQQ"
+                                     :position/quantity "50"
+                                     :position/unrealized-pnl "-91.00"}]
+                   :report/explanations #{:explanation/open-position-carryover}
+                   :broker/equity-observed? true})]
+    (is (false? (:valid? missing)))
+    (is (contains? (issue-codes missing)
+                   :positions/open-unrealized-missing))
+    (is (false? (:valid? mismatch)))
+    (is (contains? (issue-codes mismatch)
+                   :positions/open-unrealized-total-mismatch))))
+
+(deftest open-position-carryover-requires-position-detail
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/lynx-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-192.02"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "-192.02"
+                 :trade/closed-count 0
+                 :order/count 1
+                 :positions/open-count 1
+                 :positions/open []
+                 :report/explanations #{:explanation/open-position-carryover}
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :positions/open-count-without-position-detail (:code %))
+              (:issues result)))))
+
+(deftest open-position-count-requires-detail-even-when-unrealized-is-zero
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/parrot-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "0.00"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "0.00"
+                 :trade/closed-count 0
+                 :order/count 1
+                 :positions/open-count 1
+                 :positions/open []
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :positions/open-count-without-position-detail (:code %))
+              (:issues result)))))
+
+(deftest open-position-count-detail-mismatch-is-invalid
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/oak-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "0.00"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "0.00"
+                 :trade/closed-count 0
+                 :order/count 0
+                 :positions/open-count 2
+                 :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                   :position/quantity "100"}]
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (some #(= :positions/open-count-detail-mismatch (:code %))
+              (:issues result)))))
+
+(deftest open-position-side-matches-quantity-sign
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/parrot-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "0.00"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "0.00"
+                 :trade/closed-count 0
+                 :order/count 1
+                 :positions/open-count 2
+                 :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                   :position/side "long"
+                                   :position/quantity "100"}
+                                  {:instrument/id "equity/NASDAQ/QQQ"
+                                   :position/side "short"
+                                   :position/quantity "-50"}]
+                 :broker/equity-observed? true})]
+    (is (true? (:valid? result)))
+    (is (= :ok (:status result)))))
+
+(deftest trading-day-account-must-include-economic-fields-explicitly
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/minimal-paper"
+                 :report/date "2026-07-02"
+                 :report/rendered? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :report/missing-economic-fields (:code %))
+              (:issues result)))))
+
+(deftest malformed-numeric-report-values-return-validation-error
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/bad-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "lol"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "0.00"
+                 :trade/closed-count 0
+                 :order/count 0
+                 :positions/open-count 0
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (some #(= :report/invalid-account-day-shape (:code %))
+              (:issues result)))))
+
+(deftest equity-gap-without-explanation-warns
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/parrot-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-35.87"
+                 :pnl/realized "-35.87"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "-35.87"
+                 :trade/closed-count 52
+                 :order/count 104
+                 :positions/open-count 0
+                 :positions/open []
+                 :broker/equity-observed? false})]
+    (is (true? (:valid? result)))
+    (is (= :warn (:status result)))
+    (is (some #(= :broker/missing-equity-observation (:code %))
+              (:issues result)))))
+
+(deftest malformed-broker-equity-observation-fails-closed
+  (let [base {:account/id "account/alpaca/parrot-paper"
+              :report/date "2026-07-02"
+              :pnl/equity-day "0.00"
+              :pnl/realized "0.00"
+              :pnl/unrealized "0.00"
+              :pnl/closed-trades "0.00"
+              :trade/closed-count 0
+              :order/count 0
+              :positions/open-count 0
+              :positions/open []}
+        cases [["string false" "false"]
+               ["string true" "true"]
+               ["explicit nil" nil]
+               ["numeric one" 1]]]
+    (doseq [[label broker-observed] cases]
+      (testing label
+        (let [result (reporting/validate-account-day
+                      (assoc base :broker/equity-observed?
+                             broker-observed))]
+          (is (false? (:valid? result)))
+          (is (= :error (:status result)))
+          (is (contains? (issue-codes result)
+                         :broker/equity-observed-malformed)))))))
+
+(deftest realized-pnl-must-reconcile-to-closed-trade-pnl
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/oak-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-150.00"
+                 :pnl/realized "0.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "-150.00"
+                 :trade/closed-count 33
+                 :order/count 66
+                 :positions/open-count 0
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (some #(= :pnl/realized-closed-trades-gap (:code %))
+              (:issues result)))))
+
+(deftest material-closed-trade-pnl-requires-closed-trades
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/oak-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-150.00"
+                 :pnl/realized "-150.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "-150.00"
+                 :trade/closed-count 0
+                 :order/count 10
+                 :positions/open-count 0
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :pnl/closed-pnl-without-closed-trades (:code %))
+      (:issues result)))))
+
+(deftest material-realized-pnl-requires-closed-trades-even-when-closed-pnl-is-zero
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/oak-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-150.00"
+                 :pnl/realized "-150.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "0.00"
+                 :trade/closed-count 0
+                 :order/count 10
+                 :positions/open-count 0
+                 :positions/open []
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :pnl/realized-without-closed-trades (:code %))
+              (:issues result)))))
+
+(deftest closed-trades-require-orders
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/oak-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-150.00"
+                 :pnl/realized "-150.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "-150.00"
+                 :trade/closed-count 3
+                 :order/count 0
+                 :positions/open-count 0
+                 :positions/open []
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :trade/closed-trades-without-orders (:code %))
+              (:issues result)))))
+
+(deftest closed-trade-reconciliation-can-be-explicitly-explained
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/oak-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-151.00"
+                 :pnl/realized "-150.00"
+                 :pnl/unrealized "0.00"
+                 :pnl/closed-trades "-151.00"
+                 :trade/closed-count 33
+                 :order/count 66
+                 :positions/open-count 0
+                 :positions/open []
+                 :report/explanations #{:explanation/manual-adjustment}
+                 :broker/equity-observed? true})]
+    (is (true? (:valid? result)))
+    (is (= :ok (:status result)))))
+
+(deftest open-position-carryover-does-not-explain-realized-closed-trade-gap
+  (let [result (reporting/validate-account-day
+                {:account/id "account/alpaca/lynx-paper"
+                 :report/date "2026-07-02"
+                 :pnl/equity-day "-191.00"
+                 :pnl/realized "1.00"
+                 :pnl/unrealized "-192.00"
+                 :pnl/closed-trades "-5.00"
+                 :trade/closed-count 1
+                 :order/count 3
+                 :positions/open-count 1
+                 :positions/open [{:instrument/id "equity/NASDAQ/SPY"
+                                   :position/quantity "100"
+                                   :position/unrealized-pnl "-192.00"}]
+                 :report/explanations #{:explanation/open-position-carryover}
+                 :broker/equity-observed? true})]
+    (is (false? (:valid? result)))
+    (is (some #(= :pnl/realized-closed-trades-gap (:code %))
+              (:issues result)))))

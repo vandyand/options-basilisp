@@ -1,0 +1,290 @@
+;; Build the canonical 918-column Steve V2 historical feature cache.
+;;
+;; Reconstructs missing full_features_5yr_v3.npz from the 653-column base
+;; cache and matching SPY Greeks grids. Expensive compute stays out of the
+;; market-evidence hot path; evidence can consume the built NPZ later.
+(import argparse builtins json numpy os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.core :as fp]
+         '[stevetrading.feature-parity.raw-unlock :as raw])
+
+(def default-ref (os.path/join (os.path/dirname repo-root) "SteveTrading" "ref" "Data-Preprocessor"))
+(def default-base (os.path/join default-ref "cache/full_features.npz"))
+(def default-grids (os.path/join default-ref "cache/spy_greeks_grids.npz"))
+(def default-names (os.path/join default-ref "pipeline_data/live_model_chestnut_multihead_corrected/feature_names.json"))
+(def default-hmm (os.path/join default-ref "pipeline_data/live_model_chestnut_multihead_corrected/hmm_model.npz"))
+(def default-dictionary-atoms (os.path/join default-ref "pipeline_data/live_model_chestnut_multihead_corrected/dictionary_atoms.npz"))
+(def default-out (os.path/join default-ref "cache/full_features_5yr_v3.npz"))
+(def default-json (os.path/join repo-root "live_runtime/analysis/historical_v3_feature_cache_build.json"))
+(def greeks ["iv" "delta" "vega" "theta" "rho" "gamma"])
+
+(defn write-json [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--ref-root" ** :default default-ref)
+    (.add_argument parser "--base-features" ** :default default-base)
+    (.add_argument parser "--grids" ** :default default-grids)
+    (.add_argument parser "--feature-names" ** :default default-names)
+    (.add_argument parser "--hmm-model" ** :default default-hmm)
+    (.add_argument parser "--dictionary-atoms" ** :default default-dictionary-atoms)
+    (.add_argument parser "--out-npz" ** :default default-out)
+    (.add_argument parser "--out-json" ** :default default-json)
+    (.add_argument parser "--train-frac" ** :type float :default 0.75)
+    (.add_argument parser "--max-rows" ** :type int :default nil :help "debug/smoke subset; output is not canonical")
+    (.add_argument parser "--plan-only" ** :action "store_true" :help "validate paths/shapes/names without expensive compute")
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn expected-advanced-names []
+  (let [names (atom [])
+        scat-suffixes ["coarse_energy" "coarse_energy_d5" "coarse_mean" "coarse_mean_d5"
+                       "cross_scale_corr" "cross_scale_corr_d5" "fine_energy" "fine_energy_d5"
+                       "fine_mean" "fine_mean_d5" "med_energy" "med_energy_d5" "med_mean" "med_mean_d5"]
+        tda-suffixes ["betti_auc" "betti_auc_d5" "n_comp_high" "n_comp_high_d5"
+                      "n_comp_low" "n_comp_low_d5" "n_comp_mid" "n_comp_mid_d5"
+                      "persistence_range" "persistence_range_d5" "roughness" "roughness_d5"]
+        wass-suffixes ["flow_dte" "flow_dte_d5" "flow_moneyness" "flow_moneyness_d5"
+                       "surface_divergence" "surface_divergence_d5" "w1_consec" "w1_consec_d5"
+                       "w1_ratio" "w1_ratio_d5" "w1_trailing" "w1_trailing_d5"]]
+    (doseq [i (range 20)]
+      (swap! names conj (str "dict_code_" i)))
+    (swap! names into ["dict_code_entropy" "dict_n_active" "dict_recon_error"
+                       "dict_recon_error_d20" "dict_recon_error_d5" "dict_top_weight"])
+    (doseq [greek greeks]
+      (swap! names into (map #(str "scat_" greek "_" %) scat-suffixes)))
+    (doseq [greek greeks]
+      (swap! names into (map #(str "tda_" greek "_" %) tda-suffixes)))
+    (doseq [greek greeks]
+      (swap! names into (map #(str "wass_" greek "_" %) wass-suffixes)))
+    (vec (sort @names))))
+
+(defn expected-v2-names []
+  (vec (sort ["vix_proxy" "vix_term_slope" "put_call_ratio" "vix_momentum_5"
+              "vix_momentum_20" "realized_vol_20" "realized_vol_60" "vol_ratio"
+              "hmm_state_0" "hmm_state_1" "hmm_state_2"])))
+
+(defn train-mask-from-day-ids [day-ids train-frac]
+  (let [unique-days (numpy/unique day-ids)
+        n-train-days (int (* (len unique-days) train-frac))
+        train-days (set (for [i (range n-train-days)] (.__getitem__ unique-days i)))]
+    (numpy/asarray (python/list (for [day day-ids] (contains? train-days day))) ** :dtype builtins/bool)))
+
+(defn hmm-predict-state [obs means covars]
+  (loop [state 0
+         best-state 0
+         best-ll (- (builtins/float "inf"))]
+    (if (>= state (.__getitem__ (.-shape means) 0))
+      best-state
+      (let [diff (- obs (.__getitem__ means state))
+            cov-inv (numpy.linalg/inv (.__getitem__ covars state))
+            ll (float (* -0.5 (.__matmul__ (.__matmul__ diff cov-inv) diff)))]
+        (if (> ll best-ll)
+          (recur (inc state) state ll)
+          (recur (inc state) best-state best-ll))))))
+
+(defn compute-exported-hmm-features [spy-prices day-ids hmm-path]
+  (let [model (numpy/load hmm-path)
+        means (numpy/asarray (.__getitem__ model "means") ** :dtype numpy/float64)
+        covars (numpy/asarray (.__getitem__ model "covars") ** :dtype numpy/float64)
+        unique-days (numpy/unique day-ids)
+        daily-close (numpy/zeros (len unique-days) ** :dtype numpy/float64)
+        daily-vol (numpy/zeros (len unique-days) ** :dtype numpy/float64)]
+    (doseq [idx (range (len unique-days))]
+      (let [day (.__getitem__ unique-days idx)
+            prices0 (numpy/asarray (.__getitem__ spy-prices (= day-ids day)) ** :dtype numpy/float64)
+            prices (.__getitem__ prices0 (numpy/logical_and (numpy/isfinite prices0) (> prices0 0)))]
+        (when (> (.-size prices) 0)
+          (.__setitem__ daily-close idx (.__getitem__ prices (dec (.-size prices)))))
+        (when (> (.-size prices) 1)
+          (let [returns (numpy/log (/ (.__getitem__ prices (slice 1 nil))
+                                      (numpy/maximum (.__getitem__ prices (slice nil -1)) 1.0e-10)))]
+            (.__setitem__ daily-vol idx (float (numpy/std returns)))))))
+    (let [daily-return (numpy/zeros (len unique-days) ** :dtype numpy/float64)
+          curr (.__getitem__ daily-close (slice 1 nil))
+          prev (.__getitem__ daily-close (slice nil -1))
+          valid (numpy/logical_and (> curr 0) (> prev 0))]
+      (.__setitem__ (.__getitem__ daily-return (slice 1 nil)) valid (numpy/log (/ (.__getitem__ curr valid) (.__getitem__ prev valid))))
+      (let [states (into {}
+                         (for [idx (range (len unique-days))
+                               :let [day (.__getitem__ unique-days idx)
+                                     obs (numpy/asarray [(.__getitem__ daily-return idx)
+                                                         (.__getitem__ daily-vol idx)]
+                                                        ** :dtype numpy/float64)]]
+                           [day (hmm-predict-state obs means covars)]))
+            bar-states (numpy/asarray (python/list (for [day day-ids] (get states day))) ** :dtype numpy/int32)]
+        {"hmm_state_0" (.astype (= bar-states 0) numpy/float32)
+         "hmm_state_1" (.astype (= bar-states 1) numpy/float32)
+         "hmm_state_2" (.astype (= bar-states 2) numpy/float32)}))))
+
+(defn npz-files [npz]
+  (set (map str (.-files npz))))
+
+(defn py-dict->map [d]
+  (into {} (for [k (.keys d)] [k (.__getitem__ d k)])))
+
+(defn load-npz-dict [path keys]
+  (let [data (numpy/load path)]
+    (python/dict
+     (keep (fn [k]
+             (when (contains? (set (python/list (.-files data))) k)
+               (python/tuple [k (.__getitem__ data k)])))
+           keys))))
+
+(defn run-main [args]
+  (let [names (vec (map str (python/list (fp/read-json (attr args "feature_names")))))
+        v2-names (expected-v2-names)
+        advanced-names (expected-advanced-names)
+        expected-names (vec (concat (take 653 names) v2-names advanced-names))
+        out-json (attr args "out_json")]
+    (when (not= names expected-names)
+      (let [first-mismatch (first
+                            (keep-indexed (fn [i [live expected]]
+                                            (when (not= live expected)
+                                              {"index" i "live" live "expected" expected}))
+                                          (map vector names expected-names)))
+            payload {"ok" false
+                     "status" "error"
+                     "reason" "live feature_names do not match expected v3 cache order"
+                     "feature_count" (count names)
+                     "expected_count" (count expected-names)
+                     "first_mismatch" first-mismatch}]
+        (write-json out-json payload)
+        (binding [*out* *err*] (println (get payload "reason")))
+        (python/exit 1)))
+    (when (or (not (os.path/exists (attr args "base_features")))
+              (not (os.path/exists (attr args "grids"))))
+      (let [payload {"ok" false
+                     "status" "error"
+                     "reason" "required base feature cache or greeks grid cache missing"
+                     "base_features" (attr args "base_features")
+                     "grids" (attr args "grids")}]
+        (write-json out-json payload)
+        (binding [*out* *err*] (println (get payload "reason")))
+        (python/exit 1)))
+    (let [base-npz (numpy/load (attr args "base_features") ** :allow_pickle true)
+          grid-npz (numpy/load (attr args "grids") ** :allow_pickle true)
+          x0 (numpy/asarray (.__getitem__ base-npz "X") ** :dtype numpy/float32)
+          spy-prices0 (numpy/asarray (.__getitem__ base-npz "spy_prices"))
+          day-ids0 (numpy/asarray (.__getitem__ base-npz "day_ids"))
+          split-idx (numpy/asarray (.__getitem__ base-npz "split_idx"))
+          grids0 (numpy/asarray (.__getitem__ grid-npz "grids") ** :dtype numpy/float32)
+          max-rows (attr args "max_rows")
+          x (if max-rows (.__getitem__ x0 (slice nil max-rows)) x0)
+          spy-prices (if max-rows (.__getitem__ spy-prices0 (slice nil max-rows)) spy-prices0)
+          day-ids (if max-rows (.__getitem__ day-ids0 (slice nil max-rows)) day-ids0)
+          grids (if max-rows (.__getitem__ grids0 (slice nil max-rows)) grids0)
+          issues (atom [])]
+      (when (or (not= (.-ndim x) 2) (not= (.__getitem__ (.-shape x) 1) 653))
+        (swap! issues conj (str "base X must be (n, 653), got " (.-shape x))))
+      (when (or (not= (.__getitem__ (.-shape grids) 0) (.__getitem__ (.-shape x) 0))
+                (not= (python/tuple (drop 1 (python/list (.-shape grids)))) (python/tuple [6 21 8])))
+        (swap! issues conj (str "grids must be (n, 6, 21, 8) aligned to X, got " (.-shape grids))))
+      (when (or (not= (len spy-prices) (.__getitem__ (.-shape x) 0))
+                (not= (len day-ids) (.__getitem__ (.-shape x) 0)))
+        (swap! issues conj "spy_prices/day_ids lengths must match X rows")
+      )
+      (when-not (< 0.0 (attr args "train_frac") 1.0)
+        (swap! issues conj "--train-frac must be between 0 and 1"))
+      (when (seq @issues)
+        (let [payload {"ok" false "status" "error" "reason" "input validation failed" "issues" @issues}]
+          (write-json out-json payload)
+          (binding [*out* *err*] (println (get payload "reason")))
+          (python/exit 1)))
+      (let [base-payload {"base_features" (attr args "base_features")
+                          "grids" (attr args "grids")
+                          "feature_names" (attr args "feature_names")
+                          "dictionary_atoms" (attr args "dictionary_atoms")
+                          "out_npz" (attr args "out_npz")
+                          "rows" (int (.__getitem__ (.-shape x) 0))
+                          "base_columns" (int (.__getitem__ (.-shape x) 1))
+                          "v2_columns" (count v2-names)
+                          "advanced_columns" (count advanced-names)
+                          "output_columns" (int (+ (.__getitem__ (.-shape x) 1) (count v2-names) (count advanced-names)))
+                          "unique_days" (int (len (numpy/unique day-ids)))
+                          "plan_only" (true? (attr args "plan_only"))
+                          "max_rows" max-rows}]
+        (if (true? (attr args "plan_only"))
+          (let [payload (merge {"ok" true "status" "planned"} base-payload)]
+            (write-json out-json payload)
+            (println (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+            0)
+          (let [train-mask (train-mask-from-day-ids day-ids (attr args "train_frac"))
+                v2-new (atom {})]
+            (swap! v2-new merge (raw/compute-v2-grid-feature-arrays grids))
+            (swap! v2-new merge (raw/compute-realized-vol-feature-arrays spy-prices))
+            (when-not (os.path/exists (attr args "hmm_model"))
+              (let [payload {"ok" false "status" "error" "reason" "exported HMM model missing" "hmm_model" (attr args "hmm_model")}]
+                (write-json out-json payload)
+                (binding [*out* *err*] (println (get payload "reason")))
+                (python/exit 1)))
+            (swap! v2-new merge (compute-exported-hmm-features spy-prices day-ids (attr args "hmm_model")))
+            (when-not (os.path/exists (attr args "dictionary_atoms"))
+              (let [payload {"ok" false "status" "error" "reason" "exported dictionary atoms missing"
+                             "dictionary_atoms" (attr args "dictionary_atoms")}]
+                (write-json out-json payload)
+                (binding [*out* *err*] (println (get payload "reason")))
+                (python/exit 1)))
+            (let [computed-v2-names (vec (sort (keys @v2-new)))]
+              (when (not= computed-v2-names v2-names)
+                (let [payload {"ok" false "status" "error" "reason" "computed v2 feature names do not match live v2 order"
+                               "computed" computed-v2-names "expected" v2-names}]
+                  (write-json out-json payload)
+                  (binding [*out* *err*] (println (get payload "reason")))
+                  (python/exit 1))))
+              (let [v2-cols (raw/standardize-feature-columns @v2-new train-mask
+                                                            #{"hmm_state_0" "hmm_state_1" "hmm_state_2"})
+                  dictionary-atoms (py-dict->map (load-npz-dict (attr args "dictionary_atoms")
+                                                                ["components" "train_mean" "train_std"]))
+                  advanced-new (raw/compute-live-v3-feature-arrays grids dictionary-atoms)]
+              (let [computed-names (vec (sort (keys advanced-new)))]
+                (when (not= computed-names advanced-names)
+                  (let [payload {"ok" false "status" "error" "reason" "computed advanced feature names do not match live v3 order"
+                                 "computed_count" (count computed-names) "expected_count" (count advanced-names)}]
+                    (write-json out-json payload)
+                    (binding [*out* *err*] (println (get payload "reason")))
+                    (python/exit 1))))
+              (let [advanced-cols (raw/standardize-feature-columns advanced-new train-mask)
+                    x-v3 (.astype (numpy/concatenate (python/list [x v2-cols advanced-cols]) ** :axis 1) numpy/float32)]
+                (when (not= (.__getitem__ (.-shape x-v3) 1) (count names))
+                  (let [payload {"ok" false "status" "error" "reason" "output feature width mismatch"
+                                 "output_shape" (vec (.-shape x-v3)) "feature_names" (count names)}]
+                    (write-json out-json payload)
+                    (binding [*out* *err*] (println (get payload "reason")))
+                    (python/exit 1)))
+                (os/makedirs (os.path/dirname (attr args "out_npz")) ** :exist_ok true)
+                (numpy/savez_compressed (attr args "out_npz")
+                                        ** :X x-v3
+                                           :spy_prices spy-prices
+                                           :day_ids day-ids
+                                           :split_idx split-idx
+                                           :feature_names (numpy/asarray names))
+                (let [payload (merge {"ok" true "status" "built"} base-payload {"output_shape" (vec (.-shape x-v3))})]
+                  (write-json out-json payload)
+                  (println (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+                  0)))))))))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/SystemExit e
+    (let [code (or (python/getattr e "code" 1) 1)]
+      (if (int? code)
+        (python/exit code)
+        (do
+          (binding [*out* *err*] (println (str code)))
+          (python/exit 1)))))
+  (catch python/Exception e
+    (let [args (try (parse-args) (catch python/Exception _ nil))
+          out-json (when args (attr args "out_json"))
+          payload {"ok" false "status" "error" "reason" (str "historical v3 cache build failed: " e)}]
+      (when out-json
+        (write-json out-json payload))
+      (binding [*out* *err*] (println (get payload "reason")))
+      (python/exit 1))))

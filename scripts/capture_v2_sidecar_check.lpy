@@ -1,0 +1,531 @@
+;; Validate Steve V2 feature-capture NPZ files for raw replay sidecars.
+(import builtins datetime json os os.path re sys)
+(import numpy)
+
+(def required-arrays
+  #{"capture_version" "times" "spy" "grids" "chestnut" "lynx" "moose"
+    "bar_buffers_json" "option_chain_json" "option_surfaces_json"
+    "grid_history_json"})
+
+(def required-raw-sidecars
+  #{"bar_buffers_json" "option_chain_json" "option_surfaces_json"
+    "grid_history_json"})
+
+(def required-option-surface-prefixes #{"SPX" "SPXW" "VIX" "VIXW"})
+(def duplicate-json-key-check? (atom true))
+
+(defn now-utc []
+  (.isoformat (datetime.datetime/now datetime.timezone/utc)))
+
+(defn sorted-vec [xs]
+  (vec (sort xs)))
+
+(defn decode [value]
+  (if (isinstance value builtins/bytes)
+    (.decode value "utf-8" "replace")
+    (str value)))
+
+(defn reject-duplicate-json-object [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}]
+    (if remaining
+      (let [pair (first remaining)
+            k (first pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining) (conj seen k)))
+      (python/dict pairs))))
+
+(defn loads-json [text]
+  (if @duplicate-json-key-check?
+    (json/loads text ** :object_pairs_hook reject-duplicate-json-object)
+    (json/loads text)))
+
+(defn normalize-timestamp [value]
+  (let [raw (.strip (decode value))]
+    (when (pos? (count raw))
+      (let [m (re/fullmatch "#inst\\s+\"([^\"]+)\"" raw)
+            text (if m (.strip (.group m 1)) raw)
+            iso (if (.endswith text "Z")
+                  (str (subs text 0 (- (count text) 1)) "+00:00")
+                  text)]
+        (try
+          (let [parsed (datetime.datetime/fromisoformat iso)
+                parsed (if (nil? (.-tzinfo parsed))
+                         (.replace parsed ** :tzinfo datetime.timezone/utc)
+                         (.astimezone parsed datetime.timezone/utc))]
+            (.strftime (.replace parsed ** :microsecond 0) "%Y-%m-%dT%H:%M:%SZ"))
+          (catch python/Exception _ nil))))))
+
+(defn capture-stamp [path]
+  (let [m (re/search "live_features_(\\d{8})\\.npz$" (os.path/basename (str path)))]
+    (when m (.group m 1))))
+
+(defn target-stamp [target-date]
+  (when target-date
+    (when (not (re/fullmatch "\\d{4}-\\d{2}-\\d{2}" target-date))
+      (throw (python/ValueError (str "target date must be YYYY-MM-DD: " target-date))))
+    (.replace target-date "-" "")))
+
+(defn arr-len [arr]
+  (python/len arr))
+
+(defn data-files [data]
+  (set (vec (.-files data))))
+
+(defn get-array [data key]
+  (.__getitem__ data key))
+
+(defn first-int [arr]
+  (when (pos? (arr-len arr))
+    (python/int (aget arr 0))))
+
+(defn contract-stats [payload]
+  (if (not (isinstance payload builtins/dict))
+    [0 0]
+    (let [contracts (get payload "contracts")]
+      (if (not (isinstance contracts builtins/list))
+        [0 0]
+        (let [valid (count (filter #(isinstance % builtins/dict) contracts))]
+          [valid (- (count contracts) valid)])))))
+
+(defn decode-surface-payload [value]
+  (if (isinstance value builtins/str)
+    (loads-json value)
+    value))
+
+(defn surface-contract-stats-by-prefix [payload]
+  (if (not (isinstance payload builtins/dict))
+    [{} {}]
+    (loop [items (seq (.items payload))
+           counts {}
+           malformed {}]
+      (if items
+        (let [item (first items)
+              prefix (str (first item))
+              decoded (decode-surface-payload (second item))
+              [valid bad] (contract-stats decoded)]
+          (recur (next items)
+                 (assoc counts prefix (+ (int (get counts prefix 0)) valid))
+                 (assoc malformed prefix (+ (int (get malformed prefix 0)) bad))))
+        [counts malformed]))))
+
+(defn bar-buffer-useful? [payload]
+  (and (isinstance payload builtins/dict)
+       (some (fn [rows]
+               (and (isinstance rows builtins/list) (pos? (count rows))))
+             (.values payload))))
+
+(defn grid-history-useful? [payload]
+  (try
+    (if (and (isinstance payload builtins/list) (pos? (count payload)))
+      (let [arr (numpy/asarray payload ** :dtype numpy/float32)
+            shape (.-shape arr)]
+        (and (= 4 (count shape))
+             (= 6 (aget shape 1))
+             (= 21 (aget shape 2))
+             (= 8 (aget shape 3))
+             (> (aget shape 0) 0)))
+      false)
+    (catch python/Exception _ false)))
+
+(defn missing-result [path target-date]
+  {"ok" false
+   "status" "missing"
+   "generated_at" (now-utc)
+   "capture" (str path)
+   "target_date" target-date
+   "issues" [(str "capture file is missing: " path)]
+   "warnings" []})
+
+(defn empty-state []
+  {:issues (atom [])
+   :warnings (atom [])
+   :arrays (atom [])
+   :row-count (atom 0)
+   :unique-time-count (atom 0)
+   :valid-time-count (atom 0)
+   :blank-time-count (atom 0)
+   :malformed-time-count (atom 0)
+   :duplicate-time-count (atom 0)
+   :duplicate-times (atom [])
+   :malformed-times (atom [])
+   :capture-version (atom nil)
+   :sidecar-nonblank-rows (atom {})
+   :sidecar-useful-rows (atom {})
+   :sidecar-total-contracts (atom {})
+   :sidecar-malformed-contracts (atom {})
+   :sidecar-dtypes (atom {})
+   :option-surface-contracts-by-prefix (atom {})
+   :option-surface-malformed-contracts-by-prefix (atom {})
+   :option-surface-status-by-prefix (atom {})})
+
+(defn issue! [state message]
+  (swap! (:issues state) conj message))
+
+(defn warn! [state message]
+  (swap! (:warnings state) conj message))
+
+(defn merge-add! [state-key state k n]
+  (let [m-atom (get state state-key)]
+    (swap! m-atom assoc k (+ (int (get @m-atom k 0)) (int n)))))
+
+(defn validate-filename-stamp! [state path target-date]
+  (let [expected (target-stamp target-date)
+        actual (capture-stamp path)]
+    (when (and expected actual (not= expected actual))
+      (issue! state (str "capture filename stamp " actual
+                         " does not match target date " expected)))))
+
+(defn validate-capture-version! [state data file-set]
+  (when (contains? file-set "capture_version")
+    (let [version-arr (get-array data "capture_version")]
+      (if (zero? (arr-len version-arr))
+        (issue! state "capture_version array is empty")
+        (do
+          (reset! (:capture-version state) (first-int version-arr))
+          (when (not= @(:capture-version state) 2)
+            (issue! state (str "capture_version must be 2 for raw replay; found "
+                               @(:capture-version state)))))))))
+
+(defn validate-times! [state data file-set missing min-rows]
+  (if (contains? file-set "times")
+    (let [raw-times (vec (map decode (get-array data "times")))
+          normalized (atom [])]
+      (reset! (:row-count state) (count raw-times))
+      (doseq [raw-time raw-times]
+        (if (zero? (count (.strip raw-time)))
+          (swap! (:blank-time-count state) inc)
+          (let [normalized-time (normalize-timestamp raw-time)]
+            (if (nil? normalized-time)
+              (do
+                (swap! (:malformed-time-count state) inc)
+                (when (< (count @(:malformed-times state)) 20)
+                  (swap! (:malformed-times state) conj raw-time)))
+              (swap! normalized conj normalized-time)))))
+      (reset! (:valid-time-count state) (count @normalized))
+      (let [freqs (frequencies @normalized)
+            dups (sorted-vec (map first (filter (fn [[_ n]] (> n 1)) freqs)))]
+        (reset! (:duplicate-times state) dups)
+        (reset! (:duplicate-time-count state)
+                (reduce + 0 (map (fn [[_ n]]
+                                   (if (> n 1) (dec n) 0))
+                                 freqs)))
+        (reset! (:unique-time-count state) (count freqs)))
+      (when (pos? @(:blank-time-count state))
+        (issue! state (str "capture has " @(:blank-time-count state) " blank timestamp rows")))
+      (when (pos? @(:malformed-time-count state))
+        (issue! state (str "capture has " @(:malformed-time-count state) " malformed timestamp rows")))
+      (when (< @(:unique-time-count state) min-rows)
+        (issue! state (str "capture has " @(:unique-time-count state)
+                           " unique timestamp rows; expected at least " min-rows)))
+      (when (pos? @(:duplicate-time-count state))
+        (issue! state (str "capture has " @(:duplicate-time-count state)
+                           " duplicate timestamp rows across "
+                           (count @(:duplicate-times state)) " timestamps"))))
+    (when (not (seq missing))
+      (issue! state "times array is missing"))))
+
+(defn account-sidecar-payload! [state sidecar payload useful total-contracts malformed-contracts]
+  (cond
+    (= sidecar "bar_buffers_json")
+    (when (bar-buffer-useful? payload)
+      (swap! useful inc))
+
+    (= sidecar "grid_history_json")
+    (when (grid-history-useful? payload)
+      (swap! useful inc))
+
+    (= sidecar "option_chain_json")
+    (let [[contracts bad] (contract-stats payload)]
+      (swap! total-contracts + contracts)
+      (swap! malformed-contracts + bad)
+      (when (pos? contracts)
+        (swap! useful inc)))
+
+    (= sidecar "option_surfaces_json")
+    (let [[counts malformed] (surface-contract-stats-by-prefix payload)
+          contracts (reduce + 0 (vals counts))
+          bad (reduce + 0 (vals malformed))]
+      (doseq [[prefix n] counts]
+        (merge-add! :option-surface-contracts-by-prefix state prefix n))
+      (doseq [[prefix n] malformed]
+        (merge-add! :option-surface-malformed-contracts-by-prefix state prefix n))
+      (swap! total-contracts + contracts)
+      (swap! malformed-contracts + bad)
+      (when (pos? contracts)
+        (swap! useful inc)))))
+
+(defn sidecar-items [arr sidecar-row-limit]
+  (if (pos? sidecar-row-limit)
+    (let [n (arr-len arr)
+          start (max 0 (- n sidecar-row-limit))]
+      (.__getitem__ arr (slice start n)))
+    arr))
+
+(defn validate-sidecar! [state data file-set sidecar min-rows sidecar-row-limit allow-missing-option-surfaces?]
+  (when (contains? file-set sidecar)
+    (let [arr (get-array data sidecar)
+          dtype (str (.-dtype arr))
+          nonblank (atom 0)
+          useful (atom 0)
+          total-contracts (atom 0)
+          malformed-contracts (atom 0)
+          invalid-json (atom 0)]
+      (swap! (:sidecar-dtypes state) assoc sidecar dtype)
+      (when (not= dtype "object")
+        (issue! state (str sidecar " sidecar dtype must be object for append-safe capture; found " dtype)))
+      (when (and (contains? file-set "times")
+                 (not= (arr-len arr) @(:row-count state)))
+        (issue! state (str sidecar " row count " (arr-len arr)
+                           " does not match times row count " @(:row-count state))))
+      (doseq [item (sidecar-items arr sidecar-row-limit)]
+        (let [text (.strip (decode item))]
+          (when (pos? (count text))
+            (swap! nonblank inc)
+            (try
+              (account-sidecar-payload! state sidecar (loads-json text)
+                                        useful total-contracts malformed-contracts)
+              (catch python/Exception _
+                (swap! invalid-json inc))))))
+      (swap! (:sidecar-nonblank-rows state) assoc sidecar @nonblank)
+      (swap! (:sidecar-useful-rows state) assoc sidecar @useful)
+      (when (not= sidecar "bar_buffers_json")
+        (swap! (:sidecar-total-contracts state) assoc sidecar @total-contracts)
+        (swap! (:sidecar-malformed-contracts state) assoc sidecar @malformed-contracts))
+      (when (pos? @malformed-contracts)
+        (issue! state (str sidecar " has " @malformed-contracts " non-object contract entries")))
+      (when (pos? @invalid-json)
+        (issue! state (str sidecar " has " @invalid-json " invalid JSON rows")))
+      (when (and (< @useful min-rows)
+                 (not (and allow-missing-option-surfaces?
+                           (= sidecar "option_surfaces_json"))))
+        (issue! state (str sidecar " has " @useful " useful rows; expected at least " min-rows)))
+      (when (and (= sidecar "bar_buffers_json") (zero? @useful))
+        (issue! state "bar_buffers_json has no rows with buffered bars"))
+      (when (and (= sidecar "grid_history_json") (zero? @useful))
+        (issue! state "grid_history_json has no rows with full greeks-grid history; DTE/windowed Greek features will not replay"))
+      (when (and (= sidecar "option_surfaces_json")
+                 (zero? @useful)
+                 (not allow-missing-option-surfaces?))
+        (issue! state "option_surfaces_json has no rows with option contracts; SPX/VIX/VIXW option unlocks will not verify"))
+      (when (= sidecar "option_surfaces_json")
+        (let [counts @(:option-surface-contracts-by-prefix state)
+              missing-prefixes (sorted-vec
+                                (filter (fn [prefix]
+                                          (<= (int (get counts prefix 0)) 0))
+                                        required-option-surface-prefixes))]
+          (when (and (seq missing-prefixes)
+                     (not allow-missing-option-surfaces?))
+            (issue! state (str "option_surfaces_json is missing required surface prefixes with contracts: "
+                               (.join ", " missing-prefixes))))))
+      (when (and (= sidecar "option_chain_json") (zero? @useful))
+        (issue! state "option_chain_json has no rows with option contracts; SPY option-chain unlocks will not verify")))))
+
+(defn validate-option-surface-status! [state data file-set sidecar-row-limit allow-missing-option-surfaces?]
+  (if (contains? file-set "option_surface_status_json")
+    (let [arr (get-array data "option_surface_status_json")
+          dtype (str (.-dtype arr))
+          invalid-json (atom 0)]
+      (swap! (:sidecar-dtypes state) assoc "option_surface_status_json" dtype)
+      (when (not= dtype "object")
+        (issue! state (str "option_surface_status_json sidecar dtype must be object for append-safe capture; found " dtype)))
+      (when (and (contains? file-set "times")
+                 (not= (arr-len arr) @(:row-count state)))
+        (issue! state (str "option_surface_status_json row count " (arr-len arr)
+                           " does not match times row count " @(:row-count state))))
+      (doseq [item (sidecar-items arr sidecar-row-limit)]
+        (let [text (.strip (decode item))]
+          (when (pos? (count text))
+            (try
+              (let [payload (loads-json text)]
+                (when (isinstance payload builtins/dict)
+                  (doseq [[prefix value] (.items payload)]
+                    (try
+                      (let [status (decode-surface-payload value)]
+                        (when (isinstance status builtins/dict)
+                          (swap! (:option-surface-status-by-prefix state)
+                                 assoc (str prefix) status)))
+                      (catch python/Exception _
+                        (swap! invalid-json inc))))))
+              (catch python/Exception _
+                (swap! invalid-json inc))))))
+      (when (pos? @invalid-json)
+        (issue! state (str "option_surface_status_json has " @invalid-json " invalid JSON rows"))))
+    (when (and (not allow-missing-option-surfaces?)
+               (contains? file-set "option_surfaces_json")
+               (zero? (int (get @(:sidecar-useful-rows state) "option_surfaces_json" 0))))
+      (warn! state "option_surface_status_json is missing; cannot diagnose why required SPX/VIX/VIXW surfaces were absent"))))
+
+(defn validate-model-row-counts! [state data file-set]
+  (doseq [model-key ["chestnut" "lynx" "moose"]]
+    (when (and (contains? file-set model-key)
+               (contains? file-set "times")
+               (not= (arr-len (get-array data model-key)) @(:row-count state)))
+      (issue! state (str model-key " row count " (arr-len (get-array data model-key))
+                         " does not match times row count " @(:row-count state))))))
+
+(defn state-result [state path target-date sidecar-row-limit allow-missing-option-surfaces?]
+  {"ok" (empty? @(:issues state))
+   "status" (if (empty? @(:issues state)) "ok" "fail")
+   "generated_at" (now-utc)
+   "capture" (str path)
+   "target_date" target-date
+   "sidecar_row_limit" sidecar-row-limit
+   "allow_missing_option_surfaces" allow-missing-option-surfaces?
+   "capture_version" @(:capture-version state)
+   "row_count" @(:row-count state)
+   "valid_time_count" @(:valid-time-count state)
+   "unique_time_count" @(:unique-time-count state)
+   "blank_time_count" @(:blank-time-count state)
+   "malformed_time_count" @(:malformed-time-count state)
+   "duplicate_time_count" @(:duplicate-time-count state)
+   "duplicate_times" (vec (take 20 @(:duplicate-times state)))
+   "malformed_times" (vec (take 20 @(:malformed-times state)))
+   "arrays" @(:arrays state)
+   "required_arrays" (sorted-vec required-arrays)
+   "required_raw_sidecars" (sorted-vec required-raw-sidecars)
+   "sidecar_nonblank_rows" @(:sidecar-nonblank-rows state)
+   "sidecar_useful_rows" @(:sidecar-useful-rows state)
+   "sidecar_total_contracts" @(:sidecar-total-contracts state)
+   "sidecar_malformed_contracts" @(:sidecar-malformed-contracts state)
+   "sidecar_dtypes" @(:sidecar-dtypes state)
+   "required_option_surface_prefixes" (sorted-vec required-option-surface-prefixes)
+   "option_surface_prefixes" (sorted-vec
+                              (map first
+                                   (filter (fn [[_ n]] (> n 0))
+                                           @(:option-surface-contracts-by-prefix state))))
+   "option_surface_contracts_by_prefix" @(:option-surface-contracts-by-prefix state)
+   "option_surface_malformed_contracts_by_prefix" @(:option-surface-malformed-contracts-by-prefix state)
+   "option_surface_status_by_prefix" @(:option-surface-status-by-prefix state)
+   "issues" @(:issues state)
+   "warnings" @(:warnings state)})
+
+(defn validate-existing-capture [path target-date min-rows sidecar-row-limit allow-missing-option-surfaces?]
+  (let [state (empty-state)]
+    (validate-filename-stamp! state path target-date)
+    (try
+      (let [data (numpy/load path ** :allow_pickle true)
+            file-set (data-files data)
+            missing (sorted-vec (filter #(not (contains? file-set %)) required-arrays))]
+        (reset! (:arrays state) (sorted-vec file-set))
+        (when (seq missing)
+          (issue! state (str "missing required arrays: " (.join ", " missing))))
+        (validate-capture-version! state data file-set)
+        (validate-times! state data file-set missing min-rows)
+        (doseq [sidecar (sort required-raw-sidecars)]
+          (validate-sidecar! state data file-set sidecar min-rows sidecar-row-limit allow-missing-option-surfaces?))
+        (validate-option-surface-status! state data file-set sidecar-row-limit allow-missing-option-surfaces?)
+        (validate-model-row-counts! state data file-set)
+        (try (.close data) (catch python/Exception _ nil)))
+      (catch python/Exception e
+        (issue! state (str "failed to read capture NPZ: " e))))
+    (state-result state path target-date sidecar-row-limit allow-missing-option-surfaces?)))
+
+(defn validate-capture [path target-date min-rows sidecar-row-limit allow-missing-option-surfaces?]
+  (if (not (os.path/exists path))
+    (missing-result path target-date)
+    (validate-existing-capture path target-date min-rows sidecar-row-limit allow-missing-option-surfaces?)))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple [(if (keyword? k) (name k) (str k))
+                                    (jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable (sort x)))
+    (nil? x) nil
+    :else x))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-positive-int [remaining arg]
+  (let [raw (option-value remaining arg)
+        value (try
+                (python/int raw)
+                (catch python/Exception _
+                  (throw (python/ValueError (str arg " must be >= 1: " raw)))))]
+    (when (< value 1)
+      (throw (python/ValueError (str arg " must be >= 1: " raw))))
+    value))
+
+(defn usage []
+  (println "usage: basilisp run scripts/capture_v2_sidecar_check.lpy -- --capture live_features_YYYYMMDD.npz [--target-date YYYY-MM-DD] [--min-rows N] [--sidecar-row-limit N] [--fast-json] [--out-json PATH] [--allow-missing] [--allow-missing-option-surfaces]"))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:min-rows 1 :sidecar-row-limit 0 :fast-json false :allow-missing false :allow-missing-option-surfaces false}]
+    (if remaining
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--capture")
+          (recur (nnext remaining) (assoc out :capture (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+
+          (= arg "--min-rows")
+          (recur (nnext remaining) (assoc out :min-rows (parse-positive-int remaining arg)))
+
+          (= arg "--out-json")
+          (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+
+          (= arg "--sidecar-row-limit")
+          (recur (nnext remaining) (assoc out :sidecar-row-limit (parse-positive-int remaining arg)))
+
+          (= arg "--fast-json")
+          (recur (next remaining) (assoc out :fast-json true))
+
+          (= arg "--allow-missing")
+          (recur (next remaining) (assoc out :allow-missing true))
+
+          (= arg "--allow-missing-option-surfaces")
+          (recur (next remaining) (assoc out :allow-missing-option-surfaces true))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg)))))
+      out)))
+
+(defn write-text! [path text]
+  (let [parent (os.path/dirname path)]
+    (when (pos? (count parent))
+      (os/makedirs parent ** :exist_ok true)))
+  (spit path text))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))]
+    (when (not (:capture opts))
+      (throw (python/ValueError "missing required --capture")))
+    (reset! duplicate-json-key-check? (not (:fast-json opts)))
+    (let [result* (validate-capture (:capture opts)
+                                    (:target-date opts)
+                                    (:min-rows opts)
+                                    (:sidecar-row-limit opts)
+                                    (:allow-missing-option-surfaces opts))
+          result (if (and (:allow-missing opts)
+                          (= "missing" (get result* "status")))
+                   (assoc result*
+                          "ok" true
+                          "warnings" (conj (vec (get result* "warnings" []))
+                                           "capture file is not present yet"))
+                   result*)
+          text (json/dumps (jsonable result) ** :indent 2 :sort_keys true)]
+      (when-let [out (:out-json opts)]
+        (write-text! out (str text "\n")))
+      (println text)
+      (python/exit (if (get result "ok") 0 1))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

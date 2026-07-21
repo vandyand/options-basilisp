@@ -1,0 +1,169 @@
+;; Full-universe, fixed-window ThetaData historical event collector.
+;;
+;; This is deliberately a physical measurement tool.  It never narrows an
+;; option root by expiry, strike, DTE, or liquidity.  Each option request uses
+;; expiration=* and strike=*, and writes the selected provider response format
+;; losslessly before any profiling or representation work.
+(import argparse datetime hashlib json os os.path pathlib shutil subprocess sys traceback urllib.error urllib.parse urllib.request)
+
+(def canonical-raw-root (pathlib/Path "D:\\SteveTradingData\\raw\\v1"))
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+
+(defn under? [path root]
+  (try (.relative_to (.resolve path) (.resolve root)) true
+       (catch python/ValueError _ false)))
+
+(defn csv-items [value flag]
+  (let [items (vec (filter #(pos? (count %)) (map #(.upper (.strip %)) (.split (str value) ","))))]
+    (when (empty? items) (throw (python/ValueError (str flag " must be non-empty"))))
+    items))
+
+(defn assert-corpus-volume-healthy! []
+  (when-not (= (.-name os) "nt")
+    (throw (python/RuntimeError "ThetaData collection is Windows-only against D:\\SteveTradingData")))
+  (let [command (python/list ["powershell" "-NoProfile" "-Command"
+                              "Get-Volume -DriveLetter D | Select-Object HealthStatus,OperationalStatus | ConvertTo-Json -Compress"])
+        completed (subprocess/run command ** :check true :capture_output true :text true :timeout 20)
+        volume (json/loads (.-stdout completed))]
+    (when-not (and (= (.get volume "HealthStatus") "Healthy")
+                   (not= -1 (.find (str (.get volume "OperationalStatus")) "OK")))
+      (throw (python/RuntimeError (str "external corpus volume is not healthy: " volume))))
+    volume))
+
+(defn request-url [base path params]
+  (str (.rstrip base "/") path "?"
+       (urllib.parse/urlencode
+        (python/list (map (fn [[k v]] (python/tuple [(str k) (str v)])) (sort-by first params))))))
+
+(defn request-spec [asset-class symbol date start-time end-time event-class response-format]
+  (case asset-class
+    "options"
+    {"endpoint" (str "/v3/option/history/" event-class)
+     "params" {"symbol" symbol "expiration" "*" "strike" "*" "right" "both"
+               "date" date "start_time" start-time "end_time" end-time
+               "interval" "tick" "format" response-format}}
+    "indexes"
+    {"endpoint" "/v3/index/history/price"
+     "params" {"symbol" symbol "date" date "start_time" start-time "end_time" end-time
+               "interval" "tick" "format" response-format}}
+    (throw (python/ValueError (str "unsupported --asset-class: " asset-class)))))
+
+(defn copy-response! [response staging]
+  (let [digest (hashlib/sha256)]
+    (with-open [output (python/open staging "wb")]
+      (loop [total 0 chunk (.read response 1048576)]
+        (if (pos? (count chunk))
+          (do (.write output chunk) (.update digest chunk) (recur (+ total (count chunk)) (.read response 1048576)))
+          {"bytes" total "sha256" (.hexdigest digest)
+           "content_type" (str (.getheader response "Content-Type"))})))))
+
+(defn download! [url staging]
+  (let [;; The terminal selects NDJSON from the query parameter.  Supplying an
+        ;; HTTP Accept media type causes some V3 builds to reject the request.
+        request (urllib.request/Request url)]
+    (try
+      (with-open [response (urllib.request/urlopen request ** :timeout 900)]
+        (assoc (copy-response! response staging) "http_status" (or (.-status response) 200) "available" true))
+      (catch urllib.error/HTTPError error
+        ;; A declared symbol can be unavailable for a historical date.  Retain
+        ;; that exact vendor error beside the successful full-universe payloads;
+        ;; do not silently omit it or discard the whole measurement run.
+        (assoc (copy-response! error staging) "http_status" (.-code error) "available" false
+               "error" (str error))))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--asset-class" ** :required true :choices (python/list ["options" "indexes"]))
+    (.add_argument parser "--class-id" ** :required true)
+    (.add_argument parser "--symbols" ** :required true)
+    (.add_argument parser "--date" ** :required true)
+    (.add_argument parser "--start-time" ** :required true)
+    (.add_argument parser "--end-time" ** :required true)
+    (.add_argument parser "--event-classes" ** :default "quote,trade")
+    (.add_argument parser "--format" ** :dest "response_format"
+                   :choices (python/list ["csv" "json" "ndjson"]) :default "ndjson")
+    (.add_argument parser "--base-url" ** :default "http://127.0.0.1:25503")
+    (.add_argument parser "--out-root" ** :default "D:\\SteveTradingData\\raw\\v1")
+    (.add_argument parser "--manifest-root" ** :default "D:\\SteveTradingData\\manifests\\v1")
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        asset-class (.-asset_class args)
+        response-format (.-response_format args)
+        symbols (csv-items (.-symbols args) "--symbols")
+        event-classes (csv-items (.-event_classes args) "--event-classes")
+        _ (when (and (= asset-class "indexes") (not= event-classes ["PRICE"]))
+            (throw (python/ValueError "indexes require --event-classes price")))
+        _ (when (and (= asset-class "options") (not (every? #(contains? #{"QUOTE" "TRADE"} %) event-classes)))
+            (throw (python/ValueError "options support only quote,trade")))
+        raw-root (.resolve (pathlib/Path (.-out_root args)))
+        manifest-root (.resolve (pathlib/Path (.-manifest_root args)))]
+    (when-not (and (under? raw-root canonical-raw-root) (under? manifest-root canonical-manifest-root))
+      (throw (python/ValueError "collector writes only below D:\\SteveTradingData raw/v1 and manifests/v1")))
+    (assert-corpus-volume-healthy!)
+    (let [run-id (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y%m%dT%H%M%S%fZ")
+          relative (.joinpath (pathlib/Path "thetadata") (if (= asset-class "options") "OPRA" "INDEX") "hard"
+                              (.-class_id args) (str "trade_date=" (.-date args)))
+          final-dir (.joinpath raw-root relative (str "run=" run-id))
+          staging-dir (.with_name final-dir (str (.-name final-dir) ".staging"))
+          manifest-path (.joinpath manifest-root relative (str "run=" run-id ".json"))]
+      (.mkdir staging-dir ** :parents true :exist_ok false)
+      (try
+        (let [payloads
+              (vec (for [symbol symbols event-class event-classes]
+                     (let [event-name (.lower event-class)
+                           spec (request-spec asset-class symbol (.-date args) (.-start_time args) (.-end_time args)
+                                              event-name response-format)
+                           url (request-url (.-base_url args) (get spec "endpoint") (get spec "params"))
+                           filename (str symbol "." event-name "." response-format)
+                           output (.joinpath staging-dir filename)
+                           result (download! url (str output))]
+                       {"symbol" symbol "event_class" event-name "endpoint" (get spec "endpoint")
+                        "params" (get spec "params") "url" url "path" filename
+                        "bytes" (get result "bytes") "sha256" (get result "sha256")
+                        "content_type" (get result "content_type") "http_status" (get result "http_status")
+                        "available" (get result "available") "error" (get result "error")})))]
+          (.mkdir (.-parent final-dir) ** :parents true :exist_ok true)
+          (.replace staging-dir final-dir)
+          (let [receipt {"schema_version" 1 "provider" "thetadata" "asset_class" asset-class
+                         "class" (.-class_id args) "admission" "hard" "symbols" symbols
+                         "event_classes" (vec (map #(.lower %) event-classes)) "date" (.-date args)
+                         "response_format" response-format
+                         "start_time_et" (.-start_time args) "end_time_et" (.-end_time args)
+                         "base_url" (.-base_url args) "collected_at" (now-utc)
+                         "collector_revision" "thetadata-event-collection-v2-basilisp"
+                         "selection_policy" "full-root/full-index-universe; no expiry, strike, DTE, moneyness, or liquidity filter"
+                         "archive_status" (if (every? #(get % "available") payloads)
+                                              "historical-response-raw"
+                                              "historical-response-raw-with-unavailable-symbols")
+                         "raw_payloads" payloads
+                         "raw_run_dir" (str final-dir)}]
+            (.mkdir (.-parent manifest-path) ** :parents true :exist_ok true)
+            (spit (str manifest-path) (json-text receipt))
+            (assoc receipt "manifest_path" (str manifest-path))))
+        (catch python/Exception e
+          (let [failed (.joinpath (.-parent (.-parent canonical-raw-root)) "quarantine" "v1" "thetadata" asset-class
+                                  (str "run=" run-id ".partial"))]
+            (.mkdir (.-parent failed) ** :parents true :exist_ok true)
+            (when (.exists staging-dir) (shutil/move (str staging-dir) (str failed)))
+            (throw e)))))))
+
+(try
+  (println (json-text (run-main (vec *command-line-args*))))
+  (python/exit 0)
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e "\n" (traceback/format_exc)))
+    (python/exit 3))))

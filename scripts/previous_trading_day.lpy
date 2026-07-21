@@ -1,0 +1,49 @@
+;; Print the previous NYSE trading day before the supplied ISO date.
+(import datetime glob os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.reporting.core :as reporting])
+
+(defn usage
+  []
+  (println "usage: basilisp run scripts/previous_trading_day.lpy -- YYYY-MM-DD"))
+
+(try
+  (let [args (vec *command-line-args*)]
+    (cond
+      (and (= 1 (count args))
+           (or (= "-h" (first args)) (= "--help" (first args))))
+      (do
+        (usage)
+        (python/exit 0))
+
+      (not= 1 (count args))
+      (do
+        (usage)
+        (python/exit 2))
+
+      :else
+      (let [start (datetime.date/fromisoformat (first args))]
+        (loop [candidate (- start (datetime/timedelta ** :days 1))
+               remaining 21]
+          (cond
+            (neg? remaining)
+            (throw (python/RuntimeError
+                    (str "could not find previous trading day before " (first args))))
+
+            (reporting/trading-day? (.isoformat candidate))
+            (do
+              (println (.isoformat candidate))
+              (python/exit 0))
+
+            :else
+            (recur (- candidate (datetime/timedelta ** :days 1))
+                   (dec remaining)))))))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

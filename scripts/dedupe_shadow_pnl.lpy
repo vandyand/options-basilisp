@@ -1,0 +1,144 @@
+;; Remove duplicate shadow_pnl rows by full trade identity.
+;;
+;; The legacy Python P&L materializer can re-insert synthetic expiry-flatten
+;; rows because those closes do not map back to a shadow_fills cursor. This
+;; repair is deliberately conservative: rows are duplicates only when all
+;; business fields match exactly, and the lowest pnl_id is retained.
+(import json os os.path sqlite3 sys)
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/dedupe_shadow_pnl.lpy -- "
+                "--db-path DB [--apply]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:apply? false}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--db-path")
+          (recur (nnext remaining) (assoc out :db-path (option-value remaining arg)))
+
+          (= arg "--apply")
+          (recur (next remaining) (assoc out :apply? true))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn validate-opts
+  [opts]
+  (when-not (:db-path opts)
+    (throw (python/ValueError "missing required --db-path")))
+  (when-not (os.path/exists (:db-path opts))
+    (throw (python/ValueError (str "db does not exist: " (:db-path opts)))))
+  opts)
+
+(def duplicate-summary-sql
+  "SELECT strategy_id,
+          COUNT(*) AS duplicate_groups,
+          SUM(n - 1) AS duplicate_rows
+   FROM (
+     SELECT strategy_id, closed_t, instrument, qty, entry_price, exit_price,
+            realized_pnl, holding_minutes, side, COUNT(*) AS n
+     FROM shadow_pnl
+     GROUP BY strategy_id, closed_t, instrument, qty, entry_price, exit_price,
+              realized_pnl, holding_minutes, side
+     HAVING COUNT(*) > 1
+   )
+   GROUP BY strategy_id
+   ORDER BY duplicate_rows DESC, strategy_id")
+
+(def total-duplicate-rows-sql
+  "SELECT COALESCE(SUM(n - 1), 0) AS duplicate_rows
+   FROM (
+     SELECT COUNT(*) AS n
+     FROM shadow_pnl
+     GROUP BY strategy_id, closed_t, instrument, qty, entry_price, exit_price,
+              realized_pnl, holding_minutes, side
+     HAVING COUNT(*) > 1
+   )")
+
+(def delete-duplicates-sql
+  "DELETE FROM shadow_pnl
+   WHERE pnl_id NOT IN (
+     SELECT MIN(pnl_id)
+     FROM shadow_pnl
+     GROUP BY strategy_id, closed_t, instrument, qty, entry_price, exit_price,
+              realized_pnl, holding_minutes, side
+   )")
+
+(defn row->summary
+  [row]
+  {"strategy_id" (.__getitem__ row "strategy_id")
+   "duplicate_groups" (int (.__getitem__ row "duplicate_groups"))
+   "duplicate_rows" (int (.__getitem__ row "duplicate_rows"))})
+
+(defn duplicate-summary
+  [conn]
+  (set! (.-row_factory conn) sqlite3/Row)
+  (vec (map row->summary (.fetchall (.execute conn duplicate-summary-sql)))))
+
+(defn duplicate-row-count
+  [conn]
+  (let [row (.fetchone (.execute conn total-duplicate-rows-sql))]
+    (int (.__getitem__ row "duplicate_rows"))))
+
+(defn delete-duplicates!
+  [conn]
+  (let [before (.-total_changes conn)]
+    (.execute conn delete-duplicates-sql)
+    (.commit conn)
+    (- (.-total_changes conn) before)))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(try
+  (let [opts (validate-opts (parse-args (vec *command-line-args*)))
+        conn (sqlite3/connect (:db-path opts))]
+    (try
+      (.execute conn "PRAGMA foreign_keys = ON")
+      (let [before-summary (duplicate-summary conn)
+            before-count (duplicate-row-count conn)
+            deleted (if (:apply? opts) (delete-duplicates! conn) 0)
+            after-summary (duplicate-summary conn)
+            after-count (duplicate-row-count conn)
+            result {"db_path" (:db-path opts)
+                    "applied" (boolean (:apply? opts))
+                    "duplicate_rows_before" before-count
+                    "duplicate_rows_after" after-count
+                    "deleted" deleted
+                    "duplicates_before" before-summary
+                    "duplicates_after" after-summary
+                    "valid?" (zero? after-count)}]
+        (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))
+        (python/exit (if (get result "valid?") 0 1)))
+      (finally
+        (.close conn))))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch sqlite3/Error e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

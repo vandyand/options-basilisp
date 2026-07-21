@@ -1,0 +1,180 @@
+;; Basilisp implementation of the Steve-v2 live feature parity baseline.
+(import datetime glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def default-ref
+  (or (os.environ/get "STEVE_REF_ROOT")
+      (let [vps-ref "/opt/stevetrading/shared/Data-Preprocessor"]
+        (if (os.path/isdir vps-ref)
+          vps-ref
+          (os.path/join (os.path/expanduser "~")
+                        "contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")))))
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/live_feature_parity_baseline.lpy -- "
+                "[--capture-dir DIR] [--bundle DIR] [--out-dir DIR] "
+                "[--target-date YYYY-MM-DD] [--dates YYYYMMDD ...] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn cli-compact-date
+  [value arg]
+  (let [s (str value)]
+    (when-not (and (= 8 (count s)) (.isdigit s))
+      (throw (python/ValueError
+              (str "invalid " arg ": " s
+                   " (expected YYYYMMDD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat
+       (str (subs s 0 4) "-" (subs s 4 6) "-" (subs s 6 8)))
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid " arg ": " s
+                     " (expected YYYYMMDD calendar date)")))))
+    s))
+
+(defn date-values
+  [remaining arg]
+  (let [values (vec (rest remaining))]
+    (when (or (empty? values)
+              (some #(.startswith (str %) "--") values))
+      (throw (python/ValueError (str "missing value for " arg))))
+    (mapv #(cli-compact-date % arg) values)))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:capture-dir (os.path/join repo-root fp/default-capture-dir)
+              :bundle (os.path/join default-ref
+                                    "pipeline_data/live_model_chestnut_multihead_corrected")
+              :out-dir (os.path/join repo-root fp/default-analysis-dir)
+              :dates []}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--capture-dir")
+          (recur (nnext remaining) (assoc out :capture-dir (option-value remaining arg)))
+
+          (= arg "--bundle")
+          (recur (nnext remaining) (assoc out :bundle (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining)
+                 (assoc out :target-date
+                        (cli-target-date (option-value remaining arg))))
+
+          (= arg "--dates")
+          (recur nil (assoc out :dates (date-values remaining arg)))
+
+          (= arg "--write-unavailable")
+          (recur (next remaining) (assoc out :write-unavailable true))
+
+          (= arg "--unavailable-reason")
+          (recur (nnext remaining)
+                 (assoc out :unavailable-reason (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn write-unavailable!
+  [{:keys [out-dir target-date generated-at unavailable-reason]}]
+  (let [out-dir (or out-dir (os.path/join repo-root fp/default-analysis-dir))
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        target-date (or target-date (subs generated-at 0 10))
+        stamp (.replace (subs target-date 0 10) "-" "")
+        reason (or unavailable-reason "feature parity baseline unavailable")
+        out-base (os.path/join (str out-dir)
+                               (str "live_feature_parity_baseline_" stamp))
+        csv-path (str out-base ".csv")
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")
+        summary {"status" "unavailable"
+                 "available" false
+                 "ok" false
+                 "generated_at" generated-at
+                 "target_date" target-date
+                 "unavailable_reason" reason
+                 "captures" {"files" []
+                             "rows_by_file" {}
+                             "skipped_files" {}
+                             "required_raw_replay_arrays" true
+                             "raw_replay_missing_by_file" {}}
+                 "per_capture" []
+                 "rows" 0
+                 "capture_file_count" 0
+                 "features" 0
+                 "neutralized_count" 0
+                 "active_problem_count" 0
+                 "active_sane_count" 0
+                 "status_counts" {}}]
+    (os/makedirs (str out-dir) ** :exist_ok true)
+    (spit csv-path (str (apply str (interpose "," fp/baseline-csv-columns)) "\n"))
+    (spit json-path (json/dumps (fp/->jsonable {"summary" summary "features" []})
+                                ** :indent 2 :sort_keys true))
+    (spit md-path (str "# Live Feature Parity Baseline Unavailable\n\n"
+                       "- Target date: `" target-date "`\n"
+                       "- Generated at: `" generated-at "`\n"
+                       "- Reason: `" reason "`\n"))
+    {:summary summary
+     :csv-path csv-path
+     :json-path json-path
+     :markdown-path md-path}))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        {:keys [summary markdown-path csv-path json-path]}
+        (if (get opts :write-unavailable)
+          (write-unavailable! opts)
+          (fp/write-baseline! opts))]
+    (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote " markdown-path))
+    (println (str "wrote " csv-path))
+    (println (str "wrote " json-path))
+    (when (get opts :write-unavailable)
+      (python/exit 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

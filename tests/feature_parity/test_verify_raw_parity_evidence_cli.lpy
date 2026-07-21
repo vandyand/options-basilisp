@@ -1,0 +1,72 @@
+(ns feature-parity.test-verify-raw-parity-evidence-cli
+  (:import hashlib json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "verify_raw_parity_evidence.lpy"))
+
+(defn resolve-basilisp []
+  (cond (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+        (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+        (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+        (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+        :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable [value]
+  (cond (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+        (or (vector? value) (seq? value)) (python/list (map jsonable value))
+        :else value))
+
+(defn write-json! [path payload]
+  (.mkdir (.-parent path) ** :parents true :exist_ok true)
+  (.write_text path (json/dumps (jsonable payload))))
+
+(defn sha256 [path]
+  (.hexdigest (hashlib/sha256 (.read_bytes path))))
+
+(defn build-ready-session! [landing]
+  (let [date "2026-07-13" run-id "fixture-run"
+        event (.joinpath landing "live" date "stream-events" run-id "events.ndjson")
+        receipt (.joinpath landing "receipts" date "stream-events" (str run-id ".json"))
+        manifest (.joinpath landing "manifests" date "raw-history-requests.json")]
+    (.mkdir (.-parent event) ** :parents true :exist_ok true)
+    (.write_text event "{\"sec_type\":\"OPTION\"}\n")
+    (write-json! receipt {"status" "CAPTURED" "event_sha256" (sha256 event)
+                          "summary" {"market_event_count" 1}})
+    (write-json! manifest {"event_path" "/remote/events.ndjson" "historical_requests" []})
+    (write-json! (pathlib/Path (str manifest ".comparison.json"))
+                 {"summary" {"requests" 2 "pass" 1 "fail" 1 "inconclusive" 0}
+                  "results" [{"request_index" 0 "historical_venue" nil "comparison" {"status" "PASS"}}
+                             {"request_index" 1 "historical_venue" "nqb" "comparison" {"status" "FAIL"}}]})
+    (doseq [name ["0-canonical.json" "1-nqb.json"]]
+      (let [path (.joinpath landing "historical" name)]
+        (.mkdir (.-parent path) ** :parents true :exist_ok true)
+        (.write_text path "{}")))
+    date))
+
+(defn run-cli [landing date & args]
+  (subprocess/run (python/list (concat [basilisp-bin "run" (str script) "--"
+                                        "--landing-root" (str landing) "--target-date" date] args))
+                  ** :cwd (str root) :text true :capture_output true :check false))
+
+(deftest verifier-accepts-a-complete-integrity-checked-session
+  (let [landing (pathlib/Path (tempfile/mkdtemp)) date (build-ready-session! landing)
+        out (.joinpath landing "verification.json")]
+    (try
+      (let [result (run-cli landing date "--out" (str out))
+            payload (json/loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "READY" (.get payload "status")))
+        (is (= 1 (.get payload "captured_stream_receipts")))
+        (is (.exists out)))
+      (finally (shutil/rmtree landing ** :ignore_errors true)))))
+
+(deftest verifier-reports-pending-before-comparison-is-present
+  (let [landing (pathlib/Path (tempfile/mkdtemp)) date "2026-07-13"]
+    (try
+      (let [result (run-cli landing date) payload (json/loads (.-stdout result))]
+        (is (= 1 (.-returncode result)))
+        (is (= "PENDING" (.get payload "status"))))
+      (finally (shutil/rmtree landing ** :ignore_errors true)))))

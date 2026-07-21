@@ -1,0 +1,101 @@
+;; Bounded raw Databento Live capture for later historical parity testing.
+(import argparse collections datetime hashlib json os pathlib time traceback uuid databento)
+
+(defn utc-now []
+  (.replace (.isoformat (datetime.datetime/now datetime.timezone/utc) ** :timespec "microseconds")
+            "+00:00" "Z"))
+
+(defn sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [source (python/open (str path) "rb")]
+      (loop [chunk (.read source 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read source 1048576)))))
+    (.hexdigest digest)))
+
+(defn comma-values [text]
+  (python/list (filter seq (map #(.strip %) (.split text ",")))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--out-root" ** :required true)
+    (.add_argument parser "--dataset" ** :required true)
+    (.add_argument parser "--symbols" ** :required true)
+    (.add_argument parser "--stype-in" ** :required true)
+    (.add_argument parser "--schemas" ** :required true)
+    (.add_argument parser "--duration-seconds" ** :type float :required true)
+    (.add_argument parser "--api-key-env" ** :default "DATABENTO_API_KEY")
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        key (os.environ/get (.-api_key_env args))
+        _ (when-not key
+            (throw (python/RuntimeError
+                    (str "missing required environment variable: " (.-api_key_env args)))))
+        _ (when (<= (.-duration_seconds args) 0)
+            (throw (python/ValueError "duration-seconds must be positive")))
+        schemas (comma-values (.-schemas args))
+        symbols (comma-values (.-symbols args))
+        now (datetime.datetime/now datetime.timezone/utc)
+        run-id (str (.strftime now "%Y%m%dT%H%M%S%fZ") "-" (subs (.-hex (uuid/uuid4)) 0 8))
+        out-dir (.joinpath (pathlib/Path (.-out_root args)) (.-dataset args)
+                           (.strftime now "%Y-%m-%d") run-id)
+        _ (.mkdir out-dir ** :parents true :exist_ok false)
+        live-path (.joinpath out-dir "live.dbn")
+        started-at (utc-now)
+        subscribed-at (atom nil)
+        client (databento/Live ** :key key :ts_out false)]
+    (try
+      (do
+        (.add_stream client (str live-path))
+        (doseq [schema schemas]
+          (.subscribe client ** :dataset (.-dataset args) :schema schema
+                      :symbols symbols :stype_in (.-stype_in args)))
+        (.start client)
+        (reset! subscribed-at (utc-now))
+        (time/sleep (.-duration_seconds args)))
+      (finally (.stop client)))
+    (let [ended-at (utc-now)
+          size (.-st_size (.stat live-path))
+          counts (collections/Counter)
+          messages (python/list)
+          tally! (fn [record]
+                   (let [record-type (.-__name__ (python/type record))]
+                     (.update counts (python/list [record-type]))
+                     (when (= "SystemMsg" record-type)
+                       (.append messages (.-msg record)))))
+          ;; Count records as they are decoded. Keeping every decoded event in
+          ;; a list makes receipt generation consume memory proportional to the
+          ;; capture and can appear hung after a long market-hours run.
+          _ (when (pos? size)
+              (.replay (databento/read_dbn (str live-path)) tally!))
+          receipt (python/dict
+                   [#py ("dataset" (.-dataset args))
+                    #py ("duration_seconds" (.-duration_seconds args))
+                    #py ("ended_at" ended-at)
+                    #py ("event_type_counts" (python/dict (python/sorted (.items counts))))
+                    #py ("live_dbn" (.-name live-path))
+                    #py ("live_dbn_bytes" size)
+                    #py ("live_dbn_sha256" (sha256-file live-path))
+                    #py ("schemas" schemas)
+                    #py ("started_at" started-at)
+                    #py ("stype_in" (.-stype_in args))
+                    #py ("subscribed_at" @subscribed-at)
+                    #py ("symbols" symbols)
+                    #py ("system_messages" messages)
+                    #py ("ts_out" false)])
+          output (python/dict receipt)
+          _ (.__setitem__ output "run_dir" (str out-dir))]
+      (.write_text (.joinpath out-dir "receipt.json")
+                   (str (json/dumps receipt ** :indent 2 :sort_keys true :default str) "\n")
+                   ** :encoding "utf-8")
+      (println (json/dumps output ** :indent 2 :sort_keys true :default str))
+      0)))
+
+(try
+  (python/exit (run-main (vec *command-line-args*)))
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 2)))

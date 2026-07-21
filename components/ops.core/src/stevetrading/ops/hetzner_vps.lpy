@@ -1,0 +1,427 @@
+(ns stevetrading.ops.hetzner-vps
+  "Hetzner VPS provisioning helpers for SteveTrading ops."
+  (:import argparse base64 hashlib json os pathlib re socket subprocess sys time
+           urllib.error urllib.parse urllib.request))
+
+(def base-url "https://api.hetzner.cloud/v1")
+(def default-leases (pathlib/Path ".hetzner/stevetrading-leases.json"))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(name k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn load-env-file
+  [path]
+  (if (or (nil? path) (not (.exists path)))
+    {}
+    (loop [lines (.splitlines (.read_text path))
+           out {}]
+      (if (empty? lines)
+        out
+        (let [line (.strip (first lines))]
+          (if (or (empty? line) (.startswith line "#") (= -1 (.find line "=")))
+            (recur (rest lines) out)
+            (let [[k v] (.split line "=" 1)]
+              (recur (rest lines)
+                     (assoc out (.strip k) (.strip (.strip (.strip v) "\"") "'"))))))))))
+
+(defn get-secret
+  ([name] (get-secret name nil []))
+  ([name env-file alternatives]
+   (let [names (concat [name] alternatives)
+         file-env (load-env-file env-file)]
+     (loop [remaining names]
+       (if (empty? remaining)
+         (let [joined (.join " / " (python/list names))
+               source (if env-file (str " or " env-file) "")]
+           (throw (python/RuntimeError (str "error: " joined " not set in environment" source))))
+         (let [k (first remaining)
+               v (or (os.environ/get k) (get file-env k))]
+           (if (and v (not (empty? (.strip v))))
+             (.strip v)
+             (recur (rest remaining)))))))))
+
+(defn request
+  [api-key method path & [body]]
+  (let [data (when body (.encode (json/dumps (jsonable body)) "utf-8"))
+        req (urllib.request/Request
+             (str base-url path)
+             ** :data data
+                :method method
+                :headers {"Authorization" (str "Bearer " api-key)
+                          "Accept" "application/json"
+                          "Content-Type" "application/json"})]
+    (try
+      (with-open [resp (urllib.request/urlopen req ** :timeout 60)]
+        (let [raw (.decode (.read resp) "utf-8")]
+          (if (empty? raw) {} (json/loads raw))))
+      (catch urllib.error/HTTPError e
+        (let [raw (.decode (.read e) "utf-8" "replace")
+              parsed (try (json/loads raw) (catch json/JSONDecodeError _ nil))
+              err (if parsed (or (.get parsed "error") {}) {})
+              msg (or (.get err "message") raw)]
+          (throw (python/RuntimeError (str "hetzner " method " " path " failed: " msg)))))
+      (catch urllib.error/URLError e
+        (throw (python/RuntimeError (str "hetzner " method " " path " failed: " (.-reason e))))))))
+
+(defn local-pubkey
+  ([] (local-pubkey nil))
+  ([path]
+   (let [candidates (if path
+                      [path]
+                      [(pathlib/Path (os.path/expanduser "~/.ssh/id_ed25519.pub"))
+                       (pathlib/Path (os.path/expanduser "~/.ssh/id_rsa.pub"))])]
+     (loop [remaining candidates]
+       (if (empty? remaining)
+         (throw (python/RuntimeError "error: no SSH pubkey found; expected ~/.ssh/id_ed25519.pub or ~/.ssh/id_rsa.pub"))
+         (let [candidate (first remaining)]
+           (if (and candidate (.exists candidate))
+             (let [text (.strip (.read_text candidate))]
+               (if (empty? text)
+                 (recur (rest remaining))
+                 text))
+             (recur (rest remaining)))))))))
+
+(defn pubkey-fingerprint
+  [pubkey]
+  (let [parts (.split (.strip pubkey))]
+    (when (< (count parts) 2)
+      (throw (python/ValueError "malformed OpenSSH public key")))
+    (let [blob (base64/b64decode (second parts))
+          digest (.hexdigest (hashlib/md5 blob))]
+      (.join ":" (python/list (map (fn [i] (subs digest i (+ i 2))) (range 0 (count digest) 2)))))))
+
+(defn operator-key-name
+  []
+  (let [host (or (first (.split (socket/gethostname) ".")) "workstation")]
+    (str "stevetrading-operator-" host)))
+
+(defn register-ssh-key
+  [api-key pubkey]
+  (let [fp (pubkey-fingerprint pubkey)
+        query (urllib.parse/urlencode {"fingerprint" fp})
+        keys (.get (request api-key "GET" (str "/ssh_keys?" query)) "ssh_keys" [])]
+    (if (seq keys)
+      (python/int (.get (first keys) "id"))
+      (let [created (request api-key "POST" "/ssh_keys"
+                             {"name" (operator-key-name)
+                              "public_key" pubkey})]
+        (python/int (.get (.get created "ssh_key") "id"))))))
+
+(defn normalize-arch
+  [value]
+  (let [v (.lower (str value))]
+    (cond
+      (#{"amd" "x86" "x86_64"} v) "x86"
+      (#{"arm" "aarch64"} v) "arm"
+      :else (throw (python/ValueError (str "unsupported arch: " value))))))
+
+(defn server-catalog
+  [api-key location]
+  (let [types (.get (request api-key "GET" "/server_types") "server_types" [])
+        datacenters (.get (request api-key "GET" "/datacenters") "datacenters" [])
+        available-ids (set
+                       (mapcat
+                        (fn [dc]
+                          (let [loc (.lower (or (.get (or (.get dc "location") {}) "name") ""))]
+                            (if (= loc (.lower location))
+                              (map python/int (.get (or (.get dc "server_types") {}) "available" []))
+                              [])))
+                        datacenters))]
+    (vec
+     (keep
+      (fn [item]
+        (let [type-id (python/int (.get item "id"))]
+          (when (or (empty? available-ids) (contains? available-ids type-id))
+            (let [price (first
+                         (keep (fn [p]
+                                 (when (= (.get p "location") location)
+                                   (python/float (.get (.get p "price_monthly") "gross"))))
+                               (.get item "prices" [])))]
+              (when price
+                {:name (.get item "name")
+                 :memory (python/int (.get item "memory"))
+                 :disk (python/int (.get item "disk"))
+                 :cores (python/int (.get item "cores"))
+                 :arch (normalize-arch (.get item "architecture"))
+                 :price-monthly price
+                 :location location
+                 :type-id type-id})))))
+      types))))
+
+(defn choose-server-type
+  [catalog {:keys [min-ram min-disk arch max-price-monthly]}]
+  (let [normalized (normalize-arch arch)
+        matches (filter (fn [st]
+                          (and (>= (:memory st) min-ram)
+                               (>= (:disk st) min-disk)
+                               (= (:arch st) normalized)
+                               (or (nil? max-price-monthly)
+                                   (<= (:price-monthly st) max-price-monthly))))
+                        catalog)]
+    (first (sort-by (fn [st] [(:price-monthly st) (:memory st) (:disk st) (:cores st)])
+                    matches))))
+
+(defn render-cloud-init
+  [hostname pubkey]
+  (str "#!/bin/bash\n"
+       "set -euxo pipefail\n\n"
+       "hostnamectl set-hostname " hostname "\n"
+       "export DEBIAN_FRONTEND=noninteractive\n"
+       "apt-get update\n"
+       "apt-get install -y ca-certificates curl git jq rsync sqlite3 unzip python3 python3-venv python3-pip openjdk-21-jre-headless ufw\n\n"
+       "useradd -m -s /bin/bash bot || true\n"
+       "mkdir -p /home/bot/.ssh\n"
+       "cat > /home/bot/.ssh/authorized_keys <<'EOF'\n"
+       pubkey "\n"
+       "EOF\n"
+       "chown -R bot:bot /home/bot/.ssh\n"
+       "chmod 700 /home/bot/.ssh\n"
+       "chmod 600 /home/bot/.ssh/authorized_keys\n"
+       "echo 'bot ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/bot\n"
+       "chmod 440 /etc/sudoers.d/bot\n\n"
+       "sed -i 's/^#\\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config\n"
+       "sed -i 's/^#\\?PermitRootLogin .*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config\n"
+       "systemctl reload ssh || systemctl reload sshd || true\n\n"
+       "ufw allow OpenSSH\n"
+       "ufw --force enable\n\n"
+       "mkdir -p /opt/stevetrading/releases /opt/stevetrading/shared /var/log/stevetrading\n"
+       "chown -R bot:bot /opt/stevetrading /var/log/stevetrading\n"))
+
+(defn redact-payload
+  [payload]
+  (let [user-data0 (str (or (get payload "user_data") ""))
+        user-data1 (re/sub "(?m)^ssh-[^\\n]+$" "ssh-<REDACTED-OPERATOR-PUBKEY>" user-data0)
+        user-data (if (> (count user-data1) 900)
+                    (str (subs user-data1 0 900) "... <truncated " (- (count user-data1) 900) " chars>")
+                    user-data1)
+        copy (assoc payload "user_data" user-data)]
+    (assoc copy "ssh_keys" ["<operator-key-id>"])))
+
+(defn leases-read
+  [path]
+  (if (.exists path)
+    (json/loads (.read_text path))
+    {}))
+
+(defn leases-write
+  [path leases]
+  (.mkdir (.-parent path) ** :parents true :exist_ok true)
+  (let [tmp (.with_suffix path (str (.-suffix path) ".tmp"))]
+    (.write_text tmp (str (json/dumps leases ** :indent 2 :sort_keys true) "\n"))
+    (.replace tmp path)))
+
+(defn ipv4-info
+  [server key]
+  (.get (or (.get (or (.get server "public_net") {}) "ipv4") {}) key))
+
+(defn add-lease
+  [path server selection]
+  (let [leases (leases-read path)
+        sid (str (.get server "id"))]
+    (leases-write path
+                  (assoc leases sid
+                         {"id" (.get server "id")
+                          "name" (.get server "name")
+                          "type" (:name selection)
+                          "location" (:location selection)
+                          "price_monthly_eur" (:price-monthly selection)
+                          "ipv4" (ipv4-info server "ip")
+                          "primary_ip_id" (ipv4-info server "id")
+                          "status" (.get server "status")
+                          "created_at" (.get server "created")}))))
+
+(defn remove-lease
+  [path server-id]
+  (let [leases (leases-read path)]
+    (.pop leases (str server-id) nil)
+    (leases-write path leases)))
+
+(defn wait-running
+  [api-key server-id & [timeout-seconds]]
+  (let [deadline (+ (time/time) (or timeout-seconds 180))]
+    (loop [last {}]
+      (if (>= (time/time) deadline)
+        last
+        (let [server (.get (request api-key "GET" (str "/servers/" server-id)) "server" {})]
+          (if (#{"running" "error"} (.get server "status"))
+            server
+            (do (time/sleep 3)
+                (recur server))))))))
+
+(defn wait-ssh
+  [host & [timeout-seconds]]
+  (let [deadline (+ (time/time) (or timeout-seconds 300))]
+    (loop []
+      (if (>= (time/time) deadline)
+        false
+        (let [probe (subprocess/run ["ssh" "-o" "BatchMode=yes"
+                                     "-o" "StrictHostKeyChecking=accept-new"
+                                     "-o" "ConnectTimeout=10"
+                                     (str "bot@" host)
+                                     "true"]
+                                    ** :stdout subprocess/DEVNULL
+                                       :stderr subprocess/DEVNULL
+                                       :check false)]
+          (if (= 0 (.-returncode probe))
+            true
+            (do
+              (try
+                (with-open [_ (socket/create_connection #py (host 22) ** :timeout 3)] nil)
+                (catch OSError _ nil))
+              (time/sleep 5)
+              (recur))))))))
+
+(defn build-payload
+  [args selection pubkey ssh-key-id]
+  {"name" (.-hostname args)
+   "server_type" (:name selection)
+   "location" (.-location args)
+   "image" (.-image args)
+   "ssh_keys" [ssh-key-id]
+   "user_data" (render-cloud-init (.-hostname args) pubkey)
+   "public_net" {"enable_ipv4" true "enable_ipv6" true}
+   "labels" {"project" "stevetrading" "role" "live-paper-trading"}
+   "start_after_create" true})
+
+(defn do-provision
+  [args]
+  (let [api-key (get-secret "HCLOUD_TOKEN" (.-env_file args) ["HETZNER_API_KEY"])
+        pubkey (local-pubkey (.-pubkey args))
+        catalog (server-catalog api-key (.-location args))
+        selection (choose-server-type catalog {:min-ram (.-min_ram args)
+                                               :min-disk (.-min_disk args)
+                                               :arch (.-arch args)
+                                               :max-price-monthly (.-max_price_monthly args)})]
+    (if-not selection
+      (do
+        (binding [*out* *err*] (println "no Hetzner server type matches requested constraints"))
+        4)
+      (let [monthly (+ (:price-monthly selection) 0.50)
+            ssh-key-id (if (.-dry_run args) 0 (register-ssh-key api-key pubkey))
+            payload (build-payload args selection pubkey ssh-key-id)]
+        (println (format "selected %s %s: %s vCPU, %sGB RAM, %sGB disk, €%.2f/mo incl IPv4"
+                         (:name selection) (:location selection) (:cores selection)
+                         (:memory selection) (:disk selection) monthly))
+        (if (.-dry_run args)
+          (do
+            (println "dry-run: would POST /servers with body:")
+            (println (json/dumps (jsonable (redact-payload payload)) ** :indent 2 :sort_keys true))
+            0)
+          (let [existing (.get (request api-key "GET"
+                                        (str "/servers?"
+                                             (urllib.parse/urlencode {"name" (.-hostname args)})))
+                               "servers" [])]
+            (when (seq existing)
+              (throw (python/RuntimeError (str "error: Hetzner already has a server named " (.-hostname args)))))
+            (let [created (request api-key "POST" "/servers" payload)
+                  server (.get created "server")
+                  server-id (python/int (.get server "id"))]
+              (println (str "created server id=" server-id "; waiting for running"))
+              (let [running (wait-running api-key server-id)]
+                (add-lease (.-leases args) (if (seq running) running server) selection)
+                (cond
+                  (= "error" (.get running "status"))
+                  (do (binding [*out* *err*]
+                        (println (str "server entered error state; lease recorded in " (.-leases args))))
+                      4)
+
+                  (ipv4-info running "ip")
+                  (let [ip (ipv4-info running "ip")]
+                    (println (str "public ipv4: " ip "; waiting for ssh"))
+                    (if (wait-ssh ip)
+                      (do (println (str "ready: ssh bot@" ip)) 0)
+                      (do (binding [*out* *err*]
+                            (println (str "server is running but SSH did not become reachable; inspect cloud-init. lease=" (.-leases args))))
+                          4)))
+
+                  :else
+                  (do (binding [*out* *err*]
+                        (println (str "server is running but no IPv4 found; lease=" (.-leases args))))
+                      4))))))))))
+
+(defn do-list
+  [args]
+  (let [api-key (get-secret "HCLOUD_TOKEN" (.-env_file args) ["HETZNER_API_KEY"])
+        leases (leases-read (.-leases args))
+        servers (.get (request api-key "GET" "/servers") "servers" [])
+        tracked (set (map str (.keys leases)))]
+    (println "NAME                         ID          STATUS       TYPE      IPV4")
+    (doseq [s servers]
+      (let [labels (or (.get s "labels") {})]
+        (when (or (= "stevetrading" (.get labels "project"))
+                  (contains? tracked (str (.get s "id"))))
+          (let [ip (or (ipv4-info s "ip") "-")
+                stype (or (.get (or (.get s "server_type") {}) "name") "-")]
+            (println (format "%-28s %-11s %-12s %-9s %s"
+                             (or (.get s "name") "-")
+                             (or (.get s "id") "-")
+                             (or (.get s "status") "-")
+                             stype
+                             ip))))))
+    0))
+
+(defn do-destroy
+  [args]
+  (let [api-key (get-secret "HCLOUD_TOKEN" (.-env_file args) ["HETZNER_API_KEY"])
+        leases (leases-read (.-leases args))
+        target0 (first
+                 (keep (fn [[sid lease]]
+                         (when (or (= (.-hostname_or_id args) sid)
+                                   (= (.-hostname_or_id args) (str (.get lease "name"))))
+                           (python/int sid)))
+                       leases))
+        target1 (or target0
+                    (when (.isdigit (.-hostname_or_id args))
+                      (python/int (.-hostname_or_id args))))
+        target (or target1
+                   (let [servers (.get (request api-key "GET"
+                                                (str "/servers?"
+                                                     (urllib.parse/urlencode {"name" (.-hostname_or_id args)})))
+                                       "servers" [])]
+                     (when (seq servers) (python/int (.get (first servers) "id")))))]
+    (if-not target
+      (do (println (str "not found: " (.-hostname_or_id args))) 0)
+      (do
+        (request api-key "DELETE" (str "/servers/" target))
+        (remove-lease (.-leases args) target)
+        (println (str "destroyed server id=" target "; lease removed"))
+        0))))
+
+(defn parser
+  []
+  (let [p (argparse/ArgumentParser ** :description "SteveTrading Hetzner VPS operations")]
+    (.add_argument p "--env-file" ** :type pathlib/Path :default nil
+                   :help "optional env file containing HCLOUD_TOKEN")
+    (.add_argument p "--leases" ** :type pathlib/Path :default default-leases)
+    (let [sub (.add_subparsers p ** :dest "command" :required true)
+          provision (.add_parser sub "provision" ** :help "create a non-Tailscale SteveTrading VPS")
+          list-cmd (.add_parser sub "list" ** :help "list SteveTrading Hetzner servers")
+          destroy (.add_parser sub "destroy" ** :help "destroy by hostname or server id")]
+      (.add_argument provision "hostname")
+      (.add_argument provision "--location" ** :default "ash" :help "Hetzner location, e.g. ash, hil, nbg1")
+      (.add_argument provision "--min-ram" ** :type python/int :default 4)
+      (.add_argument provision "--min-disk" ** :type python/int :default 40)
+      (.add_argument provision "--arch" ** :default "amd" :choices ["amd" "arm" "x86" "x86_64" "aarch64"])
+      (.add_argument provision "--image" ** :default "ubuntu-24.04")
+      (.add_argument provision "--max-price-monthly" ** :type python/float :default 25.0)
+      (.add_argument provision "--pubkey" ** :type pathlib/Path :default nil)
+      (.add_argument provision "--dry-run" ** :action "store_true")
+      (.add_argument destroy "hostname_or_id")
+      p)))
+
+(defn main
+  [& argv]
+  (let [args (.parse_args (parser) (python/list argv))]
+    (try
+      (case (.-command args)
+        "provision" (do-provision args)
+        "list" (do-list args)
+        "destroy" (do-destroy args)
+        (do (binding [*out* *err*] (println (str "unknown command: " (.-command args)))) 2))
+      (catch python/RuntimeError e
+        (binding [*out* *err*] (println (str e)))
+        4))))

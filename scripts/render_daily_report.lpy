@@ -1,0 +1,250 @@
+;; Render a canonical daily report HTML page from validation JSON.
+;;
+;; The Python builder may still collect broker/order facts during the
+;; transition, but publication should depend on this validated artifact-backed
+;; projection rather than Python report templates.
+(import datetime glob json math os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.reporting.core :as reporting])
+
+(defn usage []
+  (println
+   "usage: basilisp run scripts/render_daily_report.lpy -- --daily-dir DIR --date YYYY-MM-DD"))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--daily-dir")
+          (recur (nnext remaining) (assoc out :daily-dir (option-value remaining arg)))
+
+          (= arg "--date")
+          (recur (nnext remaining) (assoc out :date (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn compact-date [iso-date]
+  (.replace iso-date "-" ""))
+
+(defn read-json [path]
+  (json/loads (slurp path)))
+
+(defn escape-html [s]
+  (-> (str s)
+      (.replace "&" "&amp;")
+      (.replace "<" "&lt;")
+      (.replace ">" "&gt;")
+      (.replace "\"" "&quot;")))
+
+(defn ->float [x]
+  (cond
+    (nil? x) 0.0
+    (string? x) (python/float x)
+    :else (python/float x)))
+
+(defn ->int [x]
+  (cond
+    (nil? x) 0
+    (string? x) (python/int (python/float x))
+    :else (python/int x)))
+
+(defn money [x]
+  (let [n (->float x)
+        body (.format "${:,.2f}" (math/fabs n))]
+    (if (neg? n) (str "-" body) body)))
+
+(defn number-label [x]
+  (.format "{:,}" (->int x)))
+
+(defn pnl-class [x]
+  (let [n (->float x)]
+    (cond
+      (pos? n) "positive"
+      (neg? n) "negative"
+      :else "neutral")))
+
+(defn account-display [account]
+  (or (.get account "account/display")
+      (last (.split (str (.get account "account/id" "ACCOUNT")) "/"))
+      "ACCOUNT"))
+
+(defn status-label [status]
+  (let [s (cond
+            (nil? status) "unknown"
+            :else (str status))]
+    (if (.startswith s ":") (subs s 1) s)))
+
+(defn sum-key [accounts k]
+  (reduce + 0.0 (map #(->float (.get % k 0.0)) accounts)))
+
+(defn sum-int-key [accounts k]
+  (reduce + 0 (map #(->int (.get % k 0)) accounts)))
+
+(defn open-position-row [position]
+  (str "<tr>"
+       "<td>" (escape-html (.get position "instrument/id" "n/a")) "</td>"
+       "<td>" (escape-html (.get position "position/side" "n/a")) "</td>"
+       "<td>" (escape-html (.get position "position/quantity" "n/a")) "</td>"
+       "<td class=\"" (pnl-class (.get position "position/unrealized-pnl" 0.0)) "\">"
+       (money (.get position "position/unrealized-pnl" 0.0)) "</td>"
+       "</tr>"))
+
+(defn issue-row [issue]
+  (str "<tr>"
+       "<td>" (escape-html (status-label (:severity issue))) "</td>"
+       "<td>" (escape-html (status-label (:code issue))) "</td>"
+       "<td>" (escape-html (or (:account/id issue) "report")) "</td>"
+       "<td>" (escape-html (:message issue)) "</td>"
+       "</tr>"))
+
+(defn account-card [account]
+  (let [display (account-display account)
+        equity (.get account "pnl/equity-day" 0.0)
+        realized (.get account "pnl/realized" 0.0)
+        unrealized (.get account "pnl/unrealized" 0.0)
+        closed (.get account "pnl/closed-trades" 0.0)
+        trades (.get account "trade/closed-count" 0)
+        orders (.get account "order/count" 0)
+        open-count (.get account "positions/open-count" 0)
+        broker-observed? (.get account "broker/equity-observed?" false)
+        explanations (.get account "report/explanations" [])
+        positions (.get account "positions/open" [])]
+    (str "<article class=\"account-card\">"
+         "<div class=\"account-head\"><div><h3>" (escape-html display) "</h3>"
+         "<div class=\"muted\">" (escape-html (.get account "account/id" "")) "</div></div>"
+         "<div class=\"pnl " (pnl-class equity) "\">" (money equity) "</div></div>"
+         "<div class=\"metric-grid\">"
+         "<div><span>Broker equity P&amp;L</span><strong>" (money equity) "</strong></div>"
+         "<div><span>Realized</span><strong>" (money realized) "</strong></div>"
+         "<div><span>Unrealized / carry-over</span><strong>" (money unrealized) "</strong></div>"
+         "<div><span>Closed-trade P&amp;L</span><strong>" (money closed) "</strong></div>"
+         "<div><span>Closed trades</span><strong>" (number-label trades) "</strong></div>"
+         "<div><span>Orders/fills</span><strong>" (number-label orders) "</strong></div>"
+         "<div><span>Open positions</span><strong>" (number-label open-count) "</strong></div>"
+         "<div><span>Broker observed</span><strong>" (if (true? broker-observed?) "yes" "no") "</strong></div>"
+         "</div>"
+         (when (seq explanations)
+           (str "<div class=\"notice\">Explanations: "
+                (escape-html (.join ", " (map str explanations)))
+                "</div>"))
+         (if (seq positions)
+           (str "<details open><summary>Open position detail</summary>"
+                "<table><thead><tr><th>Instrument</th><th>Side</th><th>Qty</th><th>Unrealized</th></tr></thead><tbody>"
+                (apply str (map open-position-row positions))
+                "</tbody></table></details>")
+           "<div class=\"muted open-note\">No open positions in validation artifact.</div>")
+         "</article>")))
+
+(def css
+  "body{margin:0;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif}.site-header{border-bottom:1px solid #30363d;background:#161b22}.site-header-inner{max-width:1180px;margin:0 auto;padding:18px 24px;display:flex;justify-content:space-between;gap:20px;align-items:center}.brand a{color:#e6edf3;text-decoration:none}.brand h1{margin:0;font-size:24px}.updated,.muted{color:#8b949e;font-size:12px}.site-nav{display:flex;gap:10px;flex-wrap:wrap}.site-nav a{color:#c9d1d9;text-decoration:none;border:1px solid #30363d;border-radius:999px;padding:7px 10px}.site-nav a:hover{border-color:#58a6ff;color:#fff}.container{max-width:1180px;margin:0 auto;padding:28px 24px}.hero,.account-card{background:#161b22;border:1px solid #30363d;border-radius:16px;padding:20px}.hero{margin-bottom:18px}.hero-grid,.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.hero h2{margin:0 0 14px}.stat,.metric-grid div{background:#0d1117;border:1px solid #30363d;border-radius:12px;padding:12px}.stat span,.metric-grid span{display:block;color:#8b949e;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.stat strong,.metric-grid strong{display:block;margin-top:6px;font-size:22px}.accounts{display:grid;gap:14px}.account-head{display:flex;justify-content:space-between;gap:16px;align-items:start;margin-bottom:14px}.account-head h3{margin:0}.pnl{font-size:30px;font-weight:900}.positive{color:#3fb950}.negative{color:#f85149}.neutral{color:#8b949e}.notice{margin-top:12px;padding:10px;border:1px solid #d29922;border-radius:10px;color:#f2cc60;background:#1f1a0d}details{margin-top:12px}summary{cursor:pointer;color:#c9d1d9}table{width:100%;border-collapse:collapse;margin-top:10px}td,th{border-bottom:1px solid #30363d;padding:9px;text-align:left}th{color:#8b949e;font-size:12px;text-transform:uppercase}.open-note{margin-top:12px}@media(max-width:720px){.site-header-inner,.account-head{display:block}.site-nav{margin-top:14px}.pnl{margin-top:10px}}")
+
+(defn render-html [payload validation]
+  (let [accounts (vec (.get payload "accounts" []))
+        report-date (.get payload "report/date")
+        rendered-at (.strftime (datetime.datetime/now) "%Y-%m-%d %H:%M:%S")
+        total-equity (sum-key accounts "pnl/equity-day")
+        total-realized (sum-key accounts "pnl/realized")
+        total-unrealized (sum-key accounts "pnl/unrealized")
+        total-closed (sum-key accounts "pnl/closed-trades")
+        total-trades (sum-int-key accounts "trade/closed-count")
+        total-orders (sum-int-key accounts "order/count")
+        open-count (sum-int-key accounts "positions/open-count")
+        issue-count (count (:issues validation))]
+    (str "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+         "  <meta charset=\"utf-8\">\n"
+         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+         "  <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">\n"
+         "  <title>Daily Report &mdash; " (escape-html report-date) "</title>\n"
+         "  <style>" css "</style>\n"
+         "</head>\n<body>\n"
+         "  <header class=\"site-header\"><div class=\"site-header-inner\"><div class=\"brand\">"
+         "<a href=\"/reports/index.html\"><h1>Daily Report &mdash; " (escape-html report-date) "</h1></a>"
+         "<div class=\"updated\">Rendered by Basilisp from canonical validation JSON: " (escape-html rendered-at) "</div></div>"
+         "<nav class=\"site-nav\"><a href=\"/reports/index.html\">Overview</a>"
+         "<a href=\"/reports/daily/index.html\">Daily</a>"
+         "<a href=\"/reports/weekly/index.html\">Weekly</a>"
+         "<a href=\"/reports/accounts/index.html\">Accounts</a>"
+         "<a href=\"/reports/status/index.html\">System</a>"
+         "<a href=\"/index.html\" class=\"back\">All Reports</a></nav></div></header>\n"
+         "  <main class=\"container\">\n"
+         "    <section class=\"hero\"><h2>Canonical Daily Summary</h2><div class=\"hero-grid\">"
+         "<div class=\"stat\"><span>Total broker equity P&amp;L</span><strong class=\"" (pnl-class total-equity) "\">" (money total-equity) "</strong></div>"
+         "<div class=\"stat\"><span>Total realized</span><strong>" (money total-realized) "</strong></div>"
+         "<div class=\"stat\"><span>Total unrealized / carry-over</span><strong>" (money total-unrealized) "</strong></div>"
+         "<div class=\"stat\"><span>Total closed-trade P&amp;L</span><strong>" (money total-closed) "</strong></div>"
+         "<div class=\"stat\"><span>Closed trades</span><strong>" (number-label total-trades) "</strong></div>"
+         "<div class=\"stat\"><span>Orders/fills</span><strong>" (number-label total-orders) "</strong></div>"
+         "<div class=\"stat\"><span>Open positions</span><strong>" (number-label open-count) "</strong></div>"
+         "<div class=\"stat\"><span>Validation</span><strong>" (escape-html (status-label (:status validation))) " / " issue-count " issues</strong></div>"
+         "</div></section>\n"
+         (when (seq (:issues validation))
+           (str "    <section class=\"hero\"><h2>Validation Issues</h2>"
+                "<table><thead><tr><th>Severity</th><th>Code</th><th>Scope</th><th>Message</th></tr></thead><tbody>"
+                (apply str (map issue-row (:issues validation)))
+                "</tbody></table></section>\n"))
+         "    <section class=\"accounts\">"
+         (apply str (map account-card accounts))
+         "    </section>\n"
+         "  </main>\n</body>\n</html>\n")))
+
+(defn build! [{:keys [daily-dir date]}]
+  (when-not daily-dir
+    (throw (python/ValueError "--daily-dir is required")))
+  (when-not date
+    (throw (python/ValueError "--date is required")))
+  (when-not (os.path/isdir daily-dir)
+    (throw (python/FileNotFoundError daily-dir)))
+  (let [stamp (compact-date date)
+        validation-path (os.path/join daily-dir (str stamp ".validation.json"))
+        html-path (os.path/join daily-dir (str stamp ".html"))]
+    (when-not (os.path/exists validation-path)
+      (throw (python/FileNotFoundError validation-path)))
+    (let [payload (read-json validation-path)
+          validation (reporting/validate-report-day payload)]
+      (spit html-path (render-html payload validation))
+      {:html-path html-path
+       :validation-path validation-path
+       :accounts (count (.get payload "accounts" []))
+       :validation-status (:status validation)
+       :validation-issues (count (:issues validation))})))
+
+(try
+  (let [result (build! (parse-args (vec *command-line-args*)))]
+    (println (json/dumps (python/dict {"html_path" (:html-path result)
+                                       "validation_path" (:validation-path result)
+                                       "accounts" (:accounts result)
+                                       "validation_status" (str (:validation-status result))
+                                       "validation_issues" (:validation-issues result)})
+                         ** :indent 2 :sort_keys true))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/FileNotFoundError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

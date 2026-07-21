@@ -1,0 +1,48 @@
+;; Physical storage measurement only. Every request must contain the full
+;; declared source universe. Time is the sole permitted operational adjustment.
+{:schema-version 1
+ :id :full-universe-fixed-window-measurement-v1
+ :status :active
+ :purpose :measure-actual-event-storage-before-representation-selection
+ :date "2026-07-10"
+ :constraints {:max-cost-usd-per-request "10"
+               :max-billable-bytes-per-request 549755813888
+               :fallback "If a full one-hour preflight exceeds a ceiling, repeat the exact full universe for 15 minutes; never reduce the universe."}
+ :excluded-from-this-study [:alpaca-iex-causal-quote-state]
+ :thetadata-collection {:status :frozen-after-current-run
+                         :current-run-id "20260718T173002002505Z"
+                         :rule "Permit the active full-universe 15-minute option request to finalize. Do not submit any further ThetaData historical requests unless this policy is explicitly revised."}
+ :universes
+ [{:id :glbx-futures
+   :dataset "GLBX.MDP3" :stype-in :parent
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :schemas ["mbp-1" "trades"]}
+  {:id :equs-mini
+   :dataset "EQUS.MINI" :stype-in :raw-symbol
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN"
+             "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :schemas ["mbp-1" "trades"]}
+  {:id :glbx-es-options
+   :dataset "GLBX.MDP3" :stype-in :parent :symbols ["ES.OPT"]
+   :schemas ["mbp-1" "trades"]}
+  {:id :thetadata-options
+   :dataset :opra-options :transport :thetadata-v3-history
+   :symbols ["SPY" "SPX" "SPXW" "VIX" "VIXW"]
+   :schemas ["quote" "trade"]
+   :selection-policy :all-expirations-all-strikes-both-rights}
+  {:id :thetadata-indexes
+   :dataset :us-indexes :transport :thetadata-v3-history
+   :symbols ["NDX" "RUT" "RVX" "SPX" "TNX" "VIX" "VIXN"]
+   :schemas ["price"]
+   :selection-policy :all-declared-index-symbols}]
+ :windows
+ [{:id :cash-open :start "2026-07-10T13:30:00" :end "2026-07-10T14:30:00"
+   :status {:databento :complete :thetadata :awaiting-approved-terminal}}
+  {:id :active-morning :start "2026-07-10T14:30:00" :end "2026-07-10T15:30:00"
+   :status {:databento :complete :thetadata :awaiting-approved-terminal}}
+  {:id :midday :start "2026-07-10T17:30:00" :end "2026-07-10T18:30:00"
+   :status {:databento :complete :thetadata :awaiting-approved-terminal}}
+  {:id :cash-close :start "2026-07-10T19:00:00" :end "2026-07-10T20:00:00"
+   :status {:databento :complete :thetadata :awaiting-approved-terminal}}
+  {:id :globex-overnight :start "2026-07-10T00:00:00" :end "2026-07-10T01:00:00"
+   :universe-ids [:glbx-futures :glbx-es-options] :status :complete}]}

@@ -1,7 +1,9 @@
 ;; Bridge strategy declaration (STRATEGY_PIPELINE §4 + the :strategy/bridge
 ;; extension) — PARROT v2: the 2-of-3 consensus vote over
 ;; CHESTNUT/LYNX/MOOSE at hysteresis mult 1.0, trading SPY equity,
-;; signalling through components/bridge.steve-v2. No
+;; signalling through components/bridge.steve-v2. Alpaca supports integer-share
+;; shorting for SPY in paper, so Parrot preserves the consensus short posture
+;; instead of flatten-only degradation. No
 ;; :strategy/features/:strategy/inference — the feature/inference stages
 ;; live Python-side; risk + execution run through the canonical pipeline.
 ;;
@@ -14,7 +16,7 @@
  :strategy/family :strategy-family/steve-v2
  :strategy/name :strategy-name/parrot
  :strategy/version 1
- :strategy/mode-policy #{:mode/paper :mode/sim}
+ :strategy/mode-policy #{:mode/paper :mode/sim :mode/replay}
  :strategy/schedule {:session :session/us-equities-regular}
  :strategy/warmup {:required-bars 1}
  :strategy/instruments ["equity/NASDAQ/SPY"]
@@ -23,4 +25,4 @@
  :strategy/risk {:policy-id :risk/steve-v2-default
                  :params {:max-positions 1}}
  :strategy/execution {:policy-id :execution/equity-direction-v1
-                      :params {:quantity "50" :allow-short? false}}}
+                      :params {:quantity "50" :allow-short? true}}}

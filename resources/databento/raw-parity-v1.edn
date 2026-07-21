@@ -1,0 +1,169 @@
+{:schema-version 1
+ :purpose :raw-live-historical-parity
+ :provider :databento
+ :raw-landing-root "/mnt/d/stevetrading/databento-parity-v1"
+ :feature-selection :intentionally-deferred
+
+ ;; Admission is source- and representation-specific.  It authorizes these
+ ;; classes for the parity-qualified research corpus; it does not silently add
+ ;; them to an existing Steve feature vector or a production strategy.
+ :tiers
+ {:hard "Approved parity in the declared model representation. The minimum shared-interior event match rate is 99.0%; exact comparisons and bounded, enumerated residuals at or above that threshold are both hard parity. Every residual and representation restriction remains mandatory evidence."
+  :minimum-match-rate 0.99
+  :match-rate-rule "matched events divided by max(matched + live-only interior, matched + historical-only interior), after declared field exclusions and event-time intersection"
+  :excluded "Observed residuals are too large for either corpus tier."}
+
+ :classes
+ [{:id :glbx-ohlcv-1s
+   :tier :hard
+   :dataset "GLBX.MDP3"
+   :schema "ohlcv-1s"
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :live {:transport :databento-live :stype-in :parent}
+   :historical {:transport :databento-historical :stype-in :parent}
+   :history {:available-from "2010-06-07"
+             :included-at-zero-cost "Multi-year range verified through the current date on 2026-07-16"}
+   :canonical :completed-bar
+   :rule "Compare complete one-second bars only; exclude the partially observed subscription-start interval."}
+
+  {:id :glbx-ohlcv-1m
+   :tier :hard
+   :dataset "GLBX.MDP3"
+   :schema "ohlcv-1m"
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :live {:transport :databento-live :stype-in :parent}
+   :historical {:transport :databento-historical :stype-in :parent}
+   :history {:available-from "2010-06-07"
+             :included-at-zero-cost "Multi-year range verified through the current date on 2026-07-16"}
+   :canonical :completed-bar
+   :rule "Compare complete one-minute bars only; exclude the partially observed subscription-start minute."}
+
+  {:id :equs-mini-ohlcv-1s
+   :tier :hard
+   :dataset "EQUS.MINI"
+   :schema "ohlcv-1s"
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN" "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :live {:transport :databento-live :stype-in :raw-symbol}
+   :historical {:transport :databento-historical :stype-in :raw-symbol}
+   :history {:available-from "2023-03"
+             :included-at-zero-cost "Entire available range verified through the current date on 2026-07-16"}
+   :canonical :completed-bar
+   :rule "Compare complete one-second bars only. Preserve EQUS.MINI provenance: it is a derived top-of-book composite, not SIP/NBBO or a direct exchange."}
+
+  {:id :equs-mini-ohlcv-1m
+   :tier :hard
+   :dataset "EQUS.MINI"
+   :schema "ohlcv-1m"
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN" "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :live {:transport :databento-live :stype-in :raw-symbol}
+   :historical {:transport :databento-historical :stype-in :raw-symbol}
+   :history {:available-from "2023-03"
+             :included-at-zero-cost "Entire available range verified through the current date on 2026-07-16"}
+   :canonical :completed-bar
+   :rule "Compare complete one-minute bars only. Preserve EQUS.MINI derived-composite provenance."}
+
+  {:id :glbx-es-nq-futures-option-mbp-1
+   :tier :hard
+   :dataset "GLBX.MDP3"
+   :schema "mbp-1"
+   :symbols ["ES.OPT" "NQ.OPT"]
+   :live {:transport :databento-live :stype-in :parent}
+   :historical {:transport :databento-historical :stype-in :parent}
+   :history {:available-from "2010-06-07"
+             :included-at-zero-cost "Approximately rolling one year as of 2026-07-20; older raw history is usage-billed"}
+   :canonical :market-event
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :retain-fields :all-other-dbn-market-fields
+                    :boundary-policy :event-time-intersection}
+   :admission-basis {:ES :measured-exact
+                     :NQ :owner-directed-hard}
+   :observed-evidence "ES: 48,222 interior events matched exactly across four 2026-07-17 windows. NQ: 532 ordinary contracts emitted MBP-1 during the 2026-07-20 live window; the finalized exact-contract historical MBP-1 comparison is scheduled and was not represented as completed when NQ was admitted."
+   :rule "ES and NQ are admitted. Preserve root-level evidence separately; exclude transport timestamps and apply event-time intersection. A later NQ recheck must append residual evidence and may trigger an explicit review, but its pending status must not be confused with a completed parity measurement."}
+
+  {:id :glbx-es-nq-futures-option-trade
+   :tier :hard
+   :dataset "GLBX.MDP3"
+   :schema "trades"
+   :symbols ["ES.OPT" "NQ.OPT"]
+   :live {:transport :databento-live :stype-in :parent}
+   :historical {:transport :databento-historical :stype-in :parent}
+   :history {:available-from "2010-06-07"
+             :included-at-zero-cost "Approximately rolling one year as of 2026-07-20; older raw history is usage-billed"}
+   :canonical :market-event
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :retain-fields :all-other-dbn-market-fields
+                    :boundary-policy :event-time-intersection}
+   :admission-basis {:ES :measured-exact
+                     :NQ :owner-directed-hard}
+   :observed-evidence "ES: 108/108 ordinary option trades matched exactly across four 2026-07-17 windows. NQ: the sole ordinary option trade in the first 2026-07-20 window matched exactly; additional scheduled windows provide the required broader replication."
+   :rule "ES and NQ are admitted under the declared representation. Preserve root-level sample counts so sparse NQ evidence is never mistaken for ES-scale replication."}
+
+  {:id :glbx-mbp-1
+   :tier :hard
+   :dataset "GLBX.MDP3"
+   :schema "mbp-1"
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :live {:transport :databento-live :stype-in :parent}
+   :historical {:transport :databento-historical :stype-in :parent}
+   :history {:available-from "2010"
+             :included-at-zero-cost "Approximately rolling one year as of 2026-07-16; older raw history is available but usage-billed"}
+   :canonical :market-event
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :retain-fields :all-other-dbn-market-fields}
+   :observed-residual "2026-07-16 bounded full-window probe: 742277 exact events; one SR3 calendar-spread event differed only in side (:ask live versus :none historical). One final live event lay on the historical end-exclusive boundary."
+   :rule "Do not use transport timestamps as model fields. Require a finalized-archive recheck for every seed session; any residual beyond the recorded exception blocks promotion to :hard."}
+
+  {:id :glbx-trade
+   :tier :hard
+   :dataset "GLBX.MDP3"
+   :schema "trades"
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :live {:transport :databento-live :stype-in :parent}
+   :historical {:transport :databento-historical :stype-in :parent}
+   :history {:available-from "2010"
+             :included-at-zero-cost "Approximately rolling one year as of 2026-07-16; older raw history is available but usage-billed"}
+   :canonical :market-event
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :normalize-flags {:ignore-bits [:F-LAST]
+                                      :retain-other-bits true}}
+   :observed-residual "2026-07-16 bounded full-window probe: every economic trade field matched. Sixteen identical trades differed only in F_LAST packet/batch-end flag; one final live event lay on the historical end-exclusive boundary. The unfinalized 2026-07-20 SR3-only stratum matched 710/716 live trades (99.1620%); six one-for-one residual pairs occurred across four SR3 outright/complex symbols."
+   :rule "Hard at a shared-interior match rate of at least 99.0%. Retain all non-F_LAST quality flags and preserve root-level residual rates. Require finalized-archive rechecks; falling below 99.0% triggers probationary review."}
+
+  {:id :equs-mini-mbp-1
+   :tier :hard
+   :dataset "EQUS.MINI"
+   :schema "mbp-1"
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN" "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :live {:transport :databento-live :stype-in :raw-symbol}
+   :historical {:transport :databento-historical :stype-in :raw-symbol}
+   :history {:available-from "2023-03"
+             :included-at-zero-cost "Approximately rolling one year as of 2026-07-16; older raw history is available but usage-billed"}
+   :canonical :market-event
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :retain-fields :all-other-dbn-market-fields}
+   :observed-residual "2026-07-16: 617582/618214 events matched (99.8978%); 632 were live-only and zero historical-only in the declared representation."
+   :rule "Hard parity with bounded residual evidence. Preserve EQUS.MINI derived-composite provenance; do not use exact event-count, sub-bar ordering, event-arrival, or sequence-sensitive features. Require finalized-archive and multi-session rechecks."}
+
+  {:id :equs-mini-trade
+   :tier :hard
+   :dataset "EQUS.MINI"
+   :schema "trades"
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN" "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :live {:transport :databento-live :stype-in :raw-symbol}
+   :historical {:transport :databento-historical :stype-in :raw-symbol}
+   :history {:available-from "2023-03"
+             :included-at-zero-cost "Approximately rolling one year as of 2026-07-16; older raw history is available but usage-billed"}
+   :canonical :market-event
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :retain-fields :all-other-dbn-market-fields}
+   :observed-residual "2026-07-16: 8355/8360 events matched (99.9402%); five were live-only and zero historical-only in the declared representation."
+   :rule "Hard parity with bounded residual evidence. Preserve EQUS.MINI derived-composite provenance; do not use exact event-count, sub-bar ordering, event-arrival, or sequence-sensitive features. Require finalized-archive and multi-session rechecks."}]
+
+ :promotion-gate
+ [:receipt-backed-live-capture
+  :zero-cost-or-explicit-cost-preflight
+  :complete-bar-boundary-policy
+  :documented-model-representation
+  :same-session-finalized-historical-recheck
+  :multi-session-seed-corpus-validation
+  :preserved-dataset-and-symbology-provenance]}

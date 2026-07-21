@@ -1,0 +1,552 @@
+;; Summarize matched live-vs-historical feature parity diagnostics.
+(import collections csv datetime json os os.path re)
+(require '[clojure.string :as str])
+
+(def default-top-n 25)
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/summarize_matched_feature_parity.lpy -- "
+                "--matched-csv PATH [--usage-csv PATH] [--grid-input-parity-json PATH] [--target-date YYYY-MM-DD] "
+                "[--out-json PATH] [--md-out PATH] [--top-n N]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn positive-int
+  [value arg]
+  (let [n (try
+            (python/int value)
+            (catch python/Exception _
+              (throw (python/ValueError (str arg " must be a positive integer: " value)))))]
+    (when (<= n 0)
+      (throw (python/ValueError (str arg " must be a positive integer: " value))))
+    n))
+
+(defn parse-target-date
+  [value arg]
+  (try
+    (.isoformat (datetime.date/fromisoformat value))
+    (catch python/Exception _
+      (throw (python/ValueError (str arg " must be YYYY-MM-DD: " value))))))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:top-n default-top-n}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--matched-csv")
+          (recur (nnext remaining) (assoc out :matched-csv (option-value remaining arg)))
+
+          (= arg "--usage-csv")
+          (recur (nnext remaining) (assoc out :usage-csv (option-value remaining arg)))
+
+          (= arg "--grid-input-parity-json")
+          (recur (nnext remaining) (assoc out :grid-input-parity-json (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining) (assoc out :target-date (parse-target-date (option-value remaining arg) arg)))
+
+          (= arg "--out-json")
+          (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+
+          (= arg "--md-out")
+          (recur (nnext remaining) (assoc out :md-out (option-value remaining arg)))
+
+          (= arg "--top-n")
+          (recur (nnext remaining) (assoc out :top-n (positive-int (option-value remaining arg) arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn csv-rows
+  [path]
+  (with-open [fh (open path)]
+    (vec (csv/DictReader fh))))
+
+(defn feature-prefix
+  [feature]
+  (let [s (str feature)]
+    (if (str/includes? s "_")
+      (first (.split s "_" 1))
+      s)))
+
+(defn counter-map
+  [values]
+  (into {} (.items (collections/Counter values))))
+
+(defn counter-top
+  [values n]
+  (vec (map (fn [[k v]] {"key" k "count" v})
+            (.most_common (collections/Counter values) n))))
+
+(defn parse-float
+  [value]
+  (try
+    (when (seq (str value))
+      (python/float value))
+    (catch python/Exception _
+      nil)))
+
+(defn parse-int
+  [value]
+  (try
+    (if (seq (str value))
+      (python/int value)
+      0)
+    (catch python/Exception _
+      0)))
+
+(defn abs-diff
+  [a b]
+  (when (and (some? a) (some? b))
+    (abs (- (float a) (float b)))))
+
+(defn target-date-from-path
+  [path]
+  (let [name (os.path/basename (str path))
+        match (re/search #"(20\d{6})" name)]
+    (when match
+      (let [stamp (.group match 1)]
+        (try
+          (.isoformat (datetime.date/fromisoformat
+                       (str (subs stamp 0 4) "-" (subs stamp 4 6) "-" (subs stamp 6 8))))
+          (catch python/Exception _
+            nil))))))
+
+(defn compact-date
+  [iso-date]
+  (when iso-date
+    (str/replace iso-date "-" "")))
+
+(defn first-value
+  [row keys]
+  (loop [remaining keys]
+    (when (seq remaining)
+      (let [value (.get row (first remaining))]
+        (if (and (some? value) (seq (str value)))
+          value
+          (recur (rest remaining)))))))
+
+(defn diagnostic
+  [row]
+  (let [status (.get row "status")
+        prefix (feature-prefix (.get row "feature"))
+        corr (parse-float (.get row "correlation"))
+        live-zero (parse-float (first-value row ["live_zero_frac" "live_zero_pct"]))
+        hist-zero (parse-float (first-value row ["historical_zero_frac" "historical_zero_pct"]))
+        live-leading (parse-float (.get row "live_leading_zero_count"))
+        hist-leading (parse-float (.get row "historical_leading_zero_count"))
+        zero-diff (abs-diff live-zero hist-zero)
+        leading-diff (abs-diff live-leading hist-leading)
+        structural? (contains? #{"tda" "wass" "scat" "dict"} prefix)
+        bar-derived? (contains? #{"SPY" "SPX" "HYG" "TLT" "VXX" "TNX" "VIX"} prefix)]
+    (cond
+      (= status "CONSTANT_OR_DEGENERATE")
+      {"key" "constant-or-degenerate"
+       "reason" "live or historical matched series has too little variance for reliable parity"
+       "next_action" "inspect whether the source feature should remain neutralized or whether one side is being filled/held constant"}
+
+      (or (and zero-diff (> zero-diff 0.25))
+          (and leading-diff (> leading-diff 5.0)))
+      {"key" "leading-zero-or-zero-fraction-mismatch"
+       "reason" "live and historical series have materially different zero/leading-zero behavior"
+       "next_action" "compare warmup windows, lookback availability, and cross-day state carryover before unmasking"}
+
+      structural?
+      {"key" "v3-structural-transform-divergence"
+       "reason" "topology/scattering/wasserstein/dictionary feature diverges after Greek-grid transform"
+       "next_action" "use grid_feature_input_parity and the advanced-feature builder to decide whether the grid source or transform implementation differs"}
+
+      (= status "TRACKS_WITH_OFFSET_OR_SCALE")
+      {"key" "tracks-with-offset-or-scale"
+       "reason" "live and historical series are highly correlated but shifted or scaled"
+       "next_action" "check normalization, corporate-action adjustment, option multiplier, and price source conventions"}
+
+      (and bar-derived? corr (>= corr 0.75))
+      {"key" "bar-source-drift"
+       "reason" "bar-derived feature broadly tracks but fails strict matched parity"
+       "next_action" "compare live bar construction against historical OHLC/VWAP source, timestamp bucketing, and warmup seed rows"}
+
+      (or (nil? corr) (< corr 0.25))
+      {"key" "weak-or-missing-correlation"
+       "reason" "live and historical matched series do not correlate enough to support unmasking"
+       "next_action" "treat as a builder/data-source mismatch until raw inputs and formulas are reconciled"}
+
+      (< corr 0.90)
+      {"key" "moderate-correlation-divergence"
+       "reason" "live and historical matched series correlate, but not enough for parity"
+       "next_action" "inspect per-timestamp deviations and source alignment before unmasking"}
+
+      :else
+      {"key" "residual-distribution-divergence"
+       "reason" "feature differs under matched timestamps without a more specific automated diagnosis"
+       "next_action" "inspect feature-specific live vs historical formula and raw input provenance"})))
+
+(defn problem-row
+  [row usage]
+  (let [feature (.get row "feature")
+        usage-row (get usage feature {"split_count" 0 "total_gain" 0.0})
+        diag (diagnostic row)]
+    {"feature" feature
+     "status" (.get row "status")
+     "prefix" (feature-prefix feature)
+     "diagnostic_key" (get diag "key")
+     "diagnostic_reason" (get diag "reason")
+     "next_action" (get diag "next_action")
+     "model_split_count" (get usage-row "split_count")
+     "model_total_gain" (get usage-row "total_gain")
+     "correlation" (parse-float (.get row "correlation"))
+     "max_abs_deviation" (parse-float (.get row "max_abs_deviation"))
+     "live_zero_frac" (parse-float (first-value row ["live_zero_frac" "live_zero_pct"]))
+     "historical_zero_frac" (parse-float (first-value row ["historical_zero_frac" "historical_zero_pct"]))
+     "live_leading_zero_count" (parse-float (.get row "live_leading_zero_count"))
+     "live_leading_zero_until" (first-value row ["live_leading_zero_until"])
+     "historical_leading_zero_count" (parse-float (.get row "historical_leading_zero_count"))
+     "historical_leading_zero_until" (first-value row ["historical_leading_zero_until"])}))
+
+(defn sort-problems
+  [rows]
+  (vec (sort-by (fn [row]
+                  [(- (or (.get row "max_abs_deviation") 0.0))
+                   (.get row "status")
+                   (.get row "feature")])
+                rows)))
+
+(defn sort-weighted-problems
+  [rows]
+  (vec (sort-by (fn [row]
+                  [(- (or (.get row "model_total_gain") 0.0))
+                   (- (or (.get row "model_split_count") 0))
+                   (- (or (.get row "max_abs_deviation") 0.0))
+                   (.get row "status")
+                   (.get row "feature")])
+                rows)))
+
+(defn usage-by-feature
+  [path]
+  (if-not path
+    {}
+    (do
+      (when-not (os.path/exists path)
+        (throw (python/ValueError (str "usage CSV does not exist: " path))))
+      (reduce
+       (fn [acc row]
+         (let [feature (.get row "feature")
+               split-count (parse-int (.get row "split_count"))
+               total-gain (or (parse-float (.get row "total_gain")) 0.0)]
+           (if (seq (str feature))
+             (update acc feature
+                     (fn [existing]
+                       {"split_count" (+ (get (or existing {}) "split_count" 0) split-count)
+                        "total_gain" (+ (get (or existing {}) "total_gain" 0.0) total-gain)}))
+             acc)))
+       {}
+       (csv-rows path)))))
+
+(defn load-json
+  [path]
+  (with-open [fh (open path)]
+    (json/load fh)))
+
+(defn py-dict?
+  [value]
+  (isinstance value dict))
+
+(defn dict-get
+  [value key]
+  (when (py-dict? value)
+    (.get value key)))
+
+(defn grid-input-summary
+  [path]
+  (when path
+    (when-not (os.path/exists path)
+      (throw (python/ValueError (str "grid input parity JSON does not exist: " path))))
+    (let [payload (load-json path)
+          best-lag (.get payload "best_sequence_lag")
+          best-lag-by-mean (or (.get payload "best_sequence_lag_by_mean")
+                               (when (py-dict? best-lag) best-lag))
+          best-lag-by-min (or (.get payload "best_sequence_lag_by_min")
+                              (when (py-dict? best-lag) best-lag))]
+      {"path" path
+       "status" (.get payload "status")
+       "ok" (.get payload "ok")
+       "matched_rows" (.get payload "matched_rows")
+       "min_correlation" (.get payload "min_correlation")
+       "mean_correlation" (.get payload "mean_correlation")
+       "max_abs_deviation" (.get payload "max_abs_deviation")
+       "best_sequence_lag" best-lag
+       "best_sequence_lag_by_mean" best-lag-by-mean
+       "best_sequence_lag_by_min" best-lag-by-min
+       "best_sequence_lag_minutes" (or (dict-get best-lag "lag_minutes")
+                                       (when-not (py-dict? best-lag) best-lag))
+       "best_sequence_lag_mean_correlation" (or (.get payload "best_sequence_lag_mean_correlation")
+                                                (dict-get best-lag-by-mean "mean_correlation")
+                                                (dict-get best-lag "mean_correlation"))
+       "best_sequence_lag_min_correlation" (or (.get payload "best_sequence_lag_min_correlation")
+                                               (dict-get best-lag-by-min "min_correlation")
+                                               (dict-get best-lag "min_correlation"))
+       "alignment_diagnosis" (or (.get payload "alignment_diagnosis") {})
+       "unavailable_reason" (.get payload "unavailable_reason")})))
+
+(defn weighted-group-summary
+  [rows key-fn]
+  (vec (sort-by (fn [row]
+                  [(- (get row "total_gain"))
+                   (- (get row "split_count"))
+                   (get row "key")])
+                (map (fn [[k group]]
+                       {"key" k
+                        "count" (count group)
+                        "split_count" (reduce + (map #(.get % "model_split_count") group))
+                        "total_gain" (reduce + (map #(.get % "model_total_gain") group))})
+                     (group-by key-fn rows)))))
+
+(defn parity-interpretation
+  [problem-rows grid-input]
+  (let [diagnostic-counts (counter-map (map #(.get % "diagnostic_key") problem-rows))
+        top-weighted (first (weighted-group-summary problem-rows #(.get % "diagnostic_key")))
+        grid-min (get grid-input "min_correlation")
+        lag-minutes (get grid-input "best_sequence_lag_minutes")
+        lag-mean (get grid-input "best_sequence_lag_mean_correlation")
+        alignment-diagnosis (get grid-input "alignment_diagnosis")
+        alignment-category (dict-get alignment-diagnosis "category")
+        alignment-reason (dict-get alignment-diagnosis "reason")
+        source-drift? (and (number? grid-min) (< (float grid-min) 0.95))
+        lagged-source? (and (number? lag-minutes)
+                            (not= 0 (int lag-minutes))
+                            (number? lag-mean)
+                            (or (nil? grid-min) (> (float lag-mean) (float grid-min))))]
+    {"primary_blocker" (cond
+                         (and (some? top-weighted) (= "v3-structural-transform-divergence" (get top-weighted "key")))
+                         "v3-structural-transform-divergence"
+
+                         source-drift?
+                         "source-grid-input-drift"
+
+                         :else
+                         (or (get top-weighted "key") "none"))
+     "source_grid_input_drift?" (boolean source-drift?)
+     "source_grid_lag_suspected?" (boolean lagged-source?)
+     "source_grid_min_correlation" grid-min
+     "source_grid_best_lag_minutes" lag-minutes
+     "source_grid_best_lag_mean_correlation" lag-mean
+     "source_grid_alignment_category" alignment-category
+     "source_grid_alignment_reason" alignment-reason
+     "problem_diagnostic_counts" diagnostic-counts
+     "recommended_next_action" (cond
+                                 (= alignment-category "rolling-window-sequence-lag")
+                                 "Fix live-vs-historical rolling grid-history order/warmup/bucketing before unmasking grid-derived or bar-derived features."
+
+                                 (= alignment-category "timestamp-bucket-shift")
+                                 "Fix live-vs-historical timestamp bucketing/close-time conventions before unmasking grid-derived or bar-derived features."
+
+                                 (or source-drift? lagged-source?)
+                                 "Fix live-vs-historical source grid timestamp/bucketing/alignment before unmasking grid-derived or bar-derived features."
+
+                                 (and (some? top-weighted)
+                                      (= "v3-structural-transform-divergence" (get top-weighted "key")))
+                                 "Regenerate matched parity after the live-compatible V3 historical-cache formula fix and compare remaining structural transforms."
+
+                                 (seq problem-rows)
+                                 "Work the top weighted diagnostic group first; do not unmask features until matched parity is exact or the blocker is documented."
+
+                                 :else
+                                 "No matched parity blockers detected.")}))
+
+(defn summarize
+  [{:keys [matched-csv usage-csv grid-input-parity-json top-n target-date]}]
+  (when-not matched-csv
+    (throw (python/ValueError "missing required argument: --matched-csv")))
+  (when-not (os.path/exists matched-csv)
+    (throw (python/ValueError (str "matched CSV does not exist: " matched-csv))))
+  (let [;; Artifact names in the market-evidence flow include the compact date.
+        target-date (or target-date (target-date-from-path matched-csv))
+        usage (usage-by-feature usage-csv)
+        grid-input (grid-input-summary grid-input-parity-json)
+        rows (csv-rows matched-csv)
+        problems (vec (filter (fn [row]
+                                (not= "EXACT_MATCH" (.get row "status")))
+                              rows))
+        problem-rows (sort-problems (map #(problem-row % usage) problems))
+        weighted-problem-rows (sort-weighted-problems problem-rows)
+        prefixes (map #(.get % "prefix") problem-rows)
+        statuses (map #(.get % "status") problem-rows)
+        diagnostics (map #(.get % "diagnostic_key") problem-rows)
+        status-prefixes (map (fn [row] (str (.get row "status") ":" (.get row "prefix")))
+                             problem-rows)
+        status-diagnostics (map (fn [row] (str (.get row "status") ":" (.get row "diagnostic_key")))
+                                problem-rows)]
+    {"matched_csv" matched-csv
+     "target_date" (or target-date "")
+     "target_stamp" (or (compact-date target-date) "")
+     "generated_at" (.isoformat (datetime.datetime/now datetime.timezone/utc) ** :timespec "seconds")
+     "feature_count" (count rows)
+     "problem_count" (count problem-rows)
+     "exact_match_count" (- (count rows) (count problem-rows))
+     "by_status" (counter-map statuses)
+     "by_prefix" (counter-map prefixes)
+     "by_diagnostic" (counter-map diagnostics)
+     "top_prefixes" (counter-top prefixes top-n)
+     "top_status_prefixes" (counter-top status-prefixes top-n)
+     "top_diagnostics" (counter-top diagnostics top-n)
+     "top_status_diagnostics" (counter-top status-diagnostics top-n)
+     "top_problem_rows" (vec (take top-n problem-rows))
+     "usage_csv" (or usage-csv "")
+     "grid_input_parity_json" (or grid-input-parity-json "")
+     "grid_input_parity" (or grid-input {})
+     "interpretation" (parity-interpretation problem-rows (or grid-input {}))
+     "top_weighted_prefixes" (vec (take top-n (weighted-group-summary problem-rows #(.get % "prefix"))))
+     "top_weighted_diagnostics" (vec (take top-n (weighted-group-summary problem-rows #(.get % "diagnostic_key"))))
+     "top_weighted_status_prefixes" (vec (take top-n (weighted-group-summary problem-rows
+                                                                              #(str (.get % "status")
+                                                                                    ":"
+                                                                                    (.get % "prefix")))))
+     "top_weighted_status_diagnostics" (vec (take top-n (weighted-group-summary problem-rows
+                                                                                #(str (.get % "status")
+                                                                                      ":"
+                                                                                      (.get % "diagnostic_key")))))
+     "top_weighted_problem_rows" (vec (take top-n weighted-problem-rows))}))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn md-table
+  [headers rows]
+  (str "| " (str/join " | " headers) " |\n"
+       "| " (str/join " | " (repeat (count headers) "---")) " |\n"
+       (str/join "\n" (map (fn [row] (str "| " (str/join " | " (map str row)) " |")) rows))
+       "\n"))
+
+(defn markdown
+  [summary]
+  (str "# Matched Feature Parity Summary\n\n"
+       "- Generated at: `" (get summary "generated_at") "`\n"
+       "- Target date: `" (get summary "target_date") "`\n"
+       "- Matched CSV: `" (get summary "matched_csv") "`\n"
+       "- Feature count: `" (get summary "feature_count") "`\n"
+       "- Exact matches: `" (get summary "exact_match_count") "`\n"
+       "- Problem features: `" (get summary "problem_count") "`\n\n"
+       "## Interpretation\n\n"
+       (let [interp (get summary "interpretation")]
+         (str "- Primary blocker: `" (get interp "primary_blocker") "`\n"
+              "- Source grid input drift: `" (get interp "source_grid_input_drift?") "`\n"
+              "- Source grid lag suspected: `" (get interp "source_grid_lag_suspected?") "`\n"
+              "- Source grid alignment category: `" (get interp "source_grid_alignment_category") "`\n"
+              "- Recommended next action: " (get interp "recommended_next_action") "\n\n"))
+       (when (seq (get summary "grid_input_parity"))
+         (let [grid (get summary "grid_input_parity")]
+           (str "## Grid Input Parity\n\n"
+                (md-table ["Status" "Rows" "Mean Corr" "Min Corr" "Max Abs Dev" "Best Lag" "Best Lag Mean Corr" "Best Lag Min Corr"]
+                          [[(get grid "status")
+                            (get grid "matched_rows")
+                            (get grid "mean_correlation")
+                            (get grid "min_correlation")
+                            (get grid "max_abs_deviation")
+                            (get grid "best_sequence_lag_minutes")
+                            (get grid "best_sequence_lag_mean_correlation")
+                            (get grid "best_sequence_lag_min_correlation")]])
+                "\n")))
+       "## Top Prefixes\n\n"
+       (md-table ["Prefix" "Problem Count"]
+                 (map (fn [row] [(get row "key") (get row "count")])
+                      (get summary "top_prefixes")))
+       "\n## Top Status/Prefix Pairs\n\n"
+       (md-table ["Status:Prefix" "Problem Count"]
+                 (map (fn [row] [(get row "key") (get row "count")])
+                      (get summary "top_status_prefixes")))
+       "\n## Top Diagnostics\n\n"
+       (md-table ["Diagnostic" "Problem Count"]
+                 (map (fn [row] [(get row "key") (get row "count")])
+                      (get summary "top_diagnostics")))
+       "\n## Top Problem Rows\n\n"
+       (md-table ["Feature" "Status" "Prefix" "Diagnostic" "Corr" "Max Abs Dev" "Live Zero" "Hist Zero" "Live Leading Zero Until"]
+                 (map (fn [row]
+                        [(get row "feature")
+                         (get row "status")
+                         (get row "prefix")
+                         (get row "diagnostic_key")
+                         (get row "correlation")
+                         (get row "max_abs_deviation")
+                         (get row "live_zero_frac")
+                         (get row "historical_zero_frac")
+                         (or (get row "live_leading_zero_until") "")])
+                      (get summary "top_problem_rows")))
+       (when (seq (str (get summary "usage_csv")))
+         (str "\n## Top Weighted Status/Prefix Pairs\n\n"
+              (md-table ["Status:Prefix" "Features" "Splits" "Total Gain"]
+                        (map (fn [row] [(get row "key")
+                                        (get row "count")
+                                        (get row "split_count")
+                                        (get row "total_gain")])
+                             (get summary "top_weighted_status_prefixes")))
+              "\n## Top Weighted Diagnostics\n\n"
+              (md-table ["Diagnostic" "Features" "Splits" "Total Gain"]
+                        (map (fn [row] [(get row "key")
+                                        (get row "count")
+                                        (get row "split_count")
+                                        (get row "total_gain")])
+                             (get summary "top_weighted_diagnostics")))
+              "\n## Top Weighted Status/Diagnostics\n\n"
+              (md-table ["Status:Diagnostic" "Features" "Splits" "Total Gain"]
+                        (map (fn [row] [(get row "key")
+                                        (get row "count")
+                                        (get row "split_count")
+                                        (get row "total_gain")])
+                             (get summary "top_weighted_status_diagnostics")))
+              "\n## Top Weighted Problem Rows\n\n"
+              (md-table ["Feature" "Status" "Prefix" "Diagnostic" "Splits" "Total Gain" "Corr" "Max Abs Dev"]
+                        (map (fn [row]
+                               [(get row "feature")
+                                (get row "status")
+                                (get row "prefix")
+                                (get row "diagnostic_key")
+                                (get row "model_split_count")
+                                (get row "model_total_gain")
+                                (get row "correlation")
+                                (get row "max_abs_deviation")])
+                             (get summary "top_weighted_problem_rows")))))))
+
+(defn write-if
+  [path text]
+  (when path
+    (let [parent (os.path/dirname path)]
+      (when (seq parent)
+        (os/makedirs parent ** :exist_ok true)))
+    (spit path text)))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        summary (summarize opts)
+        json-text (json/dumps (jsonable summary) ** :indent 2 :sort_keys true)]
+    (write-if (:out-json opts) json-text)
+    (write-if (:md-out opts) (markdown summary))
+    (println json-text)
+    (when (:out-json opts)
+      (println (str "wrote " (:out-json opts))))
+    (when (:md-out opts)
+      (println (str "wrote " (:md-out opts)))))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

@@ -1,0 +1,467 @@
+;; Audit neutralized V3 grid features by recomputing them from captured grids.
+;;
+;; Native Basilisp entrypoint. V3 grid features and prediction-delta scoring
+;; run through Basilisp-owned adapters.
+(import argparse datetime json math numpy os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT")
+                                    (os/getcwd))))
+(def default-ref (os.path/join (os.path/dirname repo-root) "SteveTrading" "ref" "Data-Preprocessor"))
+(def feature-parity-src (os.path/join repo-root "components" "feature-parity.core" "src"))
+(def bridge-src (os.path/join repo-root "components" "bridge.steve-v2" "src"))
+
+(doseq [src [feature-parity-src bridge-src]]
+  (when-not (contains? (set (.-path sys)) src)
+    (.insert (.-path sys) 0 src)))
+
+(require '[stevetrading.bridge.steve-v2.inference :as inf]
+         '[stevetrading.feature-parity.raw-unlock :as raw])
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn py-dict? [x]
+  (python/isinstance x python/dict))
+
+(defn py-list? [x]
+  (python/isinstance x python/list))
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (py-dict? x) (python/dict (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ x k))])) (.keys x)))
+    (py-list? x) (python/list (map ->jsonable x))
+    (python/isinstance x numpy/integer) (int x)
+    (python/isinstance x numpy/floating) (float x)
+    :else x))
+
+(defn reject-duplicate-json-object [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining) (conj seen k) (assoc out k v))))))
+
+(defn load-json-value [path]
+  (json/loads (slurp path) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn mget
+  ([m k] (mget m k nil))
+  ([m k default]
+   (cond
+     (nil? m) default
+     (map? m) (get m k default)
+     (py-dict? m) (.get m k default)
+     :else default)))
+
+(defn parse-args [& argv]
+  (let [argv0 (vec argv)
+        sep-idx (first (keep-indexed (fn [idx value] (when (= value "--") idx)) argv0))
+        argv1 (if (some? sep-idx) (subvec argv0 (inc sep-idx)) argv0)
+        parser (argparse/ArgumentParser)]
+    (.add_argument parser "--target-date" ** :required true :help "YYYY-MM-DD")
+    (.add_argument parser "--ref-root" ** :default default-ref)
+    (.add_argument parser "--capture" ** :default nil)
+    (.add_argument parser "--baseline-json" ** :default nil)
+    (.add_argument parser "--usage-json" ** :default nil)
+    (.add_argument parser "--bundle" ** :default nil)
+    (.add_argument parser "--out-dir" ** :default (os.path/join repo-root "live_runtime" "analysis"))
+    (.add_argument parser "--max-prediction-rows" ** :type int :default nil
+                   :help "Score at most the latest N rows for prediction-delta gating.")
+    (.add_argument parser "--write-unavailable" ** :action "store_true"
+                   :help "Write explicit unavailable audit artifacts and exit non-zero.")
+    (.add_argument parser "--unavailable-reason" ** :default "V3 grid unlock audit unavailable")
+    (.parse_args parser (python/list argv1))))
+
+(defn compact-date [date]
+  (let [parts (.split date "-")]
+    (when (or (not= (count parts) 3)
+              (some #(not (.isdigit %)) parts))
+      (throw (python/ValueError (str "invalid --target-date: " date))))
+    (apply str parts)))
+
+(defn feature-family [name]
+  (let [head (first (.split name "_" 1))]
+    (cond
+      (contains? #{"dict" "scat" "tda" "wass"} head) "v3-grid"
+      (contains? #{"vix_proxy" "vix_term_slope" "put_call_ratio"
+                   "vix_momentum_5" "vix_momentum_20"
+                   "realized_vol_20" "realized_vol_60" "vol_ratio"
+                   "hmm_state_0" "hmm_state_1" "hmm_state_2"} name) "v2-grid"
+      (contains? #{"SPX" "VIX" "TNX"} head) "index-proxy"
+      (or (>= (.find name "opt") 0)
+          (>= (.find name "greeks") 0)
+          (contains? #{"SPXW" "VIXW"} head)) "options-base"
+      :else "equity-base")))
+
+(defn classify [raw z train-std]
+  (let [finite (numpy/logical_and (numpy/isfinite raw) (numpy/isfinite z))]
+    (if-not (bool (numpy/any finite))
+      "NONFINITE"
+      (let [raw-f (.__getitem__ raw finite)
+            z-f (.__getitem__ z finite)
+            live-zero (bool (numpy/all (= raw-f 0)))
+            z-mu (float (numpy/mean z-f))
+            z-sd (float (numpy/std z-f))]
+        (cond
+          (and live-zero (> train-std 1.0e-12)) "ZERO_FILLED_LIVE"
+          live-zero "BOTH_ZERO"
+          (< z-sd 1.0e-3) "DEGENERATE_LIVE"
+          (and (< (abs z-mu) 2.0) (< 0.1 z-sd) (< z-sd 4.0)) "SANE"
+          (>= (abs z-mu) 8.0) "WILD_OFFSET"
+          (>= z-sd 4.0) "WILD_SCALE"
+          (<= z-sd 0.1) "LOW_VARIANCE"
+          :else "OFFSET")))))
+
+(defn load-usage [path]
+  (let [payload (load-json-value path)
+        gain (atom {})
+        splits (atom {})]
+    (doseq [row (or (mget payload "features") [])]
+      (let [name (mget row "feature")
+            total-gain (float (or (mget row "total_gain") 0.0))
+            split-count (int (float (or (mget row "split_count") 0)))]
+        (swap! gain update name (fnil + 0.0) total-gain)
+        (swap! splits update name (fnil + 0) split-count)))
+    [@gain @splits]))
+
+(defn add-ref-to-path! [ref-root]
+  (let [ref (os.path/abspath (str ref-root))]
+    (when-not (contains? (set (.-path sys)) ref)
+      (.insert (.-path sys) 0 ref))))
+
+(defn recompute-v3 [ref-root bundle capture-path]
+  (let [atoms-npz (numpy/load (os.path/join bundle "dictionary_atoms.npz"))
+        atoms {"components" (.__getitem__ atoms-npz "components")
+               "train_mean" (.__getitem__ atoms-npz "train_mean")
+               "train_std" (.__getitem__ atoms-npz "train_std")}
+        capture (numpy/load capture-path ** :allow_pickle true)
+        grids (python/list (.__getitem__ capture "grids"))
+        feature-names (vec (load-json-value (os.path/join bundle "feature_names.json")))
+        name-to-idx (into {} (map-indexed (fn [i n] [n i]) feature-names))
+        feature-arrays (raw/compute-live-v3-feature-arrays grids atoms)
+        rows (atom [])
+        n-rows (len grids)]
+    (doseq [i (range n-rows)]
+      (let [arr (numpy/zeros (count feature-names) ** :dtype numpy/float32)]
+        (doseq [[name values] feature-arrays]
+          (let [idx (get name-to-idx name)]
+            (when (some? idx)
+              (let [value (float (.__getitem__ values i))]
+                (when (math/isfinite value)
+                  (.__setitem__ arr idx value))))))
+        (swap! rows conj arr)))
+    [feature-names (numpy/stack (python/list @rows))]))
+
+(defn seed-std [bundle head]
+  (let [d (numpy/load (os.path/join bundle (str "calibration_seed_" head ".npz")))
+        n (float (.__getitem__ d "pred_count"))
+        mu (/ (float (.__getitem__ d "pred_sum")) n)
+        var (- (/ (float (.__getitem__ d "pred_sum_sq")) n) (* mu mu))]
+    (math/sqrt (max var 0.0))))
+
+(defn grid-seq [grids end-idx lookback]
+  (let [start (max 0 (- (inc end-idx) lookback))]
+    (.astype (.__getitem__ grids (slice start (inc end-idx))) numpy/float32)))
+
+(defn prediction-delta [ref-root ref-pipeline-data capture-path candidate-names raw-v3 max-prediction-rows]
+  (add-ref-to-path! ref-root)
+  (let [cap (numpy/load capture-path ** :allow_pickle true)
+        grids (.astype (.__getitem__ cap "grids") numpy/float32)
+        total-rows (int (.__getitem__ (.-shape raw-v3) 0))
+        score-start (if (some? max-prediction-rows)
+                      (max 0 (- total-rows (int max-prediction-rows)))
+                      0)
+        rows (atom [])]
+    (doseq [account ["chestnut" "lynx" "moose"]]
+      (let [bundle (os.path/join ref-pipeline-data (str "live_model_" account "_multihead_corrected"))
+            inference (inf/make-multihead-inference ref-root bundle)
+            names (vec (load-json-value (os.path/join bundle "feature_names.json")))
+            name-to-idx (into {} (map-indexed (fn [i n] [n i]) names))
+            candidate-idxs (vec (keep #(get name-to-idx %) candidate-names))
+            candidate-idx (numpy/asarray (python/list candidate-idxs) ** :dtype numpy/int64)
+            base-features (.astype (.__getitem__ cap account) numpy/float32)
+            p0 (atom [])
+            p1 (atom [])]
+        (doseq [i (range score-start total-rows)]
+            (let [seq (grid-seq grids i (int (:lookback inference)))
+                f0 (.copy (.__getitem__ base-features i))
+                f1 (.copy f0)]
+            (when (> (.-size candidate-idx) 0)
+              (.__setitem__ f1 candidate-idx
+                            (.astype (.__getitem__ (.__getitem__ raw-v3 i) candidate-idx)
+                                     numpy/float32)))
+            (swap! p0 conj (inf/predict inference f0 seq))
+            (swap! p1 conj (inf/predict inference f1 seq))))
+        (let [p0a (numpy/array (python/list @p0) ** :dtype numpy/float64)
+              p1a (numpy/array (python/list @p1) ** :dtype numpy/float64)
+              delta (- p1a p0a)
+              row (atom {"account" account
+                         "rows" (int (.__getitem__ (.-shape base-features) 0))})]
+          (doseq [[h head] (map-indexed vector ["long" "gen" "short"])]
+            (let [abs-delta (numpy/abs (.__getitem__ delta #py ((slice nil nil) h)))
+                  abs-z (/ abs-delta (max (seed-std bundle head) 1.0e-9))]
+              (swap! row assoc
+                     (str head "_mean_abs_delta") (float (numpy/mean abs-delta))
+                     (str head "_p95_abs_delta") (float (numpy/quantile abs-delta 0.95))
+                     (str head "_max_abs_delta") (float (numpy/max abs-delta))
+                     (str head "_mean_abs_seed_z") (float (numpy/mean abs-z))
+                     (str head "_p95_abs_seed_z") (float (numpy/quantile abs-z 0.95))
+                     (str head "_max_abs_seed_z") (float (numpy/max abs-z)))))
+          (swap! row assoc
+                 "p95_abs_seed_z_any_head" (apply max (map #(get @row (str % "_p95_abs_seed_z")) ["long" "gen" "short"]))
+                 "max_abs_seed_z_any_head" (apply max (map #(get @row (str % "_max_abs_seed_z")) ["long" "gen" "short"])))
+          (swap! rows conj @row))))
+    @rows))
+
+(def csv-fields ["feature" "baseline_status" "recomputed_status" "candidate"
+                 "model_gain" "model_split_count" "live_mean" "live_std"
+                 "z_mean" "z_std" "zero_frac" "train_mean" "train_std"])
+
+(defn csv-escape [value]
+  (let [s (str (or value ""))]
+    (if (or (>= (.find s ",") 0) (>= (.find s "\"") 0) (>= (.find s "\n") 0))
+      (str "\"" (.replace s "\"" "\"\"") "\"")
+      s)))
+
+(defn write-csv! [path rows]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path
+        (str (apply str (interpose "," csv-fields))
+             "\n"
+             (apply str
+                    (for [row rows]
+                      (str (apply str (interpose "," (map #(csv-escape (get row % "")) csv-fields))) "\n"))))))
+
+(defn md-table [headers rows]
+  (str "| " (apply str (interpose " | " headers)) " |\n"
+       "| " (apply str (interpose " | " (repeat (count headers) "---"))) " |\n"
+       (apply str (for [row rows]
+                    (str "| " (apply str (interpose " | " (map str row))) " |\n")))))
+
+(defn status-counts [rows]
+  (into {}
+        (for [status (sort (set (map #(get % "recomputed_status") rows)))]
+          [status (count (filter #(= (get % "recomputed_status") status) rows))])))
+
+(defn disable-candidates
+  [rows reason]
+  (vec
+   (map (fn [row]
+          (if (get row "candidate")
+            (assoc row
+                   "candidate" false
+                   "candidate_blocker" reason)
+            row))
+        rows)))
+
+(defn write-unavailable! [out-dir stamp target-date reason]
+  (let [generated-at (.isoformat (datetime.datetime/now datetime.timezone/utc))
+        summary {"status" "unavailable"
+                 "available" false
+                 "ok" false
+                 "target_date" target-date
+                 "generated_at" generated-at
+                 "unavailable_reason" reason
+                 "neutralized_v3_features" 0
+                 "recomputed_non_degenerate" 0
+                 "recomputed_candidate_now" 0
+                 "neutralized_v3_model_gain" 0.0
+                 "non_degenerate_model_gain" 0.0
+                 "candidate_model_gain" 0.0
+                 "prediction_delta_p95_abs_seed_z" 0.0
+                 "prediction_delta_max_abs_seed_z" 0.0
+                 "prediction_delta_status" "unavailable"
+                 "prediction_delta_error" reason
+                 "status_counts" {}}
+        base (os.path/join out-dir (str "v3_grid_unlock_audit_" stamp))
+        csv-path (str base ".csv")
+        json-path (str base ".json")
+        md-path (str base ".md")]
+    (os/makedirs out-dir ** :exist_ok true)
+    (write-csv! csv-path [])
+    (spit json-path
+          (str (json/dumps (->jsonable {"target_date" target-date
+                                        "generated_at" generated-at
+                                        "summary" summary
+                                        "features" []
+                                        "prediction_delta" []})
+                           ** :indent 2 :sort_keys true) "\n"))
+    (spit md-path
+          (str "# V3 Grid Unlock Audit\n\n"
+               "- Target date: `" target-date "`\n"
+               "- Status: `unavailable`\n"
+               "- Reason: `" reason "`\n"
+               "- Recomputed candidate-now by parity gate: `0`\n"))
+    (println (json/dumps (->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote " json-path))
+    (println (str "wrote " csv-path))
+    (println (str "wrote " md-path))
+    1))
+
+(defn main [& argv]
+  (let [args (apply parse-args argv)
+        target-date (attr args "target_date")
+        stamp (compact-date target-date)
+        ref-root (os.path/abspath (attr args "ref_root"))
+        out-dir (attr args "out_dir")
+        write-unavailable (attr args "write_unavailable")
+        unavailable-reason (attr args "unavailable_reason")]
+    (if write-unavailable
+      (write-unavailable! out-dir stamp target-date unavailable-reason)
+      (let [capture (or (attr args "capture")
+                    (os.path/join repo-root "live_runtime" "feature-capture" (str "live_features_" stamp ".npz")))
+        baseline-json (or (attr args "baseline_json")
+                          (os.path/join out-dir (str "live_feature_parity_baseline_" stamp ".json")))
+        usage-json (or (attr args "usage_json")
+                       (os.path/join out-dir (str "live_feature_model_usage_" stamp ".json")))
+        bundle (or (attr args "bundle")
+                   (os.path/join ref-root "pipeline_data" "live_model_chestnut_multihead_corrected"))
+        max-prediction-rows (attr args "max_prediction_rows")
+        baseline (mget (load-json-value baseline-json) "features")
+        baseline-by-name (into {} (for [row baseline] [(mget row "feature") row]))
+        [gain splits] (load-usage usage-json)
+        [names raw] (recompute-v3 ref-root bundle capture)
+        stats (numpy/load (os.path/join bundle "feature_stats.npz"))
+        train-mean (.__getitem__ stats "mean")
+        train-std (.__getitem__ stats "std")
+        rows (atom [])]
+    (doseq [[idx name] (map-indexed vector names)]
+      (when (= (feature-family name) "v3-grid")
+        (let [base (get baseline-by-name name)]
+          (when (and base (mget base "neutralized"))
+            (let [values (.__getitem__ raw #py ((slice nil nil) idx))
+                  stdv (float (.__getitem__ train-std idx))
+                  denom (if (not= stdv 0.0) stdv 1.0)
+                  z (/ (- values (.__getitem__ train-mean idx)) denom)
+                  status (classify values z stdv)
+                  candidate (contains? #{"SANE" "BOTH_ZERO"} status)]
+              (swap! rows conj {"feature" name
+                                "baseline_status" (mget base "status")
+                                "recomputed_status" status
+                                "candidate" candidate
+                                "model_gain" (float (get gain name 0.0))
+                                "model_split_count" (int (get splits name 0))
+                                "live_mean" (float (numpy/nanmean values))
+                                "live_std" (float (numpy/nanstd values))
+                                "z_mean" (float (numpy/nanmean z))
+                                "z_std" (float (numpy/nanstd z))
+                                "zero_frac" (float (numpy/mean (= values 0)))
+                                "train_mean" (float (.__getitem__ train-mean idx))
+                                "train_std" stdv}))))))
+    (let [initial-rows (vec (sort-by #(- (get % "model_gain")) @rows))
+          initial-candidates (vec (filter #(get % "candidate") initial-rows))
+          initial-candidate-names (vec (map #(get % "feature") initial-candidates))
+          pred-result (cond
+                        (not (seq initial-candidate-names))
+                        {"rows" []
+                         "status" "skipped-no-candidates"}
+
+                        (and (some? max-prediction-rows)
+                             (<= (int max-prediction-rows) 0))
+                        (let [reason "prediction delta skipped by --max-prediction-rows <= 0"]
+                          {"rows" []
+                           "status" "skipped-row-cap-zero"
+                           "error" reason
+                           "fail_closed_rows" (disable-candidates initial-rows reason)})
+
+                        :else
+                        (try
+                          {"rows" (prediction-delta ref-root
+                                                    (os.path/join ref-root "pipeline_data")
+                                                    capture
+                                                    initial-candidate-names
+                                                    raw
+                                                    max-prediction-rows)
+                           "status" "ok"}
+                          (catch python/Exception e
+                            (let [reason (str "prediction delta unavailable: " e)]
+                              {"rows" []
+                               "status" "error"
+                               "error" reason
+                               "fail_closed_rows" (disable-candidates initial-rows reason)}))))
+          sorted-rows (vec (or (get pred-result "fail_closed_rows") initial-rows))
+          candidates (vec (filter #(get % "candidate") sorted-rows))
+          nondegenerate (vec (filter #(> (get % "live_std") 1.0e-9) sorted-rows))
+          pred-delta (get pred-result "rows")
+          max-p95 (if (seq pred-delta) (apply max (map #(get % "p95_abs_seed_z_any_head") pred-delta)) 0.0)
+          max-abs (if (seq pred-delta) (apply max (map #(get % "max_abs_seed_z_any_head") pred-delta)) 0.0)
+          generated-at (.isoformat (datetime.datetime/now datetime.timezone/utc))
+          summary {"target_date" target-date
+                   "generated_at" generated-at
+                   "capture" capture
+                   "bundle" bundle
+                   "neutralized_v3_features" (count sorted-rows)
+                   "recomputed_non_degenerate" (count nondegenerate)
+                   "recomputed_candidate_now" (count candidates)
+                   "neutralized_v3_model_gain" (float (reduce + (map #(get % "model_gain") sorted-rows)))
+                   "non_degenerate_model_gain" (float (reduce + (map #(get % "model_gain") nondegenerate)))
+                   "candidate_model_gain" (float (reduce + (map #(get % "model_gain") candidates)))
+                   "prediction_delta_p95_abs_seed_z" (float max-p95)
+                   "prediction_delta_max_abs_seed_z" (float max-abs)
+                   "prediction_delta_status" (get pred-result "status")
+                   "prediction_delta_error" (get pred-result "error")
+                   "status_counts" (status-counts sorted-rows)}
+          base (os.path/join out-dir (str "v3_grid_unlock_audit_" stamp))
+          csv-path (str base ".csv")
+          json-path (str base ".json")
+          md-path (str base ".md")
+          top-rows (take 20 sorted-rows)]
+      (os/makedirs out-dir ** :exist_ok true)
+      (write-csv! csv-path sorted-rows)
+      (spit json-path
+            (str (json/dumps (->jsonable {"target_date" target-date
+                                          "generated_at" generated-at
+                                          "summary" summary
+                                          "features" sorted-rows
+                                          "prediction_delta" pred-delta})
+                             ** :indent 2 :sort_keys true) "\n"))
+      (spit md-path
+            (str "# V3 Grid Unlock Audit\n\n"
+                 "- Target date: `" target-date "`\n"
+                 "- Neutralized V3 features: `" (get summary "neutralized_v3_features") "`\n"
+                 "- Recomputed non-degenerate: `" (get summary "recomputed_non_degenerate") "`\n"
+                 "- Recomputed candidate-now by parity gate: `" (get summary "recomputed_candidate_now") "`\n"
+                 "- Non-degenerate model gain: `" (.format "{:.4f}" (get summary "non_degenerate_model_gain")) "`\n"
+                 "- Candidate model gain: `" (.format "{:.4f}" (get summary "candidate_model_gain")) "`\n\n"
+                 "- Candidate enablement P95 prediction delta: `" (.format "{:.4f}" (get summary "prediction_delta_p95_abs_seed_z")) "` seed-z\n"
+                 "- Candidate enablement max prediction delta: `" (.format "{:.4f}" (get summary "prediction_delta_max_abs_seed_z")) "` seed-z\n\n"
+                 "## Status Counts\n\n"
+                 (md-table ["Status" "Count"] (for [[k v] (get summary "status_counts")] [k v]))
+                 "\n## Candidate Enablement Prediction Delta\n\n"
+                 (md-table ["Account" "Rows" "P95 |Δ| seed-z" "Max |Δ| seed-z"]
+                           (for [r pred-delta]
+                             [(get r "account")
+                              (get r "rows")
+                              (.format "{:.4f}" (get r "p95_abs_seed_z_any_head"))
+                              (.format "{:.4f}" (get r "max_abs_seed_z_any_head"))]))
+                 "\n## Top Neutralized V3 Features By Model Gain\n\n"
+                 (md-table ["Feature" "Baseline" "Recomputed" "Candidate" "Gain" "Splits" "Live Std" "Z Mean" "Z Std"]
+                           (for [r top-rows]
+                             [(get r "feature")
+                              (get r "baseline_status")
+                              (get r "recomputed_status")
+                              (get r "candidate")
+                              (.format "{:.2f}" (get r "model_gain"))
+                              (get r "model_split_count")
+                              (.format "{:.6g}" (get r "live_std"))
+                              (.format "{:.3f}" (get r "z_mean"))
+                              (.format "{:.3f}" (get r "z_std"))]))
+                 "\n## Interpretation\n\n"
+                 "This recomputes V3 grid-derived features from captured `grids` before bundle neutralization. "
+                 "Features marked candidate satisfy the existing parity classifier after recomputation. "
+                 "Non-degenerate but non-candidate rows are live-varying, but still need scale/offset investigation before unmasking.\n"))
+      (println (json/dumps (->jsonable summary) ** :indent 2 :sort_keys true))
+      (println (str "wrote " json-path))
+      (println (str "wrote " csv-path))
+      (println (str "wrote " md-path))
+      0)))))
+
+(sys/exit (apply main (rest (.-argv sys))))

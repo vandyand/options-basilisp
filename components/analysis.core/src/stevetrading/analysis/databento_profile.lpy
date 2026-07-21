@@ -1,0 +1,136 @@
+(ns stevetrading.analysis.databento-profile
+  "Receipt-backed physical and event-rate profiles for immutable Databento DBN files."
+  (:import datetime hashlib json pathlib
+           databento))
+
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+(def transport-types #{"SystemMsg" "SymbolMappingMsg" "InstrumentDefMsg" "ErrorMsg"})
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]]
+                                     (python/tuple [(str k) (jsonable v)]))
+                                   value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+
+(defn- under? [path root]
+  (try
+    (.relative_to path root)
+    true
+    (catch python/ValueError _ false)))
+
+(defn- sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [stream (python/open path "rb")]
+      (loop [chunk (.read stream 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read stream 1048576)))))
+    (.hexdigest digest)))
+
+(defn- percentile [values quantile]
+  (when (seq values)
+    (let [ordered (vec (sort values))
+          index (int (python/round (* (dec (count ordered)) quantile)))]
+      (nth ordered index))))
+
+(defn- frame-for [store schema]
+  (try
+    (.to_df store ** :schema schema)
+    (catch python/ValueError _ nil)))
+
+(defn- frame-count [frame]
+  (if frame (python/len frame) 0))
+
+(defn- counts-for [frame column]
+  (when (and frame (pos? (frame-count frame)))
+    (.value_counts (.get frame column))))
+
+(defn- add-counts [left right]
+  (cond
+    (and left right) (.add left right ** :fill_value 0)
+    left left
+    :else right))
+
+(defn- frame-event-bounds [frame]
+  (when (and frame (pos? (frame-count frame)))
+    (let [timestamps (.astype (.get frame "ts_event") "int64")]
+      [(int (.min timestamps)) (int (.max timestamps))])))
+
+(defn- event-nanoseconds [frame]
+  (.astype (.get frame "ts_event") "int64"))
+
+(defn profile-dbn
+  "Return a profile of the declared market records in one immutable DBN file.
+
+   System, mapping, definition, and error messages remain represented in the
+   raw record counts but are excluded from market-event rates."
+  [dbn-path top-instruments]
+  (let [raw (.resolve (pathlib/Path (str dbn-path)))]
+    (when-not (.is_file raw)
+      (throw (python/ValueError (str "DBN does not exist: " raw))))
+    (let [store (databento/read_dbn (str raw))
+          mbp (frame-for store "mbp-1")
+          trades (frame-for store "trades")
+          mbp-count (frame-count mbp)
+          trade-count (frame-count trades)
+          market-events (+ mbp-count trade-count)
+          instrument-counts (add-counts (counts-for mbp "instrument_id")
+                                        (counts-for trades "instrument_id"))
+          minute-counts (add-counts
+                         (when mbp (.value_counts (.floordiv (event-nanoseconds mbp) 60000000000)))
+                         (when trades (.value_counts (.floordiv (event-nanoseconds trades) 60000000000))))
+          per-minute (if minute-counts (vec (.tolist minute-counts)) [])
+          bounds (keep identity [(frame-event-bounds mbp) (frame-event-bounds trades)])
+          event-start (when (seq bounds) (apply min (map first bounds)))
+          event-end (when (seq bounds) (apply max (map second bounds)))
+          bytes (.stat raw)
+          byte-count (.-st_size bytes)
+          top (if instrument-counts
+                (map (fn [[instrument-id count]]
+                     {"instrument_id" (int instrument-id)
+                        "market_events" (int count)})
+                     (take top-instruments
+                           (iterator-seq (.items (.sort_values instrument-counts ** :ascending false)))))
+                [])]
+      {"created_at_utc" (now-utc)
+       "kind" "databento-event-profile-v1"
+       "raw" {"path" (str raw)
+              "sha256" (sha256-file raw)
+              "bytes" byte-count
+              "record_type_counts" {"MBP1Msg" mbp-count
+                                    "TradeMsg" trade-count}}
+       "market_events"
+       {"count" market-events
+        "bytes_per_event" (when (pos? market-events) (/ (float byte-count) market-events))
+        "record_type_counts" {"MBP1Msg" mbp-count "TradeMsg" trade-count}
+        "active_instruments" (if instrument-counts (python/len instrument-counts) 0)
+        "event_start_ns" event-start
+        "event_end_ns" event-end
+        "per_minute" {"nonempty_minutes" (count per-minute)
+                      "min" (when (seq per-minute) (apply min per-minute))
+                      "p50" (percentile per-minute 0.50)
+                      "p95" (percentile per-minute 0.95)
+                      "max" (when (seq per-minute) (apply max per-minute))}
+        "top_instruments" (vec top)}
+       "limits" {"physical_compression_measured" false
+                 "representation_utility_measured" false
+                  "note" "This receipt profiles DBN market schemas with Databento's compiled decoder; it does not infer alpha or approve an aggregation."}})))
+
+(defn write-profile!
+  [dbn-path out-path top-instruments]
+  (let [out (.resolve (pathlib/Path (str out-path)))]
+    (when-not (under? out (.resolve canonical-manifest-root))
+      (throw (python/ValueError
+              (str "--out must be below " (.resolve canonical-manifest-root)))))
+    (.mkdir (.-parent out) ** :parents true :exist_ok true)
+    (let [profile (profile-dbn dbn-path top-instruments)]
+      (spit (str out) (json-text profile))
+      profile)))

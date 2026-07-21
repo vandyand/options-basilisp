@@ -1,0 +1,355 @@
+;; Basilisp shadow_fills -> shadow_pnl materializer.
+;;
+;; Replaces the legacy Python `strategy-lab compute-pnl` report dependency.
+;; It pairs OPEN/CLOSE fills FIFO by instrument, records realized P&L, and
+;; synthesizes worthless-expiry closes for expired OCC option legs. Inserts are
+;; idempotent by full trade identity, so synthetic expiry rows do not inflate on
+;; repeated report builds.
+(import datetime json os os.path re sqlite3 sys)
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/materialize_shadow_pnl.lpy -- "
+                "--db-path DB [--strategy-id ID] [--apply] [--as-of-date YYYY-MM-DD]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:apply? false}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--db-path")
+          (recur (nnext remaining) (assoc out :db-path (option-value remaining arg)))
+
+          (= arg "--strategy-id")
+          (recur (nnext remaining) (assoc out :strategy-id (option-value remaining arg)))
+
+          (= arg "--apply")
+          (recur (next remaining) (assoc out :apply? true))
+
+          (= arg "--as-of-date")
+          (let [s (option-value remaining arg)]
+            (datetime.date/fromisoformat s)
+            (recur (nnext remaining) (assoc out :as-of-date s)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn validate-opts
+  [opts]
+  (when-not (:db-path opts)
+    (throw (python/ValueError "missing required --db-path")))
+  (when-not (os.path/exists (:db-path opts))
+    (throw (python/ValueError (str "db does not exist: " (:db-path opts)))))
+  opts)
+
+(defn now-utc []
+  (.isoformat (datetime.datetime/now (.-utc datetime/timezone))))
+
+(defn et-today []
+  (let [et (datetime/timezone (datetime/timedelta ** :hours -4))]
+    (.date (datetime.datetime/now et))))
+
+(defn row-get [row k]
+  (.__getitem__ row k))
+
+(defn ensure-row-factory! [conn]
+  (set! (.-row_factory conn) sqlite3/Row)
+  conn)
+
+(defn strategy-exists?
+  [conn strategy-id]
+  (some? (.fetchone (.execute conn
+                              "SELECT 1 FROM shadow_strategies WHERE strategy_id = ?"
+                              [strategy-id]))))
+
+(def insert-strategy-sql
+  "INSERT OR IGNORE INTO shadow_strategies (
+     strategy_id, factory_module, factory_kwargs_json, inherits_calibration_from,
+     state, state_changed_at, created_at, notes, promoted_account, mirror_of)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+
+(defn ensure-strategy!
+  [conn strategy-id apply?]
+  (if (strategy-exists? conn strategy-id)
+    false
+    (do
+      (when apply?
+        (let [ts (now-utc)]
+          (.execute conn insert-strategy-sql
+                    [strategy-id
+                     "basilisp.shadow-pnl-materializer"
+                     "{}"
+                     nil
+                     "live_shadow_qualified"
+                     ts
+                     ts
+                     "auto-registered by Basilisp shadow P&L materializer"
+                     nil
+                     nil])
+          (.commit conn)))
+      true)))
+
+(defn occ-option-symbol?
+  [symbol]
+  (and (>= (count symbol) 15)
+       (contains? #{"C" "P" "c" "p"} (subs symbol (- (count symbol) 9) (- (count symbol) 8)))))
+
+(defn contract-multiplier [symbol]
+  (if (occ-option-symbol? symbol) 100 1))
+
+(defn expiry-from-occ
+  [symbol]
+  (when (occ-option-symbol? symbol)
+    (try
+      (let [n (count symbol)
+            yy (python/int (subs symbol (- n 15) (- n 13)))
+            mm (python/int (subs symbol (- n 13) (- n 11)))
+            dd (python/int (subs symbol (- n 11) (- n 9)))
+            year (if (< yy 50) (+ 2000 yy) (+ 1900 yy))]
+        (datetime/date year mm dd))
+      (catch python/Exception _ nil))))
+
+(defn expiry-close-iso [expiry-date]
+  (str (.isoformat expiry-date) "T16:00:00-04:00"))
+
+(defn parse-dt
+  [s]
+    (datetime.datetime/fromisoformat (str s)))
+
+(defn holding-minutes
+  [open-t close-t]
+  (try
+    (max 0 (python/int (/ (.total_seconds (- (parse-dt close-t) (parse-dt open-t))) 60)))
+    (catch python/Exception _ 0)))
+
+(defn open-leg
+  [row]
+  {:fill-id (int (row-get row "fill_id"))
+   :intent-id (int (row-get row "intent_id"))
+   :t (row-get row "t")
+   :instrument (row-get row "instrument")
+   :side (row-get row "side")
+   :qty (int (row-get row "fill_qty"))
+   :fill-price (python/float (row-get row "fill_price"))})
+
+(defn trade-row
+  [strategy-id closed-t instrument qty entry-price exit-price realized-pnl holding side]
+  {:strategy-id strategy-id
+   :closed-t closed-t
+   :instrument instrument
+   :qty qty
+   :entry-price entry-price
+   :exit-price exit-price
+   :realized-pnl realized-pnl
+   :holding-minutes holding
+   :side side})
+
+(defn pair-fills
+  [rows strategy-id]
+  (let [open-by-instrument (atom {})
+        paired (atom [])
+        warnings (atom [])]
+    (doseq [row rows]
+      (let [intent-type (row-get row "intent_type")
+            instrument (row-get row "instrument")
+            side (row-get row "side")
+            qty (int (row-get row "fill_qty"))
+            price (python/float (row-get row "fill_price"))
+            fill-id (int (row-get row "fill_id"))
+            t (row-get row "t")]
+        (if (= intent-type "OPEN")
+          (swap! open-by-instrument update instrument (fnil conj []) (open-leg row))
+          (loop [remaining qty]
+            (let [stack (vec (get @open-by-instrument instrument []))]
+              (cond
+                (and (pos? remaining) (empty? stack))
+                (swap! warnings conj
+                       {"code" "unmatched-close"
+                        "strategy_id" strategy-id
+                        "instrument" instrument
+                        "fill_id" fill-id
+                        "t" t
+                        "remaining_qty" remaining})
+
+                (pos? remaining)
+                (let [op (first stack)
+                      rest-stack (vec (rest stack))
+                      matched (min (:qty op) remaining)
+                      mult (contract-multiplier instrument)
+                      long? (= (:side op) "BUY")
+                      pnl (if long?
+                            (* (- price (:fill-price op)) matched mult)
+                            (* (- (:fill-price op) price) matched mult))
+                      side-label (if long? "LONG" "SHORT")
+                      rem-open (- (:qty op) matched)
+                      next-stack (if (pos? rem-open)
+                                   (vec (cons (assoc op :qty rem-open) rest-stack))
+                                   rest-stack)]
+                  (swap! paired conj
+                         (trade-row strategy-id t instrument matched
+                                    (:fill-price op) price pnl
+                                    (holding-minutes (:t op) t)
+                                    side-label))
+                  (swap! open-by-instrument assoc instrument next-stack)
+                  (recur (- remaining matched)))))))))
+    {:paired @paired
+     :still-open (vec (mapcat identity (vals @open-by-instrument)))
+     :warnings @warnings}))
+
+(defn flatten-expired-legs
+  [still-open strategy-id as-of-date]
+  (reduce
+   (fn [acc leg]
+     (let [exp (expiry-from-occ (:instrument leg))]
+       (if (or (nil? exp) (> (.toordinal exp) (.toordinal as-of-date)))
+         (update acc :remaining conj leg)
+         (let [mult (contract-multiplier (:instrument leg))
+               long? (= (:side leg) "BUY")
+               exit-price 0.0
+               pnl (if long?
+                     (* (- exit-price (:fill-price leg)) (:qty leg) mult)
+                     (* (- (:fill-price leg) exit-price) (:qty leg) mult))
+               closed-t (expiry-close-iso exp)]
+           (update acc :expired conj
+                   (trade-row strategy-id closed-t (:instrument leg) (:qty leg)
+                              (:fill-price leg) exit-price pnl
+                              (holding-minutes (:t leg) closed-t)
+                              (if long? "LONG" "SHORT")))))))
+   {:expired [] :remaining []}
+   still-open))
+
+(def cursor-sql
+  "SELECT MAX(f.fill_id) AS max_id
+   FROM shadow_pnl p
+   JOIN shadow_fills f
+     ON f.strategy_id = p.strategy_id
+    AND f.t = p.closed_t
+    AND f.instrument = p.instrument
+   WHERE p.strategy_id = ?")
+
+(defn cursor-for-strategy
+  [conn strategy-id]
+  (let [row (.fetchone (.execute conn cursor-sql [strategy-id]))]
+    (if (and row (some? (row-get row "max_id")))
+      (int (row-get row "max_id"))
+      0)))
+
+(def load-fills-sql
+  "SELECT f.fill_id, f.intent_id, f.strategy_id, f.t,
+          f.instrument, f.fill_price, f.fill_qty,
+          i.side, i.intent_type
+   FROM shadow_fills f
+   JOIN shadow_intents i ON i.intent_id = f.intent_id
+   WHERE f.strategy_id = ?
+   ORDER BY f.fill_id ASC")
+
+(defn load-fills
+  [conn strategy-id]
+  (vec (.fetchall (.execute conn load-fills-sql [strategy-id]))))
+
+(def insert-pnl-sql
+  "INSERT INTO shadow_pnl (
+     strategy_id, closed_t, instrument, qty, entry_price,
+     exit_price, realized_pnl, holding_minutes, side)
+   SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+   WHERE NOT EXISTS (
+     SELECT 1 FROM shadow_pnl
+     WHERE strategy_id = ? AND closed_t = ? AND instrument = ?
+       AND qty = ? AND entry_price = ? AND exit_price = ?
+       AND realized_pnl = ? AND holding_minutes = ? AND side = ?
+   )")
+
+(defn insert-trade!
+  [conn trade]
+  (let [args [(:strategy-id trade) (:closed-t trade) (:instrument trade) (:qty trade)
+              (:entry-price trade) (:exit-price trade) (:realized-pnl trade)
+              (:holding-minutes trade) (:side trade)
+              (:strategy-id trade) (:closed-t trade) (:instrument trade) (:qty trade)
+              (:entry-price trade) (:exit-price trade) (:realized-pnl trade)
+              (:holding-minutes trade) (:side trade)]
+        before (.-total_changes conn)]
+    (.execute conn insert-pnl-sql args)
+    (- (.-total_changes conn) before)))
+
+(defn strategy-ids
+  [conn strategy-id]
+  (if strategy-id
+    [strategy-id]
+    (vec (map #(row-get % "strategy_id")
+              (.fetchall (.execute conn
+                                   "SELECT DISTINCT strategy_id FROM shadow_fills ORDER BY strategy_id"))))))
+
+(defn materialize-strategy
+  [conn strategy-id apply? as-of-date]
+  (let [metadata-missing? (ensure-strategy! conn strategy-id apply?)
+        since (cursor-for-strategy conn strategy-id)
+        rows (load-fills conn strategy-id)
+        {:keys [paired still-open warnings]} (pair-fills rows strategy-id)
+        {:keys [expired remaining]} (flatten-expired-legs still-open strategy-id as-of-date)
+        all-trades (vec (concat paired expired))
+        inserted (if apply?
+                   (let [n (reduce + 0 (map #(insert-trade! conn %) all-trades))]
+                     (.commit conn)
+                     n)
+                   0)]
+    {"strategy_id" strategy-id
+     "metadata_missing_before" metadata-missing?
+     "cursor_fill_id" since
+     "fills_loaded" (count rows)
+     "paired_real" (count paired)
+     "paired_expiry_flatten" (count expired)
+     "candidate_pnl_rows" (count all-trades)
+     "inserted" inserted
+     "still_open" (count remaining)
+     "warnings" warnings}))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(try
+  (let [opts (validate-opts (parse-args (vec *command-line-args*)))
+        as-of-date (if (:as-of-date opts)
+                     (datetime.date/fromisoformat (:as-of-date opts))
+                     (et-today))
+        conn (ensure-row-factory! (sqlite3/connect (:db-path opts)))]
+    (try
+      (.execute conn "PRAGMA foreign_keys = ON")
+      (let [ids (strategy-ids conn (:strategy-id opts))
+            results (vec (map #(materialize-strategy conn % (:apply? opts) as-of-date) ids))
+            result {"db_path" (:db-path opts)
+                    "applied" (boolean (:apply? opts))
+                    "as_of_date" (.isoformat as-of-date)
+                    "strategy_count" (count results)
+                    "total_candidate_pnl_rows" (reduce + 0 (map #(get % "candidate_pnl_rows") results))
+                    "total_inserted" (reduce + 0 (map #(get % "inserted") results))
+                    "total_still_open" (reduce + 0 (map #(get % "still_open") results))
+                    "total_warnings" (reduce + 0 (map #(count (get % "warnings")) results))
+                    "results" results
+                    "valid?" true}]
+        (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))
+        (python/exit 0))
+      (finally
+        (.close conn))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch sqlite3/Error e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

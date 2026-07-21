@@ -1,0 +1,11 @@
+[Unit]
+Description=Run first-open raw ThetaData parity diagnostics
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:31:00 America/New_York
+AccuracySec=5s
+Persistent=true
+Unit=stevetrading-raw-thetadata-parity.service
+
+[Install]
+WantedBy=timers.target

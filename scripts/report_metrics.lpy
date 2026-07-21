@@ -1,0 +1,351 @@
+;; JSON adapter for Basilisp report metrics.
+;;
+;; Input JSON shape:
+;;   {"orders": [{"account": "...", "order_id": "...", "symbol": "...",
+;;                "side": "BUY", "filled_at": "...", "filled_avg_price": 1.0,
+;;                "qty": 1, "order_type": "market"}],
+;;    "round_trips": [{"account": "...", "symbol": "...",
+;;                     "open_time": "...", "close_time": "...",
+;;                     "is_long": true, "open_price": 1.0,
+;;                     "close_price": 1.25, "qty": 1,
+;;                     "pnl_dollars": 25.0, "hold_minutes": 5.0}],
+;;    "open_entries": [{"account": "...", "symbol": "...", "side": "BUY",
+;;                      "open_time": "...", "open_price": 1.0, "qty": 1,
+;;                      "is_long": true, "is_option": true}],
+;;    "as_of": "optional ISO timestamp",
+;;    "positions": {"n_positions": 1, "market_value": 123.0,
+;;                  "unrealized_pl": 4.5, "symbols": ["SPY"]}}
+;;
+;; Output JSON shape is Python report-compatible:
+;;   {"metrics": {...}, "open_activity": {...}, "round_trips": n,
+;;    "open_entries": n, "unmatched_closes": n}
+;;
+;; Batch mode:
+;;   {"batches": {"key": {same single-payload shape}, ...}}
+;; returns:
+;;   {"batches": {"key": {same output shape}, ...}}
+(import datetime fractions glob json math os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.report-metrics.core :as rm])
+
+(defn parse-dt
+  [s]
+  (when s
+    (datetime.datetime/fromisoformat (.replace s "Z" "+00:00"))))
+
+(defn required
+  [label x]
+  (when (nil? x)
+    (throw (python/ValueError (str "missing required field: " label))))
+  x)
+
+(defn nonblank-text
+  [label x]
+  (let [s (.strip (str (required label x)))]
+    (when (= "" s)
+      (throw (python/ValueError (str "blank required field: " label))))
+    s))
+
+(defn finite-number
+  [label x]
+  (when (or (true? x) (false? x))
+    (throw (python/ValueError (str "boolean numeric field: " label))))
+  (let [n (python/float (required label x))]
+    (when-not (math/isfinite n)
+      (throw (python/ValueError (str "non-finite numeric field: " label))))
+    n))
+
+(defn positive-int
+  [label x]
+  (let [raw (finite-number label x)
+        n (python/int raw)]
+    (when-not (= raw (math/floor raw))
+      (throw (python/ValueError (str "fractional integer field: " label))))
+    (when-not (pos? n)
+      (throw (python/ValueError (str "non-positive integer field: " label))))
+    n))
+
+(defn nonnegative-int
+  [label x]
+  (let [raw (finite-number label x)
+        n (python/int raw)]
+    (when-not (= raw (math/floor raw))
+      (throw (python/ValueError (str "fractional integer field: " label))))
+    (when (neg? n)
+      (throw (python/ValueError (str "negative integer field: " label))))
+    n))
+
+(defn bool-field
+  [label x]
+  (when-not (or (true? x) (false? x))
+    (throw (python/ValueError (str "boolean field required: " label))))
+  x)
+
+(defn json-object?
+  [x]
+  (or (map? x) (python/isinstance x python/dict)))
+
+(defn json-array?
+  [x]
+  (or (vector? x) (python/isinstance x python/list)))
+
+(defn object-field
+  [label x]
+  (when-not (json-object? x)
+    (throw (python/ValueError (str "object field required: " label))))
+  x)
+
+(defn optional-object-field
+  [label x]
+  (when x (object-field label x)))
+
+(defn optional-array-field
+  [label x]
+  (if (nil? x)
+    []
+    (do
+      (when-not (json-array? x)
+        (throw (python/ValueError (str "array field required: " label))))
+      x)))
+
+(defn array-member-field
+  [m key]
+  (if (contains? m key)
+    (let [value (get m key)]
+      (when-not (json-array? value)
+        (throw (python/ValueError (str "array field required: " key))))
+      value)
+    []))
+
+(def valid-sides #{"BUY" "SELL"})
+
+(defn side-field
+  [label x]
+  (let [side (.upper (str (required label x)))]
+    (when-not (contains? valid-sides side)
+      (throw (python/ValueError (str "invalid side field: " label))))
+    side))
+
+(defn required-dt
+  [label x]
+  (let [dt (parse-dt (required label x))]
+    (when (nil? dt)
+      (throw (python/ValueError (str "invalid timestamp field: " label))))
+    dt))
+
+(defn date-str
+  [dt]
+  (when dt (.isoformat (.date dt))))
+
+(defn valid-report-date
+  [x]
+  (when x
+    (let [s (str x)]
+      (try
+        (when-not (and (= 10 (count s))
+                       (= "-" (subs s 4 5))
+                       (= "-" (subs s 7 8))
+                       (.isdigit (str (subs s 0 4) (subs s 5 7) (subs s 8 10))))
+          (throw (python/ValueError "report_date must use YYYY-MM-DD")))
+        (.isoformat (datetime.date/fromisoformat s))
+        (catch python/Exception _
+          (throw (python/ValueError
+                  (str "invalid report_date field: " (pr-str x)))))))))
+
+(defn option-symbol?
+  [symbol]
+  (let [s (str symbol)]
+    (and (>= (count s) 15)
+         (contains? #{"C" "P"} (.upper (subs s (- (count s) 9)
+                                          (- (count s) 8)))))))
+
+(defn put-symbol?
+  [symbol]
+  (let [s (str symbol)]
+    (and (option-symbol? s)
+         (= "P" (.upper (subs s (- (count s) 9)
+                          (- (count s) 8)))))))
+
+(defn expected-market-long?
+  [symbol side]
+  (let [contract-long? (= "BUY" side)]
+    (if (put-symbol? symbol)
+      (not contract-long?)
+      contract-long?)))
+
+(defn pnl-tolerance
+  [expected]
+  (max 0.01 (* 1e-6 (math/fabs expected))))
+
+(defn order->canonical
+  [o]
+  {:account (nonblank-text "orders.account" (get o "account"))
+   :order-id (nonblank-text "orders.order_id" (get o "order_id"))
+   :symbol (nonblank-text "orders.symbol" (get o "symbol"))
+   :side (side-field "orders.side" (get o "side"))
+   :filled-at (required-dt "orders.filled_at" (get o "filled_at"))
+   :filled-avg-price (finite-number "orders.filled_avg_price" (get o "filled_avg_price"))
+   :qty (positive-int "orders.qty" (get o "qty"))
+   :order-type (get o "order_type")})
+
+(defn round-trip->canonical
+  [r]
+  {:account (nonblank-text "round_trips.account" (get r "account"))
+   :symbol (nonblank-text "round_trips.symbol" (get r "symbol"))
+   :open-time (required-dt "round_trips.open_time" (get r "open_time"))
+   :close-time (required-dt "round_trips.close_time" (get r "close_time"))
+   :side (when (contains? r "side") (side-field "round_trips.side" (get r "side")))
+   :is-long (bool-field "round_trips.is_long" (get r "is_long"))
+   :open-price (finite-number "round_trips.open_price" (get r "open_price"))
+   :close-price (finite-number "round_trips.close_price" (get r "close_price"))
+   :qty (positive-int "round_trips.qty" (get r "qty"))
+   :pnl-dollars (finite-number "round_trips.pnl_dollars" (get r "pnl_dollars"))
+   :hold-minutes (finite-number "round_trips.hold_minutes" (get r "hold_minutes"))})
+
+(defn open-entry->canonical
+  [e]
+  {:account (nonblank-text "open_entries.account" (get e "account"))
+   :symbol (nonblank-text "open_entries.symbol" (get e "symbol"))
+   :side (side-field "open_entries.side" (get e "side"))
+   :open-time (required-dt "open_entries.open_time" (get e "open_time"))
+   :open-price (finite-number "open_entries.open_price" (get e "open_price"))
+   :qty (positive-int "open_entries.qty" (get e "qty"))
+   :is-long (bool-field "open_entries.is_long" (get e "is_long"))
+   :is-option (bool-field "open_entries.is_option" (get e "is_option"))})
+
+(defn positions->canonical
+  [p]
+  (when-let [p (optional-object-field "positions" p)]
+    (let [symbols (if (contains? p "symbols")
+                    (optional-array-field "positions.symbols" (get p "symbols"))
+                    [])]
+      {:n-positions (nonnegative-int "positions.n_positions" (or (get p "n_positions") 0))
+       :market-value (finite-number "positions.market_value" (or (get p "market_value") 0.0))
+       :unrealized-pl (finite-number "positions.unrealized_pl" (or (get p "unrealized_pl") 0.0))
+       :symbols (mapv #(nonblank-text "positions.symbols[]" %) symbols)})))
+
+(defn validate-explicit-round-trip!
+  [report-date as-of r]
+  (when (> (.timestamp (:open-time r)) (.timestamp (:close-time r)))
+    (throw (python/ValueError "round_trip close_time is before open_time")))
+  (when (and as-of (> (.timestamp (:close-time r)) (.timestamp as-of)))
+    (throw (python/ValueError "round_trip close_time is after as_of")))
+  (when (and report-date
+             (not= report-date (date-str (:close-time r))))
+    (throw (python/ValueError "round_trip close_time is outside report_date")))
+  (let [expected (/ (- (.timestamp (:close-time r))
+                       (.timestamp (:open-time r)))
+                    60.0)]
+    (when (> (math/fabs (- expected (:hold-minutes r))) 0.001)
+      (throw (python/ValueError "round_trip hold_minutes does not match timestamps"))))
+  (let [option? (option-symbol? (:symbol r))
+        side (:side r)
+        market-long? (if side
+                       (expected-market-long? (:symbol r) side)
+                       (:is-long r))
+        _ (when (and side (not= market-long? (:is-long r)))
+            (throw (python/ValueError
+                    "round_trip is_long does not match symbol and side")))
+        contract-long? (if side (= "BUY" side) (:is-long r))
+        multiplier (if option? 100.0 1.0)
+        expected-pnl (* (if contract-long?
+                          (- (:close-price r) (:open-price r))
+                          (- (:open-price r) (:close-price r)))
+                        multiplier
+                        (:qty r))]
+    ;; Legacy daily reports did not persist option contract side. Without side,
+    ;; option P&L cannot be independently reconciled from prices because put
+    ;; market-direction and contract-direction differ; preserve supplied P&L.
+    (when (and (or side (not option?))
+               (> (math/fabs (- expected-pnl (:pnl-dollars r)))
+                  (pnl-tolerance expected-pnl)))
+      (throw (python/ValueError "round_trip pnl_dollars does not match prices, quantity, and side")))))
+
+(defn validate-explicit-open-entry!
+  [report-date as-of e]
+  (when (nil? report-date)
+    (throw (python/ValueError "explicit round_trips/open_entries require report_date or as_of")))
+  (when (> (date-str (:open-time e)) report-date)
+    (throw (python/ValueError "open_entry open_time is after report_date")))
+  (when (and as-of (> (.timestamp (:open-time e)) (.timestamp as-of)))
+    (throw (python/ValueError "open_entry open_time is after as_of")))
+  (when (not= (expected-market-long? (:symbol e) (:side e))
+              (:is-long e))
+    (throw (python/ValueError
+            "open_entry is_long does not match symbol and side"))))
+
+(defn inferred-explicit-report-date
+  [round-trips open-entries]
+  (let [dates (set (concat (map #(date-str (:close-time %)) round-trips)
+                           (map #(date-str (:open-time %)) open-entries)))]
+    (cond
+      (empty? dates) nil
+      (= 1 (count dates)) (first dates)
+      (empty? open-entries) nil
+      :else (throw (python/ValueError
+                    "explicit round_trips/open_entries span multiple dates; provide report_date or as_of")))))
+
+(defn ->jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map ->jsonable x))
+    (instance? fractions/Fraction x) (python/float x)
+    (and (python/isinstance x python/float)
+         (not (math/isfinite x))) nil
+    :else x))
+
+(defn compute-payload
+  [payload]
+  (let [_ (object-field "payload" payload)
+        explicit-round-trips (mapv round-trip->canonical
+                                   (array-member-field payload "round_trips"))
+        explicit-open-entries (mapv open-entry->canonical
+                                    (array-member-field payload "open_entries"))
+        paired? (or (seq explicit-round-trips) (seq explicit-open-entries))
+        raw-orders (array-member-field payload "orders")
+        orders (mapv order->canonical raw-orders)
+        has-orders? (seq raw-orders)
+        _ (when (and has-orders? paired?)
+            (throw (python/ValueError
+                    "orders are mutually exclusive with explicit round_trips/open_entries")))
+        as-of (parse-dt (get payload "as_of"))
+        report-date (or (valid-report-date (get payload "report_date"))
+                        (date-str as-of)
+                        (when paired?
+                          (inferred-explicit-report-date explicit-round-trips
+                                                         explicit-open-entries)))
+        _ (when paired?
+            (doseq [rt explicit-round-trips]
+              (validate-explicit-round-trip! report-date as-of rt))
+            (doseq [entry explicit-open-entries]
+              (validate-explicit-open-entry! report-date as-of entry)))
+        {:keys [round-trips open-entries unmatched-closes]} (if paired?
+                                                              {:round-trips explicit-round-trips
+                                                               :open-entries explicit-open-entries
+                                                               :unmatched-closes []}
+                                                              (rm/pair-round-trips orders))
+        positions (positions->canonical (get payload "positions"))]
+    {"metrics" (rm/compute-all-metrics-python round-trips)
+     "open_activity" (rm/open-activity-python open-entries positions {:as-of as-of})
+     "round_trips" (count round-trips)
+     "open_entries" (count open-entries)
+     "unmatched_closes" (count unmatched-closes)}))
+
+(def args (vec *command-line-args*))
+(def input-path (first args))
+(def payload (json/loads (if input-path (slurp input-path) (slurp *in*))))
+(let [batches (get payload "batches")
+      out (if batches
+            (do
+              (object-field "batches" batches)
+              {"batches" (into {} (map (fn [[k v]] [k (compute-payload v)])
+                                        (.items batches)))})
+            (compute-payload payload))]
+  (println (json/dumps (->jsonable out) ** :indent 2 :sort_keys true :allow_nan false)))

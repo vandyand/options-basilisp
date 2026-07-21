@@ -1,0 +1,464 @@
+(ns ops.test-market-evidence-status-smoke
+  (:import hashlib json os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]
+            [ops.test-market-evidence-manifest-smoke :as manifest-smoke]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts/market_evidence_status.lpy"))
+(def stamp manifest-smoke/stamp)
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp (str (resolve-basilisp)))
+
+(defn run-status [args]
+  (subprocess/run
+   (python/list (concat [basilisp "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :env (.copy os/environ)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn path [parent child] (.joinpath parent child))
+(defn read-json [p] (json/loads (.read_text p)))
+(defn parse-json [s] (json/loads s))
+(defn write-json! [p payload] (.write_text p (str (manifest-smoke/dumps payload) "\n")))
+
+(defn write-valid-manifest! [tmp]
+  (let [analysis (path tmp "analysis")
+        payloads (path tmp "payloads")
+        manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+    (manifest-smoke/write-bundle! analysis payloads)
+    (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                "--analysis-dir" (str analysis)
+                                                "--payload-dir" (str payloads)
+                                                "--out" (str manifest)])]
+      (is (= 0 (.-returncode written)) (.-stderr written)))
+    {:analysis analysis :payloads payloads :manifest manifest}))
+
+(defn sha256-file [p]
+  (.hexdigest (hashlib/sha256 (.read_bytes p))))
+
+(defn stamp-verified-apply-validation! [analysis manifest & [status-path]]
+  (let [validation (path analysis (str "neutralization_verified_apply_validation_" stamp ".json"))
+        dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+        status (or status-path (path analysis (str "market_evidence_status_" stamp ".json")))
+        payload (read-json validation)]
+    (.__setitem__ payload "manifest_json" (str manifest))
+    (.__setitem__ payload "status_json" (str status))
+    (.__setitem__ payload "manifest_sha256" (sha256-file manifest))
+    (.__setitem__ payload "dry_run_json" (str dry-run))
+    (.__setitem__ payload "dry_run_sha256" (sha256-file dry-run))
+    (write-json! validation payload)))
+
+(deftest market-evidence-status-rejects-unknown-cli-arguments
+  (let [result (run-status ["--target-date" "2026-07-05" "--manfiest" "x"])]
+    (is (= 2 (.-returncode result)))
+    (is (str/includes? (.-stderr result) "unknown argument: --manfiest"))))
+
+(deftest market-evidence-status-fails-without-matched-feature-parity-diagnostic
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          {:keys [analysis payloads manifest]} (write-valid-manifest! tmp)
+          result (run-status ["--target-date" "2026-07-05"
+                              "--analysis-dir" (str analysis)
+                              "--payload-dir" (str payloads)])
+          payload (parse-json (.-stdout result))]
+      (is (not= 0 (.-returncode result)))
+      (is (= false (get payload "ok?")))
+      (is (= true (get-in payload ["manifest" "valid?"])))
+      (is (= true (get-in payload ["manifest_verification" "valid?"])))
+      (is (= "PASS" (get-in payload ["readiness" "verdict"])))
+      (is (contains? (set (get payload "reasons"))
+                     "readiness matched feature parity diagnostic is missing"))
+      (is (= 2 (get-in payload ["manifest" "payload_example_count"])))
+      (is (= (str manifest) (get-in payload ["paths" "manifest"])))
+      (is (= false (get-in payload ["manifest" "diagnostics" "prediction_delta" "available"])))
+      (is (= false (get-in payload ["manifest" "diagnostics" "parity_gate" "available"])))
+      (is (= false (get-in payload ["manifest" "raw_unlock" "available"])))
+      (is (= 0 (get-in payload ["manifest" "raw_unlock" "candidate_count"])))
+      (is (= false (get payload "unmask_apply_ready?")))
+      (is (contains? (set (get payload "unmask_apply_reasons"))
+                     "verified apply command is not available from dry-run evidence")))))
+
+(deftest market-evidence-status-fails-when-manifest-checksum-verification-fails
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          {:keys [analysis payloads]} (write-valid-manifest! tmp)
+          readiness (path analysis (str "market_evidence_readiness_" stamp ".json"))]
+      (write-json! readiness {"verdict" "FAIL" "reasons" ["mutated"]})
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))
+            reasons (set (get payload "reasons"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (get payload "ok?")))
+        (is (= true (get-in payload ["manifest" "valid?"])))
+        (is (= false (get-in payload ["manifest_verification" "valid?"])))
+        (is (contains? reasons "manifest verification failed"))
+        (is (contains? reasons "readiness verdict is FAIL"))))))
+
+(deftest market-evidence-status-surfaces-direct-diagnostics-when-manifest-is-missing
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          capture (path analysis (str "capture_v2_sidecar_check_" stamp ".json"))
+          readiness (path analysis (str "market_evidence_readiness_" stamp ".json"))
+          verification (path analysis (str "thetadata_payload_verification_" stamp ".json"))
+          preflight (path analysis (str "capture_v2_runtime_preflight_" stamp ".json"))
+          source-audit (path analysis (str "captured_source_parity_" stamp ".json"))
+          corpus (path analysis (str "verified_feature_corpus_" stamp ".json"))]
+      (.mkdir analysis ** :parents true :exist_ok true)
+      (.mkdir payloads ** :parents true :exist_ok true)
+      (write-json! capture {"ok" false
+                            "status" "fail"
+                            "target_date" "2026-07-05"
+                            "generated_at" "2026-07-05T14:30:00Z"
+                            "capture_version" 2
+                            "row_count" 1
+                            "unique_time_count" 1
+                            "duplicate_time_count" 0
+                            "sidecar_nonblank_rows" {"option_chain_json" 1}
+                            "sidecar_useful_rows" {"option_chain_json" 1
+                                                   "option_surfaces_json" 0}
+                            "sidecar_total_contracts" {"option_chain_json" 668
+                                                       "option_surfaces_json" 0}
+                            "sidecar_malformed_contracts" {"option_chain_json" 0
+                                                           "option_surfaces_json" 0}
+                            "required_option_surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                            "option_surface_prefixes" []
+                            "issues" ["option_surfaces_json has no rows with option contracts"]
+                            "warnings" ["option_surface_status_json is missing"]})
+      (write-json! readiness {"verdict" "FAIL"
+                              "reasons" ["capture-v2 sidecar check did not pass"]})
+      (write-json! verification {"status" "ok"
+                                 "total" 2
+                                 "checked" 2
+                                 "invalid" 0})
+      (write-json! preflight {"ok" true
+                              "status" "ok"
+                              "sidecar_every" {"effective" 1}
+                              "target_capture_check" {"ok" false
+                                                      "status" "fail"}
+                              "issues" []
+                              "warnings" []})
+      (write-json! source-audit {"status" "fail"
+                                 "certifiable" false
+                                 "matched_rows" 12
+                                 "min_rows" 60
+                                 "reasons" ["matched rows below minimum 60"]
+                                 "provenance_compatibility" {"pass" false}})
+      (write-json! corpus {"ok" false
+                           "status" "rejected"
+                           "reason" "source audit is not certifiable"})
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))]
+        (is (not= 0 (.-returncode result)))
+        (is (= false (get payload "ok?")))
+        (is (= false (get-in payload ["manifest" "available"])))
+        (is (contains? (set (get payload "reasons")) "manifest is missing"))
+        (is (= true (get-in payload ["manifest" "direct_diagnostics" "capture_v2_sidecars" "available"])))
+        (is (= false (get-in payload ["manifest" "direct_diagnostics" "capture_v2_sidecars" "ok"])))
+        (is (= 1 (get-in payload ["manifest" "direct_diagnostics" "capture_v2_sidecars" "row_count"])))
+        (is (= 1 (get-in payload ["manifest" "direct_diagnostics" "capture_v2_sidecars" "issue_count"])))
+        (is (= true (get-in payload ["manifest" "direct_artifacts" "capture_v2_sidecars" "available"])))
+        (is (= true (get-in payload ["manifest" "direct_artifacts" "capture_v2_runtime_preflight" "available"])))
+        (is (= "fail" (get-in payload ["manifest" "direct_artifacts" "capture_v2_runtime_preflight" "target_capture_status"])))
+        (is (= true (get-in payload ["manifest" "direct_artifacts" "thetadata_payload_verification" "available"])))
+        (is (= "ok" (get-in payload ["manifest" "direct_artifacts" "thetadata_payload_verification" "status"])))
+        (is (= true (get-in payload ["manifest" "direct_artifacts" "readiness" "available"])))
+        (is (= "FAIL" (get-in payload ["manifest" "direct_artifacts" "readiness" "verdict"])))
+        (is (= true (get-in payload ["source_parity_gate" "available"])))
+        (is (= false (get-in payload ["source_parity_gate" "certifiable"])))
+        (is (= 12 (get-in payload ["source_parity_gate" "matched_rows"])))
+        (is (= "rejected" (get-in payload ["verified_feature_corpus" "status"])))
+        (is (= false (get-in payload ["verified_feature_corpus" "ok"])))))))
+
+(deftest market-evidence-status-surfaces-optional-diagnostics-when-manifested
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (manifest-smoke/write-bundle! analysis payloads)
+      (manifest-smoke/write-optional-diagnostics! analysis)
+      (write-json! (path analysis (str "historical_feature_cohort_" stamp ".json"))
+                   {"ok" true
+                    "status" "ok"
+                    "target_date" "2026-07-05"
+                    "rows" 120
+                    "features" 918
+                    "row_provenance_summary" {"rows" 120
+                                              "chain_present_rows" 120
+                                              "grid_appended_rows" 120
+                                              "carried_grid_rows" 0
+                                              "min_grid_history_len" 1
+                                              "max_grid_history_len" 10}})
+      (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                  "--analysis-dir" (str analysis)
+                                                  "--payload-dir" (str payloads)
+                                                  "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written)))
+      (stamp-verified-apply-validation! analysis manifest)
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (get payload "ok?")))
+        (is (= true (get payload "unmask_apply_ready?")))
+        (is (empty? (get payload "unmask_apply_reasons")))
+        (is (= true (get-in payload ["manifest" "diagnostics" "prediction_delta" "available"])))
+        (is (= true (get-in payload ["manifest" "diagnostics" "parity_gate" "available"])))
+        (is (= true (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity" "available"])))
+        (is (= 120 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity" "matched_rows"])))
+        (is (= 1.0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity" "min_correlation"])))
+        (is (= "historical SPY option universe density is comparable to live"
+               (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity" "contract_density" "reason"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "live_chain_observed_at_delta" "rows_over_180_seconds"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "live_grid_history_tail" "tail_mismatch_rows"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "grid_history_sequence" "sequence_mismatch_rows"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "best_sequence_lag" "lag_minutes"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "best_sequence_lag_by_mean" "lag_minutes"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "best_sequence_lag_by_min" "lag_minutes"])))
+        (is (= "aligned" (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                          "alignment_diagnosis" "category"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "grid_feature_input_parity"
+                                  "alignment_diagnosis" "historical_carried_grid_rows"])))
+        (is (= true (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "available"])))
+        (is (= 120 (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "matched_rows"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "problem_feature_count"])))
+        (is (= 0.0 (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "max_abs_deviation"])))
+        (is (= 1.0 (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "min_correlation"])))
+        (is (= 391 (get-in payload ["manifest" "diagnostics" "neutralized_feature_evidence"
+                                    "current_status_counts" "blocked-by-missing-market-evidence"])))
+        (is (= 135 (get-in payload ["manifest" "diagnostics" "neutralized_feature_evidence"
+                                    "missing_market_evidence_by_source" "option_surface_formula"])))
+        (is (= 391 (get-in payload ["manifest" "diagnostics" "neutralized_feature_evidence"
+                                    "missing_market_evidence_reason_counts" "missing-option-surface-prefix:SPX"])))
+        (is (= true (get-in payload ["manifest" "diagnostics" "capture_v2_runtime_preflight" "available"])))
+        (is (= true (get-in payload ["manifest" "diagnostics" "capture_v2_runtime_preflight" "ok"])))
+        (is (= true (get-in payload ["manifest" "diagnostics" "capture_v2_runtime_preflight" "target_capture_ok"])))
+        (is (= true (get-in payload ["manifest" "raw_unlock" "available"])))
+        (is (= true (get-in payload ["manifest" "raw_unlock" "unmask_dry_run_available"])))
+        (is (= true (get-in payload ["readiness" "historical_feature_cohort" "ok"])))
+        (is (= 120 (get-in payload ["readiness" "historical_feature_cohort" "rows"])))
+        (is (= 0 (get-in payload ["manifest" "diagnostics" "historical_feature_cohort"
+                                  "row_provenance_summary" "carried_grid_rows"])))
+        (is (= 120 (get-in payload ["manifest" "diagnostics" "historical_feature_cohort"
+                                    "row_provenance_summary" "grid_appended_rows"])))
+        (is (= true (get-in payload ["readiness" "raw_feature_unlock" "available"])))
+        (is (= 2 (get-in payload ["readiness" "raw_feature_unlock" "candidate_count"])))
+        (is (= "available" (get-in payload ["readiness" "v3_grid_unlock" "status"])))
+        (is (= 0 (get-in payload ["readiness" "v3_grid_unlock" "recomputed_candidate_now"])))
+        (is (= true (get-in payload ["verified_apply_validation" "apply_safe"])))))))
+
+(deftest market-evidence-status-surfaces-unavailable-unlock-diagnostics
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (manifest-smoke/write-bundle! analysis payloads)
+      (manifest-smoke/write-optional-diagnostics! analysis)
+      (write-json! (path analysis (str "raw_feature_unlock_audit_" stamp ".json"))
+                   {"summary" {"status" "unavailable"
+                               "target_date" "2026-07-05"
+                               "unavailable_reason" "capture-v2 sidecar check failed"
+                               "candidate_count" 0
+                               "candidate_features" []}
+                    "features" []})
+      (write-json! (path analysis (str "raw_feature_unlock_candidates_" stamp ".json")) [])
+      (write-json! (path analysis (str "v3_grid_unlock_audit_" stamp ".json"))
+                   {"summary" {"status" "unavailable"
+                               "target_date" "2026-07-05"
+                               "unavailable_reason" "baseline/model usage missing"
+                               "recomputed_candidate_now" 0}
+                    "features" []})
+      (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                  "--analysis-dir" (str analysis)
+                                                  "--payload-dir" (str payloads)
+                                                  "--out" (str manifest)])]
+        (is (not= 2 (.-returncode written)) (str (.-stdout written) (.-stderr written)))
+        (is (.exists manifest)))
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))]
+        (is (not= 2 (.-returncode result)) (.-stderr result))
+        (is (= "unavailable" (get-in payload ["manifest" "raw_unlock" "status"])))
+        (is (= false (get-in payload ["manifest" "raw_unlock" "available_status"])))
+        (is (= "capture-v2 sidecar check failed"
+               (get-in payload ["manifest" "raw_unlock" "unavailable_reason"])))
+        (is (= "unavailable"
+               (get-in payload ["manifest" "diagnostics" "v3_unlock" "status"])))
+        (is (= false
+               (get-in payload ["manifest" "diagnostics" "v3_unlock" "available_status"])))
+        (is (= "baseline/model usage missing"
+               (get-in payload ["manifest" "diagnostics" "v3_unlock" "unavailable_reason"])))))))
+
+(deftest market-evidence-status-fails-when-manifested-matched-parity-metrics-are-missing
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (manifest-smoke/write-bundle! analysis payloads)
+      (manifest-smoke/write-optional-diagnostics! analysis)
+      (let [matched (path analysis (str "matched_feature_parity_" stamp ".json"))
+            matched-payload (read-json matched)
+            summary (get matched-payload "summary")]
+        (doseq [k ["max_abs_deviation" "min_correlation" "matched_start" "matched_end"]]
+          (.pop summary k))
+        (write-json! matched matched-payload))
+      (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                  "--analysis-dir" (str analysis)
+                                                  "--payload-dir" (str payloads)
+                                                  "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written)))
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))
+            reasons (set (get payload "reasons"))]
+        (is (not= 0 (.-returncode result)))
+        (is (= false (get payload "ok?")))
+        (is (contains? reasons "matched feature parity diagnostic max_abs_deviation is missing or non-numeric"))
+        (is (contains? reasons "matched feature parity diagnostic min_correlation is missing or non-numeric"))
+        (is (contains? reasons "matched feature parity diagnostic matched_start is missing"))
+        (is (contains? reasons "matched feature parity diagnostic matched_end is missing"))))))
+
+(deftest market-evidence-status-surfaces-unavailable-matched-parity-cleanly
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (manifest-smoke/write-bundle! analysis payloads)
+      (manifest-smoke/write-optional-diagnostics! analysis)
+      (let [matched (path analysis (str "matched_feature_parity_" stamp ".json"))
+            matched-payload (read-json matched)
+            summary (get matched-payload "summary")
+            readiness (path analysis (str "market_evidence_readiness_" stamp ".json"))
+            readiness-payload (read-json readiness)]
+        (doseq [[k v] {"status" "unavailable"
+                       "available" false
+                       "unavailable_reason" "historical cache coverage gap"
+                       "matched_rows" 0
+                       "feature_count" 0
+                       "max_abs_deviation" nil
+                       "min_correlation" nil
+                       "matched_start" nil
+                       "matched_end" nil}]
+          (.__setitem__ summary k v))
+        (.__setitem__ matched-payload "features" (python/list []))
+        (write-json! matched matched-payload)
+        (.__setitem__ readiness-payload "matched_feature_parity"
+                       (python/dict {"available" false
+                                     "status" "unavailable"
+                                     "unavailable_reason" "historical cache coverage gap"
+                                     "matched_rows" 0
+                                     "problem_feature_count" 0}))
+        (write-json! readiness readiness-payload))
+      (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                  "--analysis-dir" (str analysis)
+                                                  "--payload-dir" (str payloads)
+                                                  "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written)))
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))
+            reasons (set (get payload "reasons"))]
+        (is (not= 0 (.-returncode result)))
+        (is (= false (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "available"])))
+        (is (= "unavailable" (get-in payload ["manifest" "diagnostics" "matched_feature_parity" "status"])))
+        (is (contains? reasons "matched feature parity diagnostic unavailable: historical cache coverage gap"))
+        (is (not (contains? reasons "matched feature parity diagnostic max_abs_deviation is missing or non-numeric")))
+        (is (not (contains? reasons "matched feature parity diagnostic matched_start is missing")))))))
+
+(deftest market-evidence-status-surfaces-failed-historical-cohort-directly
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (manifest-smoke/write-bundle! analysis payloads)
+      (manifest-smoke/write-optional-diagnostics! analysis)
+      (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                  "--analysis-dir" (str analysis)
+                                                  "--payload-dir" (str payloads)
+                                                  "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written)))
+      (let [historical-json (path analysis (str "historical_feature_cohort_" stamp ".json"))
+            historical-npz (path analysis (str "historical_features_" stamp ".npz"))
+            manifest-payload (read-json manifest)
+            historical-entry (get-in manifest-payload ["artifacts" "historical_features.npz"])]
+        (write-json! historical-json {"ok" false
+                                      "status" "error"
+                                      "target_date" "2026-07-05"
+                                      "generated_at" "2026-07-05T14:30:00Z"
+                                      "reason" "date map does not contain target date 2026-07-05"})
+        (.unlink historical-npz)
+        (.__setitem__ historical-entry "exists" false)
+        (write-json! manifest manifest-payload))
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))
+            reasons (set (get payload "reasons"))]
+        (is (not= 0 (.-returncode result)))
+        (is (= false (get payload "ok?")))
+        (is (= "error" (get-in payload ["manifest" "diagnostics" "historical_feature_cohort" "status"])))
+        (is (= "date map does not contain target date 2026-07-05"
+               (get-in payload ["manifest" "diagnostics" "historical_feature_cohort" "reason"])))
+        (is (contains? reasons
+                       "historical feature cohort unavailable: date map does not contain target date 2026-07-05"))
+        (is (not (contains? reasons "historical feature tensor artifact missing")))))))
+
+(deftest market-evidence-status-fails-when-readiness-matched-parity-disagrees-with-manifest
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          analysis (path tmp "analysis")
+          payloads (path tmp "payloads")
+          manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))]
+      (manifest-smoke/write-bundle! analysis payloads)
+      (manifest-smoke/write-optional-diagnostics! analysis)
+      (let [readiness (path analysis (str "market_evidence_readiness_" stamp ".json"))
+            readiness-payload (read-json readiness)
+            matched (get readiness-payload "matched_feature_parity")]
+        (.__setitem__ matched "matched_rows" 119)
+        (.__setitem__ matched "problem_feature_count" 1)
+        (write-json! readiness readiness-payload))
+      (let [written (manifest-smoke/run-manifest ["--target-date" "2026-07-05"
+                                                  "--analysis-dir" (str analysis)
+                                                  "--payload-dir" (str payloads)
+                                                  "--out" (str manifest)])]
+        (is (= 0 (.-returncode written)) (.-stderr written)))
+      (let [result (run-status ["--target-date" "2026-07-05"
+                                "--analysis-dir" (str analysis)
+                                "--payload-dir" (str payloads)])
+            payload (parse-json (.-stdout result))
+            reasons (set (get payload "reasons"))]
+        (is (not= 0 (.-returncode result)))
+        (is (= false (get payload "ok?")))
+        (is (contains? reasons "readiness matched feature parity rows do not match manifest diagnostic"))
+        (is (contains? reasons "readiness matched feature parity problem count does not match manifest diagnostic"))))))

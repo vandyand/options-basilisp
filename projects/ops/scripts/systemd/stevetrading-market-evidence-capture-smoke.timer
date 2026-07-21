@@ -1,0 +1,11 @@
+[Unit]
+Description=Smoke-check SteveTrading capture-v2 sidecars after open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:45:00 America/New_York
+AccuracySec=1min
+Persistent=true
+Unit=stevetrading-market-evidence-capture-smoke.service
+
+[Install]
+WantedBy=timers.target

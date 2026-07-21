@@ -1,0 +1,128 @@
+;; Basilisp implementation of the Steve-v2 live feature parity gate.
+(import datetime glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as gate])
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/live_feature_parity_gate.lpy -- "
+                "[--baseline-csv PATH] [--prediction-delta-csv PATH] [--out-dir DIR] "
+                "[--target-date YYYY-MM-DD] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:out-dir (os.path/join repo-root gate/default-analysis-dir)}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--baseline-csv")
+          (recur (nnext remaining) (assoc out :baseline-csv (option-value remaining arg)))
+
+          (= arg "--prediction-delta-csv")
+          (recur (nnext remaining) (assoc out :prediction-delta-csv (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining)
+                 (assoc out :target-date
+                        (cli-target-date (option-value remaining arg))))
+
+          (= arg "--write-unavailable")
+          (recur (next remaining) (assoc out :write-unavailable true))
+
+          (= arg "--unavailable-reason")
+          (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn compact-date [date]
+  (.replace (str date) "-" ""))
+
+(defn write-unavailable! [opts]
+  (let [target-date (:target-date opts)]
+    (when-not target-date
+      (throw (python/ValueError "missing required --target-date for --write-unavailable")))
+    (let [out-dir (:out-dir opts)
+          reason (or (:unavailable-reason opts) "parity gate unavailable")
+          generated-at (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                  "%Y-%m-%dT%H:%M:%SZ")
+          stamp (compact-date target-date)
+          out-base (os.path/join (str out-dir) (str "live_feature_parity_gate_" stamp))
+          json-path (str out-base ".json")
+          md-path (str out-base ".md")
+          payload {"target_date" target-date
+                   "generated_at" generated-at
+                   "status" "unavailable"
+                   "available" false
+                   "ok" false
+                   "verdict" "FAIL"
+                   "unavailable_reason" reason
+                   "reason_count" 1
+                   "reasons" [reason]
+                   "prediction_delta" {"available" false}}]
+      (os/makedirs (str out-dir) ** :exist_ok true)
+      (spit json-path (json/dumps (gate/->jsonable payload) ** :indent 2 :sort_keys true))
+      (spit md-path (str "# Live Feature Parity Gate\n\n"
+                         "- Target date: `" target-date "`\n"
+                         "- Status: `unavailable`\n"
+                         "- Verdict: `FAIL`\n"
+                         "- Reason: `" reason "`\n"))
+      {:payload payload
+       :json-path json-path
+       :markdown-path md-path})))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        {:keys [payload markdown-path json-path]} (if (:write-unavailable opts)
+                                                    (write-unavailable! opts)
+                                                    (gate/write-gate! opts))]
+    (println (json/dumps (gate/->jsonable payload) ** :indent 2 :sort_keys true))
+    (println (str "wrote " markdown-path))
+    (println (str "wrote " json-path))
+    (when (:write-unavailable opts)
+      (python/exit 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 1)))

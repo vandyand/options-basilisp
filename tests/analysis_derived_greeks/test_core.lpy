@@ -1,0 +1,57 @@
+(ns analysis-derived-greeks.test-core
+  (:import json os os.path tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.analysis.derived-greeks :as dg]))
+
+(defn write-json!
+  [path payload]
+  (let [parent (os.path/dirname path)]
+    (os/makedirs parent ** :exist_ok true)
+    (spit path (json/dumps (dg/jsonable payload)))))
+
+(deftest black-scholes-solver-produces-sane-first-order-greeks
+  (let [price (dg/bs-price "CALL" 100.0 100.0 0.25 0.04 0.0 0.20)
+        iv (dg/implied-vol "CALL" 100.0 100.0 0.25 0.04 0.0 price)
+        g (dg/greeks "CALL" 100.0 100.0 0.25 0.04 0.0 iv)]
+    (is (< (abs (- iv 0.20)) 1.0e-6))
+    (is (< 0.50 (get g "delta") 0.60))
+    (is (pos? (get g "gamma")))
+    (is (pos? (get g "vega")))
+    (is (neg? (get g "theta_daily")))
+    (is (neg? (get g "epsilon")))))
+
+(deftest derives-greeks-from-saved-thetadata-quote-and-underlying-examples
+  (with-open [td (tempfile/TemporaryDirectory)]
+    (let [root (os.path/join td "payload_examples")
+          stamp "20260706"
+          day-dir (os.path/join root stamp)]
+      (write-json!
+       (os.path/join day-dir "SPY_na_stock.snapshot.quote.json")
+       {"probe" "stock.snapshot.quote"
+        "symbol" "SPY"
+        "payload" {"bid" [99.99] "ask" [100.01] "timestamp" ["2026-07-06T10:00:00.000"]}})
+      (write-json!
+       (os.path/join day-dir "SPY_20260717_option.snapshot.quote.json")
+       {"probe" "option.snapshot.quote"
+        "symbol" "SPY"
+        "payload" {"strike" [100.0 100.0]
+                   "right" ["CALL" "PUT"]
+                   "bid" [2.45 2.10]
+                   "ask" [2.55 2.20]
+                   "expiration" ["2026-07-17" "2026-07-17"]
+                   "timestamp" ["2026-07-06T10:00:00.000" "2026-07-06T10:00:00.000"]}})
+      (let [payload (dg/derive-surfaces {:payload-dir root
+                                         :target-date "2026-07-06"
+                                         :risk-free-rate 0.04
+                                         :dividend-yield 0.0})
+            summary (get payload "summary")
+            row (first (get payload "sample_rows"))]
+        (is (= 1 (get summary "option_quote_examples")))
+        (is (= 2 (get summary "source_rows")))
+        (is (= 2 (get summary "derived_rows")))
+        (is (= 2 (get summary "valid_rows")))
+        (is (= "SPY" (get row "symbol")))
+        (is (pos? (get row "iv")))
+        (is (dg/finite-number? (get row "epsilon")))
+        (is (= 2 (get-in summary ["stats" "epsilon" "count"])))
+        (is (dg/valid-derived-row? row))))))

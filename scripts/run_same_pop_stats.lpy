@@ -1,0 +1,88 @@
+(import os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(def analysis-src (os.path/join repo-root "components" "analysis.core" "src"))
+(when-not (contains? (set (python/list (.-path sys))) analysis-src)
+  (.insert (.-path sys) 0 analysis-src))
+
+(require '[basilisp.edn :as edn])
+(require '[stevetrading.analysis.core :as analysis])
+
+(defn usage!
+  []
+  (println
+   (str "usage: basilisp run scripts/run_same_pop_stats.lpy -- "
+        "--live-tape <live_tape.csv> "
+        "--replay-tape <replay_tape.csv> "
+        "--live-episodes <episodes_live.csv> "
+        "--replay-episodes <episodes_replay.csv> "
+        "--calibration <sim_fill_calibration.edn> "
+        "--out <same_population_report.md> "
+        "[--bucket-seconds 60] [--bootstrap-reps 1000] "
+        "[--permutation-reps 1000] [--min-samples 30] "
+        "[--practical-mean-threshold 0.0] "
+        "[--manifest-out <manifest.edn>] [--edn-out <result.edn>]")))
+
+(def allowed-options
+  #{"--live-tape" "--replay-tape" "--live-episodes" "--replay-episodes"
+    "--calibration" "--out" "--bucket-seconds" "--bootstrap-reps"
+    "--permutation-reps" "--min-samples" "--practical-mean-threshold"
+    "--manifest-out" "--edn-out" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (usage!)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [{:keys [live-tape replay-tape live-episodes replay-episodes
+                  calibration bucket-seconds bootstrap-reps permutation-reps
+                  min-samples practical-mean-threshold out manifest-out edn-out]}
+          (analysis/parse-args args)]
+      (when (or (nil? live-tape)
+                (nil? replay-tape)
+                (nil? live-episodes)
+                (nil? replay-episodes)
+                (nil? calibration)
+                (nil? out))
+        (usage!)
+        (python/exit 2))
+      (let [result (analysis/write-same-population-report!
+                    {:live-tape live-tape
+                     :replay-tape replay-tape
+                     :live-episodes live-episodes
+                     :replay-episodes replay-episodes
+                     :calibration calibration
+                     :bucket-seconds (analysis/parse-int-arg bucket-seconds 60)
+                     :bootstrap-reps (analysis/parse-int-arg bootstrap-reps 1000)
+                     :permutation-reps (analysis/parse-int-arg permutation-reps 1000)
+                     :min-samples (analysis/parse-int-arg min-samples 30)
+                     :practical-mean-threshold
+                     (analysis/parse-double-arg practical-mean-threshold 0.0)
+                     :out out})]
+        (when edn-out
+          (spit edn-out (str (edn/write-string result) "\n")))
+        (when (and manifest-out (:manifest result))
+          (spit manifest-out (str (edn/write-string (:manifest result)) "\n")))
+        (println (edn/write-string
+                  {:status (:status result)
+                   :valid? (:valid? result)
+                   :report out
+                   :manifest manifest-out}))
+        (python/exit (if (:valid? result)
+                       0
+                       1))))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

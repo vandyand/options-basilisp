@@ -1,0 +1,132 @@
+(ns stevetrading.analysis.acquisition-feasibility
+  "Receipt-only historical acquisition feasibility analysis.  No market-data
+  endpoint is called from this namespace."
+  (:require [basilisp.edn :as edn])
+  (:import datetime glob json pathlib statistics))
+
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+(def mib 1048576.0)
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(name k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    (keyword? value) (name value)
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+
+(defn- under? [path root]
+  (try (.relative_to (.resolve path) (.resolve root)) true
+       (catch python/ValueError _ false)))
+
+(defn- read-json [path]
+  (json/loads (slurp (str path))))
+
+(defn- parse-instant [value]
+  (datetime.datetime/fromisoformat (.replace (str value) "Z" "+00:00")))
+
+(defn- calibration-row [receipt]
+  (let [actual-bytes (reduce + (map #(.get % "bytes") (.get receipt "raw_payloads")))
+        billable (float (.get (.get receipt "cost_preflight") "quoted_total_billable_bytes"))
+        checked (parse-instant (.get (.get receipt "cost_preflight") "checked_at_utc"))
+        collected (parse-instant (.get receipt "collected_at"))
+        elapsed (.total_seconds (- collected checked))]
+    {:actual-bytes actual-bytes
+     :billable-bytes billable
+     :compression-ratio (/ actual-bytes billable)
+     :elapsed-seconds elapsed
+     :actual-mib-per-second (/ (/ actual-bytes mib) elapsed)}))
+
+(defn- databento-candidate [candidate]
+  (let [quote-receipts (map #(read-json (pathlib/Path %)) (:metadata-receipts candidate))
+        billable (reduce + (map #(int (.get % "billable_size_bytes")) quote-receipts))
+        quoted-cost (reduce + (map #(float (.get % "quoted_cost_usd")) quote-receipts))
+        calibration-paths (glob/glob (:calibration-glob candidate))
+        calibration (map #(calibration-row (read-json (pathlib/Path %))) calibration-paths)
+        ratio (statistics/median (python/list (map :compression-ratio calibration)))
+        speed (statistics/median (python/list (map :actual-mib-per-second calibration)))
+        wire-bytes (* billable ratio)
+        projected-seconds (/ (/ wire-bytes mib) speed)]
+    {:id (:id candidate)
+     :provider :databento
+     :dataset (:dataset candidate)
+     :symbols (:symbols candidate)
+     :schemas (:schemas candidate)
+     :metadata-quoted-cost-usd quoted-cost
+     :metadata-billable-bytes billable
+     :calibration-samples (count calibration)
+     :median-compressed-to-billable-ratio ratio
+     :median-observed-mib-per-second speed
+     :estimated-wire-bytes wire-bytes
+     :projected-current-pipeline-seconds-per-month projected-seconds
+     :status :requires-batch-throughput-pilot}))
+
+(defn- theta-evidence [entry reference-month]
+  (case (:id entry)
+    :thetadata-option-quote-trade-full-chain-tick
+    (let [session-seconds 23400.0
+          sessions (float (:trading-sessions reference-month))
+          projected (* (:observed-wall-clock-seconds entry)
+                       (/ session-seconds (:observed-market-window-seconds entry))
+                       sessions)]
+      (assoc entry
+             :provider :thetadata
+             :projected-open-linear-seconds-per-session
+             (* (:observed-wall-clock-seconds entry)
+                (/ session-seconds (:observed-market-window-seconds entry)))
+             :projected-open-linear-seconds-per-month projected))
+
+    :thetadata-index-tick
+    (let [median-hour (statistics/median (python/list (:observed-one-hour-wall-clock-seconds entry)))
+          sessions (float (:trading-sessions reference-month))
+          projected (* median-hour 6.5 sessions)]
+      (assoc entry :provider :thetadata
+             :median-observed-seconds-per-market-hour median-hour
+             :projected-seconds-per-month projected))
+    entry))
+
+(defn evaluate [plan-path]
+  (let [plan (edn/read-string (slurp (str plan-path)))
+        target (:target plan)
+        reference (:reference-month target)
+        db (vec (map databento-candidate (:databento-candidates plan)))
+        theta (vec (map #(theta-evidence % reference) (:thetadata-evidence plan)))
+        db-seconds (reduce + (map :projected-current-pipeline-seconds-per-month db))
+        db-wire-bytes (reduce + (map :estimated-wire-bytes db))
+        index-seconds (or (:projected-seconds-per-month
+                           (first (filter #(= (:id %) :thetadata-index-tick) theta))) 0)
+        budget (:max-complete-corpus-seconds-per-month target)
+        remaining (max 0 (- budget index-seconds))
+        required-mibps (if (pos? remaining) (/ (/ db-wire-bytes mib) remaining) nil)]
+    {:schema-version 1
+     :kind :historical-acquisition-feasibility-v1
+     :created-at-utc (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ")
+     :plan-id (:id plan)
+     :trading-target (:trading-target plan)
+     :target target
+     :databento db
+     :thetadata theta
+     :aggregate
+     {:monthly-budget-seconds budget
+      :databento-estimated-wire-bytes db-wire-bytes
+      :databento-estimated-two-year-wire-bytes (* db-wire-bytes (:history-months target))
+      :databento-two-year-storage-passes
+      (<= (* db-wire-bytes (:history-months target)) (:max-corpus-bytes target))
+      :databento-current-pipeline-projected-seconds db-seconds
+      :thetadata-index-projected-seconds index-seconds
+      :seconds-remaining-for-databento-after-indexes remaining
+      :required-aggregate-databento-mib-per-second required-mibps
+      :current-raw-corpus-passes false
+      :decision "Current serial Databento retrieval and ThetaData full-chain ticks fail. Test bounded Databento batch/parallel delivery; retain ThetaData indexes; do not retry full-chain ThetaData tick history."}
+     :unestimated-vendor-side-candidates (:unestimated-vendor-side-candidates plan)}))
+
+(defn write-evaluation! [plan-path out-path]
+  (let [out (.resolve (pathlib/Path out-path))]
+    (when-not (under? out (.resolve canonical-manifest-root))
+      (throw (python/ValueError (str "--out must be below " (.resolve canonical-manifest-root)))))
+    (.mkdir (.-parent out) ** :parents true :exist_ok true)
+    (let [result (evaluate plan-path)]
+      (spit (str out) (json-text result))
+      result)))

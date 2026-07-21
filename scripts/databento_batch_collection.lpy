@@ -1,0 +1,253 @@
+;; Cost-, size-, and time-gated Databento Historical batch collector.
+;;
+;; This collector is intentionally single-schema and single-request.  It uses
+;; Databento's prepared batch delivery (DBN + Zstd) for requests large enough
+;; that the streaming endpoint is operationally inefficient.  A sanitized
+;; receipt is written immediately after submission and updated while polling,
+;; so an interrupted process never leaves an untraceable remote job.
+(import argparse collections.abc datetime decimal glob hashlib json os os.path pathlib shutil subprocess sys time traceback)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(import databento)
+
+(def canonical-raw-root (pathlib/Path "D:\\SteveTradingData\\raw\\v1"))
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    (python/isinstance value collections.abc/Mapping)
+    (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items value)))
+    (python/isinstance value python/list) (python/list (map jsonable value))
+    (python/isinstance value decimal/Decimal) (str value)
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true :default str) "\n"))
+
+(defn atomic-json! [path payload]
+  (let [target (pathlib/Path path)
+        temp (.with_suffix target (str (.-suffix target) ".tmp"))]
+    (.mkdir (.-parent target) ** :parents true :exist_ok true)
+    (spit (str temp) (json-text payload))
+    (os/replace (str temp) (str target))))
+
+(defn under? [path root]
+  (try (.relative_to (.resolve path) (.resolve root)) true
+       (catch python/ValueError _ false)))
+
+(defn sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [stream (python/open path "rb")]
+      (loop [chunk (.read stream 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read stream 1048576)))))
+    (.hexdigest digest)))
+
+(defn csv-items [value flag]
+  (let [items (vec (filter #(pos? (count %)) (map #(.strip %) (.split (str value) ","))))]
+    (when (empty? items) (throw (python/ValueError (str flag " must be non-empty"))))
+    items))
+
+(defn decimal-value [value flag]
+  (try (decimal/Decimal (str value))
+       (catch python/Exception error
+         (throw (python/ValueError (str "invalid " flag ": " error))))))
+
+(defn assert-corpus-volume-healthy! []
+  (when-not (= (.-name os) "nt")
+    (throw (python/RuntimeError "Databento batch collection is Windows-only against D:\\SteveTradingData")))
+  (let [command (python/list ["powershell" "-NoProfile" "-Command"
+                              "Get-Volume -DriveLetter D | Select-Object HealthStatus,OperationalStatus | ConvertTo-Json -Compress"])
+        completed (subprocess/run command ** :check true :capture_output true :text true :timeout 20)
+        volume (json/loads (.-stdout completed))]
+    (when-not (and (= (.get volume "HealthStatus") "Healthy")
+                   (not= -1 (.find (str (.get volume "OperationalStatus")) "OK")))
+      (throw (python/RuntimeError (str "external corpus volume is not healthy: " volume))))
+    volume))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--dataset" ** :required true)
+    (.add_argument parser "--class-id" ** :required true)
+    (.add_argument parser "--admission" ** :choices (python/list ["hard" "probationary"]) :required true)
+    (.add_argument parser "--symbols" ** :required true)
+    (.add_argument parser "--stype-in" ** :required true)
+    (.add_argument parser "--schema" ** :required true)
+    (.add_argument parser "--start" ** :required true)
+    (.add_argument parser "--end" ** :required true)
+    (.add_argument parser "--split-duration" ** :choices (python/list ["day" "week" "month" "year" "none"])
+                   :default "week")
+    (.add_argument parser "--split-size" ** :type int :default 2000000000)
+    (.add_argument parser "--poll-seconds" ** :type float :default 15.0)
+    (.add_argument parser "--max-wall-seconds" ** :type float :default 7200.0)
+    (.add_argument parser "--max-total-cost-usd" ** :default "0")
+    (.add_argument parser "--max-billable-bytes" ** :type int :default 17179869184)
+    (.add_argument parser "--max-download-bytes" ** :type int :default 6442450944)
+    (.add_argument parser "--out-root" ** :default (str canonical-raw-root))
+    (.add_argument parser "--manifest-root" ** :default (str canonical-manifest-root))
+    (.add_argument parser "--api-key-env" ** :default "DATABENTO_API_KEY")
+    (.add_argument parser "--job-id" ** :default nil
+                   :help "Resume one already-prepared job instead of submitting a duplicate")
+    (.parse_args parser (python/list argv))))
+
+(defn state-name [details]
+  (.lower (str (or (.get details "state") "unknown"))))
+
+(defn remote-size [details files]
+  ;; actual_size/billed_size are uncompressed DBN bytes. package_size and the
+  ;; per-file sizes represent the bytes that cross the wire after Zstd.
+  (let [package-size (.get details "package_size")
+        file-size (sum (keep (fn [item]
+                               (let [size (or (.get item "size") (.get item "size_bytes")
+                                              (.get item "content_length"))]
+                                 (when (some? size) (int size)))) files))]
+    (if (some? package-size) (int package-size) file-size)))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        raw-root (.resolve (pathlib/Path (.-out_root args)))
+        manifest-root (.resolve (pathlib/Path (.-manifest_root args)))
+        maximum-cost (decimal-value (.-max_total_cost_usd args) "--max-total-cost-usd")
+        _ (when-not (and (under? raw-root canonical-raw-root) (under? manifest-root canonical-manifest-root))
+            (throw (python/ValueError "collector writes only below D:\\SteveTradingData raw/v1 and manifests/v1")))
+        _ (when (or (neg? maximum-cost) (<= (.-max_billable_bytes args) 0)
+                    (<= (.-max_download_bytes args) 0) (<= (.-max_wall_seconds args) 0)
+                    (< (.-split_size args) 1000000000) (> (.-split_size args) 10000000000))
+            (throw (python/ValueError "invalid cost, byte, wall-time, or split-size gate")))
+        _ (assert-corpus-volume-healthy!)
+        key (os.environ/get (.-api_key_env args))
+        _ (when-not key (throw (python/RuntimeError (str "missing " (.-api_key_env args)))))
+        symbols (csv-items (.-symbols args) "--symbols")
+        client (databento/Historical ** :key key)
+        quoted-cost (decimal/Decimal (str (.get_cost (.-metadata client)
+                                                    ** :dataset (.-dataset args) :symbols (python/list symbols)
+                                                       :stype_in (.-stype_in args) :schema (.-schema args)
+                                                       :start (.-start args) :end (.-end args))))
+        billable-size (int (.get_billable_size (.-metadata client)
+                                                ** :dataset (.-dataset args) :symbols (python/list symbols)
+                                                   :stype_in (.-stype_in args) :schema (.-schema args)
+                                                   :start (.-start args) :end (.-end args)))
+        approved (and (<= quoted-cost maximum-cost) (<= billable-size (.-max_billable_bytes args)))
+        preflight {"approved" approved "checked_at_utc" (now-utc)
+                   "quoted_cost_usd" (str quoted-cost) "billable_size_bytes" billable-size
+                   "max_cost_usd" (str maximum-cost) "max_billable_bytes" (.-max_billable_bytes args)
+                   "max_download_bytes" (.-max_download_bytes args)}]
+    (when-not approved
+      (throw (ex-info "COST/SIZE PLAN BLOCKED: no batch job was submitted." {"preflight" preflight})))
+    (let [run-id (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y%m%dT%H%M%S%fZ")
+          trade-date (subs (.-start args) 0 10)
+          relative (.joinpath (pathlib/Path "databento") (.-dataset args) (.-admission args)
+                              (.-class_id args) (str "trade_date=" trade-date))
+          final-dir (.joinpath raw-root relative (str "run=" run-id))
+          staging-dir (.with_name final-dir (str (.-name final-dir) ".staging"))
+          manifest-path (.joinpath manifest-root relative (str "run=" run-id ".json"))
+          submitted (if (.-job_id args)
+                      (.get_job_details (.-batch client) (.-job_id args))
+                      (.submit_job (.-batch client)
+                                   ** :dataset (.-dataset args) :symbols (python/list symbols)
+                                      :stype_in (.-stype_in args) :stype_out "instrument_id"
+                                      :schema (.-schema args) :start (.-start args) :end (.-end args)
+                                      :encoding "dbn" :compression "zstd" :map_symbols false
+                                      :split_symbols false :split_duration (.-split_duration args)
+                                      :split_size (.-split_size args) :delivery "download"))
+          job-id (or (.get submitted "id") (.get submitted "job_id"))
+          _ (when-not job-id (throw (python/RuntimeError (str "batch submission omitted job id: " submitted))))
+          _ (when (and (.-job_id args)
+                       (or (not= (.get submitted "dataset") (.-dataset args))
+                           (not= (.get submitted "schema") (.-schema args))))
+              (throw (python/ValueError "--job-id does not match the declared dataset/schema")))
+          started (time/monotonic)
+          receipt (python/dict
+                   [#py ("schema_version" 1) #py ("provider" "databento")
+                    #py ("dataset" (.-dataset args)) #py ("class" (.-class_id args))
+                    #py ("admission" (.-admission args)) #py ("schema" (.-schema args))
+                    #py ("stype_in" (.-stype_in args)) #py ("symbols" (python/list symbols))
+                    #py ("started_at" (.-start args)) #py ("ended_at" (.-end args))
+                    #py ("collector_started_at" (now-utc))
+                    #py ("collector_revision" "databento-batch-collection-v1-basilisp")
+                    #py ("delivery" {"encoding" "dbn" "compression" "zstd"
+                                      "split_duration" (.-split_duration args)
+                                      "split_size" (.-split_size args)})
+                    #py ("cost_preflight" preflight) #py ("job_id" job-id)
+                    #py ("status" "submitted") #py ("submission" submitted)
+                    #py ("raw_payloads" (python/list))])]
+      (atomic-json! manifest-path receipt)
+      (loop [details (.get_job_details (.-batch client) job-id)]
+        (let [state (state-name details)
+              elapsed (- (time/monotonic) started)]
+          (.__setitem__ receipt "status" state)
+          (.__setitem__ receipt "updated_at" (now-utc))
+          (.__setitem__ receipt "elapsed_seconds" elapsed)
+          (.__setitem__ receipt "job_details" details)
+          (atomic-json! manifest-path receipt)
+          (cond
+            (= state "done") nil
+            (contains? #{"expired" "error" "failed" "cancelled"} state)
+            (throw (python/RuntimeError (str "Databento batch job ended in state " state)))
+            (>= elapsed (.-max_wall_seconds args))
+            (throw (python/TimeoutError (str "Databento batch job exceeded " (.-max_wall_seconds args) " seconds")))
+            :else (do (time/sleep (.-poll_seconds args))
+                      (recur (.get_job_details (.-batch client) job-id))))))
+      (let [details (.get_job_details (.-batch client) job-id)
+            files (vec (.list_files (.-batch client) job-id))
+            prepared-bytes (remote-size details files)]
+        (.__setitem__ receipt "job_details" details)
+        (.__setitem__ receipt "remote_files" files)
+        (.__setitem__ receipt "prepared_download_bytes" prepared-bytes)
+        (when (> prepared-bytes (.-max_download_bytes args))
+          (.__setitem__ receipt "status" "download-blocked-by-size-gate")
+          (.__setitem__ receipt "finished_at" (now-utc))
+          (atomic-json! manifest-path receipt)
+          (throw (python/RuntimeError
+                  (str "prepared batch is " prepared-bytes " bytes, above --max-download-bytes "
+                       (.-max_download_bytes args) "; nothing was downloaded"))))
+        (.mkdir staging-dir ** :parents true :exist_ok false)
+        (try
+          (let [downloaded (vec (.download (.-batch client) job-id ** :output_dir (str staging-dir) :keep_zip false))
+                payloads (vec (map (fn [path]
+                                     (let [p (pathlib/Path path)]
+                                       {"path" (str (.relative_to p staging-dir))
+                                        "bytes" (.-st_size (.stat p))
+                                        "sha256" (sha256-file p)}))
+                                   downloaded))
+                local-bytes (sum (map #(get % "bytes") payloads))]
+            (when (> local-bytes (.-max_download_bytes args))
+              (throw (python/RuntimeError (str "download crossed byte gate: " local-bytes))))
+            (.mkdir (.-parent final-dir) ** :parents true :exist_ok true)
+            (.replace staging-dir final-dir)
+            (.__setitem__ receipt "status" "complete")
+            (.__setitem__ receipt "finished_at" (now-utc))
+            (.__setitem__ receipt "elapsed_seconds" (- (time/monotonic) started))
+            (.__setitem__ receipt "raw_payloads" (jsonable payloads))
+            (.__setitem__ receipt "raw_run_dir" (str final-dir))
+            (.__setitem__ receipt "archive_status" "historical-batch-response")
+            (atomic-json! manifest-path receipt)
+            (.__setitem__ receipt "manifest_path" (str manifest-path))
+            receipt)
+          (catch python/Exception error
+            (let [quarantine (.joinpath (.-parent (.-parent canonical-raw-root)) "quarantine" "v1"
+                                        "databento" (.-dataset args) (str "run=" run-id ".partial"))]
+              (.mkdir (.-parent quarantine) ** :parents true :exist_ok true)
+              (when (.exists staging-dir) (shutil/move (str staging-dir) (str quarantine)))
+              (.__setitem__ receipt "status" "download-failed")
+              (.__setitem__ receipt "finished_at" (now-utc))
+              (.__setitem__ receipt "error" (str error))
+              (atomic-json! manifest-path receipt)
+              (throw error))))))))
+
+(try
+  (println (json-text (run-main (vec *command-line-args*))))
+  (python/exit 0)
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

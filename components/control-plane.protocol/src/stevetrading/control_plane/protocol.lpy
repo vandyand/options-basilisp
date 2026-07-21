@@ -21,6 +21,7 @@
   id, strategy id, or account id) and match only a runtime context with
   that identity. An ACTIVE switch must declare reason + activated-at;
   inactive entries may carry nils (the example manifest does)."
+  (:import datetime)
   (:require [stevetrading.domain.enums :as enums]
             [stevetrading.domain.identifiers :as identifiers]))
 
@@ -76,6 +77,39 @@
   [s]
   (and (string? s) (pos? (count s))))
 
+(defn- parse-iso-seconds
+  [s]
+  (try
+    (.timestamp
+     (datetime.datetime/fromisoformat
+      (.replace (str s) "Z" "+00:00")))
+    (catch python/Exception _ nil)))
+
+(defn- future-timestamp?
+  [seconds]
+  (let [now (.timestamp (datetime.datetime/now (.-utc datetime/timezone)))]
+    (> seconds (+ now 60.0))))
+
+(defn- check-audit-timestamp
+  [errors path value label]
+  (cond
+    (not (non-blank-string? value))
+    (conj errors (err :error/missing-field path
+                      (str label " must be a non-empty ISO timestamp")))
+
+    :else
+    (let [seconds (parse-iso-seconds value)]
+      (cond
+        (nil? seconds)
+        (conj errors (err :error/malformed-timestamp path
+                          (str label " must be parseable ISO timestamp")))
+
+        (future-timestamp? seconds)
+        (conj errors (err :error/future-timestamp path
+                          (str label " must not be in the future")))
+
+        :else errors))))
+
 (defn- duplicate-ids
   [ids]
   (->> (frequencies (filter some? ids))
@@ -118,6 +152,12 @@
                                    (str "unknown status "
                                         (pr-str (:control-plane/status
                                                  manifest)))))
+                 errors)
+        errors (if (contains? manifest :control-plane/generated-at)
+                 (check-audit-timestamp errors
+                                        [:control-plane/generated-at]
+                                        (:control-plane/generated-at manifest)
+                                        "control-plane generated-at")
                  errors)]
     errors))
 
@@ -290,6 +330,12 @@
                  (conj errors (err :error/conflicting-kill-switch
                                    path
                                    "active kill switch requires reason and activated-at"))
+                 errors)
+        errors (if (true? (:kill-switch/active? ks))
+                 (check-audit-timestamp errors
+                                        (conj path :kill-switch/activated-at)
+                                        (:kill-switch/activated-at ks)
+                                        "active kill-switch activated-at")
                  errors)]
     errors))
 
@@ -314,8 +360,12 @@
   and routes."
   [errors manifest]
   (let [strategy-ids (set (keep :strategy/id (:control-plane/strategies manifest)))
+        strategies (into {} (map (fn [s] [(:strategy/id s) s])
+                                 (:control-plane/strategies manifest)))
         account-ids (set (keep :account/id (:control-plane/accounts manifest)))
         process-ids (set (keep :process/id (:control-plane/processes manifest)))
+        processes (into {} (map (fn [p] [(:process/id p) p])
+                                (:control-plane/processes manifest)))
         route-ids (set (keep :route/id (:control-plane/routes manifest)))
         errors
         (reduce
@@ -328,13 +378,31 @@
                                             (conj path :strategy/process)
                                             (str "unknown process "
                                                  (pr-str (:strategy/process s))))))]
-             (if (or (nil? (:strategy/account-route s))
-                     (contains? route-ids (:strategy/account-route s)))
-               errors
-               (conj errors (err :error/dangling-reference
-                                 (conj path :strategy/account-route)
-                                 (str "unknown route "
-                                      (pr-str (:strategy/account-route s))))))))
+             (let [errors (if (or (nil? (:strategy/account-route s))
+                                  (contains? route-ids
+                                             (:strategy/account-route s)))
+                            errors
+                            (conj errors (err :error/dangling-reference
+                                              (conj path :strategy/account-route)
+                                              (str "unknown route "
+                                                   (pr-str
+                                                    (:strategy/account-route s))))))
+                   process (get processes (:strategy/process s))
+                   process-strategy-ids (when (vector?
+                                                (:process/strategies process))
+                                          (set (:process/strategies process)))]
+               (if (and (some? process)
+                        (non-blank-string? (:strategy/id s))
+                        (some? process-strategy-ids)
+                        (not (contains? process-strategy-ids
+                                        (:strategy/id s))))
+                 (conj errors (err :error/process-strategy-mismatch
+                                   (conj path :strategy/process)
+                                   (str "strategy " (:strategy/id s)
+                                        " points to process "
+                                        (:strategy/process s)
+                                        " but that process does not list it")))
+                 errors))))
          errors
          (map-indexed vector (:control-plane/strategies manifest)))
         errors
@@ -361,13 +429,28 @@
         (reduce
          (fn [errors [i p]]
            (reduce (fn [errors sid]
-                     (if (contains? strategy-ids sid)
-                       errors
-                       (conj errors (err :error/dangling-reference
-                                         [:control-plane/processes i
-                                          :process/strategies]
-                                         (str "unknown strategy "
-                                              (pr-str sid))))))
+                     (let [strategy (get strategies sid)
+                           path [:control-plane/processes i
+                                 :process/strategies]
+                           errors (if (contains? strategy-ids sid)
+                                    errors
+                                    (conj errors
+                                          (err :error/dangling-reference
+                                               path
+                                               (str "unknown strategy "
+                                                    (pr-str sid)))))]
+                       (if (and (some? strategy)
+                                (non-blank-string? (:process/id p))
+                                (not= (:process/id p)
+                                      (:strategy/process strategy)))
+                         (conj errors
+                               (err :error/process-strategy-mismatch
+                                    path
+                                    (str "process " (:process/id p)
+                                         " lists strategy " sid
+                                         " but the strategy points to process "
+                                         (:strategy/process strategy))))
+                         errors)))
                    errors
                    (:process/strategies p)))
          errors

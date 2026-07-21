@@ -11,8 +11,9 @@
   Torch-dependent tests SKIP (assert true + println) when torch/the REF
   tree are unavailable — the engine .venv has neither; run the full suite
   with the REF .venv's basilisp to exercise them."
-  (:import datetime importlib json math zoneinfo)
+  (:import datetime importlib json math numpy os os.path tempfile types zoneinfo)
   (:require [basilisp.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [stevetrading.bridge.steve-v2 :as b]))
 
 (def ref-root "/home/kingjames/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")
@@ -175,21 +176,450 @@
 
 (deftest signals-memoized-per-bar
   (let [spy-buf (python/list [#py {"time" "2026-06-11T10:00" "close" 600.0}])
+        hyg-buf (python/list [#py {"time" "2026-06-11T10:00" "close" 80.0}])
+        tlt-buf (python/list [#py {"time" "2026-06-11T10:00" "close" 90.0}])
+        vxx-buf (python/list [#py {"time" "2026-06-11T10:00" "close" 20.0}])
         cached {:chestnut :long :lynx :flat :moose :flat
                 :oak :flat :dolphin :flat :parrot :flat}
-        bridge {:buffers #py {"SPY" spy-buf}
+        bridge {:buffers #py {"SPY" spy-buf "HYG" hyg-buf "TLT" tlt-buf "VXX" vxx-buf}
                 :state (atom {:last-bar-time "2026-06-11T10:00"
-                              :last-result cached})}]
-    (testing "repeated calls within the same bar return the cached result"
-      (is (= cached (b/signals bridge)))
-      (is (= cached (b/signals bridge))))
-    (testing "a NEW bar time bypasses the cache (recompute is attempted)"
-      (.append spy-buf #py {"time" "2026-06-11T10:01" "close" 600.5})
-      (is (= :recomputed
-             (try
-               (b/signals bridge)
-               :served-stale-cache
-               (catch python/Exception _ :recomputed)))))))
+                              :last-result cached})}
+        previous (.get (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS")]
+    (try
+      (.__setitem__ (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" "0")
+      (testing "repeated calls within the same bar return the cached result"
+        (is (= cached (b/signals bridge)))
+        (is (= cached (b/signals bridge))))
+      (testing "a NEW bar time bypasses the cache (recompute is attempted)"
+        (.append spy-buf #py {"time" "2026-06-11T10:01" "close" 600.5})
+        (.append hyg-buf #py {"time" "2026-06-11T10:01" "close" 80.0})
+        (.append tlt-buf #py {"time" "2026-06-11T10:01" "close" 90.0})
+        (.append vxx-buf #py {"time" "2026-06-11T10:01" "close" 20.0})
+        (is (= :recomputed
+               (try
+                 (b/signals bridge)
+                 :served-stale-cache
+                 (catch python/Exception _ :recomputed)))))
+      (finally
+        (if (some? previous)
+          (.__setitem__ (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" previous)
+          (.pop (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" nil))))))
+
+(deftest signals-refuse-misaligned-stock-bars
+  (let [bridge {:buffers #py {"SPY" (python/list [#py {"time" "2026-06-11T10:01" "close" 600.0}])
+                              "HYG" (python/list [#py {"time" "2026-06-11T10:01" "close" 80.0}])
+                              "TLT" (python/list [#py {"time" "2026-06-11T10:00" "close" 90.0}])
+                              "VXX" (python/list [#py {"time" "2026-06-11T10:01" "close" 20.0}])}
+                :state (atom {})}
+        previous (.get (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS")]
+    (try
+      (.__setitem__ (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" "0")
+      (let [result (b/signals bridge)]
+        (is (= :incoherent-stock-bars (:fault result)))
+        (is (= :flat (:chestnut result)))
+        (is (= [{"symbol" "TLT" "bar_time" "2026-06-11T10:00"}]
+               (:lagging-symbols result))))
+      (finally
+        (if (some? previous)
+          (.__setitem__ (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" previous)
+          (.pop (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" nil))))))
+
+(deftest signals-force-flat-for-stale-spy-bar
+  (let [old-time (- (.now (.-datetime datetime) (.-utc datetime/timezone))
+                    (datetime/timedelta ** :minutes 10))
+        spy-buf (python/list [#py {"time" old-time "close" 600.0}])
+        bridge {:buffers #py {"SPY" spy-buf}
+                :state (atom {})}
+        previous (.get (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS")]
+    (try
+      (.__setitem__ (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" "60")
+      (let [s (b/signals bridge)]
+        (is (= :stale-spy-bar (:fault s)))
+        (is (= :flat (:chestnut s)))
+        (is (= :flat (:lynx s)))
+        (is (= :flat (:moose s)))
+        (is (= :flat (:oak s)))
+        (is (= :flat (:dolphin s)))
+        (is (= :flat (:parrot s)))
+        (is (> (:bar-lag-seconds s) 60.0)))
+      (finally
+        (if (some? previous)
+          (.__setitem__ (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" previous)
+          (.pop (.-environ os) "STEVE_MAX_SIGNAL_LAG_SECONDS" nil))))))
+
+(deftest bridge-uses-native-feature-vector-not-legacy-feature-engine
+  (let [source (slurp "components/bridge.steve-v2/src/stevetrading/bridge/steve_v2.lpy")]
+    (is (str/includes? source "raw-unlock/compute-live-feature-vector"))
+    (is (not (str/includes? source "scripts_5yr.live.feature_engine")))
+    (is (not (str/includes? source "scripts_5yr.live.model_inference")))
+    (is (not (str/includes? source ".compute_all_features")))
+    (is (not (str/includes? source ":engine engine")))))
+
+(deftest feature-capture-writes-atomically-and-preserves_required_arrays
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-capture-test-")
+        grid (numpy/zeros #py (6 21 8))
+        feats (numpy/array [1.0 2.0 3.0])
+        spy-buf (python/list [#py {"time" "2026-06-11T10:00" "close" 600.0}])
+        bridge {:np numpy
+                :grid-history (python/list [grid])
+                :buffers #py {"SPY" spy-buf}
+                :capture-dir dir
+                :capture-provenance {"schema_version" 1
+                                     "stock" {"provider" "thetadata" "bar_status" "completed"}}
+                :capture (atom [])
+                :last-chain-json (atom (json/dumps
+                                         (python/dict
+                                          {"contracts"
+                                           (python/list
+                                            [(python/dict {"strike" 600.0
+                                                           "right" "CALL"
+                                                           "bid" 1.0
+                                                           "ask" 1.2
+                                                           "expiration" "2026-07-10"})])})))
+                :last-option-surfaces-json (atom
+                                             (python/dict
+                                              {"SPXW" (json/dumps
+                                                       (python/dict
+                                                        {"contracts"
+                                                         (python/list
+                                                          [(python/dict {"strike" 6000.0
+                                                                         "right" "PUT"
+                                                                         "bid" 10.0
+                                                                         "ask" 10.5
+                                                                         "expiration" "2026-07-10"})])}))}))}
+        preds {:chestnut {:feats feats}
+               :lynx {:feats (numpy/add feats 10.0)}
+               :moose {:feats (numpy/add feats 20.0)}}]
+    (#'b/capture-features! bridge "2026-06-11T10:00" preds)
+    (let [files (vec (os/listdir dir))
+          npz-files (filter #(.endswith % ".npz") files)
+          tmp-files (filter #(not= -1 (.find % ".tmp")) files)
+          path (os.path/join dir (first npz-files))
+          data (numpy/load path ** :allow_pickle true)
+          data-files (set (vec (.-files data)))]
+      (is (= 1 (count npz-files)))
+      (is (= 0 (count tmp-files)))
+      (is (contains? data-files "capture_version"))
+	      (doseq [k ["times" "spy" "provenance_json" "bar_buffers_json" "option_chain_json"
+	                 "option_surfaces_json"
+	                 "grid_history_json"
+	                 "grids" "chestnut" "lynx" "moose"]]
+	        (is (contains? data-files k) k))
+	      (is (= 2 (int (aget (aget data "capture_version") 0))))
+	      (is (= "thetadata"
+	             (get-in (json/loads (str (aget (aget data "provenance_json") 0)))
+	                     ["stock" "provider"])))
+	      (doseq [k ["bar_buffers_json" "option_chain_json"
+	                 "option_surfaces_json" "grid_history_json"]]
+	        (is (= "object" (str (.-dtype (aget data k))))
+	            (str k " must stay object dtype so appends do not allocate huge fixed-width Unicode arrays")))
+	      (is (= 600.0
+	             (float (get-in (json/loads (str (aget (aget data "bar_buffers_json") 0)))
+	                            ["SPY" 0 "close"]))))
+	      (is (= 1
+	             (python/len (get (json/loads
+	                                (str (aget (aget data "option_chain_json") 0)))
+	                               "contracts"))))
+	      (is (= 600.0
+	             (float (get-in (json/loads
+	                              (str (aget (aget data "option_chain_json") 0)))
+	                             ["contracts" 0 "strike"]))))
+	      (is (= 1
+	             (python/len
+	              (get (json/loads
+	                    (get (json/loads
+	                          (str (aget (aget data "option_surfaces_json") 0)))
+	                         "SPXW"))
+	                   "contracts"))))
+      (is (= 6000.0
+	             (float
+	              (get-in (json/loads
+	                       (get (json/loads
+	                             (str (aget (aget data "option_surfaces_json") 0)))
+	                            "SPXW"))
+	                      ["contracts" 0 "strike"]))))
+      (is (= [1 6 21 8]
+             (vec (.-shape (numpy/array
+                            (json/loads (str (aget (aget data "grid_history_json") 0))))))))
+      (is (= [1 3] (vec (.-shape (aget data "chestnut")))))
+      (is (= 600.0 (float (aget (aget data "spy") 0)))))))
+
+(deftest feature-capture-skips-blank-bar-times
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-capture-blank-time-test-")
+        grid (numpy/zeros #py (6 21 8))
+        feats (numpy/array [1.0 2.0 3.0])
+        bridge {:np numpy
+                :grid-history (python/list [grid])
+                :buffers #py {"SPY" (python/list)}
+                :capture-dir dir
+                :capture (atom [])}
+        preds {:chestnut {:feats feats}
+               :lynx {:feats (numpy/add feats 10.0)}
+               :moose {:feats (numpy/add feats 20.0)}}]
+    (#'b/capture-features! bridge nil preds)
+    (#'b/capture-features! bridge "   " preds)
+    (is (= [] @(:capture bridge)))
+    (is (= [] (vec (os/listdir dir))))))
+
+(deftest feature-capture-appends-across-bars-and-process-restarts
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-capture-append-test-")
+        grid (numpy/zeros #py (6 21 8))
+        feats (numpy/array [1.0 2.0 3.0])
+        preds {:chestnut {:feats feats}
+               :lynx {:feats (numpy/add feats 10.0)}
+               :moose {:feats (numpy/add feats 20.0)}}
+        spy-buf-a (python/list [#py {"time" "2026-06-11T10:00" "close" 600.0}])
+        bridge-a {:np numpy
+                  :grid-history (python/list [grid])
+                  :buffers #py {"SPY" spy-buf-a}
+                  :capture-dir dir
+                  :capture (atom [])}]
+    (#'b/capture-features! bridge-a "2026-06-11T10:00" preds)
+    (.append spy-buf-a #py {"time" "2026-06-11T10:01" "close" 601.0})
+    (#'b/capture-features! bridge-a "2026-06-11T10:01" preds)
+    (let [path (os.path/join dir (first (filter #(.endswith % ".npz") (os/listdir dir))))
+          data (numpy/load path ** :allow_pickle true)]
+      (is (= 2 (python/len (aget data "times"))))
+      (is (= ["2026-06-11T10:00" "2026-06-11T10:01"]
+             (vec (aget data "times"))))
+      (is (every? #(pos? (count (str %)))
+                  (vec (aget data "bar_buffers_json")))
+          "default capture must include raw sidecars every bar for parity evidence"))
+    (let [spy-buf-b (python/list [#py {"time" "2026-06-11T10:02" "close" 602.0}])
+          bridge-b {:np numpy
+                    :grid-history (python/list [grid])
+                    :buffers #py {"SPY" spy-buf-b}
+                    :capture-dir dir
+                    :capture (atom [])}]
+      (#'b/capture-features! bridge-b "2026-06-11T10:02" preds)
+      (.append spy-buf-b #py {"time" "2026-06-11T10:03" "close" 603.0})
+      (#'b/capture-features! bridge-b "2026-06-11T10:03" preds))
+    (let [path (os.path/join dir (first (filter #(.endswith % ".npz") (os/listdir dir))))
+          data (numpy/load path ** :allow_pickle true)]
+      (is (= 4 (python/len (aget data "times"))))
+	      (doseq [k ["bar_buffers_json" "option_chain_json"
+	                 "option_surfaces_json" "grid_history_json"]]
+	        (is (= "object" (str (.-dtype (aget data k))))
+	            (str k " must remain object dtype across process restarts")))
+	      (is (= ["2026-06-11T10:00" "2026-06-11T10:01"
+                "2026-06-11T10:02" "2026-06-11T10:03"]
+	             (vec (aget data "times")))))))
+
+(deftest feature-capture-dedupes-equivalent-time-encodings-across-restarts
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-capture-time-dedupe-test-")
+        grid (numpy/zeros #py (6 21 8))
+        feats (numpy/array [1.0 2.0 3.0])
+        preds {:chestnut {:feats feats}
+               :lynx {:feats (numpy/add feats 10.0)}
+               :moose {:feats (numpy/add feats 20.0)}}
+        bridge-a {:np numpy
+                  :grid-history (python/list [grid])
+                  :buffers #py {"SPY" (python/list [#py {"time" "#inst \"2026-07-07T16:43:00+00:00\""
+                                                        "close" 600.0}])}
+                  :capture-dir dir
+                  :capture (atom [])}
+        bridge-b {:np numpy
+                  :grid-history (python/list [grid])
+                  :buffers #py {"SPY" (python/list [#py {"time" "2026-07-07T16:43:00Z"
+                                                        "close" 600.0}])}
+                  :capture-dir dir
+                  :capture (atom [])}]
+    (#'b/capture-features! bridge-a "#inst \"2026-07-07T16:43:00+00:00\"" preds)
+    (#'b/capture-features! bridge-b "2026-07-07T16:43:00Z" preds)
+    (let [path (os.path/join dir (first (filter #(.endswith % ".npz") (os/listdir dir))))
+          data (numpy/load path ** :allow_pickle true)]
+      (is (= 1 (python/len (aget data "times"))))
+      (is (= ["2026-07-07T16:43:00Z"] (vec (aget data "times")))))))
+
+(deftest feature-capture-recovers-from-fixed-width-unicode-sidecar-file
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-capture-unicode-recover-test-")
+        stamp (.strftime (datetime.datetime/now (.-utc datetime/timezone))
+                          "%Y%m%d")
+        path (os.path/join dir (str "live_features_" stamp ".npz"))
+        grid (numpy/zeros #py (6 21 8))
+        feats (numpy/array [1.0 2.0 3.0])
+        corrupt-surface (apply str (repeat 10000 "x"))
+        _ (numpy/savez_compressed
+           path
+           ** :capture_version (numpy/array (python/list [2]))
+           :times (numpy/array (python/list ["2026-07-07T16:00:00Z"]))
+           :spy (numpy/array (python/list [600.0]))
+           :bar_buffers_json (numpy/array (python/list ["{}"]))
+           :option_chain_json (numpy/array (python/list ["{}"]))
+           :option_surfaces_json (numpy/array (python/list [corrupt-surface]))
+           :grid_history_json (numpy/array (python/list ["[]"]))
+           :grids (numpy/zeros #py (1 6 21 8))
+           :chestnut (numpy/zeros #py (1 3))
+           :lynx (numpy/zeros #py (1 3))
+           :moose (numpy/zeros #py (1 3)))
+        spy-buf (python/list [#py {"time" "2026-07-07T16:01:00Z" "close" 601.0}])
+        bridge {:np numpy
+                :grid-history (python/list [grid])
+                :buffers #py {"SPY" spy-buf}
+                :capture-dir dir
+                :capture (atom [])
+                :last-chain-json (atom "{}")
+                :last-option-surfaces-json (atom (python/dict))}
+        preds {:chestnut {:feats feats}
+               :lynx {:feats (numpy/add feats 10.0)}
+               :moose {:feats (numpy/add feats 20.0)}}]
+    (#'b/capture-features! bridge "2026-07-07T16:01:00Z" preds)
+    (let [data (numpy/load path ** :allow_pickle true)]
+      (is (= 2 (python/len (aget data "times"))))
+      (doseq [k ["bar_buffers_json" "option_chain_json"
+                 "option_surfaces_json" "grid_history_json"]]
+        (is (= "object" (str (.-dtype (aget data k))))
+            (str k " must be normalized to object dtype after recovery"))))))
+
+(deftest feature-capture-failed-writes-do-not-accumulate-sidecar-backlog
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-capture-fail-test-")
+        grid (numpy/zeros #py (6 21 8))
+        big-sidecar (.dumps json (python/dict {"contracts"
+                                                (python/list
+                                                 (map (fn [i]
+                                                        (python/dict {"strike" i
+                                                                      "right" "CALL"
+                                                                      "bid" 1.0
+                                                                      "ask" 1.1
+                                                                      "expiration" "2026-07-10"}))
+                                                      (range 5000))) }))
+        feats (numpy/array [1.0 2.0 3.0])
+        bridge {:np numpy
+                :grid-history (python/list [grid])
+                :buffers #py {"SPY" (python/list)}
+                :capture-dir dir
+                :capture (atom [])
+                :last-chain-json (atom big-sidecar)
+                :last-option-surfaces-json (atom (python/dict {"SPXW" big-sidecar}))}
+        preds {:chestnut {:feats feats}
+               :lynx {:feats (numpy/add feats 10.0)}
+               :moose {:feats (numpy/add feats 20.0)}}]
+    (os/chmod dir 320)
+    (try
+      (#'b/capture-features! bridge "2026-06-11T10:00" preds)
+      (#'b/capture-features! bridge "2026-06-11T10:01" preds)
+      (#'b/capture-features! bridge "2026-06-11T10:02" preds)
+      (finally
+        (os/chmod dir 448)))
+    (is (= 1 (count @(:capture bridge))))
+    (is (= "2026-06-11T10:02" (:time (first @(:capture bridge)))))))
+
+(deftest option-surface-sidecar-merges-formula-features
+  (let [bridge {:generic-option-feature-fn
+	                (fn [prefix chain-json]
+	                  (python/dict {(str prefix "_opt_contract_count") 4.0}))
+                :last-option-surfaces-json (atom (python/dict))
+                :last-option-features (atom (python/dict))}
+        result (b/on-option-surface!
+	                bridge
+	                {:prefix "VIX"
+	                 :observed-at ((.-datetime datetime) 2026 7 7 15 30
+	                               ** :tzinfo (zoneinfo/ZoneInfo "America/New_York"))
+                 :underlying 16.0
+                 :contracts [{:strike 16.0 :right "CALL" :bid 0.5 :ask 0.7
+                              :expiration "2026-07-08"}
+                             {:strike 16.0 :right "PUT" :bid 0.4 :ask 0.5
+                              :expiration "2026-07-08"}]})]
+    (is (= "VIX" (:prefix result)))
+    (is (= 1 (:n-features result)))
+    (is (= 4.0 (.get @(:last-option-features bridge)
+                     "VIX_opt_contract_count")))
+    (is (contains? (set (vec (.keys @(:last-option-surfaces-json bridge))))
+                   "VIX"))
+    (is (= 16.0
+           (float
+            (get-in (json/loads (.get @(:last-option-surfaces-json bridge) "VIX"))
+                    ["contracts" 0 "strike"])))) ))
+
+(deftest live-option-sidecars-serialize-basilisp-contracts-as-json-objects
+  (let [dir (tempfile/mkdtemp ** :prefix "steve-v2-live-sidecar-test-")
+        grid (numpy/zeros #py (6 21 8))
+        observed ((.-datetime datetime) 2026 7 7 15 30
+                  ** :tzinfo (zoneinfo/ZoneInfo "America/New_York"))
+        spy-buf (python/list [#py {"time" "2026-07-07T15:30:00-04:00"
+                                   "close" 746.0}])
+        bridge {:np numpy
+                :grid-builder (types/SimpleNamespace
+                               ** :build_grid (fn [_contracts _underlying _observed-at]
+                                                 grid))
+                :grid-history (python/list)
+                :buffers #py {"SPY" spy-buf}
+                :capture-dir dir
+                :capture (atom [])
+                :risk-free-rate 0.01
+                :greeks-fns {:time-to-expiry (fn [_expiration _observed-at] 0.01)
+                             :implied-vol (fn [& _args] 0.2)
+                             :bs-greeks (fn [& _args]
+                                          (python/dict {"delta" 0.5
+                                                        "vega" 0.1
+                                                        "theta" -0.01
+                                                        "rho" 0.02}))}
+                :option-feature-fn (fn [_chain-json] (python/dict))
+                :generic-option-feature-fn (fn [_prefix _chain-json] (python/dict))
+                :generic-greek-grid-feature-fn (fn [_prefix _grid] (python/dict))
+                :last-chain-json (atom nil)
+                :last-option-surfaces-json (atom (python/dict))
+                :last-option-surface-status-json (atom (python/dict))
+                :last-option-features (atom (python/dict))}
+        preds {:chestnut {:feats (numpy/array [1.0 2.0 3.0])}
+               :lynx {:feats (numpy/array [4.0 5.0 6.0])}
+               :moose {:feats (numpy/array [7.0 8.0 9.0])}}]
+    (b/on-chain!
+     bridge
+     {:observed-at observed
+      :contracts [{:strike 746.0
+                   :right "CALL"
+                   :bid 1.0
+                   :ask 1.2
+                   :bid-size 10
+                   :ask-size 11
+                   :expiration "2026-07-08"
+                   :open-interest 42}]})
+    (b/on-option-surface!
+     bridge
+     {:prefix "VIXW"
+      :observed-at observed
+      :underlying 16.0
+      :contracts [{:strike 16.0
+                   :right "PUT"
+                   :bid 0.4
+                   :ask 0.5
+                   :bid-size 20
+                   :ask-size 21
+                   :expiration "2026-07-08"
+                   :open-interest 84}]})
+    (b/record-option-surface-status!
+     bridge
+     {:prefix "VIXW"
+      :observed-at observed
+      :ok? true
+      :underlying 16.0
+      :contracts 1
+      :n-gridded 1
+      :n-features 2})
+    (#'b/capture-features! bridge "2026-07-07T15:30:00-04:00" preds)
+    (let [path (os.path/join dir (first (filter #(.endswith % ".npz") (os/listdir dir))))
+          data (numpy/load path ** :allow_pickle true)
+          chain-payload (json/loads (str (aget (aget data "option_chain_json") 0)))
+          chain-contract (get-in chain-payload ["contracts" 0])
+          surfaces-payload (json/loads (str (aget (aget data "option_surfaces_json") 0)))
+          vixw-payload (json/loads (get surfaces-payload "VIXW"))
+          vixw-contract (get-in vixw-payload ["contracts" 0])
+          status-payload (json/loads (str (aget (aget data "option_surface_status_json") 0)))
+          vixw-status (json/loads (get status-payload "VIXW"))]
+      (is (python/isinstance chain-contract python/dict))
+      (is (= 746.0 (float (get chain-contract "strike"))))
+      (is (= "CALL" (get chain-contract "right")))
+      (is (= 10.0 (float (get chain-contract "bid_size"))))
+      (is (= 42.0 (float (get chain-contract "open_interest"))))
+      (is (python/isinstance vixw-contract python/dict))
+      (is (= 16.0 (float (get vixw-contract "strike"))))
+      (is (= "PUT" (get vixw-contract "right")))
+      (is (= 21.0 (float (get vixw-contract "ask_size"))))
+      (is (= 84.0 (float (get vixw-contract "open_interest"))))
+      (is (= true (get vixw-status "ok")))
+      (is (= 1 (int (get vixw-status "contracts"))))
+      (is (= 2 (int (get vixw-status "n_features")))))))
 
 ;; ────────────────────────────────────────────────────────────────────────────
 ;; torch/xgboost-dependent: bundle load + deterministic synthetic predict

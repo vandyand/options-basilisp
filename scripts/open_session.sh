@@ -10,9 +10,16 @@
 #   28 9 * * 1-5 /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/scripts/open_session.sh >> /home/kingjames/contracting/upwork/steven-tran/stevetrading-basilisp/live_runtime/open_session.cron.log 2>&1
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-LIFECYCLE="$HOME/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor/thetadata_lifecycle.sh"
+REPO="${STEVE_REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+DEFAULT_REF="$HOME/contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor"
+if [ -z "${STEVE_REF_ROOT:-}" ] && [ -d /opt/stevetrading/shared/Data-Preprocessor ]; then
+  DEFAULT_REF="/opt/stevetrading/shared/Data-Preprocessor"
+fi
+REF="${STEVE_REF_ROOT:-$DEFAULT_REF}"
+LIFECYCLE="${STEVE_THETADATA_LIFECYCLE:-$REF/thetadata_lifecycle.sh}"
+BASILISP="${BASILISP_BIN:-$REF/.venv/bin/basilisp}"
 cd "$REPO"
+export STEVE_REPO_ROOT="$REPO"
 
 # ~/.bashrc's interactivity guard (line 6: `case $- in *i*) ;; *) return`)
 # returns before the export lines under cron — caused the 2026-06-11
@@ -25,6 +32,9 @@ fi
 
 log() { echo "$(date -u '+%FT%TZ') [open-session] $*"; }
 
+ls -d components/*/src bases/*/src | paste -sd: - > .nrepl-pythonpath
+PYPATH="$(cat .nrepl-pythonpath)"
+
 log "starting theta terminal"
 "$LIFECYCLE" start || { log "terminal start failed — aborting"; exit 1; }
 
@@ -35,8 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 log "launching session"
-PYTHONPATH="$(cat "$REPO/.nrepl-pythonpath")" \
-  "$REPO/.venv/bin/basilisp" run "$REPO/scripts/launch_open_venturevd.lpy"
+PYTHONPATH="$PYPATH" "$BASILISP" run "$REPO/scripts/launch_open_venturevd.lpy"
 rc=$?
 log "session exited rc=$rc"
 exit $rc

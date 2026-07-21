@@ -1,0 +1,219 @@
+;; Prepare today's Steve V2 capture file before a live session starts.
+(import datetime json os os.path re shutil subprocess sys)
+
+(def structural-issue-patterns
+  ["capture_version must be 2"
+   "capture_version array is empty"
+   "missing required arrays"
+   "times array is missing"
+   "blank timestamp rows"
+   "malformed timestamp rows"
+   "duplicate timestamp rows"
+   "non-object contract entries"
+   "sidecar dtype must be object"
+   "invalid JSON rows"
+   "row count"
+   "failed to read capture NPZ"
+   "filename stamp"])
+
+(defn repo-root []
+  (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+
+(defn basilisp-bin []
+  (let [env-bin (os.environ/get "BASILISP_BIN")
+        repo-candidate (os.path/join (repo-root) ".venv/bin/basilisp")
+        shared-candidate "/opt/stevetrading/shared/Data-Preprocessor/.venv/bin/basilisp"]
+    (cond
+      (and env-bin (pos? (count env-bin))) env-bin
+      (os.path/exists repo-candidate) repo-candidate
+      (os.path/exists shared-candidate) shared-candidate
+      :else "basilisp")))
+
+(defn now-utc []
+  (.isoformat (.replace (datetime.datetime/now datetime.timezone/utc)
+                        ** :microsecond 0)))
+
+(defn target-date [value]
+  (if (and value (pos? (count (str value))))
+    (do
+      (try
+        (datetime.date/fromisoformat value)
+        (catch python/Exception _
+          (throw (python/ValueError (str "target date must be YYYY-MM-DD: " value)))))
+      value)
+    (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%d")))
+
+(defn stamp [target-date]
+  (.replace target-date "-" ""))
+
+(defn safe-reason [reasons]
+  (let [joined (or (some->> reasons (take 3) (vec) (seq) (.join "-")) "invalid")
+        safe (.strip (re/sub "[^A-Za-z0-9_.-]+" "-" joined) "-")]
+    (let [truncated (subs safe 0 (min 80 (count safe)))]
+      (if (pos? (count truncated)) truncated "invalid"))))
+
+(defn int-value [x]
+  (try
+    (int (or x 0))
+    (catch python/Exception _ 0)))
+
+(defn contains-substr? [s needle]
+  (>= (.find (str s) (str needle)) 0))
+
+(defn structural-reasons [check]
+  (if (= "missing" (get check "status"))
+    []
+    (let [issues (map str (or (get check "issues") []))
+          reasons (atom [])]
+      (doseq [issue issues]
+        (when (some #(contains-substr? issue %) structural-issue-patterns)
+          (swap! reasons conj issue)))
+      (when (pos? (int-value (get check "duplicate_time_count")))
+        (swap! reasons conj "duplicate timestamp rows"))
+      (let [malformed (get check "sidecar_malformed_contracts")]
+        (when (and (map? malformed)
+                   (pos? (reduce + 0 (map int-value (vals malformed)))))
+          (swap! reasons conj "malformed non-object contract entries")))
+      (vec (sort (set @reasons))))))
+
+(defn checker-script []
+  (os.path/join (repo-root) "scripts/capture_v2_sidecar_check.lpy"))
+
+(defn validate-capture [capture target-date]
+  (let [cmd (python/list [(basilisp-bin) "run" (checker-script) "--"
+	                          "--capture" (str capture)
+	                          "--target-date" target-date
+	                          "--min-rows" "1"
+	                          "--sidecar-row-limit" "10"
+	                          "--fast-json"])
+        proc (subprocess/run cmd ** :cwd (repo-root) :text true
+                             :stdout subprocess/PIPE :stderr subprocess/PIPE)
+        stdout (str (.-stdout proc))]
+    (try
+      (json/loads stdout)
+      (catch python/Exception _
+        {"ok" false
+         "status" "fail"
+         "issues" [(str "failed to run capture-v2 sidecar check exit="
+                        (.-returncode proc)
+                        " stderr=" (.-stderr proc))]
+         "stdout" stdout}))))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn usage []
+  (println "usage: basilisp run scripts/prepare_capture_v2_session.lpy -- [--capture-dir DIR] [--target-date YYYY-MM-DD] [--quarantine-dir DIR] [--out-json PATH] [--dry-run]"))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:capture-dir "live_runtime/feature-capture" :dry-run false}]
+    (if remaining
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--capture-dir")
+          (recur (nnext remaining) (assoc out :capture-dir (option-value remaining arg)))
+
+          (= arg "--target-date")
+          (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+
+          (= arg "--quarantine-dir")
+          (recur (nnext remaining) (assoc out :quarantine-dir (option-value remaining arg)))
+
+          (= arg "--out-json")
+          (recur (nnext remaining) (assoc out :out-json (option-value remaining arg)))
+
+          (= arg "--dry-run")
+          (recur (next remaining) (assoc out :dry-run true))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg)))))
+      out)))
+
+(defn write-text! [path text]
+  (let [parent (os.path/dirname path)]
+    (when (pos? (count parent))
+      (os/makedirs parent ** :exist_ok true)))
+  (spit path text))
+
+(defn prepare-session [opts]
+  (let [target (target-date (:target-date opts))
+        compact (stamp target)
+        capture-dir (:capture-dir opts)
+        capture (os.path/join capture-dir (str "live_features_" compact ".npz"))
+        quarantine-dir (or (:quarantine-dir opts)
+                           (os.path/join capture-dir "quarantine"))
+        generated-at (now-utc)]
+    (if (not (os.path/exists capture))
+      {"ok" true
+       "status" "missing"
+       "action" "none"
+       "generated_at" generated-at
+       "target_date" target
+       "capture" capture
+       "quarantine_path" nil
+       "structural_reasons" []
+       "check" {"status" "missing" "issues" []}}
+      (let [check (validate-capture capture target)
+            reasons (structural-reasons check)]
+        (if (seq reasons)
+          (let [rotated-name (str "live_features_" compact "."
+                                  (.replace (.replace generated-at ":" "") "+" "Z")
+                                  "." (safe-reason reasons) ".npz")
+                quarantine-path (os.path/join quarantine-dir rotated-name)
+                action (if (:dry-run opts) "quarantine-dry-run" "quarantined")
+                status (if (:dry-run opts) "quarantine-required" "quarantined")]
+            (when (not (:dry-run opts))
+              (os/makedirs quarantine-dir ** :exist_ok true)
+              (shutil/move capture quarantine-path))
+            {"ok" true
+             "status" status
+             "action" action
+             "generated_at" generated-at
+             "target_date" target
+             "capture" capture
+             "quarantine_path" quarantine-path
+             "structural_reasons" reasons
+             "check" check})
+          {"ok" true
+           "status" "ok"
+           "action" "none"
+           "generated_at" generated-at
+           "target_date" target
+           "capture" capture
+           "quarantine_path" nil
+           "structural_reasons" []
+           "check" check})))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple [(if (keyword? k) (name k) (str k))
+                                    (jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable (sort x)))
+    (nil? x) nil
+    :else x))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        payload (prepare-session opts)
+        text (json/dumps (jsonable payload) ** :indent 2 :sort_keys true)]
+    (when-let [out (:out-json opts)]
+      (write-text! out (str text "\n")))
+    (println text)
+    (python/exit (if (get payload "ok") 0 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

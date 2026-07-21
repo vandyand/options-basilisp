@@ -1,0 +1,15 @@
+{:schema-version 1
+ :purpose :stock-nqb-vs-historical-feed-proof
+ :live {:venue "nqb"
+        :classes [:stock-nbbo-quote :stock-trade]
+        :symbols ["SPY" "HYG" "TLT" "VXX"]}
+ :historical-candidates
+ [{:venue "nqb" :classes [:stock-nbbo-quote :stock-trade]}
+  {:venue "utp_cta" :classes [:stock-nbbo-quote :stock-trade]}]
+ :required-evidence
+ [:retained-historical-venue
+  :same-symbol-session-and-watermark
+  :raw-event-coverage
+  :timestamp-and-field-comparison
+  :documented-venue-selection]
+ :admission :blocked-until-one-historical-venue-passes}

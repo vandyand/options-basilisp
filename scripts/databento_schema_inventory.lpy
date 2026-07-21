@@ -1,0 +1,44 @@
+;; Read-only inventory for the nested Databento Trades -> TBBO -> MBP-1 study.
+(import argparse glob os os.path pathlib sys)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.analysis.databento-schema-study :as study])
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser
+                ** :description "Inventory Trades, TBBO, and MBP-1 without copying raw data.")]
+    (.add_argument parser "--root" ** :required true)
+    (.add_argument parser "--out" ** :required true)
+    (.add_argument parser "--count-mode" ** :choices (python/list ["metadata" "exact"])
+                   :default "metadata"
+                   :help "metadata is fast; exact decodes DBN payloads to count events")
+    (.add_argument parser "--expected-symbols" ** :default nil
+                   :help "Optional comma-separated intended universe; mismatches are reported, never repaired")
+    (.parse_args parser (python/list argv))))
+
+(defn progress! [index total path]
+  (binding [*out* *err*]
+    (println (str "[" index "/" total "] " path))))
+
+(try
+  (let [args (parse-args (vec *command-line-args*))
+        out (.resolve (pathlib/Path (.-out args)))
+        base-result (study/inventory-root (.-root args) (.-count_mode args) progress!)
+        expected (when (.-expected_symbols args)
+                   (vec (filter #(pos? (count %))
+                                (map #(.strip %) (.split (.-expected_symbols args) ",")))))
+        result (if expected
+                 (assoc base-result "universe_reconciliation"
+                        (study/reconcile-universe (get base-result "observed_symbols") expected))
+                 base-result)]
+    (.mkdir (.-parent out) ** :parents true :exist_ok true)
+    (spit (str out) (study/json-text result))
+    (println (study/json-text result))
+    (python/exit (if (seq (get result "errors")) 1 0)))
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error)))
+    (python/exit 2)))

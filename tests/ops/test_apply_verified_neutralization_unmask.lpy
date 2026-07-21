@@ -1,0 +1,616 @@
+(ns ops.test-apply-verified-neutralization-unmask
+  (:import hashlib json os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "apply_verified_neutralization_unmask.lpy"))
+(def stamp "20260705")
+(def target-date "2026-07-05")
+(def basilisp-bin (or (os.environ/get "BASILISP_BIN")
+                      (str (.joinpath root ".venv/bin/basilisp"))))
+
+(defn jsonable [x]
+  (cond
+    (map? x)
+    (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+
+    (python/isinstance x python/dict)
+    (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+
+    (or (vector? x) (seq? x) (python/isinstance x python/list))
+    (python/list (map jsonable x))
+
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads [s] (json/loads s))
+(defn read-json [p] (loads (.read_text p)))
+(defn write-json! [p x] (.write_text p (dumps x)))
+(defn path [parent child] (.joinpath parent child))
+
+(defn sha256-bytes [bytes]
+  (.hexdigest (hashlib/sha256 bytes)))
+
+(defn artifact-entry [p]
+  {"exists" true
+   "path" (str p)
+   "bytes" (.-st_size (.stat p))
+   "sha256" (sha256-bytes (.read_bytes p))})
+
+(defn neutralize-path [ref account]
+  (.joinpath ref "pipeline_data" (str "live_model_" account "_multihead_corrected") "neutralize_features.json"))
+
+(defn write-ref! [tmp]
+  (let [ref (path tmp "ref")]
+    (doseq [account ["chestnut" "lynx" "moose"]]
+      (let [bundle (.-parent (neutralize-path ref account))]
+        (.mkdir bundle ** :parents true)
+        (write-json! (path bundle "neutralize_features.json") ["keep" "raw_0" "v3_0"])))
+    ref))
+
+(defn write-bundle! [tmp]
+  (let [analysis (path tmp "analysis")
+        readiness (path analysis (str "market_evidence_readiness_" stamp ".json"))
+        raw-candidates (path analysis (str "raw_feature_unlock_candidates_" stamp ".json"))
+        raw-audit (path analysis (str "raw_feature_unlock_audit_" stamp ".json"))
+        v3-audit (path analysis (str "v3_grid_unlock_audit_" stamp ".json"))
+        probe (path analysis (str "thetadata_capability_probe_" stamp ".json"))
+        dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+        manifest (path analysis (str "market_evidence_manifest_" stamp ".json"))
+        status (path analysis (str "market_evidence_status_" stamp ".json"))]
+    (.mkdir analysis)
+    (write-json! readiness {"target_date" target-date "verdict" "PASS" "reasons" []})
+    (write-json! raw-candidates ["raw_0"])
+    (write-json! raw-audit {"summary" {"target_date" target-date
+                                       "candidate_count" 1
+                                       "candidate_features" ["raw_0"]}})
+    (write-json! v3-audit {"summary" {"target_date" target-date
+                                      "candidate_count" 1
+                                      "candidate_features" ["v3_0"]}})
+    (write-json! probe {"target_date" target-date "summary" {"usable" 1}})
+    (write-json! dry-run {"applied" false
+                          "verified_by_audit" true
+                          "candidate_count" 2
+                          "candidate_features" ["raw_0" "v3_0"]
+                          "candidate_provenance" []
+                          "readiness_json" (str readiness)
+                          "readiness_available" true
+                          "readiness_target_date" target-date
+                          "readiness_target_matches" true
+                          "readiness_verdict" "PASS"
+                          "readiness_error" nil
+                          "extra_audits" [{"path" (str v3-audit)
+                                           "target_date" target-date
+                                           "candidate_count" 1}]
+                          "results" [{"account" "chestnut" "removed" 2 "missing" 0}
+                                     {"account" "lynx" "removed" 2 "missing" 0}
+                                     {"account" "moose" "removed" 2 "missing" 0}]})
+    (write-json! manifest {"target_date" target-date
+                           "target_stamp" stamp
+                           "valid?" true
+                           "status" "ok"
+                           "readiness_verdict" "PASS"
+                           "issues" []
+                           "artifacts" {"market_evidence_readiness.json" (artifact-entry readiness)
+                                        "raw_feature_unlock_candidates.json" (artifact-entry raw-candidates)
+                                        "raw_feature_unlock_audit.json" (artifact-entry raw-audit)
+                                        "v3_grid_unlock_audit.json" (artifact-entry v3-audit)
+                                        "thetadata_capability_probe.json" (artifact-entry probe)
+                                        "neutralization_unmask_dry_run.json" (artifact-entry dry-run)}})
+    (write-json! status {"target_date" target-date "ok?" true "status" "ok" "reasons" []})
+    [analysis manifest status]))
+
+(defn refresh-manifest-artifact! [manifest artifact-name p]
+  (let [payload (read-json manifest)]
+    (.update (.get payload "artifacts") (python/dict {artifact-name (artifact-entry p)}))
+    (write-json! manifest payload)))
+
+(def active-parity-readiness-reasons
+  ["baseline has active live feature parity problems"
+   "baseline features contain active live feature parity problems"
+   "matched live-vs-historical feature parity has problem features"])
+
+(def active-parity-status-reasons
+  ["manifest is missing or recorded invalid"
+   "manifest verification failed"
+   "readiness verdict is FAIL"
+   "matched feature parity diagnostic has problem features"])
+
+(defn mark-active-parity-failed! [analysis manifest status]
+  (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+        dry-run-payload (read-json dry-run)
+        manifest-payload (read-json manifest)]
+    (aset manifest-payload "valid?" false)
+    (aset manifest-payload "status" "invalid")
+    (aset manifest-payload "readiness_verdict" "FAIL")
+    (aset manifest-payload "issues"
+          (python/list [{"code" "market-evidence/readiness-not-pass"
+                         "verdict" "FAIL"
+                         "reasons" active-parity-readiness-reasons}]))
+    (write-json! status {"target_date" target-date
+                         "ok?" false
+                         "status" "error"
+                         "reasons" active-parity-status-reasons})
+    (aset dry-run-payload "readiness_verdict" "FAIL")
+    (aset dry-run-payload "readiness_target_matches" true)
+    (aset dry-run-payload "readiness_reasons" active-parity-readiness-reasons)
+    (write-json! dry-run dry-run-payload)
+    (write-json! manifest manifest-payload)
+    (refresh-manifest-artifact! manifest "neutralization_unmask_dry_run.json" dry-run)))
+
+(defn run-script [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn write-validation! [analysis manifest status ref]
+  (let [validation (path analysis (str "neutralization_verified_apply_validation_" stamp ".json"))
+        result (run-script "--target-date" target-date
+                           "--analysis-dir" (str analysis)
+                           "--manifest-json" (str manifest)
+                           "--status-json" (str status)
+                           "--ref-root" (str ref)
+                           "--validation-json" (str validation))]
+    (is (= 0 (.-returncode result)) (.-stderr result))
+    (is (.exists validation))
+    (let [payload (read-json validation)]
+      (write-json! status {"target_date" target-date
+                           "ok?" true
+                           "status" "ok"
+                           "reasons" []
+                           "verified_apply_validation" {"available" true
+                                                        "path" (str validation)
+                                                        "json_valid" true
+                                                        "target_matches_request" true
+                                                        "apply" false
+                                                        "candidate_count" (.get payload "candidate_count")
+                                                        "candidate_count_matches_dry_run" true
+                                                        "command_available" true
+                                                        "apply_safe" true}}))
+    validation))
+
+(defn with-fixture [f]
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          ref (write-ref! tmp)
+          [analysis manifest status] (write-bundle! tmp)]
+      (f tmp ref analysis manifest status))))
+
+(deftest validates-and-prints-command
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [result (run-script "--target-date" target-date
+                               "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest)
+                               "--status-json" (str status)
+                               "--ref-root" (str ref))
+            payload (loads (.-stdout result))
+            dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= false (.get payload "apply")))
+        (is (= 2 (.get payload "candidate_count")))
+        (is (= (sha256-bytes (.read_bytes manifest)) (.get payload "manifest_sha256")))
+        (is (= (sha256-bytes (.read_bytes dry-run)) (.get payload "dry_run_sha256")))
+        (is (not (str/includes? (.get payload "command") "--apply")))
+        (is (str/includes? (.get payload "command") "--audit-json"))
+        (is (str/includes? (.get payload "command") "--extra-audit-json"))))))
+
+(deftest allows-active-parity-only-failed-evidence-with-explicit-flag
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (mark-active-parity-failed! analysis manifest status)
+      (let [result (run-script "--target-date" target-date
+                               "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest)
+                               "--status-json" (str status)
+                               "--ref-root" (str ref)
+                               "--allow-active-parity-problems")
+            payload (loads (.-stdout result))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= false (.get payload "apply")))
+        (is (= 2 (.get payload "candidate_count")))))))
+
+(deftest rejects-active-parity-failed-evidence-without-explicit-flag
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (mark-active-parity-failed! analysis manifest status)
+      (let [result (run-script "--target-date" target-date
+                               "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest)
+                               "--status-json" (str status)
+                               "--ref-root" (str ref))]
+        (is (not= 0 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "manifest is not valid/ok"))))))
+
+(deftest rejects-non-parity-readiness-failure-even-with-explicit-flag
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (mark-active-parity-failed! analysis manifest status)
+      (let [payload (read-json manifest)]
+        (aset (aget (.get payload "issues") 0) "reasons"
+              (python/list (conj active-parity-readiness-reasons "some unrelated collector failed")))
+        (write-json! manifest payload))
+      (let [result (run-script "--target-date" target-date
+                               "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest)
+                               "--status-json" (str status)
+                               "--ref-root" (str ref)
+                               "--allow-active-parity-problems")]
+        (is (not= 0 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "manifest is not valid/ok"))))))
+
+(deftest rejects-non-parity-status-failure-even-with-explicit-flag
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (mark-active-parity-failed! analysis manifest status)
+      (let [payload (read-json status)]
+        (.append (.get payload "reasons") "disk full")
+        (write-json! status payload))
+      (let [result (run-script "--target-date" target-date
+                               "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest)
+                               "--status-json" (str status)
+                               "--ref-root" (str ref)
+                               "--allow-active-parity-problems")]
+        (is (not= 0 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "status is not ok"))))))
+
+(deftest executes-verified-apply
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [result (run-script "--target-date" target-date
+                               "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest)
+                               "--status-json" (str status)
+                               "--ref-root" (str ref)
+                               "--apply")
+            payload (loads (.-stdout result))
+            apply-payload (read-json (path analysis (str "neutralization_unmask_apply_" stamp ".json")))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 0 (.get payload "returncode")))
+        (is (= true (.get apply-payload "applied")))
+        (is (= ["raw_0" "v3_0"] (vec (.get apply-payload "candidate_features"))))
+        (doseq [account ["chestnut" "lynx" "moose"]]
+          (let [bundle (.-parent (neutralize-path ref account))]
+            (is (= ["keep"] (vec (read-json (path bundle "neutralize_features.json")))))
+            (is (.exists (path bundle (str "neutralize_features.before_unmask_" stamp ".json"))))))))))
+
+(deftest requires-prior-validation-for-apply
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest) "--status-json" (str status)
+                               "--ref-root" (str ref) "--apply")]
+        (is (not= 0 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "requires prior validation JSON"))))))
+
+(deftest rejects-partial-dry-run-coverage
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+            payload (read-json dry-run)]
+        (aset (aget (.get payload "results") -1) "removed" 1)
+        (aset (aget (.get payload "results") -1) "missing" 1)
+        (write-json! dry-run payload)
+        (refresh-manifest-artifact! manifest "neutralization_unmask_dry_run.json" dry-run)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result)
+                             "neutralization_unmask_dry_run has 1 missing candidate(s) for account moose")))))))
+
+(deftest rejects-wrong-dry-run-accounts
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+            payload (read-json dry-run)]
+        (aset (aget (.get payload "results") -1) "account" "wrong")
+        (write-json! dry-run payload)
+        (refresh-manifest-artifact! manifest "neutralization_unmask_dry_run.json" dry-run)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "neutralization_unmask_dry_run result accounts do not match requested accounts"))
+          (is (str/includes? (.-stderr result) "missing=['moose']"))
+          (is (str/includes? (.-stderr result) "extra=['wrong']")))))))
+
+(deftest rejects-stale-prior-validation
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [validation (write-validation! analysis manifest status ref)
+            payload (read-json validation)]
+        (aset payload "candidate_count" 1)
+        (aset payload "candidate_features" (python/list ["raw_0"]))
+        (write-json! validation payload)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "validation candidate_count does not match")))))))
+
+(deftest rejects-validation-bound-to-old-dry-run
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+            dry-payload (read-json dry-run)
+            validation (path analysis (str "neutralization_verified_apply_validation_" stamp ".json"))
+            validation-payload (read-json validation)]
+        (aset dry-payload "candidate_provenance"
+              (python/list [{"feature" "raw_0" "sources" ["tampered"] "audit_paths" []}
+                            {"feature" "v3_0" "sources" ["tampered"] "audit_paths" []}]))
+        (write-json! dry-run dry-payload)
+        (refresh-manifest-artifact! manifest "neutralization_unmask_dry_run.json" dry-run)
+        (aset validation-payload "manifest_sha256" (sha256-bytes (.read_bytes manifest)))
+        (write-json! validation validation-payload)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "validation dry_run_sha256 does not match")))))))
+
+(deftest rejects-validation-bound-to-old-manifest
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [payload (read-json manifest)]
+        (aset payload "issues" (python/list [{"severity" "info" "code" "tampered-but-still-ok"}]))
+        (write-json! manifest payload)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "validation manifest_sha256 does not match")))))))
+
+(deftest rejects-status-that-is-not-apply-safe
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [payload (read-json status)]
+        (aset (.get payload "verified_apply_validation") "apply_safe" false)
+        (write-json! status payload)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "apply_safe is not true")))))))
+
+(deftest rejects-status-validation-path-mismatch
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [payload (read-json status)]
+        (aset (.get payload "verified_apply_validation") "path" (str (path analysis "other_validation.json")))
+        (write-json! status payload)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "path does not match")))))))
+
+(deftest rejects-manifest-artifact-tamper
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+            payload (read-json dry-run)]
+        (.append (.get payload "candidate_features") "tampered")
+        (write-json! dry-run payload)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "mismatch")))))))
+
+(deftest rejects-duplicate-manifest-keys
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (.write_text manifest (.replace (.read_text manifest) "\"valid?\": true" "\"valid?\": true, \"valid?\": false" 1))
+      (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                               "--manifest-json" (str manifest) "--status-json" (str status)
+                               "--ref-root" (str ref))]
+        (is (not= 0 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "duplicate JSON key: valid?"))))))
+
+(deftest rejects-forged-manifest-candidate-union
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+            dry-payload (read-json dry-run)]
+        (aset dry-payload "candidate_count" 3)
+        (aset dry-payload "candidate_features" (python/list ["raw_0" "v3_0" "forged_0"]))
+        (doseq [row (.get dry-payload "results")]
+          (aset row "removed" 3)
+          (aset row "missing" 0))
+        (write-json! dry-run dry-payload)
+        (refresh-manifest-artifact! manifest "neutralization_unmask_dry_run.json" dry-run)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "candidate_features do not match audit union"))
+          (is (str/includes? (.-stderr result) "forged_0")))))))
+
+(deftest rejects-duplicate-dry-run-candidates
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [dry-run (path analysis (str "neutralization_unmask_dry_run_" stamp ".json"))
+            payload (read-json dry-run)]
+        (aset payload "candidate_count" 3)
+        (aset payload "candidate_features" (python/list ["raw_0" "v3_0" "v3_0"]))
+        (write-json! dry-run payload)
+        (refresh-manifest-artifact! manifest "neutralization_unmask_dry_run.json" dry-run)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "neutralization_unmask_dry_run candidate_features contains duplicate feature names")))))))
+
+(deftest rejects-boolean-audit-candidate-count
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [raw-audit (path analysis (str "raw_feature_unlock_audit_" stamp ".json"))
+            payload (read-json raw-audit)]
+        (aset (.get payload "summary") "candidate_count" true)
+        (write-json! raw-audit payload)
+        (refresh-manifest-artifact! manifest "raw_feature_unlock_audit.json" raw-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "audit candidate_count:"))
+          (is (str/includes? (.-stderr result) "must be a nonnegative integer")))))))
+
+(deftest allows-extra-audit-row-candidates-without-summary-count
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [v3-audit (path analysis (str "v3_grid_unlock_audit_" stamp ".json"))
+            payload (read-json v3-audit)]
+        (.pop (.get payload "summary") "candidate_count")
+        (.pop (.get payload "summary") "candidate_features")
+        (aset payload "features" (python/list [{"feature" "v3_0" "candidate" true}
+                                               {"feature" "ignored" "candidate" false}]))
+        (write-json! v3-audit payload)
+        (refresh-manifest-artifact! manifest "v3_grid_unlock_audit.json" v3-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))
+              payload (loads (.-stdout result))]
+          (is (= 0 (.-returncode result)) (.-stderr result))
+          (is (= 2 (.get payload "candidate_count"))))))))
+
+(defn write-greek-audit! [analysis payload]
+  (let [greek-audit (path analysis (str "greek_reconstruction_promotion_gate_" stamp ".json"))]
+    (write-json! greek-audit payload)
+    greek-audit))
+
+(deftest rejects-bad-greek-promotion-coverage
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [greek-audit (write-greek-audit!
+                         analysis
+                         {"summary" {"target_date" target-date "capture_ok" true "capture_reasons" []
+                                     "coverage_ok" false "coverage_reasons" ["evaluated rows 45 below minimum 60"]
+                                     "evaluated_count" 45 "min_evaluated_count" 60
+                                     "candidate_count" 0 "candidate_features" []}
+                          "features" []})]
+        (refresh-manifest-artifact! manifest "greek_reconstruction_promotion_gate.json" greek-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "Greek promotion audit coverage_ok is not true")))))))
+
+(deftest rejects-bad-greek-promotion-capture
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [greek-audit (write-greek-audit!
+                         analysis
+                         {"summary" {"target_date" target-date "capture_ok" false "capture_reasons" ["capture check has issues"]
+                                     "coverage_ok" true "coverage_reasons" []
+                                     "evaluated_count" 60 "min_evaluated_count" 60
+                                     "candidate_count" 1 "candidate_features" ["v3_0"]}
+                          "features" [{"feature" "v3_0" "candidate" true}]})]
+        (refresh-manifest-artifact! manifest "greek_reconstruction_promotion_gate.json" greek-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "Greek promotion audit capture_ok is not true")))))))
+
+(deftest rejects-boolean-greek-evaluated-count
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [greek-audit (write-greek-audit!
+                         analysis
+                         {"summary" {"target_date" target-date "capture_ok" true "capture_reasons" []
+                                     "coverage_ok" true "coverage_reasons" []
+                                     "evaluated_count" true "min_evaluated_count" 0
+                                     "candidate_count" 0 "candidate_features" []}
+                          "features" []})]
+        (refresh-manifest-artifact! manifest "greek_reconstruction_promotion_gate.json" greek-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "Greek promotion audit evaluated_count must be a nonnegative integer")))))))
+
+(deftest rejects-stale-raw-audit-target
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [raw-audit (path analysis (str "raw_feature_unlock_audit_" stamp ".json"))
+            payload (read-json raw-audit)]
+        (aset (.get payload "summary") "target_date" "2026-07-04")
+        (write-json! raw-audit payload)
+        (refresh-manifest-artifact! manifest "raw_feature_unlock_audit.json" raw-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "audit target_date '2026-07-04' does not match '2026-07-05'")))))))
+
+(deftest rejects-stale-extra-audit-target
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [v3-audit (path analysis (str "v3_grid_unlock_audit_" stamp ".json"))
+            payload (read-json v3-audit)]
+        (aset (.get payload "summary") "target_date" "2026-07-04")
+        (write-json! v3-audit payload)
+        (refresh-manifest-artifact! manifest "v3_grid_unlock_audit.json" v3-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "audit target_date '2026-07-04' does not match '2026-07-05'")))))))
+
+(deftest rejects-stale-greek-promotion-target
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (let [greek-audit (write-greek-audit!
+                         analysis
+                         {"summary" {"target_date" "2026-07-04" "capture_ok" true "capture_reasons" []
+                                     "coverage_ok" true "coverage_reasons" []
+                                     "evaluated_count" 0 "min_evaluated_count" 0
+                                     "candidate_count" 0 "candidate_features" []}
+                          "features" []})]
+        (refresh-manifest-artifact! manifest "greek_reconstruction_promotion_gate.json" greek-audit)
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref))]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "Greek promotion audit target_date '2026-07-04' does not match '2026-07-05'")))))))
+
+(deftest rejects-non-input-manifest-artifact-tamper
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [probe (path analysis (str "thetadata_capability_probe_" stamp ".json"))]
+        (write-json! probe {"target_date" target-date "summary" {"usable" 0}})
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "thetadata_capability_probe.json"))
+          (is (str/includes? (.-stderr result) "mismatch")))))))
+
+(deftest rejects-recorded-missing-artifact-that-now-exists
+  (with-fixture
+    (fn [_ ref analysis manifest status]
+      (write-validation! analysis manifest status ref)
+      (let [late-artifact (path analysis (str "late_optional_" stamp ".json"))
+            payload (read-json manifest)]
+        (aset (.get payload "artifacts") "late_optional.json" {"exists" false "path" (str late-artifact)})
+        (write-json! manifest payload)
+        (.write_text late-artifact "{}")
+        (let [result (run-script "--target-date" target-date "--analysis-dir" (str analysis)
+                                 "--manifest-json" (str manifest) "--status-json" (str status)
+                                 "--ref-root" (str ref) "--apply")]
+          (is (not= 0 (.-returncode result)))
+          (is (str/includes? (.-stderr result) "recorded artifact missing but it now exists")))))))

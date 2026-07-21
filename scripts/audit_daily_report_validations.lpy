@@ -1,0 +1,91 @@
+;; Audit generated daily report validation artifacts and fail closed.
+(import fractions glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.reporting.artifact-audit :as audit])
+
+(defn usage
+  []
+  (println (str "usage: basilisp run scripts/audit_daily_report_validations.lpy -- "
+                "[--daily-dir DIR] [--date YYYY-MM-DD | --all] "
+                "[--allow-missing-html] [--write-manifests] [--require-manifests]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--daily-dir")
+          (recur (nnext remaining) (assoc out :daily-dir (option-value remaining arg)))
+
+          (= arg "--date")
+          (recur (nnext remaining) (assoc out :date (option-value remaining arg)))
+
+          (= arg "--all")
+          (recur (next remaining) (assoc out :all? true))
+
+          (= arg "--allow-missing-html")
+          (recur (next remaining) (assoc out :require-html? false))
+
+          (= arg "--write-manifests")
+          (recur (next remaining) (assoc out :write-manifests? true))
+
+          (= arg "--require-manifests")
+          (recur (next remaining) (assoc out :require-manifests? true))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn validate-opts
+  [opts]
+  (when (and (:all? opts) (:date opts))
+    (throw (python/ValueError "--all and --date are mutually exclusive")))
+  opts)
+
+(defn ->jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple [(cond
+                                      (keyword? k) (name k)
+                                      :else (str k))
+                                    (->jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x)) (python/list (map ->jsonable x))
+    (instance? fractions/Fraction x) (python/float x)
+    (keyword? x) (name x)
+    :else x))
+
+(try
+  (let [result (audit/audit-daily-validations
+                (validate-opts (parse-args (vec *command-line-args*))))]
+    (println (json/dumps (->jsonable result) ** :indent 2 :sort_keys true))
+    (python/exit (if (:valid? result) 0 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

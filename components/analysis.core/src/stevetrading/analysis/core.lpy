@@ -3,13 +3,22 @@
   calibration. This namespace is read-only with respect to live trading state:
   it opens facts.db snapshots, derives normalized tapes, and writes explicit
   artifacts for review/application elsewhere."
-  (:import csv datetime math os os.path re sqlite3)
+  (:import csv datetime hashlib math os os.path re sqlite3 subprocess)
   (:require [basilisp.edn :as edn]
-            [basilisp.string :as bstr]))
+            [basilisp.string :as bstr]
+            [stevetrading.analysis.schema :as analysis-schema]))
 
 (def fill-fact :fact/fill-observed)
 (def intent-fact :fact/order-intent-created)
 (def signal-fact :fact/signal-decision-produced)
+(def ack-accepted-fact :fact/broker-ack-accepted)
+(def ack-rejected-fact :fact/broker-ack-rejected)
+(def order-status-fact :fact/broker-order-status-observed)
+(def cancel-accepted-fact :fact/cancel-ack-accepted)
+(def cancel-rejected-fact :fact/cancel-ack-rejected)
+(def command-dispatched-fact :fact/command-dispatched)
+(def lot-opened-fact :fact/position-lot-opened)
+(def lot-closed-fact :fact/position-lot-closed)
 (def option-chain-fact :fact/option-chain-observed)
 
 (def ^:private fill-price-re (re/compile ":fill/price \"([^\"]+)\""))
@@ -17,6 +26,11 @@
 (def ^:private fill-id-re (re/compile ":fill/id \"([^\"]+)\""))
 (def ^:private fill-symbol-re (re/compile ":fill/symbol \"([^\"]+)\""))
 (def ^:private decision-id-re (re/compile ":decision/id \"([^\"]+)\""))
+(def ^:private command-type-re (re/compile ":command/type :(command/[^\\s\\}]+)"))
+(def ^:private cancel-reason-re (re/compile ":cancel/reason :(cancel/[^\\s\\}]+)"))
+(def ^:private broker-status-re (re/compile ":broker/status :(broker-status/[^\\s\\}]+)"))
+(def ^:private broker-rejection-code-re (re/compile ":broker/rejection-code :(broker-rejection/[^\\s\\}]+)"))
+(def ^:private broker-message-re (re/compile ":broker/message \"([^\"]+)\""))
 (def ^:private posture-re (re/compile ":decision/posture :(posture/[^\\s\\}]+)"))
 (def ^:private bot-re (re/compile ":decision/bot :([^\\s\\}]+)"))
 (def ^:private bridge-kind-re (re/compile ":decision/bridge-kind :([^\\s\\}]+)"))
@@ -26,10 +40,20 @@
 (def ^:private side-re (re/compile ":order-intent/side :(order-side/[^\\s\\}]+)"))
 (def ^:private limit-price-re (re/compile ":order-intent/limit-price \"([^\"]+)\""))
 (def ^:private intent-qty-re (re/compile ":order-intent/quantity \"([^\"]+)\""))
+(def ^:private lot-id-re (re/compile ":lot/id \"([^\"]+)\""))
+(def ^:private lot-intent-id-re (re/compile ":lot/order-intent-id \"([^\"]+)\""))
+(def ^:private lot-side-re (re/compile ":lot/side :(order-side/[^\\s\\}]+)"))
+(def ^:private lot-opened-at-re (re/compile ":lot/opened-at \"([^\"]+)\""))
+(def ^:private lot-qty-re (re/compile ":lot/quantity \"([^\"]+)\""))
+(def ^:private lot-price-re (re/compile ":lot/price \"([^\"]+)\""))
+(def ^:private lot-close-qty-re (re/compile ":lot-close/quantity \"([^\"]+)\""))
+(def ^:private lot-close-price-re (re/compile ":lot-close/price \"([^\"]+)\""))
+(def ^:private lot-close-pnl-re (re/compile ":lot-close/realized-pnl \"([^\"]+)\""))
+(def ^:private closing-intent-id-re (re/compile ":lot-close/closing-order-intent-id \"([^\"]+)\""))
 (def ^:private leg-re
   (re/compile "\\{:leg/side :(order-side/[^\\s\\}]+) :leg/quantity \"([^\"]+)\" :instrument/id \"([^\"]+)\"\\}"))
 (def ^:private quote-re
-  (re/compile "\\{:quote/bid \"([^\"]+)\" :quote/ask \"([^\"]+)\" :instrument/id \"([^\"]+)\"\\}"))
+  (re/compile "\\{(?=[^\\}]*:quote/bid \"([^\"]+)\")(?=[^\\}]*:quote/ask \"([^\"]+)\")(?=[^\\}]*:instrument/id \"([^\"]+)\")[^\\}]*\\}"))
 
 (defn- kw-text
   [x]
@@ -39,6 +63,29 @@
   [x]
   (when (some? x)
     (float x)))
+
+(defn- finite-double?
+  [x]
+  (and (not (boolean? x))
+       (try
+         (math/isfinite (float x))
+         (catch python/Exception _ false))))
+
+(defn- positive-int-value?
+  [x]
+  (and (not (boolean? x))
+       (try
+         (let [n (int x)]
+           (and (= x n) (pos? n)))
+         (catch python/Exception _ false))))
+
+(defn- nonnegative-finite-double?
+  [x]
+  (and (not (boolean? x))
+       (try
+         (let [v (float x)]
+           (and (math/isfinite v) (not (neg? v))))
+         (catch python/Exception _ false))))
 
 (defn- re-one
   [pattern text]
@@ -50,6 +97,16 @@
   [s]
   (when (some? s)
     (str ":" s)))
+
+(defn- direction-from
+  [posture side]
+  (cond
+    (contains? #{:posture/enter-long ":posture/enter-long"} posture) "long"
+    (contains? #{:posture/enter-short ":posture/enter-short"} posture) "short"
+    (contains? #{:posture/flatten ":posture/flatten"} posture) "flat"
+    (contains? #{:order-side/buy ":order-side/buy"} side) "long"
+    (contains? #{:order-side/sell ":order-side/sell"} side) "short"
+    :else nil))
 
 (defn- placeholders
   [n]
@@ -111,6 +168,33 @@
       (finally
         (.close conn)))))
 
+(declare artifact-sha256)
+
+(defn fact-db-fingerprint
+  [facts-db]
+  (let [conn (sqlite3/connect facts-db)]
+    (try
+      (let [row (.fetchone
+                 (.execute conn
+                           (str "SELECT COUNT(*), MIN(occurred_at), "
+                                "MAX(occurred_at), MIN(\"offset\"), "
+                                "MAX(\"offset\") FROM facts")))
+            counts (.fetchall
+                    (.execute conn
+                              (str "SELECT fact_type, COUNT(*) FROM facts "
+                                   "GROUP BY fact_type ORDER BY fact_type")))]
+        {:path facts-db
+         :sha256 (artifact-sha256 facts-db)
+         :rows (or (nth row 0) 0)
+         :start (nth row 1)
+         :end (nth row 2)
+         :min-offset (nth row 3)
+         :max-offset (nth row 4)
+         :fact-counts (into {} (map (fn [r] [(nth r 0) (nth r 1)])
+                                    counts))})
+      (finally
+        (.close conn)))))
+
 (defn fact-counts
   [facts]
   (into {}
@@ -140,6 +224,7 @@
     (merge (row-base "signal" fact)
            {:decision-id (:decision/id pl)
             :posture (:decision/posture pl)
+            :direction (direction-from (:decision/posture pl) nil)
             :bot (:decision/bot pl)
             :bridge-kind (:decision/bridge-kind pl)
             :reason-codes (:decision/reason-codes pl)})))
@@ -152,10 +237,12 @@
     (merge (row-base "intent" fact)
            {:decision-id (:order-intent/decision-id pl)
             :order-intent-id (:order-intent/id pl)
+            :role (:order-intent/role pl)
             :intent-role (:order-intent/role pl)
             :order-type (:order-intent/order-type pl)
             :effect (:order-intent/effect pl)
             :side (:order-intent/side pl)
+            :direction (direction-from nil (:order-intent/side pl))
             :quantity (:order-intent/quantity pl)
             :limit-price (:order-intent/limit-price pl)
             :leg-count (count legs)
@@ -176,6 +263,26 @@
             :fill-quantity (:fill/quantity pl)
             :fill-symbol (:fill/symbol pl)})))
 
+(defn broker-row
+  [fact event-type]
+  (let [pl (:fact/payload fact)]
+    (merge (row-base event-type fact)
+           {:order-intent-id (:order-intent/id pl)
+            :broker-order-id (:broker/order-id pl)
+            :broker-status (:broker/status pl)
+            :reason-codes (vec (keep identity [(:broker/rejection-code pl)
+                                                (:broker/message pl)]))})))
+
+(defn command-row
+  [fact]
+  (let [pl (:fact/payload fact)]
+    (when (= :command/cancel-broker-order (:command/type pl))
+      (merge (row-base "cancel_intent" fact)
+             {:order-intent-id (:order-intent/id pl)
+              :broker-order-id (:broker/order-id pl)
+              :role :intent-role/exit
+              :reason-codes (vec (keep identity [(:cancel/reason pl)]))}))))
+
 (defn live-tape-rows
   "Normalize signal, intent, and fill facts into one chronological behavior
   tape. This is the first layer needed before any performance significance
@@ -187,17 +294,29 @@
                  :fact/signal-decision-produced (signal-row f)
                  :fact/order-intent-created (intent-row f)
                  :fact/fill-observed (fill-row f)
+                 :fact/broker-ack-accepted (broker-row f "broker_ack")
+                 :fact/broker-ack-rejected (broker-row f "broker_reject")
+                 :fact/broker-order-status-observed (broker-row f "broker_status")
+                 :fact/cancel-ack-accepted (broker-row f "cancel_ack")
+                 :fact/cancel-ack-rejected (broker-row f "cancel_reject")
+                 :fact/command-dispatched (command-row f)
                  nil)))
        vec))
 
 (def live-tape-columns
-  [:event-type :occurred-at :account-id :strategy-id :decision-id :posture
-   :bot :bridge-kind :order-intent-id :intent-role :order-type :effect :side
-   :instrument-id :quantity :limit-price :fill-price :fill-quantity
-   :broker-order-id :fill-id :leg-count :leg-instruments :source-system
-   :correlation-id :record-id :reason-codes])
+  [:event-type :occurred-at :account-id :strategy-id :decision-id
+   :order-intent-id :broker-order-id :instrument-id :direction :posture
+   :role :intent-role :effect :side :quantity :limit-price :fill-price
+   :fill-quantity :correlation-id :reason-codes :order-type :broker-status
+   :fill-id :leg-count :leg-instruments :source-system :record-id :bot
+   :bridge-kind])
 
-(declare live-tape-rows-fast calibration-artifact-fast)
+(def tape-fact-types
+  [signal-fact intent-fact fill-fact ack-accepted-fact ack-rejected-fact
+   order-status-fact cancel-accepted-fact cancel-rejected-fact
+   command-dispatched-fact])
+
+(declare live-tape-rows-fast calibration-artifact-fast utc-now-string)
 
 (defn- csv-cell
   [v]
@@ -219,15 +338,113 @@
           (.writerow writer (mapv #(csv-cell (get row %)) columns)))))
     path))
 
+(defn artifact-sha256
+  [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh 1048576)]
+        (when (pos? (count chunk))
+          (.update h chunk)
+          (recur (.read fh 1048576)))))
+    (.hexdigest h)))
+
+(defn- sidecar-path
+  [path]
+  (str path ".manifest.edn"))
+
+(defn write-artifact-sidecar!
+  [{:keys [artifact-kind path facts-db row-count columns source-kind]}]
+  (let [manifest {:manifest/version 1
+                  :manifest/kind :analysis/export-provenance-v1
+                  :artifact/kind artifact-kind
+                  :artifact/path path
+                  :artifact/sha256 (artifact-sha256 path)
+                  :artifact/rows row-count
+                  :artifact/columns (mapv name columns)
+                  :artifact/generated-at (utc-now-string)
+                  :source/kind source-kind
+                  :source/facts-db (fact-db-fingerprint facts-db)}
+        out (sidecar-path path)]
+    (spit out (str (edn/write-string manifest) "\n"))
+    manifest))
+
+(defn- write-csv-artifact!
+  [{:keys [path columns rows facts-db artifact-kind source-kind]}]
+  (write-csv! path columns rows)
+  (let [sidecar (write-artifact-sidecar!
+                 {:artifact-kind artifact-kind
+                  :path path
+                  :facts-db facts-db
+                  :row-count (count rows)
+                  :columns columns
+                  :source-kind source-kind})]
+    {:path path
+     :rows (count rows)
+     :sidecar-path (sidecar-path path)
+     :sidecar sidecar}))
+
+(defn validate-artifact-rows!
+  [kind rows]
+  (let [result (analysis-schema/rows-validation-result kind rows)]
+    (when-not (:valid? result)
+      (throw (ex-info (str "invalid " kind " artifact rows")
+                      {:error/code :error/invalid-analysis-artifact
+                       :schema/kind kind
+                       :errors (:errors result)})))
+    result))
+
+(defn validate-artifact!
+  [kind artifact]
+  (let [result (analysis-schema/validation-result kind artifact)]
+    (when-not (:valid? result)
+      (throw (ex-info (str "invalid " kind " artifact")
+                      {:error/code :error/invalid-analysis-artifact
+                       :schema/kind kind
+                       :errors (:errors result)})))
+    result))
+
+(defn read-csv!
+  [path]
+  (with-open [fh (python/open path "r" ** :newline "")]
+    (let [reader (csv/DictReader fh)
+          columns (vec (.-fieldnames reader))]
+      (mapv (fn [row]
+              (into {}
+                    (map (fn [col]
+                           (let [v (get row col)]
+                             [(keyword col)
+                             (when-not (or (nil? v) (= "" v)) v)]))
+                         columns)))
+            (iterator-seq reader)))))
+
+(defn- csv-header
+  [path]
+  (with-open [fh (python/open path "r" ** :newline "")]
+    (vec (.-fieldnames (csv/DictReader fh)))))
+
 (defn write-live-tape!
-  [{:keys [facts-db out]}]
-  (let [raw-rows (read-fact-rows facts-db [signal-fact intent-fact fill-fact])
+  [{:keys [facts-db out source-kind]
+    :or {source-kind :source/live-facts}}]
+  (let [raw-rows (read-fact-rows facts-db tape-fact-types)
         rows (live-tape-rows-fast raw-rows)]
-    (write-csv! out live-tape-columns rows)
+    (validate-artifact-rows! :analysis/tape-row rows)
+    (write-csv-artifact! {:path out
+                          :columns live-tape-columns
+                          :rows rows
+                          :facts-db facts-db
+                          :artifact-kind :analysis/tape-row
+                          :source-kind source-kind})
     {:facts-db facts-db
      :out out
+     :sidecar (sidecar-path out)
      :rows (count rows)
      :counts (frequencies (map :fact-type raw-rows))}))
+
+(defn write-replay-tape!
+  "Replay facts use the same normalized tape schema as live facts; this
+  separate entry point keeps CLI intent explicit while sharing the exporter."
+  [opts]
+  (write-live-tape! (assoc opts :source-kind :source/replay-facts)))
 
 (defn- event-type-of
   [fact-type]
@@ -235,6 +452,12 @@
     ":fact/signal-decision-produced" "signal"
     ":fact/order-intent-created" "intent"
     ":fact/fill-observed" "fill"
+    ":fact/broker-ack-accepted" "broker_ack"
+    ":fact/broker-ack-rejected" "broker_reject"
+    ":fact/broker-order-status-observed" "broker_status"
+    ":fact/cancel-ack-accepted" "cancel_ack"
+    ":fact/cancel-ack-rejected" "cancel_reject"
+    ":fact/command-dispatched" "command_dispatched"
     "unknown"))
 
 (defn- fast-base
@@ -260,23 +483,28 @@
   (let [record (:record row)]
     (case (:fact-type row)
       ":fact/signal-decision-produced"
-      (merge (fast-base row)
-             {:decision-id (re-one decision-id-re record)
-              :posture (colonize (re-one posture-re record))
-              :bot (colonize (re-one bot-re record))
+        (merge (fast-base row)
+               {:decision-id (re-one decision-id-re record)
+                :posture (colonize (re-one posture-re record))
+                :direction (direction-from (colonize (re-one posture-re record))
+                                           nil)
+                :bot (colonize (re-one bot-re record))
               :bridge-kind (colonize (re-one bridge-kind-re record))})
 
       ":fact/order-intent-created"
       (let [legs (leg-matches record)
             first-leg (first legs)]
         (merge (fast-base row)
-               {:decision-id (re-one decision-id-re record)
-                :order-intent-id (:order-intent-id row)
-                :intent-role (colonize (re-one intent-role-re record))
-                :order-type (colonize (re-one order-type-re record))
-                :effect (colonize (re-one effect-re record))
-                :side (colonize (re-one side-re record))
-                :quantity (re-one intent-qty-re record)
+                 {:decision-id (re-one decision-id-re record)
+                  :order-intent-id (:order-intent-id row)
+                  :role (colonize (re-one intent-role-re record))
+                  :intent-role (colonize (re-one intent-role-re record))
+                  :order-type (colonize (re-one order-type-re record))
+                  :effect (colonize (re-one effect-re record))
+                  :side (colonize (re-one side-re record))
+                  :direction (direction-from nil
+                                             (colonize (re-one side-re record)))
+                  :quantity (re-one intent-qty-re record)
                 :limit-price (re-one limit-price-re record)
                 :leg-count (count legs)
                 :leg-instruments (mapv :instrument-id legs)
@@ -291,10 +519,66 @@
               :instrument-id (:instrument-id row)
               :quantity (re-one fill-qty-re record)
               :fill-price (re-one fill-price-re record)
-              :fill-quantity (re-one fill-qty-re record)
-              :fill-symbol (re-one fill-symbol-re record)})
+                :fill-quantity (re-one fill-qty-re record)
+                :fill-symbol (re-one fill-symbol-re record)})
 
-      (fast-base row))))
+        ":fact/broker-ack-accepted"
+        (merge (fast-base row)
+               {:event-type "broker_ack"
+                :order-intent-id (:order-intent-id row)
+                :broker-order-id (:broker-order-id row)
+                :broker-status (colonize (re-one broker-status-re record))})
+
+        ":fact/broker-ack-rejected"
+        (merge (fast-base row)
+               {:event-type "broker_reject"
+                :order-intent-id (:order-intent-id row)
+                :broker-order-id (:broker-order-id row)
+                :broker-status (colonize (re-one broker-status-re record))
+                :reason-codes (vec (keep identity
+                                          [(colonize (re-one broker-rejection-code-re
+                                                            record))
+                                           (re-one broker-message-re record)]))})
+
+        ":fact/broker-order-status-observed"
+        (merge (fast-base row)
+               {:event-type "broker_status"
+                :order-intent-id (:order-intent-id row)
+                :broker-order-id (:broker-order-id row)
+                :broker-status (colonize (re-one broker-status-re record))})
+
+        ":fact/cancel-ack-accepted"
+        (merge (fast-base row)
+               {:event-type "cancel_ack"
+                :order-intent-id (:order-intent-id row)
+                :broker-order-id (:broker-order-id row)
+                :broker-status (colonize (re-one broker-status-re record))})
+
+        ":fact/cancel-ack-rejected"
+        (merge (fast-base row)
+               {:event-type "cancel_reject"
+                :order-intent-id (:order-intent-id row)
+                :broker-order-id (:broker-order-id row)
+                :broker-status (colonize (re-one broker-status-re record))
+                :reason-codes (vec (keep identity
+                                          [(colonize (re-one broker-rejection-code-re
+                                                            record))
+                                           (re-one broker-message-re record)]))})
+
+        ":fact/command-dispatched"
+        (let [command-type (colonize (re-one command-type-re record))]
+          (if (= ":command/cancel-broker-order" command-type)
+            (merge (fast-base row)
+                   {:event-type "cancel_intent"
+                    :order-intent-id (:order-intent-id row)
+                    :broker-order-id (:broker-order-id row)
+                    :role ":intent-role/exit"
+                    :reason-codes (vec (keep identity
+                                              [(colonize (re-one cancel-reason-re
+                                                                record))]))})
+            (fast-base row)))
+
+        (fast-base row))))
 
 (defn live-tape-rows-fast
   [raw-rows]
@@ -311,6 +595,180 @@
 (defn- seconds-between
   [a b]
   (abs (.total_seconds (- (parse-time a) (parse-time b)))))
+
+(def episode-columns
+  [:episode-id :strategy-id :account-id :direction :instrument-group
+   :entry-time :entry-price :entry-quantity :exit-time :exit-price
+   :exit-quantity :holding-minutes :gross-pnl :net-pnl :return-on-risk
+   :max-favorable-excursion :max-adverse-excursion :exit-reason
+   :forced-flatten :data-quality-flags :order-intent-id
+   :closing-order-intent-id :instrument-id :lot-id])
+
+(defn- minutes-between
+  [a b]
+  (when (and a b)
+    (/ (.total_seconds (- (parse-time b) (parse-time a))) 60.0)))
+
+(defn- instrument-group
+  [instrument-id]
+  (when (some? instrument-id)
+    (cond
+      (.startswith instrument-id "option/")
+      (bstr/join "/" (take 4 (.split instrument-id "/")))
+
+      :else instrument-id)))
+
+(defn- episode-id
+  [prefix row]
+  (str prefix "/" (:account-id row) "/" (:strategy-id row) "/"
+       (:instrument-id row) "/" (or (:lot-id row)
+                                    (:order-intent-id row)
+                                    (:record-id row))))
+
+(defn- lot-open-row-fast
+  [row]
+  (let [record (:record row)]
+    {:lot-id (re-one lot-id-re record)
+     :strategy-id (:strategy-id row)
+     :account-id (:account-id row)
+     :instrument-id (:instrument-id row)
+     :direction (direction-from nil (colonize (re-one lot-side-re record)))
+     :entry-time (or (re-one lot-opened-at-re record) (:occurred-at row))
+     :entry-price (re-one lot-price-re record)
+     :entry-quantity (re-one lot-qty-re record)
+     :order-intent-id (or (:order-intent-id row)
+                          (re-one lot-intent-id-re record))}))
+
+(defn- lot-close-row-fast
+  [row]
+  (let [record (:record row)]
+    {:lot-id (re-one lot-id-re record)
+     :strategy-id (:strategy-id row)
+     :account-id (:account-id row)
+     :instrument-id (:instrument-id row)
+     :exit-time (:occurred-at row)
+     :exit-price (re-one lot-close-price-re record)
+     :exit-quantity (re-one lot-close-qty-re record)
+     :gross-pnl (re-one lot-close-pnl-re record)
+     :net-pnl (re-one lot-close-pnl-re record)
+     :closing-order-intent-id (re-one closing-intent-id-re record)}))
+
+(defn- completed-episode
+  [open close]
+  (let [entry-price (:entry-price open)
+        entry-qty (:entry-quantity open)
+        gross (:gross-pnl close)]
+    (merge open close
+           {:episode-id (episode-id "episode" open)
+            :instrument-group (instrument-group (:instrument-id open))
+            :holding-minutes (minutes-between (:entry-time open)
+                                              (:exit-time close))
+            :return-on-risk (when (and entry-price entry-qty gross)
+                              (let [risk (* (float entry-price)
+                                            (float entry-qty))]
+                                (when (pos? risk)
+                                  (/ (float gross) risk))))
+            :forced-flatten false
+            :data-quality-flags []})))
+
+(defn- incomplete-intent-episode
+  [intent rows-by-oi]
+  (let [oi (:order-intent-id intent)
+        lineage (get rows-by-oi oi)
+        has-fill? (boolean (some #(= "fill" (:event-type %)) lineage))
+        rejected? (boolean (some #(= "broker_reject" (:event-type %))
+                                 lineage))
+        cancelled? (boolean
+                    (some #(and (contains? #{"cancel_ack" "broker_status"}
+                                           (:event-type %))
+                                (contains? #{":broker-status/cancelled"
+                                             :broker-status/cancelled}
+                                           (:broker-status %)))
+                          lineage))
+        flags (vec (cond-> []
+                     (not has-fill?) (conj :episode/missing-fill)
+                     rejected? (conj :episode/rejected-order)
+                     cancelled? (conj :episode/cancelled-order)))]
+    (when (seq flags)
+      {:episode-id (episode-id "incomplete" intent)
+       :strategy-id (:strategy-id intent)
+       :account-id (:account-id intent)
+       :direction (:direction intent)
+       :instrument-group (instrument-group (:instrument-id intent))
+       :entry-time (:occurred-at intent)
+       :entry-price (:limit-price intent)
+       :entry-quantity (:quantity intent)
+       :exit-time nil
+       :exit-price nil
+       :exit-quantity nil
+       :holding-minutes nil
+       :gross-pnl nil
+       :net-pnl nil
+       :return-on-risk nil
+       :max-favorable-excursion nil
+       :max-adverse-excursion nil
+       :exit-reason (cond rejected? :exit/rejected
+                          cancelled? :exit/cancelled
+                          :else :exit/missing-fill)
+       :forced-flatten false
+       :data-quality-flags flags
+       :order-intent-id oi
+       :closing-order-intent-id nil
+       :instrument-id (:instrument-id intent)
+       :lot-id nil})))
+
+(defn episode-rows-fast
+  "Assemble conservative lot-level trade episodes from normalized facts.
+  Completed rows are built from durable ledger lot open/close facts. Intents
+  that never produce fills, are rejected, or are cancelled are preserved as
+  incomplete rows with data-quality flags instead of being silently dropped."
+  [raw-rows]
+  (let [tape (live-tape-rows-fast raw-rows)
+        rows-by-oi (group-by :order-intent-id
+                             (filter :order-intent-id tape))
+        opens (into {}
+                    (map (fn [row]
+                           (let [open (lot-open-row-fast row)]
+                             [(:lot-id open) open]))
+                         (filter #(= ":fact/position-lot-opened"
+                                     (:fact-type %))
+                                 raw-rows)))
+        completed (->> raw-rows
+                       (filter #(= ":fact/position-lot-closed"
+                                   (:fact-type %)))
+                       (keep (fn [row]
+                               (let [close (lot-close-row-fast row)
+                                     open (get opens (:lot-id close))]
+                                 (when open
+                                   (completed-episode open close)))))
+                       vec)
+        incomplete (->> tape
+                        (filter #(and (= "intent" (:event-type %))
+                                      (contains? #{":intent-role/entry"
+                                                   :intent-role/entry}
+                                                 (or (:role %)
+                                                     (:intent-role %)))))
+                        (keep #(incomplete-intent-episode % rows-by-oi))
+                        vec)]
+    (vec (concat completed incomplete))))
+
+(defn write-episodes!
+  [{:keys [facts-db out]}]
+  (let [raw-rows (read-fact-rows facts-db
+                                 (into tape-fact-types
+                                       [lot-opened-fact lot-closed-fact]))
+        rows (episode-rows-fast raw-rows)]
+    (validate-artifact-rows! :analysis/episode-row rows)
+    (write-csv-artifact! {:path out
+                          :columns episode-columns
+                          :rows rows
+                          :facts-db facts-db
+                          :artifact-kind :analysis/episode-row
+                          :source-kind :source/facts})
+    {:facts-db facts-db
+     :out out
+     :sidecar (sidecar-path out)
+     :rows (count rows)}))
 
 (defn- option-instrument?
   [instrument-id]
@@ -441,6 +899,509 @@
           idx (int (math/floor (* q (dec (count v)))))]
       (nth v (max 0 (min idx (dec (count v))))))))
 
+;; ---------------------------------------------------------------------------
+;; Behavior alignment
+;; ---------------------------------------------------------------------------
+
+(def alignment-event-types #{"signal" "intent" "fill"})
+
+(declare alignable-row?)
+
+(defn- present?
+  [x]
+  (and (some? x) (not= "" x)))
+
+(defn- sorted-distinct
+  [xs]
+  (vec (sort (set (filter present? xs)))))
+
+(defn- event-counts
+  [rows]
+  (into {}
+        (map (fn [[k rs]] [k (count rs)])
+             (sort-by first (group-by :event-type rows)))))
+
+(defn- account-strategy
+  [row]
+  [(:account-id row) (:strategy-id row)])
+
+(defn- account-strategy-counts
+  [rows]
+  (->> rows
+       (filter #(and (present? (:account-id %))
+                     (present? (:strategy-id %))))
+       (group-by account-strategy)
+       (map (fn [[[account strategy] rs]]
+              {:account-id account
+               :strategy-id strategy
+               :events (count rs)}))
+       (sort-by (juxt :account-id :strategy-id))
+       vec))
+
+(defn- identity-complete?
+  [row]
+  (and (present? (:occurred-at row))
+       (present? (:account-id row))
+       (present? (:strategy-id row))
+       (present? (:instrument-id row))))
+
+(defn- identity-gap-count
+  [rows]
+  (count (remove identity-complete? rows)))
+
+(defn- time-range
+  [rows]
+  (let [times (sorted-distinct (map :occurred-at rows))]
+    {:start (first times)
+     :end (last times)}))
+
+(defn cohort-profile
+  "Summarize the standardized analysis cohort represented by a normalized
+  behavior tape. This is intentionally small and comparable across live,
+  paper, sim, replay, and backtest exporters."
+  [rows]
+  (let [alignable (filterv alignable-row? rows)
+        tr (time-range alignable)]
+    {:rows (count rows)
+     :alignable-rows (count alignable)
+     :start (:start tr)
+     :end (:end tr)
+     :accounts (sorted-distinct (map :account-id alignable))
+     :strategies (sorted-distinct (map :strategy-id alignable))
+     :account-strategies (account-strategy-counts alignable)
+     :event-counts (event-counts alignable)}))
+
+(defn- same-set?
+  [a b]
+  (= (set a) (set b)))
+
+(defn- nonempty-same-set?
+  [a b]
+  (and (seq a) (same-set? a b)))
+
+(defn- pair-set
+  [profile]
+  (set (map (fn [row] [(:account-id row) (:strategy-id row)])
+            (:account-strategies profile))))
+
+(defn- cohort-check
+  [check pass? details]
+  {:check check
+   :status (if pass? :pass :fail)
+   :details details})
+
+(defn cohort-compatibility
+  "Gate that prevents same-population reports from comparing unrelated runs.
+  It checks the cohort representation before behavior precision/recall or P&L
+  statistics are considered valid."
+  [live-rows replay-rows]
+  (let [live (cohort-profile live-rows)
+        replay (cohort-profile replay-rows)
+        checks [(cohort-check
+                 :cohort/nonempty-live
+                 (pos? (:alignable-rows live))
+                 {:live-alignable-rows (:alignable-rows live)})
+                (cohort-check
+                 :cohort/nonempty-replay
+                 (pos? (:alignable-rows replay))
+                 {:replay-alignable-rows (:alignable-rows replay)})
+                (cohort-check
+                 :cohort/strategy-set
+                 (nonempty-same-set? (:strategies live) (:strategies replay))
+                 {:live (:strategies live)
+                  :replay (:strategies replay)})
+                (cohort-check
+                 :cohort/account-set
+                 (nonempty-same-set? (:accounts live) (:accounts replay))
+                 {:live (:accounts live)
+                  :replay (:accounts replay)})
+                (cohort-check
+                 :cohort/account-strategy-set
+                 (and (seq (pair-set live))
+                      (= (pair-set live) (pair-set replay)))
+                 {:live (vec (sort (pair-set live)))
+                  :replay (vec (sort (pair-set replay)))})
+                (cohort-check
+                 :cohort/identity-complete
+                 (and (zero? (identity-gap-count
+                              (filterv alignable-row? live-rows)))
+                      (zero? (identity-gap-count
+                              (filterv alignable-row? replay-rows))))
+                 {:live-missing-identity
+                  (identity-gap-count (filterv alignable-row? live-rows))
+                  :replay-missing-identity
+                  (identity-gap-count (filterv alignable-row? replay-rows))})
+                (cohort-check
+                 :cohort/time-window
+                 (and (present? (:start live))
+                      (= (:start live) (:start replay))
+                      (= (:end live) (:end replay)))
+                 {:live {:start (:start live) :end (:end live)}
+                  :replay {:start (:start replay) :end (:end replay)}})
+                (cohort-check
+                 :cohort/event-type-set
+                 (nonempty-same-set? (keys (:event-counts live))
+                                     (keys (:event-counts replay)))
+                 {:live (sorted-distinct (keys (:event-counts live)))
+                  :replay (sorted-distinct (keys (:event-counts replay)))})
+                (cohort-check
+                 :cohort/event-counts
+                 (= (:event-counts live) (:event-counts replay))
+                 {:live (:event-counts live)
+                  :replay (:event-counts replay)})]
+        failed (filterv #(= :fail (:status %)) checks)]
+    {:status (if (seq failed) :cohort/fail :cohort/pass)
+     :checks checks
+     :live live
+     :replay replay}))
+
+(def mismatch-columns
+  [:side :event-type :occurred-at :account-id :strategy-id :decision-id
+   :order-intent-id :broker-order-id :instrument-id :direction :role
+   :quantity :fill-price :fill-quantity :reason-codes :alignment-key])
+
+(defn parse-int-arg
+  [x default]
+  (if (some? x)
+    (try
+      (let [s (str x)
+            n (int s)]
+        (when-not (= s (str n))
+          (throw (python/ValueError
+                  (str "integer argument must be an integer literal: " s))))
+        (when-not (pos? n)
+          (throw (python/ValueError
+                  (str "integer argument must be positive: " s))))
+        n)
+      (catch python/Exception e
+        (throw (python/ValueError
+                (str "invalid integer argument: " x " (" e ")")))))
+    default))
+
+(defn- timestamp-bucket
+  [iso bucket-seconds]
+  (when (some? iso)
+    (let [dt (parse-time iso)
+          epoch (.timestamp dt)
+          bucket (* bucket-seconds
+                    (math/floor (/ epoch bucket-seconds)))
+          bucket-dt (datetime.datetime/fromtimestamp
+                     bucket
+                     (.-utc datetime/timezone))]
+      (.replace (.isoformat bucket-dt) "+00:00" "Z"))))
+
+(defn- alignable-row?
+  [row]
+  (contains? alignment-event-types (:event-type row)))
+
+(defn- row-role
+  [row]
+  (or (:role row) (:intent-role row)))
+
+(defn- alignment-key
+  [row bucket-seconds]
+  [(:event-type row)
+   (:account-id row)
+   (:strategy-id row)
+   (timestamp-bucket (:occurred-at row) bucket-seconds)
+   (instrument-group (:instrument-id row))
+   (:direction row)
+   (row-role row)])
+
+(defn- metric-row
+  [event-type live-rows replay-rows bucket-seconds]
+  (let [live (filterv #(= event-type (:event-type %)) live-rows)
+        replay (filterv #(= event-type (:event-type %)) replay-rows)
+        live-freq (frequencies (map #(alignment-key % bucket-seconds) live))
+        replay-freq (frequencies (map #(alignment-key % bucket-seconds) replay))
+        keys* (set (concat (keys live-freq) (keys replay-freq)))
+        matched (reduce + 0 (map #(min (get live-freq % 0)
+                                       (get replay-freq % 0))
+                                 keys*))
+        live-n (count live)
+        replay-n (count replay)]
+    {:event-type event-type
+     :live-count live-n
+     :replay-count replay-n
+     :matched-count matched
+     :precision (when (pos? live-n) (/ matched live-n))
+     :recall (when (pos? replay-n) (/ matched replay-n))}))
+
+(defn- matched-row-pairs
+  [event-type live-rows replay-rows bucket-seconds]
+  (let [live (group-by #(alignment-key % bucket-seconds)
+                       (filterv #(= event-type (:event-type %)) live-rows))
+        replay (group-by #(alignment-key % bucket-seconds)
+                         (filterv #(= event-type (:event-type %)) replay-rows))]
+    (->> (keys live)
+         (mapcat
+          (fn [k]
+            (let [ls (sort-by :occurred-at (get live k))
+                  rs (sort-by :occurred-at (get replay k))
+                  n (min (count ls) (count rs))]
+              (map vector (take n ls) (take n rs)))))
+         vec)))
+
+(defn- field-mismatch-kinds
+  [live replay]
+  (vec (cond-> []
+         (not= (:direction live) (:direction replay))
+         (conj :mismatch/direction)
+
+         (not= (:instrument-id live) (:instrument-id replay))
+         (conj :mismatch/instrument)
+
+         (not= (or (:fill-quantity live) (:quantity live))
+               (or (:fill-quantity replay) (:quantity replay)))
+         (conj :mismatch/quantity))))
+
+(defn- field-mismatch-summary
+  [event-type live-rows replay-rows bucket-seconds]
+  (let [pairs (matched-row-pairs event-type live-rows replay-rows
+                                 bucket-seconds)
+        kinds (mapcat (fn [[l r]] (field-mismatch-kinds l r)) pairs)
+        counts (frequencies kinds)]
+    {:event-type event-type
+     :direction-mismatches (get counts :mismatch/direction 0)
+     :instrument-mismatches (get counts :mismatch/instrument 0)
+     :quantity-mismatches (get counts :mismatch/quantity 0)}))
+
+(defn- unmatched-side
+  [side rows other-freq bucket-seconds]
+  (let [seen (atom {})]
+    (->> rows
+         (keep (fn [row]
+                 (let [k (alignment-key row bucket-seconds)
+                       n (get @seen k 0)]
+                   (swap! seen assoc k (inc n))
+                   (when (>= n (get other-freq k 0))
+                     (assoc row
+                            :side side
+                            :alignment-key (pr-str k))))))
+         vec)))
+
+(defn alignment-mismatch-rows
+  [live-rows replay-rows bucket-seconds]
+  (let [live (filterv alignable-row? live-rows)
+        replay (filterv alignable-row? replay-rows)
+        live-freq (frequencies (map #(alignment-key % bucket-seconds) live))
+        replay-freq (frequencies (map #(alignment-key % bucket-seconds) replay))]
+    (vec (concat (unmatched-side "live-only" live replay-freq bucket-seconds)
+                 (unmatched-side "replay-only" replay live-freq bucket-seconds)))))
+
+(defn- field-mismatch-rows
+  [live-rows replay-rows bucket-seconds]
+  (->> alignment-event-types
+       (mapcat
+        (fn [event-type]
+          (keep (fn [[live replay]]
+                  (let [kinds (field-mismatch-kinds live replay)]
+                    (when (seq kinds)
+                      (assoc live
+                             :side "field-mismatch"
+                             :reason-codes kinds
+                             :alignment-key
+                             (pr-str (alignment-key live bucket-seconds))))))
+                (matched-row-pairs event-type live-rows replay-rows
+                                   bucket-seconds))))
+       vec))
+
+(defn- matched-time-deltas
+  [event-type live-rows replay-rows bucket-seconds]
+  (let [live (group-by #(alignment-key % bucket-seconds)
+                       (filterv #(= event-type (:event-type %)) live-rows))
+        replay (group-by #(alignment-key % bucket-seconds)
+                         (filterv #(= event-type (:event-type %)) replay-rows))]
+    (->> (keys live)
+         (mapcat
+          (fn [k]
+            (let [ls (sort-by :occurred-at (get live k))
+                  rs (sort-by :occurred-at (get replay k))
+                  n (min (count ls) (count rs))]
+              (map (fn [l r]
+                     (- (.total_seconds (- (parse-time (:occurred-at l))
+                                           (parse-time (:occurred-at r))))))
+                   (take n ls)
+                   (take n rs)))))
+         vec)))
+
+(defn- delta-summary
+  [event-type live-rows replay-rows bucket-seconds]
+  (let [deltas (matched-time-deltas event-type live-rows replay-rows
+                                    bucket-seconds)
+        abs-deltas (mapv #(abs %) deltas)]
+    {:event-type event-type
+     :matched-pairs (count deltas)
+     :median-abs-seconds (quantile 0.50 abs-deltas)
+     :p95-abs-seconds (quantile 0.95 abs-deltas)
+     :max-abs-seconds (when (seq abs-deltas) (apply max abs-deltas))}))
+
+(defn behavior-alignment
+  [{:keys [live-rows replay-rows bucket-seconds]
+    :or {bucket-seconds 60}}]
+  (when-not (positive-int-value? bucket-seconds)
+    (throw (python/ValueError
+            (str "bucket-seconds must be a positive integer: "
+                 (pr-str bucket-seconds)))))
+  (validate-artifact-rows! :analysis/tape-row live-rows)
+  (validate-artifact-rows! :analysis/tape-row replay-rows)
+  (let [live (filterv alignable-row? live-rows)
+        replay (filterv alignable-row? replay-rows)
+        cohort (cohort-compatibility live replay)
+        base-metrics (mapv #(metric-row % live replay bucket-seconds)
+                           ["signal" "intent" "fill"])
+        field-summaries (into {}
+                              (map (fn [m] [(:event-type m) m])
+                                   (mapv #(field-mismatch-summary
+                                           % live replay bucket-seconds)
+                                         ["signal" "intent" "fill"])))
+        metrics (mapv #(merge % (get field-summaries (:event-type %)))
+                      base-metrics)
+        mismatches (vec (concat (alignment-mismatch-rows live replay
+                                                         bucket-seconds)
+                                (field-mismatch-rows live replay
+                                                     bucket-seconds)))]
+    {:bucket-seconds bucket-seconds
+     :metrics metrics
+     :time-deltas (mapv #(delta-summary % live replay bucket-seconds)
+                        ["signal" "intent" "fill"])
+     :cohort cohort
+     :mismatches mismatches
+     :mismatch-count (count mismatches)
+     :status (cond
+               (= :cohort/fail (:status cohort))
+               :alignment/invalid-cohort
+
+               (zero? (count mismatches))
+               :alignment/pass-exact
+
+               :else
+               :alignment/review-mismatches)}))
+
+(defn- pct
+  [x]
+  (if (nil? x) "n/a" (str (format "%.2f" (* 100.0 x)) "%")))
+
+(defn- maybe-num
+  [x]
+  (if (nil? x) "n/a" (str x)))
+
+(defn- md-list-cell
+  [xs]
+  (if (seq xs)
+    (bstr/join "<br>" (map str xs))
+    "none"))
+
+(defn- md-map-cell
+  [m]
+  (if (seq m)
+    (bstr/join "<br>" (map (fn [[k v]] (str k ": " v))
+                            (sort-by first m)))
+    "none"))
+
+(defn- cohort-profile-row
+  [label profile]
+  (str "| " label
+       " | " (:rows profile)
+       " | " (:alignable-rows profile)
+       " | " (maybe-num (:start profile))
+       " | " (maybe-num (:end profile))
+       " | " (md-list-cell (:accounts profile))
+       " | " (md-list-cell (:strategies profile))
+       " | " (md-map-cell (:event-counts profile))
+       " |\n"))
+
+(defn- cohort-check-row
+  [row]
+  (str "| " (:check row)
+       " | " (:status row)
+       " | `" (csv-cell (:details row)) "` |\n"))
+
+(defn cohort-report-md
+  [cohort]
+  (str "## Cohort Gate\n\n"
+       "- status: `" (:status cohort) "`\n\n"
+       "| side | rows | alignable_rows | start | end | accounts | strategies | event_counts |\n"
+       "|---|---:|---:|---|---|---|---|---|\n"
+       (cohort-profile-row "live" (:live cohort))
+       (cohort-profile-row "replay" (:replay cohort))
+       "\n| check | status | details |\n"
+       "|---|---|---|\n"
+       (bstr/join "" (map cohort-check-row (:checks cohort)))
+       "\n"))
+
+(defn alignment-report-md
+  [{:keys [live-path replay-path alignment]}]
+  (let [metrics (:metrics alignment)
+        deltas (:time-deltas alignment)
+        cohort (:cohort alignment)]
+    (str "# Behavior Alignment Report\n\n"
+         "- live_tape: `" live-path "`\n"
+         "- replay_tape: `" replay-path "`\n"
+         "- bucket_seconds: `" (:bucket-seconds alignment) "`\n"
+         "- status: `" (:status alignment) "`\n"
+         "- mismatch_count: `" (:mismatch-count alignment) "`\n\n"
+         (cohort-report-md cohort)
+         "## Precision / Recall\n\n"
+         "| event_type | live | replay | matched | precision | recall | direction_mismatch | instrument_mismatch | quantity_mismatch |\n"
+         "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+         (bstr/join
+          ""
+          (map (fn [m]
+                 (str "| " (:event-type m)
+                      " | " (:live-count m)
+                      " | " (:replay-count m)
+                      " | " (:matched-count m)
+                      " | " (pct (:precision m))
+                      " | " (pct (:recall m))
+                      " | " (:direction-mismatches m)
+                      " | " (:instrument-mismatches m)
+                      " | " (:quantity-mismatches m)
+                      " |\n"))
+               metrics))
+         "\n## Matched Time Deltas\n\n"
+         "| event_type | matched_pairs | median_abs_seconds | p95_abs_seconds | max_abs_seconds |\n"
+         "|---|---:|---:|---:|---:|\n"
+         (bstr/join
+          ""
+          (map (fn [d]
+                 (str "| " (:event-type d)
+                      " | " (:matched-pairs d)
+                      " | " (maybe-num (:median-abs-seconds d))
+                      " | " (maybe-num (:p95-abs-seconds d))
+                      " | " (maybe-num (:max-abs-seconds d))
+                      " |\n"))
+               deltas))
+         "\n## Interpretation\n\n"
+         (if (= :cohort/fail (:status cohort))
+           (str "The cohort gate failed, so this report is not a valid "
+                "same-population comparison. Fix the live/replay strategy, "
+                "account, and window contract before interpreting behavior "
+                "alignment or performance statistics.\n")
+           (str "This is an exact bucket-alignment report. Any nonzero "
+                "mismatch count requires review before performance "
+                "same-population tests are valid.\n")))))
+
+(defn write-behavior-alignment!
+  [{:keys [live-tape replay-tape out mismatches-out bucket-seconds]}]
+  (let [bucket (or bucket-seconds 60)
+        live-rows (read-csv! live-tape)
+        replay-rows (read-csv! replay-tape)
+        alignment (behavior-alignment {:live-rows live-rows
+                                       :replay-rows replay-rows
+                                       :bucket-seconds bucket})
+        parent (os.path/dirname out)]
+    (when (and parent (not= "" parent))
+      (os/makedirs parent ** :exist_ok true))
+    (spit out (alignment-report-md {:live-path live-tape
+                                    :replay-path replay-tape
+                                    :alignment alignment}))
+    (when (some? mismatches-out)
+      (write-csv! mismatches-out mismatch-columns (:mismatches alignment)))
+    {:out out
+     :mismatches-out mismatches-out
+     :alignment alignment}))
+
 (defn spread-bucket
   [spread]
   (cond
@@ -513,6 +1474,7 @@
                                     (datetime.datetime/now
                                      (.-utc datetime/timezone))))
      :source/facts-dbs (vec facts-dbs)
+     :source/facts-fingerprints (mapv fact-db-fingerprint facts-dbs)
      :matching/max-lag-seconds max-lag-seconds
      :estimator/prior-strength prior-strength
      :input/option-fills (count fills)
@@ -631,6 +1593,7 @@
                                     (datetime.datetime/now
                                      (.-utc datetime/timezone))))
      :source/facts-dbs (vec facts-dbs)
+     :source/facts-fingerprints (mapv fact-db-fingerprint facts-dbs)
      :matching/max-lag-seconds max-lag-seconds
      :estimator/prior-strength prior-strength
      :input/option-fills (count fills)
@@ -640,15 +1603,1508 @@
 
 (defn write-calibration!
   [{:keys [facts-dbs out max-lag-seconds prior-strength]}]
-  (let [artifact (calibration-artifact-fast
+  (let [artifact (calibration-artifact
                   {:facts-dbs facts-dbs
                    :max-lag-seconds (or max-lag-seconds 90.0)
                    :prior-strength (or prior-strength 30.0)})
         parent (os.path/dirname out)]
+    (validate-artifact! :analysis/calibration-artifact artifact)
     (when (and parent (not= "" parent))
       (os/makedirs parent ** :exist_ok true))
     (spit out (str (edn/write-string artifact) "\n"))
     artifact))
+
+;; ---------------------------------------------------------------------------
+;; Same-population readiness gate
+;; ---------------------------------------------------------------------------
+
+(defn- gate-issue
+  ([severity code message]
+   (gate-issue severity code message {}))
+  ([severity code message details]
+   {:severity severity
+    :code code
+    :message message
+    :details details}))
+
+(defn- parameter-issue
+  [parameter value expected]
+  (gate-issue :error
+              :same-pop/invalid-parameter
+              "Same-population parameter is invalid."
+              {:parameter parameter
+               :value value
+               :expected expected}))
+
+(defn- artifact-columns
+  [kind]
+  (case kind
+    :analysis/tape-row live-tape-columns
+    :analysis/episode-row episode-columns
+    nil))
+
+(defn- expected-column-names
+  [kind]
+  (when-let [columns (artifact-columns kind)]
+    (mapv name columns)))
+
+(defn- artifact-column-issues
+  [path kind]
+  (when-let [expected (expected-column-names kind)]
+    (let [actual (csv-header path)]
+      (when (not= expected actual)
+        [(gate-issue :error
+                     :same-pop/invalid-artifact-columns
+                     "Analysis artifact CSV columns do not match the canonical artifact contract."
+                     {:path path
+                      :artifact/kind kind
+                      :expected expected
+                      :actual actual})]))))
+
+(defn- read-csv-artifact
+  [path kind]
+  (try
+    (if-not (and (some? path) (os.path/exists path))
+      {:rows []
+       :issues [(gate-issue :error
+                            :same-pop/missing-artifact
+                            (str "Missing required " kind " artifact.")
+                            {:path path :artifact/kind kind})]}
+      (let [column-issues (artifact-column-issues path kind)
+            rows (read-csv! path)
+            validation (analysis-schema/rows-validation-result kind rows)]
+        {:rows rows
+         :issues (vec
+                  (concat
+                   column-issues
+                   (if (:valid? validation)
+                     []
+                     [(gate-issue :error
+                                  :same-pop/invalid-artifact
+                                  (str "Invalid " kind " artifact rows.")
+                                  {:path path
+                                   :artifact/kind kind
+                                   :errors (:errors validation)})])))}))
+    (catch python/Exception e
+      {:rows []
+       :issues [(gate-issue :error
+                            :same-pop/unreadable-artifact
+                            (str "Could not read " kind " artifact.")
+                            {:path path
+                             :artifact/kind kind
+                             :error (str e)})]})))
+
+(defn- read-edn-artifact
+  [path kind]
+  (try
+    (if-not (and (some? path) (os.path/exists path))
+      {:artifact nil
+       :issues [(gate-issue :error
+                            :same-pop/missing-artifact
+                            (str "Missing required " kind " artifact.")
+                            {:path path :artifact/kind kind})]}
+      (let [artifact (edn/read-string (slurp path))
+            validation (analysis-schema/validation-result kind artifact)]
+        {:artifact artifact
+         :issues (if (:valid? validation)
+                   []
+                   [(gate-issue :error
+                                :same-pop/invalid-artifact
+                                (str "Invalid " kind " artifact.")
+                                {:path path
+                                 :artifact/kind kind
+                                 :errors (:errors validation)})])}))
+    (catch python/Exception e
+      {:artifact nil
+       :issues [(gate-issue :error
+                            :same-pop/unreadable-artifact
+                            (str "Could not read " kind " artifact.")
+                            {:path path
+                             :artifact/kind kind
+                            :error (str e)})]})))
+
+(defn- read-sidecar
+  [path]
+  (try
+    (let [sidecar (sidecar-path path)]
+      (if-not (os.path/exists sidecar)
+        {:artifact nil
+         :issues [(gate-issue :error
+                              :same-pop/missing-provenance-sidecar
+                              "Analysis artifact is missing its export provenance sidecar."
+                              {:path path :sidecar sidecar})]}
+        {:artifact (edn/read-string (slurp sidecar))
+         :issues []}))
+    (catch python/Exception e
+      {:artifact nil
+       :issues [(gate-issue :error
+                            :same-pop/unreadable-provenance-sidecar
+                            "Analysis artifact provenance sidecar could not be read."
+                            {:path path :sidecar (sidecar-path path)
+                             :error (str e)})]})))
+
+(def export-provenance-sidecar-keys
+  #{:manifest/version :manifest/kind :artifact/kind :artifact/path
+    :artifact/sha256 :artifact/rows :artifact/columns :artifact/generated-at
+    :source/kind :source/facts-db})
+
+(def export-provenance-source-keys
+  #{:path :sha256 :rows :start :end :min-offset :max-offset :fact-counts})
+
+(defn- provenance-exact-key-issues
+  [path label code-missing code-extra expected m]
+  (let [actual (if (map? m) (set (keys m)) #{})
+        missing (vec (sort-by str (filter #(not (contains? actual %))
+                                          expected)))
+        extra (vec (sort-by str (filter #(not (contains? expected %))
+                                        actual)))]
+    (vec
+     (concat
+      (when (seq missing)
+        [(gate-issue :error
+                     code-missing
+                     (str "Analysis artifact provenance " label
+                          " is missing required fields.")
+                     {:path path
+                      :sidecar (sidecar-path path)
+                      :fields missing})])
+      (when (seq extra)
+        [(gate-issue :error
+                     code-extra
+                     (str "Analysis artifact provenance " label
+                          " contains unexpected fields.")
+                     {:path path
+                      :sidecar (sidecar-path path)
+                      :fields extra})])))))
+
+(defn- provenance-shape-key-issues
+  [path artifact]
+  (vec
+   (concat
+    (provenance-exact-key-issues
+     path
+     "sidecar"
+     :same-pop/provenance-sidecar-missing-keys
+     :same-pop/provenance-sidecar-extra-keys
+     export-provenance-sidecar-keys
+     artifact)
+    (provenance-exact-key-issues
+     path
+     "source facts DB fingerprint"
+     :same-pop/provenance-source-fingerprint-missing-keys
+     :same-pop/provenance-source-fingerprint-extra-keys
+     export-provenance-source-keys
+     (:source/facts-db artifact)))))
+
+(defn- provenance-issues
+  [path expected-kind rows]
+  (let [{:keys [artifact issues]} (read-sidecar path)]
+    (if (seq issues)
+      issues
+      (vec
+       (concat
+        (provenance-shape-key-issues path artifact)
+        (keep identity
+              [(when (not= :analysis/export-provenance-v1
+                           (:manifest/kind artifact))
+                 (gate-issue :error
+                             :same-pop/invalid-provenance-sidecar
+                             "Analysis artifact provenance sidecar has the wrong manifest kind."
+                             {:path path
+                              :sidecar (sidecar-path path)
+                              :manifest/kind (:manifest/kind artifact)}))
+               (when (not= expected-kind (:artifact/kind artifact))
+                 (gate-issue :error
+                             :same-pop/provenance-kind-mismatch
+                             "Analysis artifact provenance kind does not match expected artifact type."
+                             {:path path
+                              :expected expected-kind
+                              :actual (:artifact/kind artifact)}))
+               (let [expected-columns (expected-column-names expected-kind)]
+                 (when (and expected-columns
+                            (not= expected-columns (:artifact/columns artifact)))
+                   (gate-issue :error
+                               :same-pop/provenance-column-mismatch
+                               "Analysis artifact provenance columns do not match the canonical artifact contract."
+                               {:path path
+                                :expected expected-columns
+                                :actual (:artifact/columns artifact)})))
+               (when (not= path (:artifact/path artifact))
+                 (gate-issue :error
+                             :same-pop/provenance-path-mismatch
+                             "Analysis artifact provenance path does not match the artifact being read."
+                             {:path path
+                              :sidecar-path (:artifact/path artifact)}))
+               (let [expected-sha (:artifact/sha256 artifact)]
+                 (when (and (present? expected-sha)
+                            (not= expected-sha (artifact-sha256 path)))
+                   (gate-issue :error
+                               :same-pop/provenance-artifact-checksum-mismatch
+                               "Analysis artifact contents changed after provenance sidecar generation."
+                               {:path path
+                                :expected-sha256 expected-sha
+                                :actual-sha256 (artifact-sha256 path)})))
+               (when (not= (count rows) (:artifact/rows artifact))
+                 (gate-issue :error
+                             :same-pop/provenance-row-count-mismatch
+                             "Analysis artifact row count differs from provenance sidecar."
+                             {:path path
+                              :expected-rows (:artifact/rows artifact)
+                              :actual-rows (count rows)}))
+               (let [facts-db (get-in artifact [:source/facts-db :path])
+                     expected-source-sha (get-in artifact
+                                                 [:source/facts-db :sha256])]
+                 (cond
+                   (and (present? facts-db)
+                        (present? expected-source-sha)
+                        (not (os.path/exists facts-db)))
+                   (gate-issue :error
+                               :same-pop/provenance-source-missing
+                               "Source facts DB referenced by provenance sidecar is missing."
+                               {:path path
+                                :facts-db facts-db
+                                :expected-sha256 expected-source-sha})
+
+                   (and (present? facts-db)
+                        (os.path/exists facts-db)
+                        (present? expected-source-sha)
+                        (not= expected-source-sha
+                              (artifact-sha256 facts-db)))
+                   (gate-issue :error
+                               :same-pop/provenance-source-checksum-mismatch
+                               "Source facts DB changed after analysis artifact export."
+                               {:path path
+                                :facts-db facts-db
+                                :expected-sha256 expected-source-sha
+                                :actual-sha256 (artifact-sha256 facts-db)})))]))))))
+
+(defn- completed-episode?
+  [row]
+  (and (present? (:entry-time row))
+       (present? (:exit-time row))
+       (present? (:gross-pnl row))
+       (present? (:entry-price row))
+       (present? (:exit-price row))))
+
+(defn- readiness-parameter-issues
+  [{:keys [bucket-seconds]}]
+  (vec
+   (keep identity
+         [(when-not (positive-int-value? bucket-seconds)
+            (parameter-issue :bucket-seconds
+                             bucket-seconds
+                             "positive integer"))])))
+
+(defn- episode-pnl-readiness-issues
+  [side rows]
+  (vec
+   (keep identity
+         (map-indexed
+          (fn [idx row]
+            (when (and (completed-episode? row)
+                       (not (finite-double? (:gross-pnl row))))
+              (gate-issue :error
+                          :same-pop/nonfinite-episode-pnl
+                          (str side " completed episode has non-finite P&L.")
+                          {:side side
+                           :row-number (inc idx)
+                           :episode-id (:episode-id row)
+                           :gross-pnl (:gross-pnl row)})))
+          rows))))
+
+(defn- parse-episode-time
+  [x]
+  (datetime.datetime/fromisoformat (.replace (str x) "Z" "+00:00")))
+
+(defn- episode-timing-readiness-issues
+  [side rows]
+  (vec
+   (mapcat
+    (fn [idx row]
+      (if-not (completed-episode? row)
+        []
+        (try
+          (let [entry (parse-episode-time (:entry-time row))
+                exit (parse-episode-time (:exit-time row))
+                observed-holding (:holding-minutes row)
+                expected-holding (/ (.total_seconds (- exit entry)) 60.0)]
+            (vec
+             (keep identity
+                   [(when (neg? expected-holding)
+                      (gate-issue
+                       :error
+                       :same-pop/negative-episode-holding
+                       (str side " completed episode exits before it enters.")
+                       {:side side
+                        :row-number (inc idx)
+                        :episode-id (:episode-id row)
+                        :entry-time (:entry-time row)
+                        :exit-time (:exit-time row)
+                        :holding-minutes expected-holding}))
+                    (when-not (finite-double? observed-holding)
+                      (gate-issue
+                       :error
+                       :same-pop/invalid-episode-holding
+                       (str side " completed episode has missing or non-finite holding minutes.")
+                       {:side side
+                        :row-number (inc idx)
+                        :episode-id (:episode-id row)
+                        :holding-minutes observed-holding}))
+                    (when (and (finite-double? observed-holding)
+                               (> (math/fabs (- (float observed-holding)
+                                                expected-holding))
+                                  1e-6))
+                      (gate-issue
+                       :error
+                       :same-pop/episode-holding-mismatch
+                       (str side " completed episode holding minutes do not match entry/exit times.")
+                       {:side side
+                        :row-number (inc idx)
+                        :episode-id (:episode-id row)
+                        :expected-holding-minutes expected-holding
+                        :actual-holding-minutes (float observed-holding)}))])))
+          (catch python/Exception e
+            [(gate-issue
+              :error
+              :same-pop/invalid-episode-time
+              (str side " completed episode has unparseable entry/exit time.")
+              {:side side
+               :row-number (inc idx)
+               :episode-id (:episode-id row)
+               :entry-time (:entry-time row)
+               :exit-time (:exit-time row)
+               :error (str e)})]))))
+    (range)
+    rows)))
+
+(defn- episode-readiness-issues
+  [side rows]
+  (let [completed (count (filter completed-episode? rows))]
+    (vec
+     (concat
+      (keep identity
+            [(when (zero? (count rows))
+               (gate-issue :error
+                           :same-pop/no-episodes
+                           (str side " episode artifact contains no rows.")
+                           {:side side}))
+             (when (zero? completed)
+               (gate-issue :error
+                           :same-pop/no-completed-episodes
+                           (str side " episode artifact contains no completed trades.")
+                           {:side side :rows (count rows)}))])
+      (episode-pnl-readiness-issues side rows)
+      (episode-timing-readiness-issues side rows)))))
+
+(defn- episode-account-strategy-counts
+  [rows]
+  (->> rows
+       (filter completed-episode?)
+       (filter #(and (present? (:account-id %))
+                     (present? (:strategy-id %))))
+       (group-by account-strategy)
+       (map (fn [[[account strategy] rs]]
+              {:account-id account
+               :strategy-id strategy
+               :episodes (count rs)}))
+       (sort-by (juxt :account-id :strategy-id))
+       vec))
+
+(defn- episode-pair-set
+  [rows]
+  (set (map (fn [row] [(:account-id row) (:strategy-id row)])
+            (episode-account-strategy-counts rows))))
+
+(defn- episode-cohort-issues
+  [alignment live-episodes replay-episodes]
+  (when alignment
+    (let [behavior-pairs (pair-set (get-in alignment [:cohort :live]))
+          live-pairs (episode-pair-set live-episodes)
+          replay-pairs (episode-pair-set replay-episodes)]
+      (vec
+       (keep identity
+             [(when (not= live-pairs replay-pairs)
+                (gate-issue :error
+                            :same-pop/episode-cohort-mismatch
+                            "Live/replay episode cohorts do not match each other."
+                            {:live (vec (sort live-pairs))
+                             :replay (vec (sort replay-pairs))}))
+              (when (not= behavior-pairs live-pairs)
+                (gate-issue :error
+                            :same-pop/episode-behavior-cohort-mismatch
+                            "Episode cohort does not match the behavior-tape cohort."
+                            {:behavior (vec (sort behavior-pairs))
+                             :live-episodes (vec (sort live-pairs))
+                             :replay-episodes (vec (sort replay-pairs))
+                             :live-episode-counts
+                             (episode-account-strategy-counts live-episodes)
+                             :replay-episode-counts
+                             (episode-account-strategy-counts replay-episodes)}))])))))
+
+(declare calibration-source-provenance-issues)
+
+(defn- calibration-readiness-issues
+  [artifact require-provenance?]
+  (when artifact
+    (vec
+     (concat
+      (keep identity
+            [(when (zero? (:input/option-fills artifact))
+               (gate-issue :warn
+                           :same-pop/no-option-fills
+                           "Calibration artifact contains no option fills."
+                           {:input/option-fills (:input/option-fills artifact)}))
+             (when (zero? (:input/matched-fills artifact))
+               (gate-issue :error
+                           :same-pop/no-quote-matched-fills
+                           "Calibration artifact has zero quote-matched fills; fill parity cannot pass."
+                           {:input/matched-fills (:input/matched-fills artifact)}))])
+      (when require-provenance?
+        (calibration-source-provenance-issues artifact))))))
+
+(defn same-pop-readiness
+  "Validate required artifacts before any same-population P&L/statistical test.
+  This is a gate, not the test itself: it fails early on malformed artifacts,
+  invalid cohorts, behavior mismatches, missing completed episodes, and unusable
+  fill calibration."
+  [{:keys [live-tape replay-tape live-episodes replay-episodes calibration
+           bucket-seconds require-provenance?]
+    :or {bucket-seconds 60 require-provenance? true}}]
+  (let [live-tape-r (read-csv-artifact live-tape :analysis/tape-row)
+        replay-tape-r (read-csv-artifact replay-tape :analysis/tape-row)
+        live-episodes-r (read-csv-artifact live-episodes :analysis/episode-row)
+        replay-episodes-r (read-csv-artifact replay-episodes :analysis/episode-row)
+        calibration-r (read-edn-artifact calibration
+                                         :analysis/calibration-artifact)
+        parameter-issues (readiness-parameter-issues
+                          {:bucket-seconds bucket-seconds})
+        provenance-issues (if require-provenance?
+                            (vec (concat
+                                  (when (empty? (:issues live-tape-r))
+                                    (provenance-issues
+                                     live-tape :analysis/tape-row
+                                     (:rows live-tape-r)))
+                                  (when (empty? (:issues replay-tape-r))
+                                    (provenance-issues
+                                     replay-tape :analysis/tape-row
+                                     (:rows replay-tape-r)))
+                                  (when (empty? (:issues live-episodes-r))
+                                    (provenance-issues
+                                     live-episodes :analysis/episode-row
+                                     (:rows live-episodes-r)))
+                                  (when (empty? (:issues replay-episodes-r))
+                                    (provenance-issues
+                                     replay-episodes :analysis/episode-row
+                                     (:rows replay-episodes-r)))))
+                            [])
+        artifact-issues (vec (concat (:issues live-tape-r)
+                                     (:issues replay-tape-r)
+                                     (:issues live-episodes-r)
+                                     (:issues replay-episodes-r)
+                                     (:issues calibration-r)
+                                     parameter-issues
+                                     provenance-issues))
+        artifact-errors? (boolean (some #(= :error (:severity %))
+                                        artifact-issues))
+        alignment (when-not artifact-errors?
+                    (behavior-alignment
+                     {:live-rows (:rows live-tape-r)
+                      :replay-rows (:rows replay-tape-r)
+                      :bucket-seconds bucket-seconds}))
+        behavior-issues (if (and alignment
+                                 (not= :alignment/pass-exact
+                                       (:status alignment)))
+                          [(gate-issue :error
+                                       :same-pop/behavior-not-aligned
+                                       "Live/replay behavior alignment did not pass exactly."
+                                       {:alignment/status (:status alignment)
+                                        :mismatch-count (:mismatch-count alignment)
+                                        :cohort/status
+                                        (get-in alignment [:cohort :status])})]
+                          [])
+        episode-issues (if-not artifact-errors?
+                         (vec (concat
+                               (episode-readiness-issues
+                                "live" (:rows live-episodes-r))
+                               (episode-readiness-issues
+                                "replay" (:rows replay-episodes-r))
+                               (episode-cohort-issues
+                                alignment
+                                (:rows live-episodes-r)
+                                (:rows replay-episodes-r))))
+                         [])
+        fill-issues (if-not artifact-errors?
+                      (calibration-readiness-issues
+                       (:artifact calibration-r)
+                       require-provenance?)
+                      [])
+        issues (vec (concat artifact-issues behavior-issues
+                            episode-issues fill-issues))
+        has-error? (boolean (some #(= :error (:severity %)) issues))
+        behavior-fail? (boolean (some #(= :same-pop/behavior-not-aligned
+                                          (:code %))
+                                      issues))
+        fill-fail? (boolean (some #(= :same-pop/no-quote-matched-fills
+                                      (:code %))
+                                  issues))
+        blocked? (boolean (some #(contains? #{:same-pop/missing-artifact
+                                              :same-pop/invalid-parameter
+                                              :same-pop/invalid-artifact-columns
+                                              :same-pop/invalid-artifact
+                                              :same-pop/unreadable-artifact
+                                              :same-pop/missing-provenance-sidecar
+                                              :same-pop/unreadable-provenance-sidecar
+                                              :same-pop/provenance-sidecar-missing-keys
+                                              :same-pop/provenance-sidecar-extra-keys
+                                              :same-pop/provenance-source-fingerprint-missing-keys
+                                              :same-pop/provenance-source-fingerprint-extra-keys
+                                              :same-pop/invalid-provenance-sidecar
+                                              :same-pop/provenance-kind-mismatch
+                                              :same-pop/provenance-column-mismatch
+                                              :same-pop/provenance-path-mismatch
+                                              :same-pop/provenance-artifact-checksum-mismatch
+                                              :same-pop/provenance-row-count-mismatch
+                                              :same-pop/missing-calibration-source-fingerprints
+                                              :same-pop/missing-calibration-source-path
+                                              :same-pop/provenance-source-missing
+                                              :same-pop/provenance-source-checksum-mismatch
+                                              :same-pop/no-episodes
+                                              :same-pop/no-completed-episodes
+                                              :same-pop/nonfinite-episode-pnl
+                                              :same-pop/invalid-episode-time
+                                              :same-pop/negative-episode-holding
+                                              :same-pop/invalid-episode-holding
+                                              :same-pop/episode-holding-mismatch
+                                              :same-pop/episode-cohort-mismatch
+                                              :same-pop/episode-behavior-cohort-mismatch}
+                                            (:code %))
+                                issues))]
+    {:valid? (not has-error?)
+     :status (cond
+               blocked? :same-pop/blocked-data
+               behavior-fail? :same-pop/fail-behavior
+               fill-fail? :same-pop/fail-fills
+               has-error? :same-pop/blocked-data
+               :else :same-pop/ready-for-stat-tests)
+     :issues issues
+     :alignment alignment
+     :artifact-counts {:live-tape (count (:rows live-tape-r))
+                       :replay-tape (count (:rows replay-tape-r))
+                       :live-episodes (count (:rows live-episodes-r))
+                       :replay-episodes (count (:rows replay-episodes-r))
+                       :calibration-matched-fills
+                       (get-in calibration-r
+                               [:artifact :input/matched-fills])}}))
+
+(defn- utc-now-string
+  []
+  (.isoformat (datetime.datetime/now (.-utc datetime/timezone))))
+
+(defn- code-revision
+  []
+  (try
+    (let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))
+          result (subprocess/run ["git" "rev-parse" "HEAD"]
+                                 ** :capture_output true
+                                 :text true
+                                 :check false
+                                 :cwd repo-root)
+          rev (.strip (.-stdout result))]
+      (if (and (= 0 (.-returncode result)) (present? rev))
+        rev
+        "unknown"))
+    (catch python/Exception _ "unknown")))
+
+(defn- artifact-ref
+  [path]
+  (let [absolute-path (os.path/abspath path)]
+    {:path absolute-path
+     :sha256 (artifact-sha256 absolute-path)}))
+
+(defn same-pop-manifest
+  [{:keys [live-tape replay-tape live-episodes replay-episodes calibration out
+           bucket-seconds bootstrap-reps permutation-reps min-samples
+           practical-mean-threshold generated-at code-revision-ref]
+    :or {bucket-seconds 60
+         bootstrap-reps 1000
+         permutation-reps 1000
+         min-samples 30
+         practical-mean-threshold 0.0}
+    :as _opts}
+   readiness]
+  (let [alignment (:alignment readiness)
+        live-profile (get-in alignment [:cohort :live])
+        artifact-counts (:artifact-counts readiness)
+        manifest {:manifest/version 1
+                  :manifest/kind :same-population/performance-v1
+                  :manifest/generated-at (or generated-at (utc-now-string))
+                  :code/revision (or code-revision-ref (code-revision))
+                  :artifacts {:live-tape (artifact-ref live-tape)
+                              :replay-tape (artifact-ref replay-tape)
+                              :live-episodes (artifact-ref live-episodes)
+                              :replay-episodes (artifact-ref replay-episodes)
+                              :calibration (artifact-ref calibration)}
+                  :cohort {:accounts (:accounts live-profile)
+                           :strategies (:strategies live-profile)
+                           :start (:start live-profile)
+                           :end (:end live-profile)
+                           :event-counts (:event-counts live-profile)
+                           :account-strategies
+                           (:account-strategies live-profile)}
+                  :gates {:readiness-status (:status readiness)
+                          :alignment-status (:status alignment)
+                          :mismatch-count (:mismatch-count alignment)
+                          :calibration-matched-fills
+                          (:calibration-matched-fills artifact-counts)}
+                  :parameters {:bucket-seconds bucket-seconds
+                               :bootstrap-reps bootstrap-reps
+                               :permutation-reps permutation-reps
+                               :min-samples min-samples
+                               :practical-mean-threshold
+                               practical-mean-threshold}}]
+    (validate-artifact! :analysis/same-pop-manifest manifest)
+    manifest))
+
+(defn- manifest-artifact-entries
+  [manifest]
+  (select-keys (:artifacts manifest)
+               [:live-tape :replay-tape :live-episodes
+                :replay-episodes :calibration :report]))
+
+(def required-same-pop-artifact-keys
+  #{:live-tape :replay-tape :live-episodes :replay-episodes :calibration})
+
+(def optional-same-pop-artifact-keys
+  #{:report})
+
+(def allowed-same-pop-artifact-keys
+  (into required-same-pop-artifact-keys optional-same-pop-artifact-keys))
+
+(defn- manifest-artifact-key-issues
+  [manifest]
+  (let [keys-present (set (keys (:artifacts manifest)))
+        missing (vec (sort-by str
+                              (filter #(not (contains? keys-present %))
+                                      required-same-pop-artifact-keys)))
+        extra (vec (sort-by str
+                            (filter #(not (contains? allowed-same-pop-artifact-keys %))
+                                    keys-present)))]
+    (vec
+     (concat
+      (when (seq missing)
+        [(gate-issue :error
+                     :manifest/missing-artifact-entry
+                     "Same-pop manifest is missing required artifact entries."
+                     {:missing missing})])
+      (when (seq extra)
+        [(gate-issue :error
+                     :manifest/extra-artifact-entry
+                     "Same-pop manifest contains unexpected artifact entries."
+                     {:extra extra})])))))
+
+(def same-pop-manifest-top-level-keys
+  #{:manifest/version :manifest/kind :manifest/generated-at :code/revision
+    :artifacts :cohort :gates :parameters})
+
+(def same-pop-manifest-cohort-keys
+  #{:accounts :strategies :start :end :event-counts :account-strategies})
+
+(def same-pop-manifest-gate-keys
+  #{:readiness-status :alignment-status :mismatch-count
+    :calibration-matched-fills})
+
+(def same-pop-manifest-parameter-keys
+  #{:bucket-seconds :bootstrap-reps :permutation-reps :min-samples
+    :practical-mean-threshold})
+
+(def same-pop-manifest-artifact-ref-keys
+  #{:path :sha256})
+
+(defn- manifest-exact-key-issues
+  [label code-missing code-extra expected m]
+  (let [actual (if (map? m) (set (keys m)) #{})
+        missing (vec (sort-by str (filter #(not (contains? actual %))
+                                          expected)))
+        extra (vec (sort-by str (filter #(not (contains? expected %))
+                                        actual)))]
+    (vec
+     (concat
+      (when (seq missing)
+        [(gate-issue :error
+                     code-missing
+                     (str "Same-pop manifest " label
+                          " is missing required fields.")
+                     {:fields missing})])
+      (when (seq extra)
+        [(gate-issue :error
+                     code-extra
+                     (str "Same-pop manifest " label
+                          " contains unexpected fields.")
+                     {:fields extra})])))))
+
+(defn- manifest-shape-key-issues
+  [manifest]
+  (vec
+   (concat
+    (manifest-exact-key-issues
+     "top level"
+     :manifest/missing-top-level-keys
+     :manifest/extra-top-level-keys
+     same-pop-manifest-top-level-keys
+     manifest)
+    (manifest-exact-key-issues
+     "cohort"
+     :manifest/cohort-missing-keys
+     :manifest/cohort-extra-keys
+     same-pop-manifest-cohort-keys
+     (:cohort manifest))
+    (manifest-exact-key-issues
+     "gates"
+     :manifest/gates-missing-keys
+     :manifest/gates-extra-keys
+     same-pop-manifest-gate-keys
+     (:gates manifest))
+    (manifest-exact-key-issues
+     "parameters"
+     :manifest/parameters-missing-keys
+     :manifest/parameters-extra-keys
+     same-pop-manifest-parameter-keys
+     (:parameters manifest))
+    (mapcat
+     (fn [[artifact-key artifact-ref]]
+       (manifest-exact-key-issues
+        (str "artifact ref " artifact-key)
+        :manifest/artifact-ref-missing-keys
+        :manifest/artifact-ref-extra-keys
+        same-pop-manifest-artifact-ref-keys
+        artifact-ref))
+     (manifest-artifact-entries manifest)))))
+
+(defn- verify-artifact-ref
+  [artifact-key {:keys [path sha256]}]
+  (cond
+    (not (and (some? path) (os.path/exists path)))
+    (gate-issue :error
+                :manifest/missing-artifact
+                "Manifest artifact is missing."
+                {:artifact artifact-key :path path})
+
+    :else
+    (try
+      (let [actual (artifact-sha256 path)]
+        (if (= sha256 actual)
+          nil
+          (gate-issue :error
+                      :manifest/checksum-mismatch
+                      "Manifest artifact checksum does not match current file contents."
+                      {:artifact artifact-key
+                       :path path
+                       :expected-sha256 sha256
+                       :actual-sha256 actual})))
+      (catch python/Exception e
+        (gate-issue :error
+                    :manifest/unreadable-artifact
+                    "Manifest artifact could not be read."
+	                    {:artifact artifact-key
+	                     :path path
+	                     :error (str e)})))))
+
+(defn- path-inside-dir?
+  [dir path]
+  (let [dir-real (os.path/realpath dir)
+        path-real (os.path/realpath path)]
+    (or (= dir-real path-real)
+        (.startswith path-real (str dir-real os/sep)))))
+
+(defn- manifest-required-artifact-parent
+  [manifest]
+  (let [paths (keep #(get-in manifest [:artifacts % :path])
+                    required-same-pop-artifact-keys)]
+    (when (= (count required-same-pop-artifact-keys) (count paths))
+      (os.path/abspath
+       (os.path/dirname (first paths))))))
+
+(defn- manifest-artifact-bundle-issues
+  [manifest]
+  (let [bundle-dir (manifest-required-artifact-parent manifest)
+        required-parents
+        (into {}
+              (keep (fn [artifact-key]
+                      (when-let [path (get-in manifest
+                                              [:artifacts artifact-key :path])]
+                        [artifact-key
+                         (os.path/abspath (os.path/dirname path))])))
+              required-same-pop-artifact-keys)
+        parent-mismatches
+        (vec
+         (keep (fn [[artifact-key parent]]
+                 (when (and bundle-dir (not= bundle-dir parent))
+                   {:artifact artifact-key
+                    :path (get-in manifest [:artifacts artifact-key :path])
+                    :parent parent}))
+               required-parents))
+        containment-issues
+        (when bundle-dir
+          (vec
+           (keep (fn [[artifact-key ref]]
+                   (let [path (:path ref)]
+                     (when (and path
+                                (os.path/exists path)
+                                (not (path-inside-dir? bundle-dir path)))
+                       (gate-issue
+                        :error
+                        :manifest/artifact-path-outside-bundle
+                        "Same-pop manifest artifact resolves outside the artifact bundle directory."
+                        {:artifact artifact-key
+                         :path path
+                         :bundle-dir bundle-dir
+                         :realpath (os.path/realpath path)}))))
+                 (manifest-artifact-entries manifest))))]
+    (vec
+     (concat
+      (when (seq parent-mismatches)
+        [(gate-issue
+          :error
+          :manifest/artifact-bundle-parent-mismatch
+          "Same-pop manifest required artifacts are not in one artifact bundle directory."
+          {:bundle-dir bundle-dir
+           :mismatches parent-mismatches})])
+      containment-issues))))
+
+(defn- manifest-artifact-duplicate-path-issues
+  [manifest]
+  (let [entries (vec
+                 (keep (fn [artifact-key]
+                         (when-let [path (get-in manifest
+                                                 [:artifacts artifact-key :path])]
+                           (when (present? path)
+                             {:artifact artifact-key
+                              :path path
+                              :realpath (os.path/realpath path)})))
+                       required-same-pop-artifact-keys))
+        by-realpath (group-by :realpath entries)]
+    (vec
+     (keep (fn [[realpath refs]]
+             (when (> (count refs) 1)
+               (gate-issue
+                :error
+                :manifest/duplicate-artifact-path
+                "Same-pop manifest artifact roles must resolve to distinct files."
+                {:realpath realpath
+                 :artifacts (vec (sort-by str (map :artifact refs)))
+                 :paths (vec (sort (map :path refs)))})))
+           by-realpath))))
+
+(defn- calibration-source-provenance-issues
+  [artifact]
+  (if (empty? (:source/facts-fingerprints artifact))
+    [(gate-issue :error
+                 :same-pop/missing-calibration-source-fingerprints
+                 "Calibration artifact is missing source facts DB fingerprints."
+                 {:source/facts-dbs (:source/facts-dbs artifact)})]
+    (vec
+     (keep identity
+           (map
+            (fn [fingerprint]
+              (let [facts-db (:path fingerprint)
+                    expected-sha (:sha256 fingerprint)]
+                (cond
+                  (not (present? facts-db))
+                  (gate-issue :error
+                              :same-pop/missing-calibration-source-path
+                              "Calibration source fingerprint is missing a facts DB path."
+                              {:fingerprint fingerprint})
+
+                  (not (os.path/exists facts-db))
+                  (gate-issue :error
+                              :same-pop/provenance-source-missing
+                              "Calibration source facts DB is missing."
+                              {:facts-db facts-db
+                               :expected-sha256 expected-sha})
+
+                  (and (present? expected-sha)
+                       (not= expected-sha (artifact-sha256 facts-db)))
+                  (gate-issue :error
+                              :same-pop/provenance-source-checksum-mismatch
+                              "Calibration source facts DB changed after calibration export."
+                              {:facts-db facts-db
+                               :expected-sha256 expected-sha
+                              :actual-sha256 (artifact-sha256 facts-db)}))))
+            (:source/facts-fingerprints artifact))))))
+
+(defn- manifest-semantic-mismatch
+  [field expected actual]
+  (gate-issue :error
+              :manifest/semantic-mismatch
+              "Same-pop manifest metadata does not match referenced artifacts."
+              {:field field
+               :expected expected
+               :actual actual}))
+
+(defn- manifest-cohort-profile
+  [profile]
+  {:accounts (:accounts profile)
+   :strategies (:strategies profile)
+   :start (:start profile)
+   :end (:end profile)
+   :event-counts (:event-counts profile)
+   :account-strategies (:account-strategies profile)})
+
+(defn- manifest-parameter-semantic-issues
+  [manifest]
+  (let [params (:parameters manifest)]
+    (vec
+     (keep identity
+           [(when-not (positive-int-value? (:bucket-seconds params))
+              (parameter-issue :bucket-seconds
+                               (:bucket-seconds params)
+                               "positive integer"))
+            (when-not (positive-int-value? (:bootstrap-reps params))
+              (parameter-issue :bootstrap-reps
+                               (:bootstrap-reps params)
+                               "positive integer"))
+            (when-not (positive-int-value? (:permutation-reps params))
+              (parameter-issue :permutation-reps
+                               (:permutation-reps params)
+                               "positive integer"))
+            (when-not (positive-int-value? (:min-samples params))
+              (parameter-issue :min-samples
+                               (:min-samples params)
+                               "positive integer"))
+	            (when-not (nonnegative-finite-double?
+	                       (:practical-mean-threshold params))
+	              (parameter-issue :practical-mean-threshold
+	                               (:practical-mean-threshold params)
+	                               "nonnegative finite number"))]))))
+
+(defn- parse-timestamp-seconds
+  [s]
+  (.timestamp
+   (datetime.datetime/fromisoformat
+    (.replace (str s) "Z" "+00:00"))))
+
+(defn- manifest-generated-at-issues
+  [manifest]
+  (try
+    (let [generated-at (:manifest/generated-at manifest)
+          generated-seconds (parse-timestamp-seconds generated-at)
+          now-seconds (.timestamp
+                       (datetime.datetime/now (.-utc datetime/timezone)))]
+      (if (> generated-seconds (+ now-seconds 60.0))
+        [(gate-issue :error
+                     :manifest/generated-at-in-future
+                     "Same-pop manifest generated-at timestamp is in the future."
+                     {:manifest/generated-at generated-at})]
+        []))
+    (catch python/Exception e
+      [(gate-issue :error
+                   :manifest/generated-at-unparseable
+                   "Same-pop manifest generated-at timestamp is not parseable."
+                   {:manifest/generated-at (:manifest/generated-at manifest)
+                    :error (str e)})])))
+
+(defn- manifest-readiness-opts
+  [manifest]
+  {:live-tape (get-in manifest [:artifacts :live-tape :path])
+   :replay-tape (get-in manifest [:artifacts :replay-tape :path])
+   :live-episodes (get-in manifest [:artifacts :live-episodes :path])
+   :replay-episodes (get-in manifest [:artifacts :replay-episodes :path])
+   :calibration (get-in manifest [:artifacts :calibration :path])
+   :bucket-seconds (get-in manifest [:parameters :bucket-seconds])})
+
+(defn- manifest-readiness-semantic-issues
+  [manifest]
+  (let [readiness (same-pop-readiness (manifest-readiness-opts manifest))
+        alignment (:alignment readiness)
+        live-profile (get-in alignment [:cohort :live])
+        expected-cohort (manifest-cohort-profile live-profile)
+        actual-cohort (:cohort manifest)
+        artifact-counts (:artifact-counts readiness)
+        expected-gates {:readiness-status (:status readiness)
+                        :alignment-status (:status alignment)
+                        :mismatch-count (:mismatch-count alignment)
+                        :calibration-matched-fills
+                        (:calibration-matched-fills artifact-counts)}
+        actual-gates (:gates manifest)]
+    (vec
+     (concat
+      (when-not (:valid? readiness)
+        [(gate-issue :error
+                     :manifest/referenced-artifacts-not-ready
+                     "Same-pop manifest references artifacts that no longer pass the readiness gate."
+                     {:status (:status readiness)
+                      :issues (:issues readiness)})])
+      (keep identity
+            [(when (not= expected-cohort actual-cohort)
+               (manifest-semantic-mismatch :cohort
+                                           expected-cohort
+                                           actual-cohort))
+             (when (not= (:readiness-status expected-gates)
+                         (:readiness-status actual-gates))
+               (manifest-semantic-mismatch :gates.readiness-status
+                                           (:readiness-status expected-gates)
+                                           (:readiness-status actual-gates)))
+             (when (not= (:alignment-status expected-gates)
+                         (:alignment-status actual-gates))
+               (manifest-semantic-mismatch :gates.alignment-status
+                                           (:alignment-status expected-gates)
+                                           (:alignment-status actual-gates)))
+             (when (not= (:mismatch-count expected-gates)
+                         (:mismatch-count actual-gates))
+               (manifest-semantic-mismatch :gates.mismatch-count
+                                           (:mismatch-count expected-gates)
+                                           (:mismatch-count actual-gates)))
+             (when (not= (:calibration-matched-fills expected-gates)
+                         (:calibration-matched-fills actual-gates))
+               (manifest-semantic-mismatch
+                :gates.calibration-matched-fills
+                (:calibration-matched-fills expected-gates)
+                (:calibration-matched-fills actual-gates)))])))))
+
+(defn- manifest-semantic-issues
+  [manifest]
+	  (vec
+	   (concat
+	    (manifest-parameter-semantic-issues manifest)
+	    (manifest-generated-at-issues manifest)
+	    (manifest-readiness-semantic-issues manifest))))
+
+(defn verify-same-pop-manifest
+  "Verify a saved same-population manifest and all referenced artifact
+  checksums. Returns {:valid? bool :status ... :issues [...]}."
+  [manifest]
+  (let [shape (analysis-schema/validation-result
+               :analysis/same-pop-manifest manifest)]
+    (if-not (:valid? shape)
+      {:valid? false
+       :status :manifest/invalid
+       :issues [(gate-issue :error
+                            :manifest/invalid-shape
+                            "Same-pop manifest failed schema validation."
+                            {:errors (:errors shape)})]}
+      (let [issues (vec
+                    (concat
+                     (manifest-shape-key-issues manifest)
+                     (manifest-artifact-key-issues manifest)
+	                     (keep identity
+	                           (map (fn [[k ref]]
+	                                  (verify-artifact-ref k ref))
+	                                (manifest-artifact-entries manifest)))
+                     (manifest-artifact-bundle-issues manifest)
+                     (manifest-artifact-duplicate-path-issues manifest)
+	                     (let [calibration-path (get-in manifest
+	                                                    [:artifacts :calibration :path])]
+                       (if (and (some? calibration-path)
+                                (os.path/exists calibration-path))
+                         (try
+                           (let [artifact (edn/read-string
+                                           (slurp calibration-path))
+                                 validation
+                                 (analysis-schema/validation-result
+                                  :analysis/calibration-artifact artifact)]
+                             (if (:valid? validation)
+                               (calibration-source-provenance-issues artifact)
+                               [(gate-issue
+                                 :error
+                                 :manifest/invalid-calibration-artifact
+                                 "Manifest calibration artifact failed schema validation."
+                                 {:path calibration-path
+                                  :errors (:errors validation)})]))
+                           (catch python/Exception e
+                             [(gate-issue
+                               :error
+                               :manifest/unreadable-calibration-artifact
+                               "Manifest calibration artifact could not be read."
+                               {:path calibration-path
+                                :error (str e)})]))
+                         []))
+                     (manifest-semantic-issues manifest)))]
+        {:valid? (empty? issues)
+         :status (if (empty? issues)
+                   :manifest/verified
+                   :manifest/failed)
+         :issues issues
+         :artifact-count (count (manifest-artifact-entries manifest))}))))
+
+(defn read-same-pop-manifest
+  [path]
+  (try
+    (edn/read-string (slurp path))
+    (catch python/Exception e
+      (throw (ex-info "could not read same-pop manifest"
+                      {:error/code :manifest/unreadable
+                       :manifest/path path
+                       :error (str e)})))))
+
+(defn verify-same-pop-manifest-file
+  [path]
+  (try
+    (verify-same-pop-manifest (read-same-pop-manifest path))
+    (catch python/Exception e
+      {:valid? false
+       :status :manifest/unreadable
+       :issues [(gate-issue :error
+                            :manifest/unreadable
+                            "Same-pop manifest could not be read."
+                            {:path path
+                             :error (str e)})]})))
+
+;; ---------------------------------------------------------------------------
+;; Same-population performance statistics
+;; ---------------------------------------------------------------------------
+
+(defn- ->double
+  [x]
+  (cond
+    (nil? x) nil
+    (string? x) (float x)
+    :else (float x)))
+
+(defn completed-episode-rows
+  [rows]
+  (filterv completed-episode? rows))
+
+(defn episode-pnls
+  [rows]
+  (mapv ->double
+        (keep :gross-pnl (completed-episode-rows rows))))
+
+(defn- win-count
+  [xs]
+  (count (filter pos? xs)))
+
+(defn- loss-count
+  [xs]
+  (count (filter neg? xs)))
+
+(defn- sample-summary
+  [xs]
+  {:n (count xs)
+   :mean (or (mean xs) 0.0)
+   :median (or (quantile 0.50 xs) 0.0)
+   :p25 (or (quantile 0.25 xs) 0.0)
+   :p75 (or (quantile 0.75 xs) 0.0)
+   :min (when (seq xs) (apply min xs))
+   :max (when (seq xs) (apply max xs))
+   :wins (win-count xs)
+   :losses (loss-count xs)
+   :win-rate (if (seq xs) (/ (win-count xs) (count xs)) 0.0)})
+
+(defn- lcg
+  [x]
+  (mod (+ (* 1103515245 x) 12345) 2147483647))
+
+(defn- sample-with-replacement
+  [xs seed n]
+  (let [v (vec xs)
+        size (count v)]
+    (loop [i 0
+           s seed
+           acc []]
+      (if (= i n)
+        acc
+        (let [s' (lcg (+ s i 1))]
+          (recur (inc i)
+                 s'
+                 (conj acc (nth v (mod s' size)))))))))
+
+(defn- bootstrap-deltas
+  [live replay reps statistic-fn]
+  (let [ln (count live)
+        rn (count replay)]
+    (mapv (fn [i]
+            (- (statistic-fn (sample-with-replacement live (+ 17 i) ln))
+               (statistic-fn (sample-with-replacement replay (+ 7919 i) rn))))
+          (range reps))))
+
+(defn- ci
+  [xs]
+  {:lo (quantile 0.025 xs)
+   :median (quantile 0.50 xs)
+   :hi (quantile 0.975 xs)})
+
+(defn- shuffle-score
+  [rep idx]
+  (mod (+ (* (inc rep) 1103515245)
+          (* (inc idx) 12345)
+          (* (inc rep) (inc idx) 2654435761))
+       2147483647))
+
+(defn- permutation-mean-deltas
+  [live replay reps]
+  (let [live-n (count live)
+        combined (vec (concat live replay))]
+    (mapv (fn [rep]
+            (let [shuffled (mapv second
+                                 (sort-by first
+                                          (map-indexed
+                                           (fn [idx x]
+                                             [(shuffle-score rep idx) x])
+                                           combined)))
+                  pseudo-live (subvec shuffled 0 live-n)
+                  pseudo-replay (subvec shuffled live-n)]
+              (- (or (mean pseudo-live) 0.0)
+                 (or (mean pseudo-replay) 0.0))))
+          (range reps))))
+
+(defn- permutation-p-value
+  [live replay reps]
+  (let [observed (math/fabs (- (or (mean live) 0.0)
+                               (or (mean replay) 0.0)))
+        deltas (permutation-mean-deltas live replay reps)
+        extreme (count (filter #(>= (math/fabs %) observed) deltas))]
+    (/ (inc extreme) (inc reps))))
+
+(defn- win-rate-p-value
+  [live replay]
+  (let [ln (count live)
+        rn (count replay)
+        lw (win-count live)
+        rw (win-count replay)
+        p (/ (+ lw rw) (+ ln rn))
+        se (math/sqrt (* p (- 1.0 p) (+ (/ 1.0 ln) (/ 1.0 rn))))]
+    (if (zero? se)
+      1.0
+      (let [z (/ (- (/ lw ln) (/ rw rn)) se)]
+        (math/erfc (/ (math/fabs z) (math/sqrt 2.0)))))))
+
+(defn- same-pop-stats-parameter-issues
+  [{:keys [bootstrap-reps permutation-reps min-samples
+           practical-mean-threshold]}]
+  (vec
+   (keep identity
+         [(when-not (positive-int-value? bootstrap-reps)
+            (parameter-issue :bootstrap-reps
+                             bootstrap-reps
+                             "positive integer"))
+          (when-not (positive-int-value? permutation-reps)
+            (parameter-issue :permutation-reps
+                             permutation-reps
+                             "positive integer"))
+          (when-not (positive-int-value? min-samples)
+            (parameter-issue :min-samples
+                             min-samples
+                             "positive integer"))
+          (when-not (nonnegative-finite-double? practical-mean-threshold)
+            (parameter-issue :practical-mean-threshold
+                             practical-mean-threshold
+                             "nonnegative finite number"))])))
+
+(defn- invalid-same-pop-result
+  [readiness issues]
+  (let [readiness' (if (seq issues)
+                     (assoc readiness
+                            :valid? false
+                            :status :same-pop/blocked-data
+                            :issues (vec (concat (:issues readiness)
+                                                 issues)))
+                     readiness)]
+    {:valid? false
+     :status (:status readiness')
+     :readiness readiness'
+     :manifest nil
+     :statistics nil}))
+
+(defn same-population-statistics
+  "Run gated episode-level same-population performance tests.
+
+  The readiness gate is always evaluated first. If it does not pass, this
+  returns the gate result and no performance statistics. This prevents P&L
+  tests from answering the wrong question when behavior/data/fill artifacts are
+  invalid."
+  [{:keys [bootstrap-reps permutation-reps min-samples
+           practical-mean-threshold]
+    :or {bootstrap-reps 1000
+         permutation-reps 1000
+         min-samples 30
+         practical-mean-threshold 0.0}
+    :as opts}]
+  (let [readiness (same-pop-readiness opts)
+        parameter-issues (same-pop-stats-parameter-issues
+                          {:bootstrap-reps bootstrap-reps
+                           :permutation-reps permutation-reps
+                           :min-samples min-samples
+                           :practical-mean-threshold
+                           practical-mean-threshold})]
+    (if (or (not (:valid? readiness)) (seq parameter-issues))
+      (invalid-same-pop-result readiness parameter-issues)
+      (let [live-episodes (:rows (read-csv-artifact (:live-episodes opts)
+                                                    :analysis/episode-row))
+            replay-episodes (:rows (read-csv-artifact (:replay-episodes opts)
+                                                      :analysis/episode-row))
+            pnl-issues (vec (concat
+                             (episode-pnl-readiness-issues
+                              "live" live-episodes)
+                             (episode-pnl-readiness-issues
+                              "replay" replay-episodes)))]
+        (if (seq pnl-issues)
+          (invalid-same-pop-result readiness pnl-issues)
+          (let [manifest (same-pop-manifest
+                      {:live-tape (:live-tape opts)
+                       :replay-tape (:replay-tape opts)
+                       :live-episodes (:live-episodes opts)
+                       :replay-episodes (:replay-episodes opts)
+                       :calibration (:calibration opts)
+                       :out (:out opts)
+                       :bucket-seconds (:bucket-seconds opts 60)
+                       :bootstrap-reps bootstrap-reps
+                       :permutation-reps permutation-reps
+                       :min-samples min-samples
+                       :practical-mean-threshold practical-mean-threshold}
+                      readiness)
+            live-pnls (episode-pnls live-episodes)
+            replay-pnls (episode-pnls replay-episodes)
+            mean-deltas (bootstrap-deltas live-pnls replay-pnls
+                                          bootstrap-reps
+                                          #(or (mean %) 0.0))
+            median-deltas (bootstrap-deltas live-pnls replay-pnls
+                                            bootstrap-reps
+                                            #(or (quantile 0.50 %) 0.0))
+            mean-ci (ci mean-deltas)
+            mean-delta (- (or (mean live-pnls) 0.0)
+                          (or (mean replay-pnls) 0.0))
+            median-delta (- (or (quantile 0.50 live-pnls) 0.0)
+                            (or (quantile 0.50 replay-pnls) 0.0))
+            small-sample? (or (< (count live-pnls) min-samples)
+                              (< (count replay-pnls) min-samples))
+            materially-worse? (< (:hi mean-ci)
+                                 (- practical-mean-threshold))
+            status (cond
+                     materially-worse? :same-pop/fail-performance
+                     small-sample? :same-pop/watch
+                     :else :same-pop/pass)
+            stats {:unit :trade-episode
+                   :live (sample-summary live-pnls)
+                   :replay (sample-summary replay-pnls)
+                   :effect-sizes
+                   {:mean-pnl-delta mean-delta
+                    :median-pnl-delta median-delta
+                    :win-rate-delta (- (get-in (sample-summary live-pnls)
+                                               [:win-rate])
+                                       (get-in (sample-summary replay-pnls)
+                                               [:win-rate]))}
+                   :bootstrap
+                   {:reps bootstrap-reps
+                    :mean-delta-ci mean-ci
+                    :median-delta-ci (ci median-deltas)}
+                   :permutation
+                   {:reps permutation-reps
+                    :mean-delta-p-value
+                    (permutation-p-value live-pnls replay-pnls
+                                         permutation-reps)}
+                   :win-rate-test
+                   {:method :normal-approx-two-proportion
+                    :p-value (win-rate-p-value live-pnls replay-pnls)}
+                   :decision
+                   {:status status
+                    :min-samples min-samples
+                    :small-sample? small-sample?
+                    :practical-mean-threshold practical-mean-threshold
+                    :materially-worse? materially-worse?}}]
+        {:valid? (= :same-pop/pass status)
+         :status status
+         :readiness readiness
+         :manifest manifest
+         :statistics stats}))))))
+
+(defn- money
+  [x]
+  (if (nil? x) "n/a" (format "%.2f" (float x))))
+
+(defn same-population-report-md
+  [result]
+  (let [stats (:statistics result)
+        readiness (:readiness result)]
+    (str "# Same-Population Performance Report\n\n"
+         "- status: `" (:status result) "`\n"
+         "- readiness_status: `" (:status readiness) "`\n\n"
+         (if-not stats
+           (str "## Gate Failure\n\n"
+                "Performance statistics were not run because the readiness "
+                "gate did not pass.\n\n"
+                "| severity | code | message |\n"
+                "|---|---|---|\n"
+                (bstr/join
+                 ""
+                 (map (fn [issue]
+                        (str "| " (:severity issue)
+                             " | " (:code issue)
+                             " | " (:message issue)
+                             " |\n"))
+                      (:issues readiness))))
+           (str "## Manifest\n\n"
+                "- manifest_version: `" (get-in result [:manifest :manifest/version]) "`\n"
+                "- code_revision: `" (get-in result [:manifest :code/revision]) "`\n"
+                "- generated_at: `" (get-in result [:manifest :manifest/generated-at]) "`\n"
+                "- live_tape: `" (get-in result [:manifest :artifacts :live-tape :path])
+                "` sha256=`" (get-in result [:manifest :artifacts :live-tape :sha256]) "`\n"
+                "- replay_tape: `" (get-in result [:manifest :artifacts :replay-tape :path])
+                "` sha256=`" (get-in result [:manifest :artifacts :replay-tape :sha256]) "`\n"
+                "- live_episodes: `" (get-in result [:manifest :artifacts :live-episodes :path])
+                "` sha256=`" (get-in result [:manifest :artifacts :live-episodes :sha256]) "`\n"
+                "- replay_episodes: `" (get-in result [:manifest :artifacts :replay-episodes :path])
+                "` sha256=`" (get-in result [:manifest :artifacts :replay-episodes :sha256]) "`\n"
+                "- calibration: `" (get-in result [:manifest :artifacts :calibration :path])
+                "` sha256=`" (get-in result [:manifest :artifacts :calibration :sha256]) "`\n"
+                "- cohort_accounts: `" (pr-str (get-in result [:manifest :cohort :accounts])) "`\n"
+                "- cohort_strategies: `" (pr-str (get-in result [:manifest :cohort :strategies])) "`\n"
+                "- cohort_window: `" (get-in result [:manifest :cohort :start])
+                " to " (get-in result [:manifest :cohort :end]) "`\n"
+                "- parameters: `" (pr-str (get-in result [:manifest :parameters])) "`\n\n"
+                "## Episode Samples\n\n"
+                "| side | n | mean | median | p25 | p75 | wins | losses | win_rate |\n"
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+                "| live | " (get-in stats [:live :n])
+                " | " (money (get-in stats [:live :mean]))
+                " | " (money (get-in stats [:live :median]))
+                " | " (money (get-in stats [:live :p25]))
+                " | " (money (get-in stats [:live :p75]))
+                " | " (get-in stats [:live :wins])
+                " | " (get-in stats [:live :losses])
+                " | " (pct (get-in stats [:live :win-rate])) " |\n"
+                "| replay | " (get-in stats [:replay :n])
+                " | " (money (get-in stats [:replay :mean]))
+                " | " (money (get-in stats [:replay :median]))
+                " | " (money (get-in stats [:replay :p25]))
+                " | " (money (get-in stats [:replay :p75]))
+                " | " (get-in stats [:replay :wins])
+                " | " (get-in stats [:replay :losses])
+                " | " (pct (get-in stats [:replay :win-rate])) " |\n\n"
+                "## Tests\n\n"
+                "- mean_pnl_delta: `" (money (get-in stats [:effect-sizes :mean-pnl-delta])) "`\n"
+                "- median_pnl_delta: `" (money (get-in stats [:effect-sizes :median-pnl-delta])) "`\n"
+                "- win_rate_delta: `" (pct (get-in stats [:effect-sizes :win-rate-delta])) "`\n"
+                "- bootstrap_mean_delta_ci: `"
+                (money (get-in stats [:bootstrap :mean-delta-ci :lo])) ", "
+                (money (get-in stats [:bootstrap :mean-delta-ci :hi])) "`\n"
+                "- bootstrap_median_delta_ci: `"
+                (money (get-in stats [:bootstrap :median-delta-ci :lo])) ", "
+                (money (get-in stats [:bootstrap :median-delta-ci :hi])) "`\n"
+                "- permutation_mean_delta_p_value: `"
+                (format "%.4f" (float (get-in stats [:permutation :mean-delta-p-value])))
+                "`\n"
+                "- win_rate_p_value: `"
+                (format "%.4f" (float (get-in stats [:win-rate-test :p-value])))
+                "`\n\n"
+                "## Decision\n\n"
+                "- decision_status: `" (get-in stats [:decision :status]) "`\n"
+                "- small_sample: `" (get-in stats [:decision :small-sample?]) "`\n"
+                "- materially_worse: `" (get-in stats [:decision :materially-worse?]) "`\n")))))
+
+(defn write-same-population-report!
+  [{:keys [out] :as opts}]
+  (let [result (same-population-statistics opts)
+        parent (when out (os.path/dirname out))]
+    (when (and parent (not= "" parent))
+      (os/makedirs parent ** :exist_ok true))
+    (when out
+      (spit out (same-population-report-md result)))
+    (if (and out (:manifest result) (os.path/exists out))
+      (let [result' (assoc-in result [:manifest :artifacts :report]
+                              (artifact-ref out))]
+        (validate-artifact! :analysis/same-pop-manifest (:manifest result'))
+        result')
+      result)))
 
 (defn parse-args
   "Small CLI parser. Repeated --facts flags are accumulated as a vector."
@@ -662,9 +3118,22 @@
                 (keyword (subs flag 2)))]
         (cond
           (nil? k) (recur (next xs) acc)
+          (or (nil? value)
+              (and (string? value) (.startswith value "--")))
+          (throw (python/ValueError (str "missing value for " flag)))
           (= :facts k) (recur (nnext xs) (update acc :facts (fnil conj []) value))
           :else (recur (nnext xs) (assoc acc k value)))))))
 
 (defn parse-double-arg
   [x default]
-  (if (some? x) (float x) default))
+  (if (some? x)
+    (try
+      (let [n (float x)]
+        (when-not (math/isfinite n)
+          (throw (python/ValueError
+                  (str "double argument must be finite: " x))))
+        n)
+      (catch python/Exception e
+        (throw (python/ValueError
+                (str "invalid double argument: " x " (" e ")")))))
+    default))

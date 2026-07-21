@@ -1,0 +1,335 @@
+(ns feature-parity.test-historical-artifact-clis
+  (:import builtins json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [stevetrading.feature-parity.raw-unlock :as raw]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def basilisp-bin
+  (str (or (os.environ/get "BASILISP_BIN")
+           (os.path/join (str root) ".venv/bin/basilisp"))))
+
+(def scripts
+  {"v3-cache" (pathlib/Path (os.path/join (str root) "scripts/build_historical_v3_feature_cache.lpy"))
+   "historical-cohort" (pathlib/Path (os.path/join (str root) "scripts/prepare_historical_feature_cohort.lpy"))
+   "date-map" (pathlib/Path (os.path/join (str root) "scripts/reconstruct_feature_cache_date_map.lpy"))})
+
+(def greeks ["iv" "delta" "vega" "theta" "rho" "gamma"])
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps
+  [x]
+  (json/dumps (jsonable x)))
+
+(defn loads-path
+  [path]
+  (json/loads (.read_text path)))
+
+(defn run-script
+  [name & args]
+  (let [env (.copy os/environ)]
+    (.__setitem__ env "STEVE_REPO_ROOT" (str root))
+    (subprocess/run
+     (python/list (concat [basilisp-bin "run" (str (get scripts name)) "--"] args))
+     ** :cwd (str root)
+        :env env
+        :text true
+        :capture_output true
+        :check false)))
+
+(defn path
+  [parent name]
+  (.joinpath parent name))
+
+(defn write-json
+  [path payload]
+  (.write_text path (dumps payload)))
+
+(defn expected-v2-names
+  []
+  (sort ["vix_proxy"
+         "vix_term_slope"
+         "put_call_ratio"
+         "vix_momentum_5"
+         "vix_momentum_20"
+         "realized_vol_20"
+         "realized_vol_60"
+         "vol_ratio"
+         "hmm_state_0"
+         "hmm_state_1"
+         "hmm_state_2"]))
+
+(defn expected-advanced-names
+  []
+  (let [base (concat
+              (map (fn [i] (str "dict_code_" i)) (range 20))
+              ["dict_code_entropy"
+               "dict_n_active"
+               "dict_recon_error"
+               "dict_recon_error_d20"
+               "dict_recon_error_d5"
+               "dict_top_weight"])
+        scat-suffixes ["coarse_energy" "coarse_energy_d5" "coarse_mean" "coarse_mean_d5"
+                       "cross_scale_corr" "cross_scale_corr_d5" "fine_energy" "fine_energy_d5"
+                       "fine_mean" "fine_mean_d5" "med_energy" "med_energy_d5"
+                       "med_mean" "med_mean_d5"]
+        tda-suffixes ["betti_auc" "betti_auc_d5" "n_comp_high" "n_comp_high_d5"
+                      "n_comp_low" "n_comp_low_d5" "n_comp_mid" "n_comp_mid_d5"
+                      "persistence_range" "persistence_range_d5" "roughness" "roughness_d5"]
+        wass-suffixes ["flow_dte" "flow_dte_d5" "flow_moneyness" "flow_moneyness_d5"
+                       "surface_divergence" "surface_divergence_d5" "w1_consec" "w1_consec_d5"
+                       "w1_ratio" "w1_ratio_d5" "w1_trailing" "w1_trailing_d5"]]
+    (sort
+     (concat base
+             (for [greek greeks suffix scat-suffixes] (str "scat_" greek "_" suffix))
+             (for [greek greeks suffix tda-suffixes] (str "tda_" greek "_" suffix))
+             (for [greek greeks suffix wass-suffixes] (str "wass_" greek "_" suffix))))))
+
+(defn make-v3-cache
+  [tmp names]
+  (let [base (path tmp "base.npz")
+        grids (path tmp "grids.npz")
+        feature-names (path tmp "feature_names.json")]
+    (numpy/savez base
+                ** :X (numpy/zeros #py (390 653) ** :dtype numpy/float32)
+                   :spy_prices (numpy/ones 390 ** :dtype numpy/float32)
+                   :day_ids (numpy/zeros 390 ** :dtype numpy/int32)
+                   :split_idx (numpy/array [292] ** :dtype numpy/int64))
+    (numpy/savez grids
+                ** :grids (numpy/zeros #py (390 6 21 8) ** :dtype numpy/float32))
+    (write-json feature-names names)
+    [base grids feature-names]))
+
+(defn write-names
+  [path n]
+  (write-json path (map (fn [i] (str "f" i)) (range n))))
+
+(defn write-date-cache
+  [cache day-ids]
+  (.mkdir (.-parent cache) ** :parents true :exist_ok true)
+  (numpy/savez_compressed cache
+                          ** :X (numpy/zeros #py ((count day-ids) 2) ** :dtype numpy/float32)
+                             :day_ids (numpy/asarray day-ids ** :dtype numpy/int32)))
+
+(defn approx-array?
+  [actual expected]
+  (< (float (numpy/max (numpy/abs (- actual expected)))) 1.0e-5))
+
+(deftest build-historical-v3-feature-cache-plan-contract
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          names (vec (concat (map (fn [i] (str "base_" i)) (range 653))
+                             (expected-v2-names)
+                             (expected-advanced-names)))
+          [base grids feature-names] (make-v3-cache tmp names)
+          out-json (path tmp "plan.json")
+          result (run-script "v3-cache"
+                             "--plan-only"
+                             "--base-features" (str base)
+                             "--grids" (str grids)
+                             "--feature-names" (str feature-names)
+                             "--out-json" (str out-json))
+          payload (loads-path out-json)]
+      (is (= 0 (.-returncode result)))
+      (is (= true (.get payload "ok")))
+      (is (= "planned" (.get payload "status")))
+      (is (= 918 (.get payload "output_columns"))))))
+
+(deftest build-historical-v3-feature-cache-detects-feature-name-drift
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          names (vec (concat (map (fn [i] (str "base_" i)) (range 653))
+                             (expected-v2-names)
+                             (expected-advanced-names)))
+          names (assoc names 653 "wrong_hmm_state")
+          [base grids feature-names] (make-v3-cache tmp names)
+          out-json (path tmp "plan.json")
+          result (run-script "v3-cache"
+                             "--plan-only"
+                             "--base-features" (str base)
+                             "--grids" (str grids)
+                             "--feature-names" (str feature-names)
+                             "--out-json" (str out-json))
+          payload (loads-path out-json)]
+      (is (= 1 (.-returncode result)))
+      (is (= false (.get payload "ok")))
+	      (is (= "live feature_names do not match expected v3 cache order"
+	             (.get payload "reason"))))))
+
+(deftest build-historical-v3-feature-cache-uses-live-v3-formulas
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          names (vec (concat (map (fn [i] (str "base_" i)) (range 653))
+                             (expected-v2-names)
+                             (expected-advanced-names)))
+          base (path tmp "base.npz")
+          grids-path (path tmp "grids.npz")
+          feature-names (path tmp "feature_names.json")
+          hmm-model (path tmp "hmm_model.npz")
+          dictionary-atoms (path tmp "dictionary_atoms.npz")
+          out-npz (path tmp "full_features_5yr_v3.npz")
+          out-json (path tmp "build.json")
+          rows 8
+          grids (numpy/zeros #py (8 6 21 8) ** :dtype numpy/float32)
+          day-ids (numpy/array [0 0 0 0 1 1 1 1] ** :dtype numpy/int32)
+          train-mask (numpy/array [true true true true false false false false] ** :dtype builtins/bool)]
+      (doseq [i (range rows)]
+        (.__setitem__ grids #py (i 0 (mod i 21) (mod (* i 3) 8)) 1.0))
+      (write-json feature-names names)
+      (numpy/savez base
+                   ** :X (numpy/zeros #py (8 653) ** :dtype numpy/float32)
+                      :spy_prices (numpy/array [100.0 101.0 102.0 103.0 104.0 105.0 106.0 107.0] ** :dtype numpy/float32)
+                      :day_ids day-ids
+                      :split_idx (numpy/array [4] ** :dtype numpy/int64))
+      (numpy/savez grids-path ** :grids grids)
+      (numpy/savez hmm-model
+                   ** :means (numpy/array [[0.0 0.0] [1.0 1.0] [-1.0 1.0]] ** :dtype numpy/float64)
+                      :covars (numpy/array [[[1.0 0.0] [0.0 1.0]]
+                                            [[1.0 0.0] [0.0 1.0]]
+                                            [[1.0 0.0] [0.0 1.0]]]
+                                           ** :dtype numpy/float64))
+      (numpy/savez dictionary-atoms
+                   ** :components (numpy/zeros #py (64 1008) ** :dtype numpy/float32)
+                      :train_mean (numpy/zeros 1008 ** :dtype numpy/float32)
+                      :train_std (numpy/ones 1008 ** :dtype numpy/float32))
+      (let [result (run-script "v3-cache"
+                               "--base-features" (str base)
+                               "--grids" (str grids-path)
+                               "--feature-names" (str feature-names)
+                               "--hmm-model" (str hmm-model)
+                               "--dictionary-atoms" (str dictionary-atoms)
+                               "--out-npz" (str out-npz)
+                               "--out-json" (str out-json))
+            payload (loads-path out-json)
+            out (numpy/load out-npz)
+            x (.__getitem__ out "X")
+            feature-idx (.index (python/list names) "wass_iv_w1_consec")
+            advanced-names (vec (sort (keys (raw/compute-live-v3-feature-arrays
+                                             grids
+                                             {"components" (numpy/zeros #py (64 1008) ** :dtype numpy/float32)
+                                              "train_mean" (numpy/zeros 1008 ** :dtype numpy/float32)
+                                              "train_std" (numpy/ones 1008 ** :dtype numpy/float32)}))))
+            advanced (raw/compute-live-v3-feature-arrays
+                      grids
+                      {"components" (numpy/zeros #py (64 1008) ** :dtype numpy/float32)
+                       "train_mean" (numpy/zeros 1008 ** :dtype numpy/float32)
+                       "train_std" (numpy/ones 1008 ** :dtype numpy/float32)})
+            expected-cols (raw/standardize-feature-columns advanced train-mask)
+            expected-idx (.index (python/list advanced-names) "wass_iv_w1_consec")]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (= true (.get payload "ok")))
+        (is (= #py (8 918) (.-shape x)))
+        (is (approx-array?
+             (.__getitem__ x #py ((slice nil nil) feature-idx))
+             (.__getitem__ expected-cols #py ((slice nil nil) expected-idx))))))))
+
+(deftest prepare-historical-feature-cohort-aligns-direct-times
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          names (path tmp "feature_names.json")
+          live (path tmp "live_features_20260705.npz")
+          source (path tmp "historical_source.npz")
+          out-npz (path tmp "historical_features_20260705.npz")
+          out-json (path tmp "historical_feature_cohort_20260705.json")]
+      (write-names names 3)
+      (numpy/savez live
+                  ** :times (numpy/array ["2026-07-05T13:30:00Z"
+                                          "#inst \"2026-07-05T13:31:00+00:00\""])
+                     :chestnut (numpy/zeros #py (2 3) ** :dtype numpy/float32))
+      (numpy/savez source
+                  ** :times (numpy/array ["2026-07-05T13:29:00Z"
+                                          "2026-07-05T13:30:00Z"
+                                          "2026-07-05T13:31:00Z"])
+                     :X (numpy/array [[0 0 0] [1 2 3] [4 5 6]] ** :dtype numpy/float32))
+      (let [result (run-script "historical-cohort"
+                               "--live-capture" (str live)
+                               "--historical-source" (str source)
+                               "--feature-names" (str names)
+                               "--out-npz" (str out-npz)
+                               "--out-json" (str out-json)
+                               "--target-date" "2026-07-05"
+                               "--min-rows" "2")
+            payload (loads-path out-json)
+            out (numpy/load out-npz)
+            x (.__getitem__ out "X")
+            shape (.-shape x)]
+        (is (= 0 (.-returncode result)))
+        (is (= true (.get payload "ok")))
+        (is (= 2 (.get payload "matched_rows")))
+        (is (= 2 (.__getitem__ shape 0)))
+        (is (= 3 (.__getitem__ shape 1)))
+        (is (= 1.0 (float (.__getitem__ x #py (0 0)))))
+        (is (= 2.0 (float (.__getitem__ x #py (0 1)))))
+        (is (= 3.0 (float (.__getitem__ x #py (0 2)))))
+        (is (= 4.0 (float (.__getitem__ x #py (1 0)))))
+        (is (= 5.0 (float (.__getitem__ x #py (1 1)))))
+        (is (= 6.0 (float (.__getitem__ x #py (1 2)))))))))
+
+(deftest prepare-historical-feature-cohort-fails-closed-when-source-missing
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          names (path tmp "feature_names.json")
+          live (path tmp "live_features_20260705.npz")
+          out-npz (path tmp "historical_features_20260705.npz")
+          out-json (path tmp "historical_feature_cohort_20260705.json")]
+      (write-names names 918)
+      (numpy/savez live ** :times (numpy/array ["2026-07-05T13:30:00Z"]))
+      (let [result (run-script "historical-cohort"
+                               "--live-capture" (str live)
+                               "--historical-source" (str (path tmp "missing_full_features_5yr_v3.npz"))
+                               "--feature-names" (str names)
+                               "--out-npz" (str out-npz)
+                               "--out-json" (str out-json)
+                               "--target-date" "2026-07-05")
+            payload (loads-path out-json)]
+        (is (= 1 (.-returncode result)))
+        (is (false? (.exists out-npz)))
+        (is (= false (.get payload "ok")))
+        (is (= "historical feature source NPZ missing" (.get payload "reason")))
+        (is (= "(n, 918)" (.get (.get payload "details") "required_shape")))))))
+
+(deftest reconstruct-feature-cache-date-map-emits-calendar-mapping
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          cache (path tmp "cache.npz")
+          out (path tmp "date_map.json")
+          report (path tmp "report.json")]
+      (write-date-cache cache [0 0 1 1 2 2])
+      (let [result (run-script "date-map"
+                               "--feature-cache" (str cache)
+                               "--end-date" "2026-01-03"
+                               "--rows-per-day" "2"
+                               "--out-json" (str out)
+                               "--report-json" (str report))
+            payload (loads-path report)
+            date-map (loads-path out)]
+        (is (= 0 (.-returncode result)))
+        (is (= "2026-01-01" (.get date-map "0")))
+        (is (= "2026-01-02" (.get date-map "1")))
+        (is (= "2026-01-03" (.get date-map "2")))
+        (is (= true (.get payload "ok")))
+        (is (= 3 (.get payload "unique_days")))))))
+
+(deftest reconstruct-feature-cache-date-map-rejects-irregular-day-counts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          cache (path tmp "cache.npz")
+          out (path tmp "date_map.json")
+          report (path tmp "report.json")]
+      (write-date-cache cache [0 0 1])
+      (let [result (run-script "date-map"
+                               "--feature-cache" (str cache)
+                               "--end-date" "2026-01-02"
+                               "--rows-per-day" "2"
+                               "--out-json" (str out)
+                               "--report-json" (str report))
+            payload (loads-path report)]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (not= -1 (.find (.get payload "reason") "expected row count")))
+        (is (false? (.exists out)))))))

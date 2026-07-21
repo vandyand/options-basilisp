@@ -1,0 +1,375 @@
+;; Classify reconstruction paths for formula-blocked Greek features.
+(import csv datetime json numpy os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+
+(doseq [path [(os.path/join repo-root "components/feature-parity.core/src")]]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def suffix-rules
+  {"dollar_delta" {"status" "candidate-reconstructable"
+                   "candidate_formula" "sum(delta * underlying_price * contract_multiplier * weight)"
+                   "required_sidecars" ["option_surfaces_json"]
+                   "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                   "validation_gate" "match legacy notional weighting and live/train z-scale before unmasking"}
+   "dollar_vega" {"status" "candidate-reconstructable"
+                  "candidate_formula" "sum(vega * currency_or_notional_scale * weight)"
+                  "required_sidecars" ["option_surfaces_json"]
+                  "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                  "validation_gate" "prove vega currency scaling and aggregation convention"}
+   "lambda_mean" {"status" "candidate-reconstructable"
+                  "candidate_formula" "mean(delta * underlying_price / option_mid_price)"
+                  "required_sidecars" ["option_surfaces_json"]
+                  "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                  "validation_gate" "prove legacy lambda/elasticity definition and price guardrails"}
+   "lambda_times_iv" {"status" "candidate-reconstructable"
+                      "candidate_formula" "aggregate(lambda * implied_volatility)"
+                      "required_sidecars" ["option_surfaces_json"]
+                      "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                      "validation_gate" "prove lambda definition, IV alignment, and aggregation convention"}
+   "lambda_weighted" {"status" "candidate-reconstructable"
+                      "candidate_formula" "weighted_mean(lambda, weight)"
+                      "required_sidecars" ["option_surfaces_json"]
+                      "required_contract_fields" ["strike" "right" "bid" "ask" "expiration" "volume"]
+                      "validation_gate" "prove weight source; fall back to open_interest only if legacy used it"}
+   "rho_exposure" {"status" "candidate-reconstructable"
+                   "candidate_formula" "sum(rho * exposure_weight)"
+                   "required_sidecars" ["option_surfaces_json"]
+                   "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                   "validation_gate" "prove exposure weighting and rho units"}
+   "skew_times_volume" {"status" "candidate-reconstructable"
+                        "candidate_formula" "skew_metric * aggregate(volume)"
+                        "required_sidecars" ["option_surfaces_json"]
+                        "required_contract_fields" ["strike" "right" "bid" "ask" "expiration" "volume"]
+                        "validation_gate" "prove skew definition, contract universe, and volume source"}
+   "theta_exposure_ratio" {"status" "candidate-reconstructable"
+                           "candidate_formula" "aggregate(theta_exposure) / denominator_exposure"
+                           "required_sidecars" ["option_surfaces_json"]
+                           "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                           "validation_gate" "prove denominator and divide-by-zero guardrail"}
+   "vega_total_exposure" {"status" "candidate-reconstructable"
+                          "candidate_formula" "sum(vega * contract_multiplier * exposure_weight)"
+                          "required_sidecars" ["option_surfaces_json"]
+                          "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                          "validation_gate" "prove total exposure weighting and vega units"}
+   "epsilon_exposure" {"status" "candidate-reconstructable"
+                       "candidate_formula" "sum(epsilon * contract_multiplier * exposure_weight), epsilon = d(option_value)/d(dividend_yield)"
+                       "required_sidecars" ["option_surfaces_json"]
+                       "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                       "validation_gate" "prove dividend-yield assumption, DTE convention, exposure weighting, and live/train z-scale before unmasking"}
+   "epsilon_mean" {"status" "candidate-reconstructable"
+                   "candidate_formula" "mean(epsilon), epsilon = Black-Scholes dividend-yield sensitivity"
+                   "required_sidecars" ["option_surfaces_json"]
+                   "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                   "validation_gate" "prove dividend-yield assumption, DTE convention, aggregation convention, and live/train z-scale before unmasking"}
+   "epsilon_times_delta" {"status" "candidate-reconstructable"
+                          "candidate_formula" "aggregate(epsilon * delta), epsilon = Black-Scholes dividend-yield sensitivity"
+                          "required_sidecars" ["option_surfaces_json"]
+                          "required_contract_fields" ["strike" "right" "bid" "ask" "expiration"]
+                          "validation_gate" "prove epsilon definition, delta alignment, DTE convention, and aggregation convention before unmasking"}})
+
+(def default-rule
+  {"status" "formula-provenance-required"
+   "candidate_formula" ""
+   "required_sidecars" []
+   "required_contract_fields" []
+   "validation_gate" "register suffix semantics before reconstructing"})
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/greek_feature_reconstruction_audit.lpy -- "
+                "--blocked-json PATH [--capture PATH] --out-dir DIR [--label LABEL] [--target-date YYYY-MM-DD] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value [remaining flag]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith value "--"))
+      (throw (python/ValueError (str "missing value for " flag))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining args
+         out {:blocked-json nil
+              :capture nil
+              :out-dir nil
+              :label "current"
+              :target-date nil
+              :write-unavailable false
+              :unavailable-reason nil}]
+    (if (empty? remaining)
+      (do
+        (when-not (:out-dir out) (throw (python/ValueError "missing required --out-dir")))
+        (if (:write-unavailable out)
+          (when-not (:target-date out)
+            (throw (python/ValueError "missing required --target-date for --write-unavailable")))
+          (when-not (:blocked-json out)
+            (throw (python/ValueError "missing required --blocked-json"))))
+        out)
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--blocked-json") (recur (nnext remaining) (assoc out :blocked-json (option-value remaining arg)))
+          (= arg "--capture") (recur (nnext remaining) (assoc out :capture (option-value remaining arg)))
+          (= arg "--out-dir") (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+          (= arg "--label") (recur (nnext remaining) (assoc out :label (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+          (= arg "--write-unavailable") (recur (next remaining) (assoc out :write-unavailable true))
+          (= arg "--unavailable-reason") (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn greek-suffix [feature]
+  (if (not= -1 (.find feature "_greeks_"))
+    (second (.split feature "_greeks_" 1))
+    (second (.split feature "_" 1))))
+
+(defn feature-prefix [feature]
+  (first (.split feature "_" 1)))
+
+(defn load-blocked [path]
+  (let [payload (fp/read-json path)]
+    (vec (for [row (get payload "features" [])
+               :when (get row "feature")]
+           row))))
+
+(defn iter-surface-contracts [raw]
+  (try
+    (let [payload (json/loads (or raw "{}") ** :object_pairs_hook fp/reject-duplicate-json-object)
+          contracts (atom [])]
+      (doseq [value (vals payload)]
+        (let [surface (if (string? value)
+                        (try
+                          (json/loads (or value "{}") ** :object_pairs_hook fp/reject-duplicate-json-object)
+                          (catch python/Exception _
+                            ::invalid))
+                        value)]
+          (if (= surface ::invalid)
+            (throw (python/ValueError "invalid nested surface JSON"))
+            (when (map? surface)
+              (doseq [row (or (get surface "contracts") [])]
+                (when (map? row)
+                  (swap! contracts conj row)))))))
+      [@contracts 0])
+    (catch python/Exception _
+      [[] 1])))
+
+(defn object-array-values [arr]
+  (vec (for [value arr] (str value))))
+
+(defn capture-capability [capture]
+  (cond
+    (nil? capture) {"available" false "path" nil}
+    (not (os.path/exists capture)) {"available" false "path" (str capture) "issues" ["capture file missing"]}
+    :else
+    (let [data (numpy/load capture ** :allow_pickle true)
+          files (set (seq (.-files data)))
+          issues (atom [])
+          version (if (contains? files "capture_version")
+                    (try
+                      (int (aget (numpy/ravel (aget data "capture_version")) 0))
+                      (catch python/Exception _ nil))
+                    (do (swap! issues conj "missing capture_version") nil))]
+      (when (not= version 2)
+        (swap! issues conj "capture_version is not 2"))
+      (if-not (contains? files "option_surfaces_json")
+        {"available" true
+         "path" (str capture)
+         "capture_version" version
+         "issues" @issues}
+        (let [rows (object-array-values (aget data "option_surfaces_json"))
+              contracts (atom [])
+              invalid-rows (atom 0)]
+          (doseq [raw rows]
+            (let [[parsed invalid] (iter-surface-contracts raw)]
+              (swap! contracts into parsed)
+              (swap! invalid-rows + invalid)))
+          (when (pos? @invalid-rows)
+            (swap! issues conj (str "option_surfaces_json has " @invalid-rows " invalid JSON rows")))
+          (let [field-counts (atom {})]
+            (doseq [contract @contracts
+                    [k v] contract]
+              (when-not (or (nil? v) (= "" v))
+                (swap! field-counts update k (fnil inc 0))))
+            {"available" true
+             "path" (str capture)
+             "capture_version" version
+             "issues" @issues
+             "surface_rows" (count rows)
+             "surface_contracts" (count @contracts)
+             "contract_field_counts" (into {} (sort @field-counts))}))))))
+
+(defn sidecar-support [rule capability]
+  (cond
+    (empty? (get rule "required_sidecars")) "not-applicable"
+    (not (get capability "available")) "needs-market-capture"
+    (seq (get capability "issues")) "capture-invalid"
+    :else
+    (let [field-counts (or (get capability "contract_field_counts") {})
+          missing (vec (for [field (get rule "required_contract_fields" [])
+                             :when (<= (int (or (get field-counts field) 0)) 0)]
+                         field))]
+      (cond
+        (seq missing) (str "missing-contract-fields:" (.join "," missing))
+        (<= (int (or (get capability "surface_contracts") 0)) 0) "no-surface-contracts"
+        :else "raw-inputs-present"))))
+
+(defn write-csv [path rows]
+  (let [fields ["feature" "prefix" "suffix" "status" "sidecar_support"
+                "candidate_formula" "validation_gate" "model_gain" "model_split_count"]]
+    (os/makedirs (os.path/dirname path) ** :exist_ok true)
+    (with-open [fh (python/open path "w" ** :newline "")]
+      (let [writer (csv/DictWriter fh fields)]
+        (.writeheader writer)
+        (doseq [row rows]
+          (.writerow writer (into {} (map (fn [field] [field (get row field "")]) fields))))))))
+
+(defn md-table [headers rows]
+  (str "| " (.join " | " headers) " |\n"
+       "| " (.join " | " (repeat (count headers) "---")) " |\n"
+       (.join "" (for [row rows]
+                   (str "| " (.join " | " (map str row)) " |\n")))))
+
+(defn write-md [path summary suffix-rows]
+  (spit path
+        (str "# Greek Feature Reconstruction Audit\n\n"
+             "This audit classifies candidate reconstruction paths only. It does not make any feature safe to unmask by itself.\n\n"
+             "- Blocked total: `" (get summary "blocked_total") "`\n"
+             "- Candidate reconstructable: `" (get summary "candidate_reconstructable") "`\n"
+             "- Formula provenance required: `" (get summary "formula_provenance_required") "`\n"
+             "- Raw inputs present: `" (get summary "raw_inputs_present") "`\n"
+             "- Auto-unmaskable: `" (get summary "auto_unmaskable") "`\n\n"
+             "## Status Counts\n\n"
+             (md-table ["Status" "Count"] (for [[k v] (get summary "status_counts")] [k v]))
+             "\n## Sidecar Support Counts\n\n"
+             (md-table ["Support" "Count"] (for [[k v] (get summary "sidecar_support_counts")] [k v]))
+             "\n## Suffixes\n\n"
+             (md-table ["Suffix" "Count" "Splits" "Gain" "Prefixes" "Status" "Sidecar" "Gate"]
+                       (for [row suffix-rows]
+                         [(str "`" (get row "suffix") "`")
+                          (get row "count")
+                          (get row "model_split_count")
+                          (format "%.4f" (float (get row "model_gain")))
+                          (.join ", " (get row "prefixes"))
+                          (get row "status")
+                          (get row "sidecar_support")
+                          (get row "validation_gate")])))))
+
+(defn write-unavailable [opts]
+  (let [reason (or (:unavailable-reason opts) "Greek feature reconstruction audit unavailable")
+        out-base (os.path/join (:out-dir opts) (str "greek_feature_reconstruction_audit_" (:label opts)))
+        json-path (str out-base ".json")
+        csv-path (str out-base ".csv")
+        md-path (str out-base ".md")
+        summary {"generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                 "target_date" (:target-date opts)
+                 "status" "unavailable"
+                 "available" false
+                 "unavailable_reason" reason
+                 "blocked_json" (str (:blocked-json opts))
+                 "capture" {"available" false
+                            "path" (when (:capture opts) (str (:capture opts)))
+                            "skipped" reason}
+                 "blocked_total" 0
+                 "suffix_total" 0
+                 "status_counts" {}
+                 "sidecar_support_counts" {}
+                 "candidate_reconstructable" 0
+                 "formula_provenance_required" 0
+                 "raw_inputs_present" 0
+                 "auto_unmaskable" 0}
+        payload {"summary" summary "suffixes" [] "features" []}]
+    (os/makedirs (:out-dir opts) ** :exist_ok true)
+    (fp/clear-artifacts! [json-path csv-path md-path])
+    (spit json-path (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+    (write-csv csv-path [])
+    (spit md-path (str "# Greek Feature Reconstruction Audit\n\n"
+                       "- Status: `unavailable`\n"
+                       "- Reason: `" reason "`\n"))
+    (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote unavailable Greek reconstruction artifact " json-path))
+    1))
+
+(defn run-main [opts]
+  (if (:write-unavailable opts)
+    (write-unavailable opts)
+    (let [blocked-json (:blocked-json opts)
+        capture (:capture opts)
+        blocked-rows (load-blocked blocked-json)
+        capability (if (seq blocked-rows)
+                     (capture-capability capture)
+                     {"available" false
+                      "path" (when capture (str capture))
+                      "skipped" "no blocked features"})
+        rows (atom [])
+        suffixes (atom {})]
+    (doseq [row blocked-rows]
+      (let [feature (str (get row "feature"))
+            suffix (greek-suffix feature)
+            rule (get suffix-rules suffix default-rule)
+            support (sidecar-support rule capability)
+            item {"feature" feature
+                  "prefix" (feature-prefix feature)
+                  "suffix" suffix
+                  "status" (get rule "status")
+                  "sidecar_support" support
+                  "candidate_formula" (get rule "candidate_formula")
+                  "validation_gate" (get rule "validation_gate")
+                  "model_gain" (float (or (get row "model_gain") 0.0))
+                  "model_split_count" (int (or (get row "model_split_count") 0))}]
+        (swap! rows conj item)
+        (let [bucket (get @suffixes suffix {"suffix" suffix
+                                            "status" (get rule "status")
+                                            "sidecar_support" support
+                                            "candidate_formula" (get rule "candidate_formula")
+                                            "validation_gate" (get rule "validation_gate")
+                                            "count" 0
+                                            "prefixes" #{}
+                                            "model_gain" 0.0
+                                            "model_split_count" 0})]
+          (swap! suffixes assoc suffix
+                 (-> bucket
+                     (update "count" inc)
+                     (update "prefixes" conj (get item "prefix"))
+                     (update "model_gain" + (get item "model_gain"))
+                     (update "model_split_count" + (get item "model_split_count")))))))
+    (let [suffix-rows (vec (sort-by (fn [row] [(- (float (get row "model_gain"))) (str (get row "suffix"))])
+                                    (for [bucket (vals @suffixes)]
+                                      (assoc bucket "prefixes" (vec (sort (get bucket "prefixes")))))))
+          status-counts (into {} (sort (frequencies (map #(get % "status") @rows))))
+          support-counts (into {} (sort (frequencies (map #(get % "sidecar_support") @rows))))
+          summary {"generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                   "target_date" (:target-date opts)
+                   "blocked_json" (str blocked-json)
+                   "capture" capability
+                   "blocked_total" (count @rows)
+                   "suffix_total" (count suffix-rows)
+                   "status_counts" status-counts
+                   "sidecar_support_counts" support-counts
+                   "candidate_reconstructable" (get status-counts "candidate-reconstructable" 0)
+                   "formula_provenance_required" (get status-counts "formula-provenance-required" 0)
+                   "raw_inputs_present" (get support-counts "raw-inputs-present" 0)
+                   "auto_unmaskable" 0}
+          out-base (os.path/join (:out-dir opts) (str "greek_feature_reconstruction_audit_" (:label opts)))
+          json-path (str out-base ".json")
+          csv-path (str out-base ".csv")
+          md-path (str out-base ".md")
+          payload {"summary" summary "suffixes" suffix-rows "features" @rows}]
+      (os/makedirs (:out-dir opts) ** :exist_ok true)
+      (fp/clear-artifacts! [json-path csv-path md-path])
+      (spit json-path (str (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+      (write-csv csv-path @rows)
+      (write-md md-path summary suffix-rows)
+      (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+      (println (str "wrote " json-path))
+      0))))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (if (.startswith (str e) "duplicate JSON key:")
+      (python/exit 1)
+      (python/exit 2)))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

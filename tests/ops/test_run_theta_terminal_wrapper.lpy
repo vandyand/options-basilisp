@@ -1,0 +1,38 @@
+(ns ops.test-run-theta-terminal-wrapper
+  (:import os pathlib shutil subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "projects" "ops" "scripts" "run_theta_terminal.sh"))
+
+(defn environment [extra]
+  (let [env (.copy os/environ)]
+    (doseq [[key value] extra] (.__setitem__ env key value))
+    env))
+
+(deftest wrapper-execs-newest-vendor-jar-directly
+  (let [tmp (pathlib/Path (tempfile/mkdtemp)) lib (.joinpath tmp "lib")]
+    (.mkdir lib ** :parents true)
+    (.touch (.joinpath lib "202607091.jar"))
+    (.touch (.joinpath lib "202607101.jar"))
+    (try
+      (let [result (subprocess/run ["bash" (str script)] ** :text true :capture_output true
+            :env (environment {"THETADATA_REF_ROOT" (str tmp)
+                                                      "THETADATA_JAVA_BIN" "/bin/echo"}))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (str/includes? (.-stdout result) (str "-jar " (.joinpath lib "202607101.jar"))))
+        (is (str/includes? (.-stdout result) (str "--creds-file=" (.joinpath tmp "creds.txt"))))
+        (is (str/includes? (.-stdout result) "--enable-native-access=ALL-UNNAMED")))
+      (finally (shutil/rmtree tmp ** :ignore_errors true)))))
+
+(deftest wrapper-refuses-to-start-without-a-vendor-jar
+  (let [tmp (pathlib/Path (tempfile/mkdtemp))]
+    (.mkdir (.joinpath tmp "lib") ** :parents true)
+    (try
+      (let [result (subprocess/run ["bash" (str script)] ** :text true :capture_output true
+            :env (environment {"THETADATA_REF_ROOT" (str tmp)
+                                                      "THETADATA_JAVA_BIN" "/bin/echo"}))]
+        (is (= 2 (.-returncode result)))
+        (is (str/includes? (.-stderr result) "ThetaData terminal jar not found")))
+      (finally (shutil/rmtree tmp ** :ignore_errors true)))))

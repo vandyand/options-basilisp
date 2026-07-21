@@ -1,0 +1,75 @@
+;; Generate a derived IV/Greeks probe from saved ThetaData payload examples.
+(import datetime json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path [(os.path/join repo-root "components" "analysis.derived-greeks" "src")]]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.analysis.derived-greeks :as dg])
+
+(defn usage []
+  (println "usage: basilisp run scripts/derived_greeks_probe.lpy -- --target-date YYYY-MM-DD [--payload-dir DIR] [--out-dir DIR] [--risk-free-rate N] [--dividend-yield N]"))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn target-date
+  [value]
+  (let [s (str value)]
+    (datetime.date/fromisoformat s)
+    s))
+
+(defn parse-float-option
+  [name value]
+  (let [n (python/float value)]
+    (when-not (dg/finite-number? n)
+      (throw (python/ValueError (str "invalid " name ": " value))))
+    n))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:payload-dir (os.path/join repo-root "resources" "thetadata" "payload_examples")
+              :out-dir (os.path/join repo-root "live_runtime" "analysis")
+              :risk-free-rate dg/default-risk-free-rate
+              :dividend-yield dg/default-dividend-yield}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--target-date")
+          (recur (nnext remaining) (assoc out :target-date (target-date (option-value remaining arg))))
+
+          (= arg "--payload-dir")
+          (recur (nnext remaining) (assoc out :payload-dir (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--risk-free-rate")
+          (recur (nnext remaining) (assoc out :risk-free-rate (parse-float-option arg (option-value remaining arg))))
+
+          (= arg "--dividend-yield")
+          (recur (nnext remaining) (assoc out :dividend-yield (parse-float-option arg (option-value remaining arg))))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn main []
+  (let [opts (parse-args (vec *command-line-args*))]
+    (when-not (:target-date opts)
+      (throw (python/ValueError "--target-date is required")))
+    (let [result (dg/write-probe! opts)]
+      (println (json/dumps (dg/jsonable (get-in result ["payload" "summary"]))
+                           ** :indent 2 :sort_keys true))
+      (println (str "wrote " (get result "json_path")))
+      (println (str "wrote " (get result "markdown_path"))))))
+
+(main)

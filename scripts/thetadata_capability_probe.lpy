@@ -1,0 +1,629 @@
+;; Read-only ThetaData capability probe for feature-unlock evidence.
+(require '[clojure.set :as set]
+         '[clojure.string :as str])
+
+(import builtins datetime json math os os.path re time traceback urllib.error urllib.parse urllib.request)
+
+(def default-analysis "live_runtime/analysis")
+(def default-base-url "http://127.0.0.1:25503")
+(def default-payload-dir "resources/thetadata/payload_examples")
+(def non-numeric-payload-fields #{"right" "expiration" "timestamp" "symbol"})
+
+(defn probe-spec [name family path unlocks required-all required-any & [note]]
+  {"name" name
+   "family" family
+   "path" path
+   "unlocks" unlocks
+   "required_all" required-all
+   "required_any" required-any
+   "note" (or note "")})
+
+(def option-probes
+  [(probe-spec "option.expirations" "option"
+               "/v3/option/list/expirations?symbol={symbol}&format=json"
+               ["options-base calendar/DTE coverage" "expiration discovery"]
+               ["expiration"] [])
+   (probe-spec "option.snapshot.quote" "option"
+               "/v3/option/snapshot/quote?symbol={symbol}&expiration={expiration}&format=json"
+               ["option mid/spread/moneyness/DTE features"
+                "local Black-Scholes IV/Greek reconstruction"
+                "partial v3-grid reconstruction"]
+               ["strike" "right" "bid" "ask"] [])
+   (probe-spec "option.snapshot.ohlc" "option"
+               "/v3/option/snapshot/ohlc?symbol={symbol}&expiration={expiration}&format=json"
+               ["option volume/count features" "put/call volume ratios" "volume concentration/skew features"]
+               [] ["volume" "count" "open" "high" "low" "close"])
+   (probe-spec "option.snapshot.open_interest" "option"
+               "/v3/option/snapshot/open_interest?symbol={symbol}&expiration={expiration}&format=json"
+               ["open-interest surface" "OI-weighted option features"]
+               [] ["open_interest" "oi"])
+   (probe-spec "option.snapshot.greeks" "option"
+               "/v3/option/snapshot/greeks/first_order?symbol={symbol}&expiration={expiration}&format=json"
+               ["native IV/delta/vega/theta/rho features"
+                "training-style option_greeks rows"
+                "v3-grid/scattering/TDA/Wasserstein features"]
+               ["strike" "right"] ["implied_vol" "iv" "delta" "vega" "theta" "rho"])
+   (probe-spec "option.snapshot.greeks_second_order" "option"
+               "/v3/option/snapshot/greeks/second_order?symbol={symbol}&expiration={expiration}&format=json"
+               ["native gamma/vanna/charm surface" "higher-order Greek features"]
+               [] ["gamma" "vanna" "charm"])
+   (probe-spec "option.snapshot.greeks_third_order" "option"
+               "/v3/option/snapshot/greeks/third_order?symbol={symbol}&expiration={expiration}&format=json"
+               ["native speed/zomma/color surface" "future higher-order Greek features"]
+               [] ["speed" "zomma" "color"])
+   (probe-spec "bulk.option.quote" "option-bulk"
+               "/v2/bulk_snapshot/option/quote/quote?root={symbol}&exp=0&format=json"
+               ["root-level full-chain quote snapshots" "fewer per-expiration requests"]
+               ["bid" "ask" "strike" "right"] []
+               "Exploratory legacy/bulk path; exact support is entitlement/version dependent.")
+   (probe-spec "bulk.option.greeks" "option-bulk"
+               "/v2/bulk_snapshot/option/greeks?root={symbol}&exp=0&format=json"
+               ["root-level native Greek snapshots" "highest-confidence v3-grid reconstruction"]
+               ["strike" "right"] ["implied_vol" "iv" "delta" "vega" "theta" "rho"]
+               "Exploratory legacy/bulk path; exact support is entitlement/version dependent.")
+   (probe-spec "bulk.option.open_interest" "option-bulk"
+               "/v2/bulk_snapshot/option/open_interest?root={symbol}&exp=0&format=json"
+               ["root-level open interest surface" "OI-weighted option features"]
+               [] ["open_interest" "oi"]
+               "Exploratory legacy/bulk path; exact support is entitlement/version dependent.")])
+
+(def index-probes
+  [(probe-spec "index.snapshot.quote" "index"
+               "/v3/index/snapshot/quote?symbol={symbol}&format=json"
+               ["SPX/VIX index-proxy features" "vix momentum/proxy/term features"]
+               [] ["bid" "ask" "last" "price" "trade_price"])
+   (probe-spec "index.snapshot.price" "index"
+               "/v3/index/snapshot/price?symbol={symbol}&format=json"
+               ["SPX/VIX close/price features" "index OHLC warmup source"]
+               [] ["price" "last" "trade_price"])])
+
+(def stock-probes
+  [(probe-spec "stock.snapshot.quote" "stock"
+               "/v3/stock/snapshot/quote?symbol={symbol}&format=json"
+               ["Theta-sourced ETF bid/ask microstructure" "feed consistency vs Alpaca"]
+               ["bid" "ask"] [])
+   (probe-spec "stock.snapshot.trade" "stock"
+               "/v3/stock/snapshot/trade?symbol={symbol}&format=json"
+               ["Theta-sourced ETF last/trade features" "feed consistency vs Alpaca"]
+               [] ["price" "last" "trade_price"])
+   (probe-spec "stock.snapshot.ohlc" "stock"
+               "/v3/stock/snapshot/ohlc?symbol={symbol}&format=json"
+               ["Theta-sourced ETF OHLCV features" "feed consistency vs Alpaca"]
+               [] ["open" "high" "low" "close" "volume"])])
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn today-date []
+  ;; Container timezone is America/New_York in production sessions; exact ET only affects default labels.
+  (.date (datetime.datetime/now)))
+
+(defn valid-session-date [value]
+  (try
+    (let [parsed (datetime.date/fromisoformat value)]
+      (.isoformat parsed))
+    (catch python/Exception _
+      (throw (python/ValueError "expected YYYY-MM-DD calendar date")))))
+
+(defn valid-expiration [value]
+  (let [raw (.strip (str value))
+        compact (.replace raw "-" "")]
+    (when (not (re/fullmatch "\\d{8}" compact))
+      (throw (python/ValueError "expected YYYYMMDD or YYYY-MM-DD expiration")))
+    (try
+      (datetime.date/fromisoformat (str (subs compact 0 4) "-" (subs compact 4 6) "-" (subs compact 6 8)))
+      (catch python/Exception _
+        (throw (python/ValueError "expected valid expiration calendar date"))))
+    compact))
+
+(defn positive-float [value arg]
+  (try
+    (let [n (float value)]
+      (when (or (not (math/isfinite n)) (<= n 0.0))
+        (throw (python/ValueError (str "expected positive number for " arg))))
+      n)
+    (catch python/Exception _
+      (throw (python/ValueError "expected positive number")))))
+
+(defn positive-int [value arg]
+  (try
+    (let [n (int value)]
+      (when (<= n 0)
+        (throw (python/ValueError (str "expected positive integer for " arg))))
+      n)
+    (catch python/Exception _
+      (throw (python/ValueError "expected positive integer")))))
+
+(defn reject-duplicate-json-object [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}]
+    (if remaining
+      (let [pair (first remaining)
+            k (first pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining) (conj seen k)))
+      (python/dict pairs))))
+
+(defn loads-json-strict [text]
+  (json/loads text ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn url-join [base-url path]
+  (str (.rstrip base-url "/") path))
+
+(defn render-path [path values]
+  (loop [out path
+         pairs (seq values)]
+    (if pairs
+      (let [[k v] (first pairs)
+            encoded (urllib.parse/quote (str v) ** :safe "")]
+        (recur (.replace out (str "{" (name k) "}") encoded) (next pairs)))
+      out)))
+
+(defn safe-name [value]
+  (.strip (re/sub "[^A-Za-z0-9_.=-]+" "_" value) "_"))
+
+(defn classify-error [error]
+  (let [e (.lower (str error))]
+    (cond
+      (or (>= (.find e "connection refused") 0)
+          (>= (.find e "reset by peer") 0)
+          (>= (.find e "unreachable") 0)) "terminal-unreachable"
+      (or (>= (.find e "timed out") 0)
+          (>= (.find e "timeout") 0)) "timeout"
+      (or (>= (.find e "403") 0)
+          (>= (.find e "agreement") 0)
+          (>= (.find e "permission") 0)
+          (>= (.find e "forbidden") 0)) "entitlement-or-agreement"
+      (or (>= (.find e "404") 0)
+          (>= (.find e "410") 0)
+          (>= (.find e "not found") 0)
+          (>= (.find e "gone") 0)) "unsupported-endpoint"
+      (>= (.find e "472") 0) "vendor-symbol-unsupported"
+      :else "error")))
+
+(defn py-list? [x] (isinstance x builtins/list))
+(defn py-dict? [x] (isinstance x builtins/dict))
+(defn py-str? [x] (isinstance x builtins/str))
+
+(defn http-get-json [url timeout-s]
+  (let [started (time/perf_counter)
+        req (urllib.request/Request url ** :headers {"Accept" "application/json"})]
+    (try
+      (let [resp (urllib.request/urlopen req ** :timeout timeout-s)
+            body (.read resp)
+            elapsed (round (* (- (time/perf_counter) started) 1000.0) 1)
+            full-text (.decode body "utf-8" "replace")
+            preview (subs full-text 0 (min 4096 (count full-text)))]
+        (try
+          {"ok" true
+           "status" (getattr resp "status" nil)
+           "elapsed_ms" elapsed
+           "payload" (loads-json-strict full-text)
+           "body_preview" preview}
+          (catch python/Exception e
+            {"ok" false
+             "status" (getattr resp "status" nil)
+             "elapsed_ms" elapsed
+             "error_class" "json-decode"
+             "error" (str e)
+             "body_preview" preview})))
+      (catch urllib.error/HTTPError e
+        (let [elapsed (round (* (- (time/perf_counter) started) 1000.0) 1)
+              body (.decode (.read e 4096) "utf-8" "replace")
+              msg (str "HTTP " (.-code e) ": " (.-reason e) "; " (subs body 0 (min 500 (count body))))]
+          {"ok" false
+           "status" (.-code e)
+           "elapsed_ms" elapsed
+           "error_class" (classify-error msg)
+           "error" msg
+           "body_preview" body}))
+      (catch python/Exception e
+        (let [elapsed (round (* (- (time/perf_counter) started) 1000.0) 1)
+              msg (str (type e) ": " e)]
+          {"ok" false
+           "status" nil
+           "elapsed_ms" elapsed
+           "error_class" (classify-error msg)
+           "error" msg})))))
+
+(defn numeric-summary [values sample-limit]
+  (let [sampled (vec (take sample-limit values))
+        finite (atom [])
+        invalid (atom 0)]
+    (doseq [raw sampled]
+      (try
+        (let [v (float raw)]
+          (if (math/isfinite v)
+            (swap! finite conj v)
+            (swap! invalid inc)))
+        (catch python/Exception _
+          (swap! invalid inc))))
+    (if (empty? @finite)
+      {"sampled" (count sampled) "finite" 0 "nonzero" 0 "invalid" @invalid}
+      {"sampled" (count sampled)
+       "finite" (count @finite)
+       "nonzero" (count (filter #(> (abs %) 1.0e-12) @finite))
+       "invalid" @invalid
+       "min" (apply min @finite)
+       "max" (apply max @finite)})))
+
+(defn header-fields [header]
+  (cond
+    (py-dict? header)
+    (or (some (fn [k]
+                (let [v (get header k)]
+                  (cond
+                    (py-list? v) (vec (map str v))
+                    (py-str? v) (vec (filter #(pos? (count %)) (map #(.strip %) (.split v ","))))
+                    :else nil)))
+              ["format" "columns" "fields" "header"])
+        [])
+    (py-list? header) (vec (map str header))
+    (py-str? header) (vec (filter #(pos? (count %)) (map #(.strip %) (.split header ","))))
+    :else []))
+
+(defn rows-to-columns [rows fields]
+  (let [columns (atom (into {} (map (fn [f] [f []]) fields)))]
+    (doseq [row rows]
+      (cond
+        (py-dict? row)
+        (doseq [field fields]
+          (swap! columns update field conj (get row field)))
+        (py-list? row)
+        (doseq [[i field] (map-indexed vector fields)]
+          (swap! columns update field conj (if (< i (count row)) (get row i) nil)))))
+    @columns))
+
+(defn row-width-mismatch? [rows fields header-backed?]
+  (let [field-set (set fields)]
+    (boolean
+     (some (fn [row]
+             (cond
+               (py-dict? row) (and header-backed?
+                                   (seq (remove field-set (map str (.keys row)))))
+               (py-list? row) (not= (count row) (count fields))
+               :else true))
+           rows))))
+
+(defn type-name [x]
+  (.-__name__ (type x)))
+
+(defn payload-columns [payload]
+  (cond
+    (py-dict? payload)
+    (if (contains? payload "response")
+      (let [response (get payload "response")
+            fields0 (header-fields (get payload "header"))]
+        (cond
+          (and (py-list? response) (seq response) (py-dict? (first response)))
+          (let [header-backed (boolean (seq fields0))
+                fields (if (seq fields0) fields0 (vec (sort (set (mapcat #(map str (.keys %)) response)))))
+                shape (if (row-width-mismatch? response fields header-backed)
+                        "response-row-dicts-width-mismatch"
+                        "response-row-dicts")]
+            [(rows-to-columns response fields) shape (vec (sort (map str (.keys payload))))])
+          (and (py-list? response) (seq fields0))
+          (let [shape (if (row-width-mismatch? response fields0 true)
+                        "response-rows-width-mismatch"
+                        "response-rows")]
+            [(rows-to-columns response fields0) shape (vec (sort (map str (.keys payload))))])
+          :else
+          [(into {} (filter (fn [[_ v]] (py-list? v)) (.items payload)))
+           "columnar-dict"
+           (vec (sort (map str (.keys payload))))]))
+      [(into {} (map (fn [[k v]] [(str k) v])
+                     (filter (fn [[_ v]] (py-list? v)) (.items payload))))
+       "columnar-dict"
+       (vec (sort (map str (.keys payload))))])
+    (and (py-list? payload) (seq payload) (py-dict? (first payload)))
+    (let [fields (vec (sort (set (mapcat #(map str (.keys %)) payload))))]
+      [(rows-to-columns payload fields) "row-dicts" fields])
+    :else [{} (type-name payload) []]))
+
+(defn payload-summary [payload required-all required-any sample-limit]
+  (let [[columns shape payload-keys] (payload-columns payload)
+        row-width-valid (not (.endswith shape "-width-mismatch"))
+        list-lengths (into {} (map (fn [[k v]] [(str k) (count v)]) columns))
+        row-count (if (seq list-lengths) (apply max (vals list-lengths)) 0)
+        missing-values (into {}
+                             (map (fn [[k v]]
+                                    [(str k) (+ (max 0 (- row-count (count v)))
+                                                (count (filter nil? v)))])
+                                  columns))
+        present-values (into {} (map (fn [k] [(str k) (max 0 (- row-count (get missing-values (str k) 0)))])
+                                     (keys columns)))
+        numeric (into {} (map (fn [[k v]] [(str k) (numeric-summary v sample-limit)]) columns))
+        column-names (set (keys columns))
+        all-present (vec (filter column-names required-all))
+        any-present (vec (filter column-names required-any))
+        all-complete (vec (filter #(zero? (get missing-values % row-count)) all-present))
+        any-complete (vec (filter #(zero? (get missing-values % row-count)) any-present))
+        numeric-valid (into {} (map (fn [k]
+                                      [(str k) (or (contains? non-numeric-payload-fields (str k))
+                                                   (= 0 (get (get numeric (str k) {}) "invalid" 0)))])
+                                    (keys columns)))
+        all-valid (vec (filter #(get numeric-valid % false) all-complete))
+        any-valid (vec (filter #(get numeric-valid % false) any-complete))
+        required-ok (and (= (count all-present) (count required-all))
+                         (if (seq required-any) (boolean (seq any-present)) true)
+                         (= (count all-complete) (count required-all))
+                         (if (seq required-any) (boolean (seq any-complete)) true)
+                         (= (count all-valid) (count required-all))
+                         (if (seq required-any) (boolean (seq any-valid)) true)
+                         row-width-valid)]
+    {"type" (type-name payload)
+     "shape" shape
+     "keys" payload-keys
+     "columns" (vec (sort (keys columns)))
+     "row_count" row-count
+     "list_lengths" (into {} (sort list-lengths))
+     "missing_value_counts" (into {} (sort missing-values))
+     "present_value_counts" (into {} (sort present-values))
+     "equal_lengths" (<= (count (set (vals list-lengths))) 1)
+     "row_width_valid" row-width-valid
+     "numeric_columns" numeric
+     "numeric_valid_columns" (into {} (sort numeric-valid))
+     "required_all" required-all
+     "required_any" required-any
+     "required_all_present" all-present
+     "required_any_present" any-present
+     "required_all_complete" all-complete
+     "required_any_complete" any-complete
+     "required_all_valid" all-valid
+     "required_any_valid" any-valid
+     "required_present" (vec (concat all-present (remove (set all-present) any-present)))
+     "required_ok" (boolean required-ok)}))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(if (keyword? k) (name k) (str k)) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable (sort x)))
+    (nil? x) nil
+    :else x))
+
+(defn choose-expiration [base-url symbol timeout-s supplied]
+  (if supplied
+    [supplied nil]
+    (let [path (render-path (get (first option-probes) "path") {:symbol symbol :expiration ""})
+          res (http-get-json (url-join base-url path) timeout-s)]
+      (if (not (get res "ok"))
+        [(.strftime (today-date) "%Y%m%d") res]
+        (let [[columns _ _] (payload-columns (get res "payload"))
+              today (.isoformat (today-date))
+              future (vec (sort (map #(subs (str %) 0 (min 10 (count (str %))))
+                                      (filter #(>= (subs (str %) 0 (min 10 (count (str %)))) today)
+                                              (get columns "expiration" [])))))]
+          (if (seq future)
+            [(.replace (first future) "-" "") res]
+            [(.strftime (today-date) "%Y%m%d") res]))))))
+
+(defn save-payload-example [payload-dir item]
+  (let [day (.replace (subs (str (or (get item "target_date") (get item "generated_at"))) 0 10) "-" "")
+        symbol (safe-name (str (get item "symbol" "unknown")))
+        probe (safe-name (str (get item "probe" "probe")))
+        expiration (safe-name (str (or (get item "expiration") "na")))
+        out-dir (os.path/join payload-dir day)
+        path (os.path/join out-dir (str symbol "_" expiration "_" probe ".json"))]
+    (os/makedirs out-dir ** :exist_ok true)
+    (spit path (json/dumps (jsonable item) ** :indent 2 :sort_keys true))
+    path))
+
+(defn run-probe [spec base-url symbol expiration timeout-s sample-limit payload-dir generated-at target-date save-unusable?]
+  (let [path (render-path (get spec "path") {:symbol symbol :expiration expiration})
+        url (url-join base-url path)
+        res (http-get-json url timeout-s)
+        out (atom {"name" (get spec "name")
+                   "family" (get spec "family")
+                   "symbol" symbol
+                   "expiration" expiration
+                   "path" path
+                   "url" url
+                   "unlocks" (get spec "unlocks")
+                   "note" (get spec "note")
+                   "ok" (boolean (get res "ok"))
+                   "status" (get res "status")
+                   "elapsed_ms" (get res "elapsed_ms")
+                   "error_class" (get res "error_class")
+                   "error" (get res "error")})]
+    (if (get res "ok")
+      (let [summary (payload-summary (get res "payload")
+                                     (get spec "required_all")
+                                     (get spec "required_any")
+                                     sample-limit)
+            usable (boolean (get summary "required_ok"))]
+        (swap! out assoc "summary" summary "usable" usable)
+        (when (and payload-dir (or usable save-unusable?))
+          (swap! out assoc "payload_example"
+                 (save-payload-example payload-dir
+                                       {"generated_at" generated-at
+                                        "target_date" target-date
+                                        "probe" (get spec "name")
+                                        "family" (get spec "family")
+                                        "symbol" symbol
+                                        "expiration" expiration
+                                        "url" url
+                                        "usable" usable
+                                        "summary" summary
+                                        "payload" (get res "payload")}))))
+      (swap! out assoc "usable" false "body_preview" (get res "body_preview")))
+    @out))
+
+(defn assess-unlocks [results]
+  (let [usable (set (map (fn [r] [(get r "symbol") (get r "name")])
+                         (filter #(get % "usable") results)))
+        names (set (map second usable))
+        option-quote (contains? names "option.snapshot.quote")
+        native-greeks (boolean (seq (set/intersection names #{"option.snapshot.greeks" "bulk.option.greeks"})))
+        option-ohlc (contains? names "option.snapshot.ohlc")
+        option-oi (boolean (seq (set/intersection names #{"option.snapshot.open_interest" "bulk.option.open_interest"})))
+        index-quote (boolean (seq (set/intersection names #{"index.snapshot.quote" "index.snapshot.price"})))
+        stock-surface (boolean (some #(.startswith % "stock.snapshot.") names))]
+    {"options_base_basic" {"status" (if option-quote "available" "blocked")
+                           "reason" "requires option quote snapshots with strike/right/bid/ask"}
+     "options_base_volume_oi" {"status" (if (or option-ohlc option-oi) "available" "blocked")
+                               "reason" "requires option OHLC/volume/count and/or open interest surfaces"}
+     "native_greek_surface" {"status" (if native-greeks "available" "blocked")
+                             "reason" "requires native IV/delta/vega/theta/rho rows, or an explicitly accepted BS reconstruction"}
+     "v3_grid_tda_scat_wass" {"status" (if native-greeks "available" (if option-quote "partial" "blocked"))
+                              "reason" "training grids are built from per-minute option_greeks rows; quote-only can only reconstruct approximately"}
+     "index_proxy_vix_spx" {"status" (if index-quote "available" "blocked")
+                            "reason" "requires SPX/VIX index price/quote surfaces"}
+     "equity_microstructure_consistency" {"status" (if stock-surface "available" "unchanged")
+                                          "reason" "Theta stock surfaces could replace/mirror Alpaca for feed-consistent ETF microstructure"}}))
+
+(defn md-table [rows]
+  (if (empty? rows)
+    ""
+    (let [cols (count (first rows))
+          widths (vec (for [i (range cols)] (apply max (map #(count (str (get % i))) rows))))
+          fmt-row (fn [row] (str "| " (str/join " | " (map-indexed (fn [i v] (.ljust (str v) (get widths i))) row)) " |"))]
+      (str/join "\n" (concat [(fmt-row (first rows))
+                              (str "| " (str/join " | " (map #(apply str (repeat % "-")) widths)) " |")]
+                             (map fmt-row (rest rows)))))))
+
+(defn write-markdown [path payload]
+  (let [rows (atom [["Probe" "Symbol" "OK" "Usable" "Rows" "Status/Error" "Unlocks"]])]
+    (doseq [r (get payload "results")]
+      (let [summary (get r "summary" {})]
+        (swap! rows conj [(get r "name")
+                          (get r "symbol")
+                          (if (get r "ok") "yes" "no")
+                          (if (get r "usable") "yes" "no")
+                          (str (get summary "row_count" ""))
+                          (str (or (get r "status") (get r "error_class") ""))
+                          (str/join "; " (take 2 (get r "unlocks")))])))
+    (let [unlock-rows (atom [["Area" "Status" "Reason"]])]
+      (doseq [[area info] (get payload "unlock_assessment")]
+        (swap! unlock-rows conj [area (get info "status") (get info "reason")]))
+      (spit path
+            (str "# ThetaData Capability Probe\n\n"
+                 "Generated: `" (get payload "generated_at") "`\n\n"
+                 "Base URL: `" (get payload "base_url") "`\n\n"
+                 "This is read-only. It probes data endpoints and does not modify trading runtime state, feature masks, or strategy configuration.\n\n"
+                 "## Headline\n\n"
+                 "- Option symbols: `" (str/join ", " (get payload "option_symbols")) "`\n"
+                 "- Index symbols: `" (str/join ", " (get payload "index_symbols")) "`\n"
+                 "- Stock symbols: `" (str/join ", " (get payload "stock_symbols")) "`\n"
+                 "- Total probes: `" (get-in payload ["summary" "total"]) "`\n"
+                 "- Usable probes: `" (get-in payload ["summary" "usable"]) "`\n"
+                 "- Failed probes: `" (get-in payload ["summary" "failed"]) "`\n"
+                 "- Saved payload examples: `" (get-in payload ["summary" "payload_examples"]) "`\n"
+                 "- Error classes: `" (get-in payload ["summary" "error_classes"]) "`\n\n"
+                 "## Unlock Assessment\n\n" (md-table @unlock-rows) "\n\n"
+                 "## Probe Results\n\n" (md-table @rows) "\n")))))
+
+(defn split-symbols [s]
+  (vec (filter #(pos? (count %)) (map #(.upper (.strip %)) (.split (or s "") ",")))))
+
+(defn collision-safe-out-base
+  [out-dir base-name]
+  (loop [i 0]
+    (let [candidate (os.path/join out-dir (if (zero? i)
+                                            base-name
+                                            (str base-name "_" i)))]
+      (if (or (os.path/exists (str candidate ".json"))
+              (os.path/exists (str candidate ".md")))
+        (recur (inc i))
+        candidate))))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:base-url default-base-url
+              :out-dir default-analysis
+              :option-symbols "SPY,SPXW,SPX,VIXW,VIX"
+              :index-symbols "SPX,VIX"
+              :stock-symbols "SPY,HYG,TLT,VXX"
+              :timeout-s 5.0
+              :sample-limit 5000
+              :save-payloads false
+              :save-unusable-payloads false
+              :payload-dir default-payload-dir}]
+    (if remaining
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--base-url") (recur (nnext remaining) (assoc out :base-url (option-value remaining arg)))
+          (= arg "--out-dir") (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+          (= arg "--option-symbols") (recur (nnext remaining) (assoc out :option-symbols (option-value remaining arg)))
+          (= arg "--index-symbols") (recur (nnext remaining) (assoc out :index-symbols (option-value remaining arg)))
+          (= arg "--stock-symbols") (recur (nnext remaining) (assoc out :stock-symbols (option-value remaining arg)))
+          (= arg "--expiration") (recur (nnext remaining) (assoc out :expiration (valid-expiration (option-value remaining arg))))
+          (= arg "--timeout-s") (recur (nnext remaining) (assoc out :timeout-s (positive-float (option-value remaining arg) arg)))
+          (= arg "--sample-limit") (recur (nnext remaining) (assoc out :sample-limit (positive-int (option-value remaining arg) arg)))
+          (= arg "--save-payloads") (recur (next remaining) (assoc out :save-payloads true))
+          (= arg "--save-unusable-payloads") (recur (next remaining) (assoc out :save-unusable-payloads true))
+          (= arg "--payload-dir") (recur (nnext remaining) (assoc out :payload-dir (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (valid-session-date (option-value remaining arg))))
+          (or (= arg "-h") (= arg "--help")) (do (println "usage: basilisp run scripts/thetadata_capability_probe.lpy -- [--base-url URL] [--out-dir DIR] [--option-symbols CSV] [--index-symbols CSV] [--stock-symbols CSV] [--expiration YYYYMMDD] [--timeout-s N] [--sample-limit N] [--save-payloads] [--save-unusable-payloads] [--payload-dir DIR] [--target-date YYYY-MM-DD]") (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg)))))
+      out)))
+
+(defn run-main [opts]
+  (let [target-date (or (:target-date opts) (.isoformat (today-date)))
+        option-symbols (split-symbols (:option-symbols opts))
+        index-symbols (split-symbols (:index-symbols opts))
+        stock-symbols (split-symbols (:stock-symbols opts))
+        generated-at (now-utc)
+        payload-dir (when (:save-payloads opts) (:payload-dir opts))
+        results (atom [])
+        expiration-probe-results (atom {})]
+    (doseq [symbol option-symbols]
+      (let [[expiration exp-probe] (choose-expiration (:base-url opts) symbol (:timeout-s opts) (:expiration opts))]
+        (when exp-probe
+          (swap! expiration-probe-results assoc symbol {"ok" (get exp-probe "ok")
+                                                        "status" (get exp-probe "status")
+                                                        "error_class" (get exp-probe "error_class")
+                                                        "error" (get exp-probe "error")}))
+        (doseq [spec option-probes]
+          (swap! results conj (run-probe spec (:base-url opts) symbol expiration (:timeout-s opts) (:sample-limit opts) payload-dir generated-at target-date (:save-unusable-payloads opts))))))
+    (doseq [symbol index-symbols
+            spec index-probes]
+      (swap! results conj (run-probe spec (:base-url opts) symbol "" (:timeout-s opts) (:sample-limit opts) payload-dir generated-at target-date (:save-unusable-payloads opts))))
+    (doseq [symbol stock-symbols
+            spec stock-probes]
+      (swap! results conj (run-probe spec (:base-url opts) symbol "" (:timeout-s opts) (:sample-limit opts) payload-dir generated-at target-date (:save-unusable-payloads opts))))
+    (let [stamp (.replace target-date "-" "")
+          error-classes (frequencies (map #(or (get % "error_class") "error") (filter #(not (get % "ok")) @results)))
+          payload {"generated_at" generated-at
+                   "target_date" target-date
+                   "base_url" (:base-url opts)
+                   "option_symbols" option-symbols
+                   "index_symbols" index-symbols
+                   "stock_symbols" stock-symbols
+                   "expiration_probe_results" @expiration-probe-results
+                   "summary" {"total" (count @results)
+                              "ok" (count (filter #(get % "ok") @results))
+                              "usable" (count (filter #(get % "usable") @results))
+                              "failed" (count (filter #(not (get % "ok")) @results))
+                              "payload_examples" (count (filter #(get % "payload_example") @results))
+                              "error_classes" error-classes}
+                   "unlock_assessment" (assess-unlocks @results)
+                   "results" @results}
+          out-base (collision-safe-out-base (:out-dir opts) (str "thetadata_capability_probe_" stamp))
+          json-path (str out-base ".json")
+          md-path (str out-base ".md")]
+      (os/makedirs (:out-dir opts) ** :exist_ok true)
+      (spit json-path (json/dumps (jsonable payload) ** :indent 2 :sort_keys true))
+      (write-markdown md-path payload)
+      (println (json/dumps (jsonable (get payload "summary")) ** :indent 2 :sort_keys true))
+      (println (str "wrote " md-path))
+      (println (str "wrote " json-path))
+      0)))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (traceback/print_exc)
+      (println (str e)))
+    (python/exit 1)))

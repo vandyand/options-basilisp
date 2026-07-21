@@ -1,0 +1,121 @@
+(ns stevetrading.bridge.v2-vol
+  "Core V2 VOL-family signal bridge (FOX/WOLF/OTTER).
+
+  The predictor seam returns a z-score where z < -enter-sigma means SHORT_VOL,
+  i.e. sell volatility. In this Basilisp engine the reusable bridge signal only
+  accepts :long/:short/:flat, and the available vol executor is the short-vol
+  iron condor. Therefore this bridge exposes SHORT_VOL as :long (enter condor)
+  and LONG_VOL as :flat (do not enter an unsupported long-vol structure; flatten
+  any existing condor).
+
+  Legacy Data-Preprocessor predictor loading lives in
+  stevetrading.bridge.v2-vol.legacy. This namespace is intentionally injectable
+  so replay/parity tests do not hide legacy imports or network hydration behind
+  the core bridge."
+  (:import datetime math))
+
+(defn- utc-now []
+  (datetime.datetime/now (.-utc datetime/timezone)))
+
+(defn- minute-key [dt]
+  (.strftime dt "%Y-%m-%dT%H:%M"))
+
+(defn- finite-z [value]
+  (try
+    (let [f (python/float value)]
+      (when-not (math/isnan f) f))
+    (catch python/Exception _
+      nil)))
+
+(defn vol-state-step
+  "Pure VolZScoreSignal step. Internal states are :short-vol, :long-vol, :flat.
+  SHORT_VOL is the tradable condor state; LONG_VOL is tracked only so it exits
+  cleanly through the hysteresis band."
+  [held z enter-sigma exit-sigma]
+  (cond
+    (nil? z) held
+    (< z (- enter-sigma)) :short-vol
+    (> z enter-sigma) :long-vol
+    (and (not= :flat held) (< (abs z) exit-sigma)) :flat
+    :else held))
+
+(defn vol-state->bridge-kind
+  "Map internal vol state to the bridge signal vocabulary.
+  :short-vol -> :long means enter the short-vol condor executor."
+  [state]
+  (case state
+    :short-vol :long
+    :long-vol :flat
+    :flat :flat
+    :flat))
+
+(defn make-v2-vol-bridge
+  "Construct the bridge. config:
+    :strategies    {bot {:enter-sigma 2.0 :exit-sigma 0.5}} — bots from
+                   the supplied prediction factory
+    :prediction-factory REQUIRED Basilisp-owned seam:
+                   (fn [bot params] {:pred-fn (fn [instant] z)})
+    :now-fn        optional clock for tests/replayable wrappers
+
+  Use stevetrading.bridge.v2-vol.legacy/make-legacy-v2-vol-bridge when loading
+  the legacy Data-Preprocessor predictors for live simulation."
+  [{:keys [strategies prediction-factory now-fn]
+    :or {strategies {:fox-vol {:enter-sigma 2.0 :exit-sigma 0.5}
+                     :wolf-vol {:enter-sigma 2.0 :exit-sigma 0.5}
+                     :otter-vol {:enter-sigma 2.0 :exit-sigma 0.5}}
+         now-fn utc-now}}]
+  (when-not prediction-factory
+    (throw (ex-info "make-v2-vol-bridge requires :prediction-factory; use stevetrading.bridge.v2-vol.legacy/make-legacy-v2-vol-bridge for legacy predictors"
+                    {:error/reason :missing-prediction-factory})))
+  (let [load-bot (fn [bot params]
+                   (let [predictor (prediction-factory bot params)
+                         pred-fn (:pred-fn predictor)]
+                     (when-not pred-fn
+                       (throw (ex-info (str "v2 vol predictor missing :pred-fn for " bot)
+                                       {:error/bot bot})))
+                     (assoc predictor
+                            :pred-fn pred-fn
+                            :enter-sigma (double (:enter-sigma params 2.0))
+                            :exit-sigma (double (:exit-sigma params 0.5)))))
+        bots (into {} (map (fn [[bot params]] [bot (load-bot bot params)])
+                           strategies))
+        state (atom {:vol-states (zipmap (keys bots) (repeat :flat))
+                     :kinds (zipmap (keys bots) (repeat :flat))
+                     :last-minute nil
+                     :last-z {}
+                     :last-error nil})]
+    {:bots bots
+     :state state
+     :signals-fn
+     (fn []
+       (let [now (now-fn)
+             minute (minute-key now)
+             st @state]
+         (if (= minute (:last-minute st))
+           (:kinds st)
+           (let [results
+                 (into {}
+                       (map (fn [[bot {:keys [pred-fn enter-sigma exit-sigma]}]]
+                              (let [held (get-in st [:vol-states bot] :flat)
+                                    z (try
+                                        (finite-z (pred-fn now))
+                                        (catch python/Exception e
+                                          (swap! state assoc :last-error
+                                                 (str bot ": " e))
+                                          nil))
+                                    vol-state (vol-state-step held z
+                                                              enter-sigma
+                                                              exit-sigma)]
+                                [bot {:vol-state vol-state
+                                      :kind (vol-state->bridge-kind vol-state)
+                                      :z z}]))
+                            bots))
+                 vol-states (into {} (map (fn [[b r]] [b (:vol-state r)])
+                                          results))
+                 kinds (into {} (map (fn [[b r]] [b (:kind r)]) results))]
+             (swap! state assoc
+                    :vol-states vol-states
+                    :kinds kinds
+                    :last-minute minute
+                    :last-z (into {} (map (fn [[b r]] [b (:z r)]) results)))
+             kinds))))}))

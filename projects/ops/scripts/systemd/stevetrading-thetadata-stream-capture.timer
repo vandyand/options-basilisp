@@ -1,0 +1,11 @@
+[Unit]
+Description=Capture raw ThetaData stream events after market open
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:32:00 America/New_York
+AccuracySec=5s
+Persistent=true
+Unit=stevetrading-thetadata-stream-capture.service
+
+[Install]
+WantedBy=timers.target

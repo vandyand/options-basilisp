@@ -1,0 +1,11 @@
+[Unit]
+Description=Compare raw ThetaData historical evidence after stream capture
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 09:50:00 America/New_York
+AccuracySec=10s
+Persistent=true
+Unit=stevetrading-raw-history-parity.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,104 @@
+(import argparse os.path re sys)
+(import numpy)
+
+(defn parse-args
+  [argv]
+  (let [parser (argparse/ArgumentParser
+                :description "Inspect Steve v2 bridge seed and live capture warmup state.")
+        _ (.add_argument parser "--seed" ** :required true)
+        _ (.add_argument parser "--capture" ** :required true)
+        _ (.add_argument parser "--max-prefix" ** :type int :default 600)]
+    (.parse_args parser argv)))
+
+(defn count-item
+  [x]
+  (if (nil? x) 0 (count x)))
+
+(def symbols ["SPY" "HYG" "TLT" "VXX" "SPX" "TNX" "VIX"])
+
+(defn re-count
+  [pattern text]
+  (count (re/findall pattern text)))
+
+(defn first-match
+  [pattern text]
+  (let [m (re/search pattern text)]
+    (when m (.group m 1))))
+
+(defn last-match
+  [pattern text]
+  (let [matches (re/findall pattern text)]
+    (when (seq matches) (last matches))))
+
+(defn summarize-seed-text
+  [text]
+  (println "seed-chain-count-estimate" (re-count ":observed-at" text))
+  (doseq [sym symbols]
+    (println "seed-bars"
+             "symbol" sym
+             "symbol-field-count" (re-count (str ":symbol \"" sym "\"") text)
+             "quoted-symbol-count" (re-count (str "\"" sym "\"") text))))
+
+(defn buffer-section
+  [text sym]
+  (let [pattern (str "\"" sym "\"\\s*:\\s*\\[(.*?)\\](?:\\s*,\\s*\"|\\s*})")
+        m (re/search pattern text ** :flags (.-S re))]
+    (when m (.group m 1))))
+
+(defn summarize-buffer-text
+  [label text]
+  (doseq [sym symbols]
+    (let [section (or (buffer-section text sym) "")
+          count-est (max (re-count "\"time\"" section)
+                         (re-count "\"timestamp\"" section)
+                         (re-count "\"t\"" section))]
+      (println label
+               "symbol" sym
+               "bar-count-estimate" count-est
+               "first-time" (or (first-match "\"time\"\\s*:\\s*\"([^\"]+)\"" section)
+                                (first-match "\"timestamp\"\\s*:\\s*\"([^\"]+)\"" section)
+                                (first-match "\"t\"\\s*:\\s*\"([^\"]+)\"" section))
+               "last-time" (or (last-match "\"time\"\\s*:\\s*\"([^\"]+)\"" section)
+                               (last-match "\"timestamp\"\\s*:\\s*\"([^\"]+)\"" section)
+                               (last-match "\"t\"\\s*:\\s*\"([^\"]+)\"" section))))))
+
+(defn main
+  [& argv]
+  (let [args (parse-args argv)
+        seed-path (.-seed args)
+        capture-path (.-capture args)]
+    (when-not (os.path/exists seed-path)
+      (println "missing seed:" seed-path)
+      (python/exit 2))
+    (when-not (os.path/exists capture-path)
+      (println "missing capture:" capture-path)
+      (python/exit 2))
+    (let [seed-text (slurp seed-path)
+          cap (numpy/load capture-path :allow_pickle true)
+          files (set (vec (.-files cap)))
+          times (when (contains? files "times") (.__getitem__ cap "times"))
+          buffers (when (contains? files "bar_buffers_json")
+                    (.__getitem__ cap "bar_buffers_json"))]
+      (println "seed-path" seed-path)
+      (println "seed-bytes" (count seed-text))
+      (summarize-seed-text seed-text)
+      (println "capture-path" capture-path)
+      (println "capture-files" (sort files))
+      (println "capture-rows" (if (some? times) (count times) 0))
+      (when (and (some? times) (pos? (count times)))
+        (println "capture-first-time" (.__getitem__ times 0))
+        (println "capture-last-time" (.__getitem__ times (- (count times) 1))))
+      (if (and (some? buffers) (pos? (count buffers)))
+        (do
+          (println "capture-first-buffer-prefix"
+                   (subs (str (.__getitem__ buffers 0))
+                         0
+                         (min (.-max_prefix args)
+                              (count (str (.__getitem__ buffers 0))))))
+          (summarize-buffer-text "capture-first-buffer" (str (.__getitem__ buffers 0)))
+          (when (> (count buffers) 1)
+            (summarize-buffer-text "capture-last-buffer"
+                                   (str (.__getitem__ buffers (- (count buffers) 1))))))
+        (println "capture-bar-buffers-json missing-or-empty")))))
+
+(apply main *command-line-args*)

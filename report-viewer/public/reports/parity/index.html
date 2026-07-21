@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="SteveTrading live-versus-historical market-data parity report.">
+  <title>SteveTrading Data Parity Report</title>
+  <style>
+    :root{--bg:#0d1117;--panel:#161b22;--panel-2:#101720;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;--green:#3fb950;--amber:#d29922;--red:#f85149;--purple:#bc8cff;--max:1240px}
+    *{box-sizing:border-box} html{scroll-behavior:smooth} body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    a{color:var(--blue)} a:focus-visible,summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px}.site-header{position:sticky;top:0;z-index:3;background:rgba(13,17,23,.95);border-bottom:1px solid var(--border);backdrop-filter:blur(9px)}.bar{max-width:var(--max);margin:auto;padding:13px 24px;display:flex;gap:20px;align-items:center;justify-content:space-between}.brand{font-weight:700;color:var(--text);text-decoration:none}.nav{display:flex;flex-wrap:wrap;gap:14px;font-size:14px}.nav a{text-decoration:none}.container{max-width:var(--max);margin:auto;padding:32px 24px 72px}.eyebrow{color:var(--blue);font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;margin:0 0 8px}.hero{padding:28px;border:1px solid var(--border);border-left:5px solid var(--green);border-radius:12px;background:linear-gradient(115deg,#161b22,#101a28)}h1{font-size:clamp(30px,4vw,48px);line-height:1.1;margin:0 0 14px}h2{font-size:24px;line-height:1.2;margin:44px 0 14px}h3{font-size:17px;line-height:1.3;margin:0 0 8px}.lede{font-size:18px;max-width:900px;margin:0;color:#c9d1d9}.muted,.note{color:var(--muted)}.small{font-size:13px}.notice{margin-top:18px;padding:12px 14px;border:1px solid #594419;border-radius:8px;background:#211a0d;color:#e3c880}.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px}.badge{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:3px 9px;font-size:12px;font-weight:650}.hard{border-color:#1f6f3c;color:#56d364;background:#12261b}.high{border-color:#725400;color:#e3b341;background:#2b2106}.candidate{border-color:#644497;color:#d2a8ff;background:#251b34}.rejected{border-color:#7c2b2b;color:#ff7b72;background:#301717}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:18px}.metric{padding:15px;border:1px solid var(--border);background:var(--panel);border-radius:10px}.metric strong{display:block;font-size:26px;line-height:1.1}.metric span{color:var(--muted);font-size:13px}.toc{margin:24px 0 0;padding:16px 18px;border:1px solid var(--border);border-radius:10px;background:var(--panel)}.toc ul{margin:8px 0 0;padding-left:20px;columns:2}.toc a{text-decoration:none}.callout{padding:16px 18px;margin:18px 0;border:1px solid var(--border);border-left:4px solid var(--blue);border-radius:8px;background:var(--panel-2)}.callout strong{display:block;margin-bottom:4px}.warning{border-left-color:var(--amber)}.danger{border-left-color:var(--red)}.table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:10px;background:var(--panel)}table{width:100%;border-collapse:collapse;min-width:820px;font-size:14px}th,td{padding:12px 14px;border-bottom:1px solid var(--border);vertical-align:top;text-align:left}th{color:var(--muted);font-size:11px;letter-spacing:.07em;text-transform:uppercase;background:#121820}tr:last-child td{border-bottom:0}td p{margin:0 0 6px}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.9em;color:#79c0ff}.source{display:grid;grid-template-columns:185px 1fr;gap:16px;padding:22px 0;border-bottom:1px solid var(--border)}.source:last-child{border-bottom:0}.source-meta{font-size:13px;color:var(--muted)}.source-meta .badge{margin-bottom:8px}.source p{margin:7px 0}.source ul{margin:8px 0;padding-left:20px}.source li{margin:5px 0}details{margin:14px 0;padding:0 14px;border:1px solid var(--border);border-radius:8px;background:var(--panel)}summary{padding:12px 0;cursor:pointer;color:var(--blue);font-weight:600}details>div{padding:0 0 14px}.footnotes{font-size:13px;color:var(--muted)}.footer{border-top:1px solid var(--border);padding:24px;color:var(--muted);font-size:13px}.footer>div{max-width:var(--max);margin:auto}.kicker{color:var(--green);font-weight:650}.tight{margin:8px 0}.status-list{padding-left:0;list-style:none}.status-list li{padding:8px 0;border-bottom:1px solid var(--border)}.status-list li:last-child{border-bottom:0}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.toc ul{columns:1}.source{grid-template-columns:1fr}.bar{padding:12px 16px}.container{padding:24px 16px 56px}}@media(max-width:500px){.grid{grid-template-columns:1fr}.nav{gap:9px;font-size:12px}.hero{padding:20px}h2{margin-top:34px}}
+    /* Report-specific information hierarchy: source identity first, then the finding. */
+    .source{grid-template-columns:205px 1fr;gap:22px;padding:26px 0}.source-meta{padding-top:3px}.source-meta .badge{margin-bottom:0}.vendor-name{display:block;color:var(--text);font-size:25px;line-height:1.05;font-weight:760;letter-spacing:-.03em;margin-bottom:7px}.vendor-scope{display:block;line-height:1.35}.finding-title{display:flex;align-items:center;gap:9px;flex-wrap:wrap;color:#79c0ff;font-size:21px;line-height:1.25;margin:0 0 8px}.finding-number{display:inline-grid;place-items:center;width:25px;height:25px;border-radius:50%;background:#19314a;color:#8cc8ff;font:700 12px ui-monospace,SFMono-Regular,Consolas,monospace}.terms{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:16px 0}.term{padding:12px 14px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}.term strong{display:block;color:#c9d1d9;font-size:13px;margin-bottom:3px}.term span{display:block;color:var(--muted);font-size:13px;line-height:1.4}.table-tier{white-space:nowrap}.storage-note{font-size:13px;color:var(--muted);margin:10px 0 0}@media(max-width:850px){.terms{grid-template-columns:1fr}.source{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <header class="site-header">
+    <div class="bar">
+      <a class="brand" href="/reports/parity/">SteveTrading · Data Parity</a>
+      <nav class="nav" aria-label="Report navigation">
+        <a href="#verdict">Verdict</a><a href="#corpus">Corpus</a><a href="#vendors">Vendors</a><a href="#method">Method</a><a href="#next">Next gates</a><a href="/reports/status/">System</a>
+      </nav>
+    </div>
+  </header>
+  <main class="container">
+    <section class="hero" id="verdict" aria-labelledby="report-title">
+      <p class="eyebrow">Research evidence report · updated July 18, 2026</p>
+      <h1 id="report-title">Live-versus-historical market-data parity</h1>
+      <p class="lede">The data foundation is now strong enough to begin serious, leakage-resistant model research. The key achievement is not a claim of alpha: it is having named data contracts whose historical replay is known to match, or closely match, the live representation used at decision time.</p>
+      <div class="badges" aria-label="Overall conclusion"><span class="badge hard">Hard parity: approved declared replay representation</span><span class="badge candidate">Candidate: more sessions or a declared watermark needed</span><span class="badge rejected">Rejected: material non-parity</span></div>
+      <div class="notice"><strong>Interpretation:</strong> parity makes backtests and live evaluation credible. It does not establish that a feature has predictive value, survives fees/slippage, or generalizes across market regimes.</div>
+    </section>
+
+    <div class="grid" aria-label="Parity corpus summary">
+      <div class="metric"><strong>4</strong><span>hard-parity Databento completed-bar classes</span></div>
+      <div class="metric"><strong>6</strong><span>hard-parity Databento raw-event classes, including ES futures options</span></div>
+      <div class="metric"><strong>2</strong><span>hard-parity ThetaData primary event families: options and indexes</span></div>
+      <div class="metric"><strong>1</strong><span>major quarantined source: ThetaData stocks</span></div>
+    </div>
+
+    <nav class="toc" aria-label="Detailed contents">
+      <strong>How to read this report</strong>
+      <ul>
+        <li><a href="#corpus">Parity-qualified corpus and history horizon</a></li>
+        <li><a href="#theta">ThetaData options, indexes, and stocks</a></li>
+        <li><a href="#databento">Databento GLBX and EQUS Mini</a></li>
+        <li><a href="#alpaca">Alpaca IEX</a></li>
+        <li><a href="#other">OANDA, Binance, and Bitunix</a></li>
+        <li><a href="#method">What was compared and what was not</a></li>
+        <li><a href="#next">Promotion gates and model-research plan</a></li>
+      </ul>
+    </nav>
+
+    <section id="corpus" aria-labelledby="corpus-title">
+      <h2 id="corpus-title">Parity-qualified corpus</h2>
+      <p class="note">Each row is one declared source and representation. “Hard” is a property of that row, never a blanket claim about an entire vendor.</p>
+      <div class="terms" aria-label="Terms used in this report">
+        <div class="term"><strong>Hard parity</strong><span>Every complete observed record or state matched under the declared comparison rule.</span></div>
+        <div class="term"><strong>Bounded residual evidence</strong><span>Known comparison residuals retained with their representation restrictions; this is evidence metadata within the hard-parity admission tier.</span></div>
+        <div class="term"><strong>OPRA</strong><span>Options Price Reporting Authority, the US options reporting feed used by ThetaData.</span></div>
+        <div class="term"><strong>NBBO</strong><span>National Best Bid and Offer: the best displayed buy and sell prices across the relevant market.</span></div>
+        <div class="term"><strong>GLBX.MDP3</strong><span>Databento’s CME Globex Market Data Platform 3.0 futures dataset.</span></div>
+        <div class="term"><strong>MBP-1 / L1</strong><span>Market-by-price, one displayed book level: the top bid and offer.</span></div>
+        <div class="term"><strong>EQUS Mini</strong><span>Databento-derived US equity top-of-book composite, not SIP/NBBO or a direct exchange.</span></div>
+        <div class="term"><strong>SIP</strong><span>Securities Information Processor: the consolidated US equity feed. EQUS Mini and IEX are not a SIP feed.</span></div>
+        <div class="term"><strong>NQB / UTP / CTA</strong><span>ThetaData’s live Nasdaq Basic stock feed versus its distinct consolidated historical stock tapes.</span></div>
+        <div class="term"><strong>IV and Greeks</strong><span>Implied volatility and option sensitivity calculations. We calculate these locally rather than trust non-parity vendor snapshots.</span></div>
+        <div class="term"><strong>Completed bar / candle</strong><span>A fixed interval after it has closed. S5 means five seconds; M1 means one minute.</span></div>
+        <div class="term"><strong>Event-driven stream</strong><span>A record is emitted when the market changes; “stream” names the delivery transport. It is not a fixed-interval bar series.</span></div>
+        <div class="term"><strong>REST polling</strong><span>Repeated web requests for a confirmed value, as distinct from a continuously streamed feed.</span></div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Data class</th><th>Parity</th><th>Available history</th><th>Typical cadence</th><th>Approx. storage / day / symbol*</th><th>Potential signal</th></tr></thead>
+        <tbody>
+          <tr><td><strong>ThetaData option quotes</strong><br><span class="small">OPRA, all expirations, strikes, and rights</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>10 years<br><span class="small">2016–present verified; 2015 denied</span></td><td>Event-driven stream</td><td>15 min full-chain seed: SPY 8.60 GiB; SPX 8.62 GiB; SPXW 1.52 GiB; VIX 0.24 GiB; VIXW 0.07 GiB</td><td>Option-book state and volatility-surface shape</td></tr>
+          <tr><td><strong>ThetaData option trades</strong><br><span class="small">OPRA, all expirations, strikes, and rights</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>10 years<br><span class="small">2016–present verified; 2015 denied</span></td><td>Event-driven stream</td><td>15 min full-chain seed: 51.4 MiB across five roots</td><td>Option trade flow and volume imbalance</td></tr>
+          <tr><td><strong>ThetaData index prices</strong><br><span class="small">NDX, RUT, RVX, SPX, TNX, VIX; VIXN separately unavailable on sampled date</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>9+ years where available</td><td>Event-driven stream, sparse</td><td>0.44 MiB for six available indexes / opening hour</td><td>Broad-market level and volatility regime</td></tr>
+          <tr><td><strong>GLBX completed bars</strong><br><span class="small">Databento CME Globex futures</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>16 years</td><td>1s and 1m completed bars</td><td>~0.3 MB (1s); ~0.1 MB (1m)</td><td>Rates and futures trend, range, and regime</td></tr>
+          <tr><td><strong>EQUS Mini completed bars</strong><br><span class="small">Databento equity composite</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>3+ years</td><td>1s and 1m completed bars</td><td>~0.1 MB (1s); ~0.01 MB (1m)</td><td>Equity momentum and liquidity context</td></tr>
+          <tr><td><strong>GLBX L1 book / trades</strong><br><span class="small">Six full futures parents, including listed spreads</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>16 years retained<br><span class="small">~1 year included at $0</span></td><td>Event-driven stream</td><td>28–153 MB / full-universe hour</td><td>Futures top-of-book and trade-flow context</td></tr>
+          <tr><td><strong>GLBX ES futures options</strong><br><span class="small">Entire ES.OPT parent</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>Since 2010<br><span class="small">cost-gated history</span></td><td>Event-driven stream</td><td>24–298 MB / full-universe hour</td><td>Futures-option book state and trade flow</td></tr>
+          <tr><td><strong>EQUS Mini L1 book / trades</strong><br><span class="small">15 declared stocks and ETFs</span></td><td class="table-tier"><span class="badge hard">Hard</span></td><td>3+ years retained<br><span class="small">~1 year included at $0</span></td><td>Event-driven stream</td><td>27–86 MB / full-universe hour</td><td>Equity book and trade-flow context at aggregated horizons</td></tr>
+          <tr><td><strong>Alpaca IEX causal quote state</strong><br><span class="small">IEX = Investors Exchange</span></td><td class="table-tier"><span class="badge hard">Hard ≥10 ms</span></td><td>≥4 years dense<br><span class="small">2022–25 verified; 2021 probe sparse</span></td><td>10 ms causal state<br><span class="small">from event-driven stream</span></td><td>~75–110 MB raw JSON capture</td><td>Independent IEX-only quote-state signal</td></tr>
+        </tbody>
+      </table></div>
+      <p class="storage-note">Storage is measured raw payload size, not a vendor billing quote. Databento figures are complete declared-universe one-hour windows. ThetaData option figures are the completed 09:30–09:45 ET, July 10 full-chain discovery seed (all expirations, strikes, and rights), encoded as raw NDJSON. These figures are deliberately not extrapolated into a day or week until the event profiler has measured multiple regimes.</p>
+      <div class="callout warning"><strong>“One year” means included raw history, not one year of retention.</strong> GLBX raw data is retained from 2010 and EQUS Mini from March 2023. Older raw data is usage-billed and must pass the cost gate before download.</div>
+    </section>
+
+    <section id="vendors" aria-labelledby="vendors-title">
+      <h2 id="vendors-title">Vendor findings</h2>
+      <article class="source" id="theta">
+        <div class="source-meta"><span class="vendor-name">ThetaData</span><span class="vendor-scope">US options, indexes, and stocks<br>Primary options source</span></div>
+        <div>
+          <h3 class="finding-title"><span class="finding-number">01</span> Options quotes, trades, and indexes <span class="badge hard">Hard</span></h3>
+          <p>Exact-contract option quote and trade comparisons established robust live-to-history parity on deterministic samples across SPY, SPX, SPXW, VIX, and VIXW. A completed all-chain 15-minute discovery seed then measured 19.09 GiB of raw NDJSON across those roots: this is strong evidence for the information available, and equally strong evidence that indiscriminate full-session archival is not yet an approved storage plan.</p>
+          <ul>
+            <li><strong>Option NBBO quotes:</strong> admitted as hard parity. Preserve option contract identity, event timestamp, endpoint parameters, and capture receipt/watermark.</li>
+            <li><strong>Option trades:</strong> admitted as hard parity. Trade/quote relationships must be constructed locally under one explicit event-time rule.</li>
+            <li><strong>Availability check:</strong> small read-only SPY tick probes returned quote and trade data for 2016–2025; equivalent 2015 requests were entitlement-denied. This verifies a ten-year usable history boundary, not retrospective live-parity evidence for every historical session.</li>
+            <li><strong>Index prices:</strong> admitted as hard parity. The feed is change-only, so live and historical code must use the same causal carry-forward implementation. Six sampled index symbols returned all four storage-study windows; VIXN returned vendor HTTP 472 for July 10 and is not silently treated as available in that seed.</li>
+            <li><strong>Vendor IV and Greeks:</strong> not admitted as raw inputs. Exact snapshot/history equality was not established because vendor calculations can use different underlying timestamps. Compute Greeks deterministically from parity-proven option inputs instead.</li>
+            <li><strong>Open interest:</strong> excluded from the intraminute corpus. It is a prior-session daily state, not intraminute flow.</li>
+          </ul>
+          <h3 class="finding-title"><span class="finding-number">02</span> Stocks: live feed and retained history differ <span class="badge rejected">Quarantined</span></h3>
+          <p>Live stock data is NQB (Nasdaq Basic), while long-horizon history resolves to distinct UTP/CTA consolidated-tape provenance. Same-session NQB trade checks were stronger than quote checks, but neither establishes a two-year same-feed historical replay. Treat SPY as a stock/ETF in this contract, not an index. The apparent stock feed difference is a data-contract issue, not a feature-engineering nuisance that should be normalized away without proof.</p>
+        </div>
+      </article>
+
+      <article class="source" id="databento">
+        <div class="source-meta"><span class="vendor-name">Databento</span><span class="vendor-scope">CME Globex futures and a derived US equity composite</span></div>
+        <div>
+          <h3 class="finding-title"><span class="finding-number">01</span> GLBX.MDP3: hard completed bars, L1, and trades <span class="badge hard">Hard</span></h3>
+          <p>GLBX is Databento’s CME Globex MDP 3.0 dataset, covering CME Group futures and related products across CME, CBOT, NYMEX, and COMEX. The live entitlement supports top-of-book prices, trades, and completed bars; it does not currently authorize deeper-book data.</p>
+          <ul>
+            <li><strong>Completed bars:</strong> the July 16 six-root capture (<code>ES.FUT</code>, <code>NQ.FUT</code>, <code>RTY.FUT</code>, <code>ZN.FUT</code>, <code>ZB.FUT</code>, <code>SR3.FUT</code>) matched exactly: 2,265 complete one-second bars and 241 complete one-minute bars. Partial start-boundary bars were excluded correctly.</li>
+            <li><strong>MBP-1:</strong> 742,277 of 742,279 captured events matched exactly after excluding transport/receipt fields (<code>ts_recv</code>, <code>ts_out</code>, <code>ts_index</code>, <code>ts_in_delta</code>). One SR3 calendar-spread event differed only in side, and one live event was at the end-exclusive historical boundary. This is hard parity with bounded residual evidence.</li>
+            <li><strong>Trades:</strong> every economic trade field matched. Sixteen records differed only in Databento <code>F_LAST</code>, a packet/batch-end flag, and one live record was on the end boundary. Only <code>F_LAST</code> may be masked; all other quality flags remain data.</li>
+          </ul>
+          <h3 class="finding-title"><span class="finding-number">02</span> EQUS Mini: hard completed bars, L1, and trades <span class="badge hard">Hard</span></h3>
+          <p>EQUS Mini is a Databento-derived, anonymized top-of-book composite from alternative trading systems and regulated US market sources. It is not a consolidated SIP/NBBO feed and not a direct-exchange feed, so that identity must remain in every feature and model artifact.</p>
+          <ul>
+            <li><strong>Completed bars:</strong> 3,077 complete one-second bars and 135 complete one-minute bars matched exactly across a 15-symbol equity basket.</li>
+            <li><strong>MBP-1:</strong> 617,582/618,214 matched after transport fields were excluded: 99.8978%, with 632 live-only and zero historical-only events.</li>
+            <li><strong>Trades:</strong> 8,355/8,360 matched: 99.9402%, with five live-only and zero historical-only events.</li>
+          </ul>
+          <div class="callout"><strong>Databento archive-finalization rule.</strong> Current-day historical metadata explicitly warns that it is not finalized and can overestimate costs/sizes. Intraday comparisons are valuable diagnostics, but every raw seed session must be rechecked after archival finalization before it is promoted in a training cohort.</div>
+        </div>
+      </article>
+
+      <article class="source" id="alpaca">
+        <div class="source-meta"><span class="vendor-name">Alpaca IEX</span><span class="vendor-scope">Single-exchange US equity view<br>Not a consolidated tape</span></div>
+        <div>
+          <h3 class="finding-title"><span class="finding-number">01</span> Causal quote state is exact from 10 ms upward <span class="badge hard">Hard state</span></h3>
+          <p>Alpaca’s IEX feed is a real live exchange feed, but it is not SIP/NBBO or the full consolidated US equity market. It can still carry independent signal, provided it is modeled and evaluated as IEX-only data rather than silently substituted for a consolidated tape.</p>
+          <ul>
+            <li><strong>Availability check:</strong> the authorized IEX historical endpoint returned dense SPY opening-minute quote data in each 2022–2025 probe (2,438–5,918 records), but the same 2021 probe had one record and 2020 had none. The table therefore claims only the verified dense four-year horizon; it does not treat the vendor’s broader advertised archive as equivalent evidence.</li>
+            <li><strong>Trades:</strong> two expanded-window captures across 20 symbols matched 4,362/4,362 events. This is a strong provisional candidate, but needs multi-day and older-history confirmation before broader admission.</li>
+            <li><strong>Raw quotes:</strong> not strict event parity. 30 live-only quote events appeared out of 246,955, with zero historical-only records.</li>
+            <li><strong>Causal quote state:</strong> all 1,076,079 shared 10 ms buckets were exact, therefore the tested 100 ms, 500 ms, one-second, and one-minute states were exact as well. The admitted representation is causal last-quote state at 10 ms or coarser.</li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="source" id="other">
+        <div class="source-meta"><span class="vendor-name">Other venues</span><span class="vendor-scope">FX and crypto context sources<br>Each contract assessed separately</span></div>
+        <div>
+          <h3 class="finding-title"><span class="finding-number">01</span> OANDA FX: completed candles, not raw stream parity <span class="badge candidate">Candidate</span></h3>
+          <p>OANDA’s pricing stream is capped at four updates per second and independently windowed, so it is not a faithful raw-event replay source. The valid candidate is completed bid/ask S5 or M1 candles using the same declared completion rule. A liquid-session capture across seven major FX pairs passed 1,315/1,315 completed S5/M1 candle comparisons. This is a promising provisional hard-parity candidate, pending repeated liquid-session and older-history validation.</p>
+          <h3 class="finding-title"><span class="finding-number">02</span> Binance USD-M: delayed REST-confirmed candles only <span class="badge candidate">Candidate</span></h3>
+          <p>Public WebSocket access was not usable from the available networks, and zero-lag REST candles continued to revise after nominal close. With an explicit ten-second post-close completion watermark, all 21/21 tested one-minute candles across BTCUSDT, ETHUSDT, and SOLUSDT matched later REST history exactly. It remains provisional until multi-session validation; do not call this WebSocket parity.</p>
+          <h3 class="finding-title"><span class="finding-number">03</span> Bitunix: streamed one-minute candles fail parity <span class="badge rejected">Rejected</span></h3>
+          <p>In the BTCUSDT/ETHUSDT/SOLUSDT study, only 4/18 completed WebSocket candles matched REST history exactly. Fourteen had volume differences, five also had different closes, and some had high/low differences. It is excluded from the hard-parity corpus for streamed candle features. A separate future study could test confirmed live REST polling, but it cannot inherit this result.</p>
+        </div>
+      </article>
+    </section>
+
+    <section id="method" aria-labelledby="method-title">
+      <h2 id="method-title">Method and boundary conditions</h2>
+      <div class="callout"><strong>The question being tested</strong>For a precisely declared data class, can live observations and later historical observations be replayed into the same model representation without unexplained differences?</div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Control</th><th>Why it matters</th><th>Applied rule</th></tr></thead>
+        <tbody>
+          <tr><td>Same source contract</td><td>Matching prices alone does not prove matching feed semantics.</td><td>Record vendor, dataset/feed, endpoint/schema, symbology, symbol/contract selection, and entitlement.</td></tr>
+          <tr><td>Event versus state</td><td>A missing raw event can be irrelevant to a stable causal state, while a state comparison can hide event-order differences.</td><td>Declare whether the admitted representation is raw event, causal quote state, or completed bar. Never switch after seeing results.</td></tr>
+          <tr><td>Boundary handling</td><td>Subscriptions begin mid-interval and historical request ends are commonly exclusive.</td><td>Exclude partial start bars; label end-boundary records rather than miscalling them vendor mismatches.</td></tr>
+          <tr><td>Transport fields</td><td>Receipt/ingest latency fields are not stable market-data fields across a live connection and historical replay.</td><td>Exclude only the named transport fields where documented. Do not use their removal to hide price, size, side, sequence, or quality-flag changes.</td></tr>
+          <tr><td>Cost control</td><td>Databento charges usage-based historical data outside included entitlement ranges.</td><td>Call metadata cost and billable-size endpoints first; block requests above the approved ceiling. Use record limits instead of killing a large stream mid-file.</td></tr>
+          <tr><td>Final archive</td><td>Current-day data can still be finalized or corrected after the live session.</td><td>Treat intraday results as diagnostic and run the same comparison on the finalized archive for every raw seed session.</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="next" aria-labelledby="next-title">
+      <h2 id="next-title">What this unlocks, and what still has to happen</h2>
+      <div class="callout"><strong>Ready now:</strong> build a source-aware, causal feature pipeline and run model research on the admitted contracts. Preserve provider and representation identity throughout training, backtest, shadow inference, and review. Do not concatenate heterogeneous feeds as though they were one tape.</div>
+      <div class="source">
+        <div class="source-meta"><strong>Immediate data gates</strong></div>
+        <div><ul class="status-list"><li><span class="kicker">1.</span> Re-run GLBX and EQUS raw comparisons after Databento finalizes the July 16 archive, then retain the receipt and residual report beside each seed session.</li><li><span class="kicker">2.</span> Collect multiple sessions, including different volatility and liquidity regimes, before promoting provisional candidates or selecting a production feature set.</li><li><span class="kicker">3.</span> Keep every historical Databento download behind the cost preflight. One-year included raw windows are sufficient for an initial seed corpus; older raw history requires an explicit budget decision.</li><li><span class="kicker">4.</span> Preserve ThetaData stock quarantine unless a genuine long-horizon same-feed contract is found. Do not train on UTP/CTA and infer on NQB under a shared “stock” label.</li></ul></div>
+      </div>
+      <div class="source">
+        <div class="source-meta"><strong>Model-research gates</strong></div>
+        <div><ul class="status-list"><li><span class="kicker">1.</span> Start from event-native inputs. Search a declared causal aggregation grammar only after the raw receipt and representation contract are fixed.</li><li><span class="kicker">2.</span> Use chronological, purged walk-forward splits and evaluate after realistic execution costs. High-frequency rows are not independent market regimes.</li><li><span class="kicker">3.</span> Run group-wise conditional-utility studies: options alone, indexes/context, GLBX macro/rates context, EQUS Mini context, and IEX-only features. An additional feed is retained only if it adds out-of-sample value.</li><li><span class="kicker">4.</span> Shadow the best candidates live before relying on results. A parity-qualified backtest is a prerequisite for a credible paper-trading result, not the result itself.</li></ul></div>
+      </div>
+      <p class="footnotes">Evidence and admission policy live in the repository under <code>projects/ops/docs/raw-data-parity-catalog.md</code>, <code>resources/thetadata/raw-parity-v1.edn</code>, and <code>resources/databento/raw-parity-v1.edn</code>. Capture-specific counts above are intentionally reported with their representation and boundary rules.</p>
+    </section>
+  </main>
+  <footer class="footer"><div>SteveTrading · live-versus-historical parity report · Generated from the July 2026 evidence program. <a href="/reports/status/">Open system status</a>.</div></footer>
+</body>
+</html>

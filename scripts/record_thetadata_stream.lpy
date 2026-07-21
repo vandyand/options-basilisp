@@ -1,0 +1,193 @@
+;; Append unmodified ThetaData WebSocket messages with a final receipt.
+(import argparse datetime hashlib json os os.path sys time)
+(import websockets.sync.client)
+
+(def default-websocket-url "ws://127.0.0.1:25520/v1/events")
+(def default-landing-root "/mnt/d/stevetrading/thetadata-parity-v1")
+
+(defn sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read fh 1048576)))))
+    (.hexdigest digest)))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn py-dict? [value] (python/isinstance value python/dict))
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    (py-dict? value) (python/dict (map (fn [key] (python/tuple [(str key) (->jsonable (.get value key))])) (.keys value)))
+    (python/isinstance value python/list) (python/list (map ->jsonable value))
+    :else value))
+
+(defn schema-fingerprint [event-fields body-fields]
+  (let [schema {"event_fields" (into {} (for [[kind fields] event-fields]
+                                            [kind (vec (sort fields))]))
+                "body_fields" (into {} (for [[kind fields] body-fields]
+                                           [kind (vec (sort fields))]))}
+        text (json/dumps (->jsonable schema) ** :sort_keys true :separators (python/tuple ["," ":"]))]
+    (.hexdigest (hashlib/sha256 (.encode text "utf-8")))))
+
+(defn event-kind [payload]
+  (let [header (.get payload "header")
+        contract (.get payload "contract")]
+    (str (or (.get payload "sec_type")
+             (when (py-dict? contract) (.get contract "security_type"))
+             "UNKNOWN")
+         "/"
+         (or (.get payload "req_type")
+             (when (py-dict? header) (.get header "type"))
+             "UNKNOWN"))))
+
+(defn market-event? [payload]
+  ;; Subscription acknowledgements and connection headers are retained in the
+  ;; raw tape, but do not constitute evidence of an observed market payload.
+  (let [body (or (.get payload "quote") (.get payload "trade"))
+        header (.get payload "header")
+        contract (.get payload "contract")]
+    (and (or (and (.get payload "sec_type") (.get payload "req_type"))
+             (and (py-dict? header) (.get header "type")
+                  (py-dict? contract) (.get contract "security_type")))
+         body
+         (.get body "date") (.get body "ms_of_day"))))
+
+(defn write-json! [path value]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable value) ** :indent 2 :sort_keys true) "\n")))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--plan-file" ** :required true)
+    (.add_argument parser "--landing-root" ** :default default-landing-root)
+    (.add_argument parser "--websocket-url" ** :default default-websocket-url)
+    (.add_argument parser "--duration-s" ** :type float :default 900.0)
+    (.add_argument parser "--receive-timeout-s" ** :type float :default 10.0)
+    (.add_argument parser "--max-reconnects" ** :type int :default 5)
+    (.parse_args parser (python/list argv))))
+
+(defn validate-args! [args plan]
+  (when (<= (.-duration_s args) 0.0) (throw (python/ValueError "--duration-s must be positive")))
+  (when (<= (.-receive_timeout_s args) 0.0) (throw (python/ValueError "--receive-timeout-s must be positive")))
+  (when (neg? (.-max_reconnects args)) (throw (python/ValueError "--max-reconnects must be non-negative")))
+  (when-not (python/isinstance (.get plan "requests") python/list)
+    (throw (python/ValueError "plan requests must be a JSON array"))))
+
+(defn assign-ids [requests start-id]
+  [(python/list (map-indexed (fn [offset request]
+                               (let [out (.copy request)]
+                                 (.__setitem__ out "id" (+ start-id offset))
+                                 out)) requests))
+   (+ start-id (count requests))])
+
+(defn write-event! [fh raw event-count market-event-count kinds fields event-fields body-fields]
+  (let [bytes (if (python/isinstance raw python/bytes) raw (.encode raw "utf-8"))]
+    (.write fh bytes)
+    (.write fh (.encode "\n" "utf-8"))
+    (.flush fh)
+    (swap! event-count inc)
+    (try
+      (let [payload (json/loads raw)]
+        (when (py-dict? payload)
+          (let [kind (event-kind payload) body (or (.get payload "quote") (.get payload "trade"))]
+          (swap! kinds update kind (fnil inc 0))
+          (swap! fields into (.keys payload))
+          (swap! event-fields update kind (fnil into #{}) (.keys payload))
+          (when (py-dict? body)
+            (swap! body-fields update kind (fnil into #{}) (.keys body)))
+          (when (market-event? payload) (swap! market-event-count inc)))))
+      (catch python/Exception _ nil))))
+
+(defn capture-once! [websocket-url assigned deadline receive-timeout-s fh event-count market-event-count kinds fields event-fields body-fields]
+  (try
+    ;; A large initial subscription batch keeps the terminal continuously busy;
+    ;; application messages provide liveness, so avoid an independent ping
+    ;; deadline terminating an otherwise productive capture.
+    (with-open [socket (websockets.sync.client/connect websocket-url ** :open_timeout receive-timeout-s :ping_interval nil)]
+      (doseq [request assigned]
+        (.send socket (json/dumps request ** :separators (python/tuple ["," ":"])) ))
+      (while (< (time/monotonic) deadline)
+        (try
+          (write-event! fh (.recv socket ** :timeout receive-timeout-s) event-count market-event-count kinds fields event-fields body-fields)
+          (catch python/TimeoutError _ nil)))
+      {"ok" true})
+    (catch python/Exception e
+      {"ok" false "error" (str e)})))
+
+(defn record-session [websocket-url requests duration-s receive-timeout-s max-reconnects event-path]
+  (let [deadline (+ (time/monotonic) duration-s)
+        reconnects (atom 0)
+        next-id (atom 1)
+        event-count (atom 0)
+        market-event-count (atom 0)
+        kinds (atom {})
+        fields (atom #{})
+        event-fields (atom {})
+        body-fields (atom {})
+        errors (atom [])
+        sent (atom [])]
+    (with-open [fh (python/open event-path "ab")]
+      (while (and (< (time/monotonic) deadline) (<= @reconnects max-reconnects))
+        (let [[assigned updated-id] (assign-ids requests @next-id)
+              result (capture-once! websocket-url assigned deadline receive-timeout-s fh event-count market-event-count kinds fields event-fields body-fields)]
+          (reset! next-id updated-id)
+          (swap! sent into assigned)
+          (when-not (get result "ok")
+            (swap! errors conj {"at" (now-utc) "error" (get result "error")})
+            (swap! reconnects inc)
+            (when (<= @reconnects max-reconnects)
+              (time/sleep (min 5.0 @reconnects))))))
+      {"event_count" @event-count "market_event_count" @market-event-count
+       "event_kinds" @kinds "top_level_fields" (vec (sort @fields))
+       "event_schema_fields" (into {} (for [[kind fields] @event-fields]
+                                          [kind (vec (sort fields))]))
+       "event_body_schema_fields" (into {} (for [[kind fields] @body-fields]
+                                               [kind (vec (sort fields))]))
+       "event_schema_fingerprint" (schema-fingerprint @event-fields @body-fields)
+       "reconnects" @reconnects "errors" @errors "sent_requests" @sent})))
+
+(defn run-main [argv]
+  (try
+    (let [args (parse-args argv)
+          plan (json/loads (slurp (.-plan_file args)))
+          _ (validate-args! args plan)
+          date (or (.get plan "session_date") (.strftime (datetime.datetime/now) "%Y-%m-%d"))
+          run-id (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y%m%dT%H%M%S%fZ")
+          dir (os.path/join (.-landing_root args) "live" date "stream-events" run-id)
+          event-path (os.path/join dir "events.ndjson")
+          request-path (os.path/join dir "requests.json")
+          receipt-path (os.path/join (.-landing_root args) "receipts" date "stream-events" (str run-id ".json"))
+          _ (os/makedirs dir ** :exist_ok true)
+          _ (write-json! request-path {"plan_file" (os.path/abspath (.-plan_file args)) "requests" (.get plan "requests")})
+          started (now-utc)
+          summary (record-session (.-websocket_url args) (.get plan "requests")
+                                  (.-duration_s args) (.-receive_timeout_s args)
+                                  (.-max_reconnects args) event-path)
+          receipt {"schema_version" 1 "started_at" started "finished_at" (now-utc)
+                   "session_date" date "transport" "websocket" "websocket_url" (.-websocket_url args)
+                   "plan_file" (os.path/abspath (.-plan_file args)) "event_path" event-path
+                   "event_sha256" (sha256-file event-path) "event_bytes" (os.path/getsize event-path)
+                   "request_path" request-path "request_sha256" (sha256-file request-path)
+                   "event_schema_fingerprint" (get summary "event_schema_fingerprint")
+                   "summary" summary
+                   "status" (if (pos? (get summary "market_event_count")) "CAPTURED" "INCONCLUSIVE")}
+          _ (write-json! receipt-path receipt)]
+      (println (json/dumps (->jsonable {"status" (.get receipt "status") "receipt_path" receipt-path
+                                        "event_count" (get summary "event_count")
+                                        "market_event_count" (get summary "market_event_count")
+                                        "reconnects" (get summary "reconnects")}) ** :sort_keys true))
+      (if (pos? (get summary "market_event_count")) 0 1))
+    (catch python/Exception e
+      (binding [*out* *err*] (println (str "ThetaData stream recorder error: " e)))
+      2)))
+
+(try (python/exit (run-main (vec *command-line-args*)))
+     (catch python/Exception e
+       (binding [*out* *err*] (println (str "ThetaData stream recorder fatal error: " e)))
+       (python/exit 2)))

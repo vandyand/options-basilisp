@@ -1,0 +1,83 @@
+;; First event-native seed plan. This declares collection intent only; no
+;; downloader may expand, replace, or silently reinterpret this universe.
+{:schema-version 1
+ :id :event-native-seed-v1
+ :status :planning
+ :purpose :measure-event-native-storage-coverage-and-replay
+ :session-dates ["2026-07-06" "2026-07-07" "2026-07-08" "2026-07-09" "2026-07-10"]
+ :storage {:root "D:\\SteveTradingData"
+           :max-corpus-bytes 4500000000000
+           :raw-format-policy {:databento :dbn
+                               :thetadata :vendor-payload-lossless
+                               :alpaca :ndjson}}
+ :excludes [:vendor-ohlcv-as-primary-model-input
+            :thetadata-stock-nqb-utp-cta
+            :thetadata-open-interest
+            :thetadata-vendor-greeks
+            :glbx-sr3-futures-options-until-parity-promotion
+            :alpaca-iex-causal-quote-state-for-current-storage-study]
+
+ :classes
+ [{:id :databento-glbx-futures-events
+   :status :hard
+   :dataset "GLBX.MDP3"
+   :stype-in :parent
+   :symbols ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]
+   :schemas ["mbp-1" "trades"]
+   :cost-policy {:max-usd "0" :max-billable-bytes 268435456
+                 :preflight-every-request true}
+   :representation :declared-market-event}
+
+  {:id :databento-equs-mini-events
+   :status :hard
+   :dataset "EQUS.MINI"
+   :stype-in :raw-symbol
+   :symbols ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN"
+             "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :schemas ["mbp-1" "trades"]
+   :cost-policy {:max-usd "0" :max-billable-bytes 268435456
+                 :preflight-every-request true}
+   :representation :declared-market-event}
+
+  {:id :alpaca-iex-causal-quote-state
+   :status :hard
+   :feed :iex
+   :symbols ["SPY" "QQQ" "IWM" "DIA" "HYG" "TLT" "GLD" "VXX" "AAPL" "MSFT"
+             "NVDA" "AMD" "TSLA" "AMZN" "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]
+   :raw-transport :websocket-and-rest-history
+   :representation {:id :causal-last-quote-state :minimum-resolution "10ms"}}
+
+  {:id :thetadata-index-events
+   :status :hard
+   :symbols ["NDX" "RUT" "RVX" "SPX" "TNX" "VIX" "VIXN"]
+   :raw-transport :websocket-and-tick-history
+   :representation :causal-carry-forward-state}
+
+  {:id :thetadata-options-discovery-and-panel
+   :status :hard
+   :symbols ["SPY" "SPX" "SPXW" "VIX" "VIXW"]
+   :raw-transport :websocket-and-tick-history
+   :schemas [:quote-event :trade-event]
+   :collection-policy
+   {:discovery {:full-chain true
+                :window-seconds 300
+                :fixed-session-strata [:opening :midday :closing]
+                :random-windows-per-session 2
+                :randomization :pre-registered-deterministic-seed}
+    :panel {:all-session true
+            :selection-time :session-open
+            :strata [:root :dte-quantile :log-moneyness-quantile :right :liquidity-quantile]
+            :selection-receipt-required true
+            :allocation :balanced-with-fixed-exploration-share}}
+   :representation :event-native-pending-grammar-search}
+
+  {:id :databento-glbx-es-nq-futures-options
+   :status :hard
+   :dataset "GLBX.MDP3"
+   :stype-in :parent
+   :symbols ["ES.OPT" "NQ.OPT"]
+   :schemas ["definition" "mbp-1" "trades"]
+   :collection-policy :cost-gated-event-native-panel
+   :representation {:exclude-fields [:ts-recv :ts-out :ts-index :ts-in-delta]
+                    :boundary-policy :event-time-intersection}
+   :evidence "ES: 2026-07-17 four five-minute windows, 48,222 interior MBP-1 events exact and 108/108 ordinary option trades exact. NQ: owner-directed hard admission on 2026-07-20; 532 active ordinary contracts observed and 1/1 ordinary trade exact, with finalized MBP-1 and broader trade replication still scheduled."}]}

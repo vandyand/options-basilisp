@@ -72,6 +72,8 @@
     :bar/low
     :bar/close
     :bar/volume
+    :bar/vwap
+    :bar/trade-count
     ;; quote facts (MARKET_DATA_ADAPTER §4.2) AND per-contract quotes inside
     ;; :chain/contracts (§4.3) — walk-value applies field checks at every
     ;; nesting depth, so these cover both

@@ -1,0 +1,482 @@
+(ns current-pnl.test-core
+  (:import os os.path subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.current-pnl.core :as pnl]))
+
+(deftest env-file-credentials-are-parsed
+  (is (= ["key-1" "secret-1"]
+         (pnl/env-creds "export ALPACA_LYNX_API_KEY=key-1\nALPACA_LYNX_API_SECRET=secret-1\n"
+                        "ALPACA_LYNX"))))
+
+(deftest alpaca-option-symbols-are-readable
+  (is (= "SPY 2026-07-02 C735"
+         (pnl/format-alpaca-symbol "SPY260702C00735000")))
+  (is (= "SPY" (pnl/format-alpaca-symbol "SPY"))))
+
+(deftest sim-strategy-labels-match-reporting-contract
+  (is (= "LOCAL-SMA-06/18"
+         (pnl/short-sim-strategy-label "strategy/sim-local-sma/sma-06-18")))
+  (is (= "LOCAL-CAN-A"
+         (pnl/short-sim-strategy-label "strategy/sim-local-canary/long-canary-a")))
+  (is (= "V2-VOL-BEAR"
+         (pnl/short-sim-strategy-label "strategy/v2-vol/bear"))))
+
+(deftest args-select-groups-and-output
+  (is (= {:groups #{"sim" "alpaca"} :output :markdown}
+         (pnl/parse-args ["sim" "alpaca" "--markdown"])))
+  (is (= {:groups #{"all"} :output :terminal}
+         (pnl/parse-args []))))
+
+(deftest args-reject-unknown-selectors
+  (doseq [bad ["smi" "alpac" "paper" "sim,alpaca" "--json"]]
+    (testing bad
+      (try
+        (pnl/parse-args [bad])
+        (is false "expected selector typo to fail")
+        (catch python/ValueError e
+          (is (not= -1 (.find (str e) "unknown current-pnl selector"))))))))
+
+(deftest current-pnl-cli-rejects-unknown-selectors-cleanly
+  (let [repo-root (os.path/abspath ".")
+        result (subprocess/run (python/list [(os.path/join repo-root ".venv/bin/basilisp")
+                                             "run"
+                                             (os.path/join repo-root "scripts/current_pnl.lpy")
+                                             "--"
+                                             "smi"])
+                               ** :capture_output true
+                                  :text true
+                                  :check false
+                                  :cwd (tempfile/mkdtemp)
+                                  :env (doto (os.environ/copy)
+                                         (.update (python/dict
+                                                   {"STEVE_REPO_ROOT" repo-root}))))]
+    (is (= 2 (.-returncode result)))
+    (is (= "" (.-stdout result)))
+    (is (not= -1 (.find (.-stderr result)
+                        "unknown current-pnl selector: smi")))))
+
+(deftest alpaca-row-is-built-from-read-only-http-observations
+  (let [calls (atom [])
+        http-json (fn [url _key _secret]
+                    (swap! calls conj url)
+                    (cond
+                      (.endswith url "/v2/account")
+                      {"equity" "100125.50"
+                       "last_equity" "100000.00"
+                       "cash" "99900.00"
+                       "buying_power" "199800.00"}
+
+                      (.endswith url "/v2/positions")
+                      [{"symbol" "SPY"
+                        "qty" "10"
+                        "market_value" "6400.00"
+                        "unrealized_intraday_pl" "25.50"}]
+
+                      (>= (.find url "/v2/account/activities/FILL") 0)
+                      []
+
+                      :else
+                      (throw (python/Exception (str "unexpected URL " url)))))
+        row (pnl/alpaca-account-row {:name "PARROT"
+                                     :key "key"
+                                     :secret "secret"
+                                     :section pnl/section-live
+                                     :http-json http-json})]
+    (is (= "PARROT" (:name row)))
+    (is (= 125.5 (:pnl row)))
+    (is (= 25.5 (get-in row [:stats :unrealized])))
+    (is (= 100.0 (get-in row [:stats :realized-est])))
+    (is (= "SPY:10" (:position row)))
+    (is (= 3 (count @calls)))))
+
+(deftest alpaca-row-source-errors-are-visible-and-excluded-from-totals
+  (let [row (pnl/alpaca-account-row {:name "LYNX"
+                                     :key "key"
+                                     :secret "secret"
+                                     :section pnl/section-live
+                                     :http-json (fn [& _]
+                                                  (throw (python/Exception
+                                                          "broker down")))})]
+    (is (nil? (:pnl row)))
+    (is (= false (get-in row [:stats :include-in-total])))
+    (is (= true (get-in row [:stats :source-error])))
+    (is (= ["source-error"] (pnl/row-issues row)))))
+
+(deftest sim-source-errors-are-visible-and-excluded-from-totals
+  (let [old-store (os.environ/get "SIM_STORE_PATH")
+        root (tempfile/mkdtemp)
+        store-dir (os.path/join root "sim-local-fleet-bad")
+        store (os.path/join store-dir "sim-broker.db")
+        facts (os.path/join store-dir "facts.db")]
+    (os/makedirs store-dir ** :exist_ok true)
+    (spit store "")
+    (spit facts "not a sqlite database")
+    (try
+      (os.environ/update (python/dict {"SIM_STORE_PATH" store}))
+      (let [rows (pnl/sim-account-rows ".")
+            row (first rows)
+            out (pnl/render-markdown rows "2026-07-03 12:00:00 EDT")]
+        (is (= 1 (count rows)))
+        (is (= "LOCAL-FLEET" (:name row)))
+        (is (nil? (:pnl row)))
+        (is (= false (get-in row [:stats :include-in-total])))
+        (is (= true (get-in row [:stats :source-error])))
+        (is (= ["source-error"] (pnl/row-issues row)))
+        (is (>= (.find out "source-error") 0))
+        (is (>= (.find out "| **SECTION TOTAL** | **$+0.00**") 0)))
+      (finally
+        (if old-store
+          (os.environ/update (python/dict {"SIM_STORE_PATH" old-store}))
+          (os.environ/pop "SIM_STORE_PATH" nil))))))
+
+(deftest markdown-render-groups-separate-sections-and-totals
+  (let [rows [{:name "LYNX"
+               :pnl 10.0
+               :position "SPY:1"
+               :stats {:section pnl/section-live
+                       :realized-est 8.0
+                       :unrealized 2.0
+                       :equity 100010.0
+                       :cash 99900.0
+                       :gross-mv 640.0
+                       :open-positions 1
+                       :long-positions 1
+                       :short-positions 0
+                       :closed-trades 2
+                       :open-trades 1
+                       :pct-in-mkt 12.5
+                       :fills 4
+                       :include-in-total true}}
+              {:name "LOCAL-FLEET"
+               :pnl -5.0
+               :position "flat"
+               :stats {:section pnl/section-sim-experiments
+                       :realized-est -5.0
+                       :unrealized 0.0
+                       :equity 99995.0
+                       :cash nil
+                       :gross-mv 0.0
+                       :open-positions 0
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades 1
+                       :open-trades 0
+                       :pct-in-mkt 0.0
+                       :fills 2
+                       :include-in-total true}}]
+        out (pnl/render-markdown rows "2026-07-03 12:00:00 EDT")]
+    (is (>= (.find out "**HETZNER / LIVE ALPACA PAPER**") 0))
+    (is (>= (.find out "**LOCAL / SIM EXPERIMENTS**") 0))
+    (is (>= (.find out "**Grand Total**") 0))
+    (is (>= (.find out "**$+5.00**") 0))))
+
+(deftest row-issues-detect-contradictory-current-pnl-inputs
+  (let [clean {:name "PARROT"
+               :pnl 12.0
+               :position "SPY:1"
+               :stats {:realized-est 10.0
+                       :unrealized 2.0
+                       :open-positions 1
+                       :long-positions 1
+                       :short-positions 0
+                       :closed-trades 1
+                       :open-trades 0
+                       :fills 2}}
+        bad {:name "OAK"
+             :pnl 12.0
+             :position "flat"
+             :stats {:realized-est 1.0
+                     :unrealized 2.0
+                     :open-positions 1
+                     :long-positions 0
+                     :short-positions 0
+                     :closed-trades 1
+                     :open-trades 0
+                     :fills 0}}]
+    (is (empty? (pnl/row-issues clean)))
+    (is (= #{"pnl!=real+unrl"
+             "pos-count!=long+short"
+             "closed-trades-without-fills"
+             "open-pos-flat-text"}
+           (set (pnl/row-issues bad))))))
+
+(deftest markdown-render-surfaces-row-issues
+  (let [rows [{:name "BROKEN"
+               :pnl 12.0
+               :position "flat"
+               :stats {:section pnl/section-live
+                       :realized-est 1.0
+                       :unrealized 2.0
+                       :equity 100012.0
+                       :cash 100000.0
+                       :gross-mv 0.0
+                       :open-positions 1
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades 1
+                       :open-trades 0
+                       :pct-in-mkt 0.0
+                       :fills 0
+                       :include-in-total true}}]
+        out (pnl/render-markdown rows "2026-07-03 12:00:00 EDT")]
+    (is (>= (.find out "| Issues |") 0))
+    (is (>= (.find out "pnl!=real+unrl") 0))
+    (is (>= (.find out "closed-trades-without-fills") 0))))
+
+(deftest markdown-render-excludes-issue-rows-from-totals
+  (let [rows [{:name "GOOD"
+               :pnl 10.0
+               :position "flat"
+               :stats {:section pnl/section-live
+                       :realized-est 10.0
+                       :unrealized 0.0
+                       :equity 100010.0
+                       :cash 100000.0
+                       :gross-mv 0.0
+                       :open-positions 0
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades 1
+                       :open-trades 0
+                       :pct-in-mkt 0.0
+                       :fills 2
+                       :include-in-total true}}
+              {:name "CONTRADICTORY"
+               :pnl 9999.0
+               :position "flat"
+               :stats {:section pnl/section-live
+                       :realized-est 1.0
+                       :unrealized 2.0
+                       :equity 109999.0
+                       :cash 100000.0
+                       :gross-mv 0.0
+                       :open-positions 0
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades 1
+                       :open-trades 0
+                       :pct-in-mkt 0.0
+                       :fills 2
+                       :include-in-total true}}]
+        out (pnl/render-markdown rows "2026-07-03 12:00:00 EDT")]
+    (is (>= (.find out "CONTRADICTORY") 0))
+    (is (>= (.find out "pnl!=real+unrl") 0))
+    (is (>= (.find out "| **SECTION TOTAL** | **$+10.00**") 0))
+    (is (>= (.find out "| **GRAND TOTAL** | **$+10.00**") 0))
+    (is (= -1 (.find out "| **SECTION TOTAL** | **$+10,009.00**")))))
+
+(deftest row-issues-detect-total-inclusion-without-valid-pnl
+  (let [row {:name "BROKEN-TOTAL"
+             :pnl nil
+             :position "flat"
+             :stats {:realized-est 0.0
+                     :unrealized 0.0
+                     :open-positions 0
+                     :long-positions 0
+                     :short-positions 0
+                     :closed-trades 0
+                     :open-trades 0
+                     :fills 0
+                     :include-in-total true}}]
+    (is (= ["included-total-without-pnl"] (pnl/row-issues row)))))
+
+(deftest markdown-render-excludes-source-error-rows-from-totals
+  (let [rows [{:name "GOOD"
+               :pnl 10.0
+               :position "flat"
+               :stats {:section pnl/section-live
+                       :realized-est 10.0
+                       :unrealized 0.0
+                       :equity 100010.0
+                       :cash 100000.0
+                       :gross-mv 0.0
+                       :open-positions 0
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades 1
+                       :open-trades 0
+                       :pct-in-mkt 0.0
+                       :fills 2
+                       :include-in-total true}}
+              {:name "BROKEN"
+               :pnl nil
+               :position "(Exception)"
+               :stats {:section pnl/section-live
+                       :realized-est nil
+                       :unrealized nil
+                       :equity nil
+                       :cash nil
+                       :gross-mv nil
+                       :open-positions 0
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades 0
+                       :open-trades 0
+                       :pct-in-mkt 0.0
+                       :fills 0
+                       :source-error true
+                       :include-in-total false}}]
+        out (pnl/render-markdown rows "2026-07-03 12:00:00 EDT")]
+    (is (>= (.find out "source-error") 0))
+    (is (>= (.find out "| **SECTION TOTAL** | **$+10.00**") 0))
+    (is (>= (.find out "| **GRAND TOTAL** | **$+10.00**") 0))))
+
+(deftest markdown-render-keeps-valid-pnl-rows-with-non-money-warnings-in-totals
+  (let [rows [{:name "VENTUREVD"
+               :pnl 5.59
+               :position "SPY:1"
+               :stats {:section pnl/section-other-alpaca
+                       :realized-est 6.31
+                       :unrealized -0.72
+                       :equity 96948.35
+                       :cash 96197.36
+                       :gross-mv 750.99
+                       :open-positions 1
+                       :long-positions 1
+                       :short-positions 0
+                       :closed-trades 0
+                       :open-trades 1
+                       :pct-in-mkt -3224729.0
+                       :fills 0
+                       :include-in-total true}}]
+        out (pnl/render-markdown rows "2026-07-10 00:32:00 EDT")]
+    (is (>= (.find out "pct-in-mkt-out-of-range") 0))
+    (is (>= (.find out "| **SECTION TOTAL** | **$+5.59**") 0))
+    (is (>= (.find out "| **GRAND TOTAL** | **$+5.59**") 0))))
+
+(deftest row-issues-allow-carryover-open-position-without-same-day-fills
+  (let [row {:name "VENTUREVD"
+             :pnl 0.0
+             :position "SPY:1"
+             :stats {:realized-est 0.0
+                     :unrealized 0.0
+                     :open-positions 1
+                     :long-positions 1
+                     :short-positions 0
+                     :closed-trades 0
+                     :open-trades 1
+                     :fills 0}}]
+    (is (empty? (pnl/row-issues row)))))
+
+(deftest row-issues-detect-open-position-without-position-identity
+  (let [base {:name "MISSING-POSITION"
+              :pnl 0.0
+              :stats {:realized-est 0.0
+                      :unrealized 0.0
+                      :open-positions 1
+                      :long-positions 1
+                      :short-positions 0
+                      :closed-trades 0
+                      :open-trades 1
+                      :fills 0}}]
+    (doseq [position ["" "   " "(BrokerUnavailable)" nil]]
+      (testing (str position)
+        (is (some #(= "open-pos-missing-position-text" %)
+                  (pnl/row-issues (assoc base :position position))))))))
+
+(deftest row-issues-detect-malformed-current-pnl-numerics
+  (let [row {:name "BROKEN"
+             :pnl "nan?"
+             :position "flat"
+             :stats {:realized-est 0.0
+                     :unrealized 0.0
+                     :equity 100000.0
+                     :cash 100000.0
+                     :gross-mv "bad"
+                     :pct-in-mkt "bad"
+                     :open-positions -1
+                     :long-positions 0
+                     :short-positions 0
+                     :closed-trades "1"
+                     :open-trades true
+                     :fills 0}}]
+    (is (= #{"bad-number:pnl"
+             "bad-number:gross-mv"
+             "bad-number:pct-in-mkt"
+             "bad-count:open-positions"
+             "bad-count:closed-trades"
+             "bad-count:open-trades"
+             "included-total-without-pnl"}
+           (set (pnl/row-issues row))))))
+
+(deftest markdown-render-survives-malformed-current-pnl-numerics
+  (let [rows [{:name "BROKEN"
+               :pnl "bad"
+               :position "flat"
+               :stats {:section pnl/section-live
+                       :realized-est 0.0
+                       :unrealized 0.0
+                       :equity 100000.0
+                       :cash 100000.0
+                       :gross-mv "bad"
+                       :open-positions -1
+                       :long-positions 0
+                       :short-positions 0
+                       :closed-trades "1"
+                       :open-trades true
+                       :pct-in-mkt "bad"
+                       :fills 0
+                       :include-in-total true}}]
+        out (pnl/render-markdown rows "2026-07-03 12:00:00 EDT")]
+    (is (>= (.find out "bad-number:pnl") 0))
+    (is (>= (.find out "bad-number:gross-mv") 0))
+    (is (>= (.find out "bad-number:pct-in-mkt") 0))
+    (is (>= (.find out "bad-count:open-trades") 0))
+    (is (>= (.find out "| BROKEN | n/a |") 0))
+    (is (>= (.find out "| **SECTION TOTAL** | **$+0.00**") 0))))
+
+(deftest row-issues-detect-impossible-market-time-percentages
+  (let [negative {:name "NEGATIVE-MKT"
+                  :pnl 0.0
+                  :position "flat"
+                  :stats {:realized-est 0.0
+                          :unrealized 0.0
+                          :pct-in-mkt -0.1
+                          :open-positions 0
+                          :long-positions 0
+                          :short-positions 0
+                          :closed-trades 0
+                          :open-trades 0
+                          :fills 0}}
+        over {:name "OVER-MKT"
+              :pnl 0.0
+              :position "flat"
+              :stats {:realized-est 0.0
+                      :unrealized 0.0
+                      :pct-in-mkt 100.1
+                      :open-positions 0
+                      :long-positions 0
+                      :short-positions 0
+                      :closed-trades 0
+                      :open-trades 0
+                      :fills 0}}]
+    (is (some #(= "pct-in-mkt-out-of-range" %) (pnl/row-issues negative)))
+    (is (some #(= "pct-in-mkt-out-of-range" %) (pnl/row-issues over)))))
+
+(deftest deterministic-fuzz-row-issues-detect-open-state-contradictions
+  (let [base {:name "OPEN-FUZZ"
+              :pnl 0.0
+              :position "SPY:1"
+              :stats {:realized-est 0.0
+                      :unrealized 0.0
+                      :open-positions 1
+                      :long-positions 1
+                      :short-positions 0
+                      :closed-trades 0
+                      :open-trades 1
+                      :pct-in-mkt 1.0
+                      :fills 1}}
+        open-trade-without-position
+        (assoc base
+               :position "flat"
+               :stats (assoc (:stats base)
+                             :open-positions 0
+                             :long-positions 0
+                             :open-trades 1))
+        carry-open-position-without-same-day-open-trade
+        (assoc-in base [:stats :open-trades] 0)]
+    (is (some #(= "open-trades-without-position" %)
+              (pnl/row-issues open-trade-without-position)))
+    (is (not (some #(= "open-position-without-open-trade" %)
+                   (pnl/row-issues
+                    carry-open-position-without-same-day-open-trade))))))

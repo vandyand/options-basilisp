@@ -1,0 +1,132 @@
+(import glob math os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[basilisp.string :as bstr])
+(require '[stevetrading.analysis.core :as analysis])
+
+(def usage
+  (str "usage: basilisp run scripts/analyze_alpaca_fill_alignment.lpy -- "
+       "<facts.db>|--facts <facts.db> [--max-lag-seconds 90] [--limit 80]"))
+
+(def allowed-options #{"--facts" "--max-lag-seconds" "--limit" "-h" "--help"})
+
+(defn reject-unknown-options!
+  [args]
+  (doseq [arg args]
+    (when (and (.startswith (str arg) "--")
+               (not (contains? allowed-options arg)))
+      (throw (python/ValueError (str "unknown argument: " arg))))))
+
+(defn parse-int-arg
+  [x default]
+  (if (some? x)
+    (try
+      (let [n (int x)]
+        (when-not (pos? n)
+          (throw (python/ValueError "integer argument must be positive")))
+        n)
+      (catch python/Exception e
+        (throw (python/ValueError
+                (str "invalid integer argument: " x " (" e ")")))))
+    default))
+
+(defn facts-db-from
+  [args opts]
+  (or (first (:facts opts))
+      (first (filter #(not (.startswith % "--")) args))))
+
+(defn fmt-num
+  [x]
+  (if (some? x)
+    (python/format (float x) ".4f")
+    "-"))
+
+(defn account-short
+  [account-id]
+  (last (bstr/split (or account-id "") #"/")))
+
+(defn side-text
+  [side]
+  (-> (str (or side "?"))
+      (.replace ":" "")
+      (.replace "order-side/" "")))
+
+(defn render-row
+  [row]
+  (str (:occurred-at row)
+       " | " (account-short (:account-id row))
+       " | " (side-text (:side row))
+       " | " (:instrument-id row)
+       " | " (fmt-num (:price row))
+       " | " (fmt-num (:bid row))
+       " | " (fmt-num (:ask row))
+       " | " (fmt-num (- (:price row) (:mid row)))
+       " | " (fmt-num (:improvement row))
+       " | " (python/format (float (:lag-seconds row)) ".1f")))
+
+(defn finite-values
+  [xs]
+  (vec (filter #(and (some? %)
+                     (not (boolean? %))
+                     (math/isfinite (float %)))
+               xs)))
+
+(defn print-summary
+  [rows]
+  (let [mid-deltas (finite-values (map #(- (:price %) (:mid %)) rows))
+        spreads (finite-values (map :spread rows))
+        improvements (finite-values (map :improvement rows))]
+    (println (apply str (repeat 132 "-")))
+    (if (seq rows)
+      (println
+       (str "summary: "
+            "mid_delta mean=" (fmt-num (analysis/mean mid-deltas))
+            " median=" (fmt-num (analysis/quantile 0.50 mid-deltas))
+            "; spread mean=" (fmt-num (analysis/mean spreads))
+            " median=" (fmt-num (analysis/quantile 0.50 spreads))
+            "; improvement_vs_cross mean=" (fmt-num (analysis/mean improvements))
+            " median=" (fmt-num (analysis/quantile 0.50 improvements))))
+      (println "summary: no side-inferred quote-matched option fills"))))
+
+(defn -main
+  [& args]
+  (when (some #(contains? #{"-h" "--help"} %) args)
+    (println usage)
+    (python/exit 0))
+  (try
+    (reject-unknown-options! args)
+    (let [opts (analysis/parse-args args)
+          facts-db (facts-db-from args opts)
+          max-lag (analysis/parse-double-arg (:max-lag-seconds opts) 90.0)
+          limit (parse-int-arg (:limit opts) 80)]
+      (when (or (nil? facts-db) (not (os.path/exists facts-db)))
+        (println usage)
+        (python/exit 2))
+      (let [raw-rows (analysis/read-fact-rows facts-db
+                                              [analysis/fill-fact
+                                               analysis/intent-fact
+                                               analysis/option-chain-fact])
+            fills (analysis/fast-fill-records raw-rows)
+            rows (analysis/matched-fill-rows-fast raw-rows max-lag)
+            shown (take-last limit rows)]
+        (println "ALPACA OPTION FILL ALIGNMENT")
+        (println (str "fills=" (count fills)
+                      " matched=" (count rows)
+                      " max_lag_seconds=" max-lag))
+        (println (str "time | account | side | instrument | fill | bid | ask | "
+                      "mid_delta | improvement_vs_cross | lag_s"))
+        (println (apply str (repeat 132 "-")))
+        (doseq [row shown]
+          (println (render-row row)))
+        (print-summary rows)
+        {:fills (count fills) :matched (count rows)}))
+    (catch python/ValueError e
+      (binding [*out* *err*]
+        (println (str e)))
+      (python/exit 2))))
+
+(apply -main *command-line-args*)

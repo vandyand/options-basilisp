@@ -1,0 +1,167 @@
+(ns feature-parity.test-greek-reconstruction-audit-cli
+  (:import json numpy os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def basilisp-bin
+  (str (or (os.environ/get "BASILISP_BIN")
+           (os.path/join (str root) ".venv/bin/basilisp"))))
+(def script (pathlib/Path (os.path/join (str root) "scripts/greek_feature_reconstruction_audit.lpy")))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads-path [path] (json/loads (.read_text path)))
+(defn path [parent name] (.joinpath parent name))
+
+(defn run-audit
+  [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn write-blocked
+  [path]
+  (.write_text path
+               (dumps {"features" [{"feature" "SPY_greeks_dollar_delta"
+                                     "model_gain" 10.0
+                                     "model_split_count" 3}
+                                    {"feature" "SPY_greeks_epsilon_mean"
+                                     "model_gain" 5.0
+                                     "model_split_count" 2}]})))
+
+(defn write-capture
+  ([path] (write-capture path true))
+  ([path include-volume?]
+   (let [contract {"strike" 600.0
+                   "right" "CALL"
+                   "bid" 1.0
+                   "ask" 1.2
+                   "expiration" "2026-07-10"}
+         contract (if include-volume? (assoc contract "volume" 42) contract)
+         surface {"SPY" (dumps {"underlying" 600.0
+                                "contracts" [contract]})}]
+     (numpy/savez_compressed path
+                             ** :capture_version (numpy/array [2])
+                                :option_surfaces_json (numpy/array [(dumps surface)])))))
+
+(defn feature-row
+  [payload feature]
+  (first (filter (fn [row] (= feature (.get row "feature")))
+                 (.get payload "features"))))
+
+(deftest greek-feature-reconstruction-audit-classifies-blocked-suffixes
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          capture (path tmp "live_features_20260706.npz")
+          out (path tmp "out")]
+      (write-blocked blocked)
+      (write-capture capture)
+      (let [result (run-audit "--blocked-json" (str blocked)
+                              "--capture" (str capture)
+                              "--out-dir" (str out)
+                              "--label" "test"
+                              "--target-date" "2026-07-06")
+            payload (loads-path (path out "greek_feature_reconstruction_audit_test.json"))
+            summary (.get payload "summary")
+            dollar (feature-row payload "SPY_greeks_dollar_delta")
+            epsilon (feature-row payload "SPY_greeks_epsilon_mean")]
+        (is (= 0 (.-returncode result)))
+        (is (= 2 (.get summary "blocked_total")))
+        (is (= 2 (.get summary "candidate_reconstructable")))
+        (is (= 0 (.get summary "formula_provenance_required")))
+        (is (= 2 (.get summary "raw_inputs_present")))
+        (is (= "raw-inputs-present" (.get dollar "sidecar_support")))
+        (is (= "raw-inputs-present" (.get epsilon "sidecar_support")))
+        (is (not= -1 (.find (.get epsilon "validation_gate") "dividend-yield")))))))
+
+(deftest greek-feature-reconstruction-audit-reports-missing-market-capture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          out (path tmp "out")]
+      (write-blocked blocked)
+      (let [result (run-audit "--blocked-json" (str blocked)
+                              "--out-dir" (str out)
+                              "--label" "closed")
+            payload (loads-path (path out "greek_feature_reconstruction_audit_closed.json"))
+            dollar (feature-row payload "SPY_greeks_dollar_delta")
+            epsilon (feature-row payload "SPY_greeks_epsilon_mean")]
+        (is (= 0 (.-returncode result)))
+        (is (= "needs-market-capture" (.get dollar "sidecar_support")))
+        (is (= "candidate-reconstructable" (.get epsilon "status")))
+        (is (= "needs-market-capture" (.get epsilon "sidecar_support")))))))
+
+(deftest greek-feature-reconstruction-audit-writes-explicit-unavailable-artifact
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out (path tmp "out")]
+      (let [result (run-audit "--out-dir" (str out)
+                              "--label" "20260709"
+                              "--target-date" "2026-07-09"
+                              "--write-unavailable"
+                              "--unavailable-reason" "blocked provenance missing")
+            json-path (path out "greek_feature_reconstruction_audit_20260709.json")
+            csv-path (path out "greek_feature_reconstruction_audit_20260709.csv")
+            md-path (path out "greek_feature_reconstruction_audit_20260709.md")
+            payload (loads-path json-path)
+            summary (.get payload "summary")]
+        (is (= 1 (.-returncode result)))
+        (is (.exists json-path))
+        (is (.exists csv-path))
+        (is (.exists md-path))
+        (is (= "unavailable" (.get summary "status")))
+        (is (= false (.get summary "available")))
+        (is (= "2026-07-09" (.get summary "target_date")))
+        (is (= "blocked provenance missing" (.get summary "unavailable_reason")))
+        (is (= 0 (.get summary "candidate_reconstructable")))
+        (is (= 0 (count (.get payload "features"))))
+        (is (not= -1 (.find (.read_text md-path) "blocked provenance missing")))))))
+
+(deftest greek-feature-reconstruction-audit-rejects-duplicate-blocked-json-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          out (path tmp "out")]
+      (.write_text blocked "{\n  \"features\": [{\"feature\": \"SPY_greeks_dollar_delta\"}],\n  \"features\": [{\"feature\": \"SPY_greeks_epsilon_mean\"}]\n}\n")
+      (let [result (run-audit "--blocked-json" (str blocked)
+                              "--out-dir" (str out)
+                              "--label" "duplicate")]
+        (is (= 1 (.-returncode result)))
+        (is (not= -1 (.find (.-stderr result) "duplicate JSON key: features")))
+        (is (false? (.exists (path out "greek_feature_reconstruction_audit_duplicate.json"))))))))
+
+(deftest greek-feature-reconstruction-audit-rejects-duplicate-nested-surface-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          capture (path tmp "live_features_20260706.npz")
+          out (path tmp "out")
+          nested "{\"contracts\": [], \"contracts\": [{\"strike\": 6000.0, \"right\": \"CALL\", \"bid\": 1.0, \"ask\": 1.2, \"expiration\": \"2026-07-10\"}]}"]
+      (write-blocked blocked)
+      (numpy/savez_compressed capture
+                              ** :capture_version (numpy/array [2])
+                                 :option_surfaces_json (numpy/array [(dumps {"SPY" nested})]))
+      (let [result (run-audit "--blocked-json" (str blocked)
+                              "--capture" (str capture)
+                              "--out-dir" (str out)
+                              "--label" "nested_duplicate"
+                              "--target-date" "2026-07-06")
+            payload (loads-path (path out "greek_feature_reconstruction_audit_nested_duplicate.json"))
+            summary (.get payload "summary")
+            capture-summary (.get summary "capture")
+            dollar (feature-row payload "SPY_greeks_dollar_delta")]
+        (is (= 0 (.-returncode result)))
+        (is (= 0 (.get summary "raw_inputs_present")))
+        (is (some (fn [issue] (= "option_surfaces_json has 1 invalid JSON rows" issue))
+                  (.get capture-summary "issues")))
+        (is (= "capture-invalid" (.get dollar "sidecar_support")))))))

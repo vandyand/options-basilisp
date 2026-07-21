@@ -1,0 +1,178 @@
+;; Bounded ThetaData SPY option quote-panel acquisition pilot.
+;;
+;; This is not a full-chain collector. It records the vendor's documented
+;; spot-relative strike_range/max_dte selection exactly, with hard byte and
+;; wall-time cutoffs. The resulting payload remains research-only until the
+;; historical selection is shown to be reproducible causally in live trading.
+(import argparse datetime hashlib json os pathlib shutil subprocess time traceback urllib.error urllib.parse urllib.request)
+
+(def canonical-raw-root (pathlib/Path "D:\\SteveTradingData\\raw\\v1"))
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true :default str) "\n"))
+
+(defn atomic-json! [path payload]
+  (let [target (pathlib/Path path)
+        temp (.with_suffix target (str (.-suffix target) ".tmp"))]
+    (.mkdir (.-parent target) ** :parents true :exist_ok true)
+    (spit (str temp) (json-text payload))
+    (os/replace (str temp) (str target))))
+
+(defn under? [path root]
+  (try (.relative_to (.resolve path) (.resolve root)) true
+       (catch python/ValueError _ false)))
+
+(defn assert-corpus-volume-healthy! []
+  (when-not (= (.-name os) "nt")
+    (throw (python/RuntimeError "ThetaData collection is Windows-only against D:\\SteveTradingData")))
+  (let [command (python/list ["powershell" "-NoProfile" "-Command"
+                              "Get-Volume -DriveLetter D | Select-Object HealthStatus,OperationalStatus | ConvertTo-Json -Compress"])
+        completed (subprocess/run command ** :check true :capture_output true :text true :timeout 20)
+        volume (json/loads (.-stdout completed))]
+    (when-not (and (= (.get volume "HealthStatus") "Healthy")
+                   (not= -1 (.find (str (.get volume "OperationalStatus")) "OK")))
+      (throw (python/RuntimeError (str "external corpus volume is not healthy: " volume))))
+    volume))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--class-id" ** :required true)
+    (.add_argument parser "--symbol" ** :default "SPY")
+    (.add_argument parser "--date" ** :required true)
+    (.add_argument parser "--start-time" ** :required true)
+    (.add_argument parser "--end-time" ** :required true)
+    (.add_argument parser "--max-dte" ** :type int :required true)
+    (.add_argument parser "--strike-range" ** :type int :required true)
+    (.add_argument parser "--max-bytes" ** :type int :default 536870912)
+    (.add_argument parser "--max-wall-seconds" ** :type float :default 900.0)
+    (.add_argument parser "--base-url" ** :default "http://127.0.0.1:25503")
+    (.add_argument parser "--out-root" ** :default (str canonical-raw-root))
+    (.add_argument parser "--manifest-root" ** :default (str canonical-manifest-root))
+    (.parse_args parser (python/list argv))))
+
+(defn request-url [args]
+  (let [params {"symbol" (.upper (.-symbol args)) "expiration" "*" "right" "both"
+                "date" (.-date args) "start_time" (.-start_time args) "end_time" (.-end_time args)
+                "interval" "tick" "format" "csv" "max_dte" (.-max_dte args)
+                "strike_range" (.-strike_range args)}]
+    [(str (.rstrip (.-base_url args) "/") "/v3/option/history/quote?"
+          (urllib.parse/urlencode
+           (python/list (map (fn [[k v]] (python/tuple [(str k) (str v)])) (sort-by first params)))))
+     params]))
+
+(defn sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [stream (python/open path "rb")]
+      (loop [chunk (.read stream 1048576)]
+        (when (pos? (count chunk))
+          (.update digest chunk)
+          (recur (.read stream 1048576)))))
+    (.hexdigest digest)))
+
+(defn copy-capped! [response output max-bytes max-wall-seconds]
+  (let [digest (hashlib/sha256)
+        started (time/monotonic)]
+    (with-open [stream (python/open output "wb")]
+      (loop [total 0 chunk (.read response 1048576)]
+        (if (zero? (count chunk))
+          {"bytes" total "sha256" (.hexdigest digest)
+           "elapsed_seconds" (- (time/monotonic) started)
+           "content_type" (str (.getheader response "Content-Type"))}
+          (let [next-total (+ total (count chunk))
+                elapsed (- (time/monotonic) started)]
+            (when (> next-total max-bytes)
+              (throw (python/RuntimeError (str "BYTE CAP REACHED at " next-total " bytes"))))
+            (when (> elapsed max-wall-seconds)
+              (throw (python/TimeoutError (str "WALL-TIME CAP REACHED at " elapsed " seconds"))))
+            (.write stream chunk)
+            (.update digest chunk)
+            (recur next-total (.read response 1048576))))))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        _ (when (or (<= (.-max_dte args) 0) (<= (.-strike_range args) 0)
+                    (<= (.-max_bytes args) 0) (<= (.-max_wall_seconds args) 0))
+            (throw (python/ValueError "DTE, strike, byte, and wall-time gates must be positive")))
+        raw-root (.resolve (pathlib/Path (.-out_root args)))
+        manifest-root (.resolve (pathlib/Path (.-manifest_root args)))
+        _ (when-not (and (under? raw-root canonical-raw-root) (under? manifest-root canonical-manifest-root))
+            (throw (python/ValueError "collector writes only below D:\\SteveTradingData raw/v1 and manifests/v1")))
+        _ (assert-corpus-volume-healthy!)
+        run-id (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y%m%dT%H%M%S%fZ")
+        relative (.joinpath (pathlib/Path "thetadata" "OPRA" "hard") (.-class_id args)
+                            (str "trade_date=" (.-date args)))
+        final-dir (.joinpath raw-root relative (str "run=" run-id))
+        staging-dir (.with_name final-dir (str (.-name final-dir) ".staging"))
+        manifest-path (.joinpath manifest-root relative (str "run=" run-id ".json"))
+        [url params] (request-url args)
+        receipt (python/dict
+                 [#py ("schema_version" 1) #py ("provider" "thetadata") #py ("dataset" "OPRA")
+                  #py ("class" (.-class_id args)) #py ("admission" "hard")
+                  #py ("symbol" (.upper (.-symbol args))) #py ("event_class" "quote")
+                  #py ("date" (.-date args)) #py ("start_time_et" (.-start_time args))
+                  #py ("end_time_et" (.-end_time args)) #py ("interval" "tick")
+                  #py ("request_params" params) #py ("max_bytes" (.-max_bytes args))
+                  #py ("max_wall_seconds" (.-max_wall_seconds args))
+                  #py ("collector_revision" "thetadata-option-quote-panel-pilot-v1-basilisp")
+                  #py ("selection_policy" "vendor spot-relative strike_range plus max_dte")
+                  #py ("model_use_status" "research-only-pending-causal-selection-audit")
+                  #py ("status" "planned") #py ("planned_at" (now-utc))])]
+    (atomic-json! manifest-path receipt)
+    (.mkdir staging-dir ** :parents true :exist_ok false)
+    (try
+      (do
+        (.__setitem__ receipt "status" "downloading")
+        (.__setitem__ receipt "started_at" (now-utc))
+        (atomic-json! manifest-path receipt)
+        (let [output (.joinpath staging-dir (str (.upper (.-symbol args)) ".quote.csv"))
+              request (urllib.request/Request url)
+              request-started (time/monotonic)
+              result (with-open [response (urllib.request/urlopen request ** :timeout (.-max_wall_seconds args))]
+                       (let [header-elapsed (- (time/monotonic) request-started)
+                             remaining (- (.-max_wall_seconds args) header-elapsed)
+                             _ (when (<= remaining 0)
+                                 (throw (python/TimeoutError
+                                         (str "WALL-TIME CAP REACHED awaiting response headers at "
+                                              header-elapsed " seconds"))))
+                             copied (copy-capped! response (str output) (.-max_bytes args) remaining)]
+                         (assoc copied "elapsed_seconds" (- (time/monotonic) request-started))))
+              payload {"path" (.-name output) "bytes" (get result "bytes")
+                       "sha256" (get result "sha256") "content_type" (get result "content_type")}]
+          (.mkdir (.-parent final-dir) ** :parents true :exist_ok true)
+          (.replace staging-dir final-dir)
+          (.__setitem__ receipt "status" "complete")
+          (.__setitem__ receipt "finished_at" (now-utc))
+          (.__setitem__ receipt "elapsed_seconds" (get result "elapsed_seconds"))
+          (.__setitem__ receipt "raw_payloads" (python/list [(jsonable payload)]))
+          (.__setitem__ receipt "raw_run_dir" (str final-dir))
+          (.__setitem__ receipt "archive_status" "historical-response-raw")
+          (atomic-json! manifest-path receipt)
+          (assoc receipt "manifest_path" (str manifest-path))))
+      (catch python/Exception error
+        (let [quarantine (.joinpath (.-parent (.-parent canonical-raw-root)) "quarantine" "v1"
+                                    "thetadata" "OPRA" (.-class_id args) (str "run=" run-id ".partial"))]
+          (.mkdir (.-parent quarantine) ** :parents true :exist_ok true)
+          (when (.exists staging-dir) (shutil/move (str staging-dir) (str quarantine)))
+          (.__setitem__ receipt "status" "capped-or-failed")
+          (.__setitem__ receipt "finished_at" (now-utc))
+          (.__setitem__ receipt "error" (str error))
+          (.__setitem__ receipt "quarantine_path" (str quarantine))
+          (atomic-json! manifest-path receipt)
+          (throw error))))))
+
+(try
+  (println (json-text (run-main (vec *command-line-args*))))
+  (python/exit 0)
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

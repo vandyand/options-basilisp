@@ -1,6 +1,10 @@
 (ns analysis.test-core
-  (:require [basilisp.test :refer [deftest is testing]]
-            [stevetrading.analysis.core :as analysis]))
+  (:import os os.path re sqlite3 subprocess tempfile)
+  (:require [basilisp.edn :as edn]
+            [basilisp.string :as bstr]
+            [basilisp.test :refer [deftest is testing]]
+            [stevetrading.analysis.core :as analysis]
+            [stevetrading.analysis.schema :as analysis-schema]))
 
 (def signal-fact
   {:record/type :fact/signal-decision-produced
@@ -44,6 +48,7 @@
   {:record/type :fact/fill-observed
    :record/source-system :broker/alpaca-paper
    :record/account-id "account/alpaca/chestnut-paper"
+   :record/strategy-id "strategy/steve-v2/chestnut/v1"
    :record/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
    :record/id "fill-rec-1"
    :fact/occurred-at "2026-06-25T14:24:56Z"
@@ -65,9 +70,78 @@
                     :quote/bid "2.27"
                     :quote/ask "2.30"}]}})
 
+(def reject-fact
+  {:record/type :fact/broker-ack-rejected
+   :record/source-system :broker/alpaca-paper
+   :record/account-id "account/alpaca/chestnut-paper"
+   :record/strategy-id "strategy/steve-v2/chestnut/v1"
+   :record/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+   :record/id "reject-rec-1"
+   :fact/occurred-at "2026-06-25T14:24:52Z"
+   :fact/payload {:order-intent/id "oi-2"
+                  :broker/source-system :broker/alpaca-paper
+                  :broker/account-id "account/alpaca/chestnut-paper"
+                  :broker/order-id "bo-rej-1"
+                  :broker/status :broker-status/rejected
+                  :broker/rejection-code :broker-rejection/insufficient-buying-power
+                  :broker/message "insufficient buying power"}})
+
+(def lot-open-fact
+  {:record/type :fact/position-lot-opened
+   :record/source-system :engine/ledger
+   :record/account-id "account/alpaca/chestnut-paper"
+   :record/strategy-id "strategy/steve-v2/chestnut/v1"
+   :record/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+   :record/id "lot-open-rec-1"
+   :fact/occurred-at "2026-06-25T14:24:56Z"
+   :fact/payload {:lot/id "lot-1"
+                  :lot/order-intent-id "oi-1"
+                  :lot/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+                  :lot/account-id "account/alpaca/chestnut-paper"
+                  :lot/strategy-id "strategy/steve-v2/chestnut/v1"
+                  :lot/side :order-side/buy
+                  :lot/opened-at "2026-06-25T14:24:56Z"
+                  :lot/quantity "1"
+                  :lot/price "2.29"}})
+
+(def lot-close-fact
+  {:record/type :fact/position-lot-closed
+   :record/source-system :engine/ledger
+   :record/account-id "account/alpaca/chestnut-paper"
+   :record/strategy-id "strategy/steve-v2/chestnut/v1"
+   :record/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+   :record/id "lot-close-rec-1"
+   :fact/occurred-at "2026-06-25T14:54:56Z"
+   :fact/payload {:lot/id "lot-1"
+                  :lot/instrument-id "option/OPRA/SPY/2026-06-25/P/735.000"
+                  :lot/account-id "account/alpaca/chestnut-paper"
+                  :lot/strategy-id "strategy/steve-v2/chestnut/v1"
+                  :lot/side :order-side/buy
+                  :lot-close/quantity "1"
+                  :lot-close/price "2.40"
+                  :lot-close/closed-at "2026-06-25T14:54:56Z"
+                  :lot-close/closing-order-intent-id "oi-close-1"
+                  :lot-close/realized-pnl "11.00"}})
+
+(defn raw-row
+  [offset fact]
+  (let [pl (:fact/payload fact)]
+    {:offset offset
+     :fact-type (str (:record/type fact))
+     :account-id (:record/account-id fact)
+     :strategy-id (:record/strategy-id fact)
+     :instrument-id (:record/instrument-id fact)
+     :order-intent-id (:order-intent/id pl)
+     :broker-order-id (:broker/order-id pl)
+     :occurred-at (:fact/occurred-at fact)
+     :correlation-id (:record/correlation-id fact)
+     :record (edn/write-string fact)}))
+
 (deftest live-tape-normalizes-core-events
   (let [rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])]
     (is (= 3 (count rows)))
+    (is (= {:valid? true :rows 3}
+           (analysis/validate-artifact-rows! :analysis/tape-row rows)))
     (testing "signal posture is explicit"
       (is (= :posture/enter-short (:posture (first rows)))))
     (testing "intent row carries target option leg"
@@ -81,6 +155,347 @@
         (is (= "fill" (:event-type row)))
         (is (= "2.29" (:fill-price row)))
         (is (= "bo-1" (:broker-order-id row)))))))
+
+(deftest live-tape-preserves-rejected-orders
+  (let [rows (analysis/live-tape-rows [intent-fact reject-fact])
+        reject-row (second rows)]
+    (is (= 2 (count rows)))
+    (is (= "broker_reject" (:event-type reject-row)))
+    (is (= "oi-2" (:order-intent-id reject-row)))
+    (is (= :broker-status/rejected (:broker-status reject-row)))
+    (is (= [:broker-rejection/insufficient-buying-power
+            "insufficient buying power"]
+           (:reason-codes reject-row)))))
+
+(deftest episodes-preserve-completed-and-incomplete-trades
+  (let [unfilled-intent (assoc-in intent-fact
+                                  [:fact/payload :order-intent/id]
+                                  "oi-unfilled")
+        rows (map-indexed (fn [idx fact] (raw-row (inc idx) fact))
+                          [intent-fact fill-fact lot-open-fact lot-close-fact
+                           unfilled-intent])
+        episodes (analysis/episode-rows-fast rows)
+        by-id (group-by :order-intent-id episodes)
+        completed (first (get by-id "oi-1"))
+        incomplete (first (get by-id "oi-unfilled"))]
+    (is (= 2 (count episodes)))
+    (is (= {:valid? true :rows 2}
+           (analysis/validate-artifact-rows! :analysis/episode-row episodes)))
+    (testing "completed lot episode carries realized economics"
+      (is (= "lot-1" (:lot-id completed)))
+      (is (= "2.29" (:entry-price completed)))
+      (is (= "2.40" (:exit-price completed)))
+      (is (= "11.00" (:gross-pnl completed)))
+      (is (= 30.0 (:holding-minutes completed))))
+    (testing "entry intent without a fill remains visible"
+      (is (= [:episode/missing-fill] (:data-quality-flags incomplete)))
+      (is (= :exit/missing-fill (:exit-reason incomplete))))))
+
+(deftest behavior-alignment-reports-precision-recall-and-mismatches
+  (let [live (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay (analysis/live-tape-rows
+                [signal-fact
+                 intent-fact
+                 (assoc-in fill-fact
+                           [:fact/payload :fill/instrument-id]
+                           "option/OPRA/SPY/2026-06-25/P/730.000")])
+        alignment (analysis/behavior-alignment
+                   {:live-rows live
+                    :replay-rows replay
+                    :bucket-seconds 60})
+        by-event (into {} (map (fn [m] [(:event-type m) m])
+                               (:metrics alignment)))]
+    (is (= :alignment/review-mismatches (:status alignment)))
+    (is (= 1 (:mismatch-count alignment)))
+    (testing "signals and intents align exactly"
+      (is (= 1 (:precision (get by-event "signal"))))
+      (is (= 1 (:recall (get by-event "intent")))))
+    (testing "fill instrument mismatch is visible on both sides"
+      (is (= 1 (:matched-count (get by-event "fill"))))
+      (is (= 1 (:instrument-mismatches (get by-event "fill"))))
+      (is (= #{"field-mismatch"}
+             (set (map :side (:mismatches alignment))))))))
+
+(deftest behavior-alignment-invalidates-mismatched-cohorts
+  (let [live (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay (analysis/live-tape-rows
+                [(assoc signal-fact
+                        :record/account-id "account/sim/vol-term"
+                        :record/strategy-id "strategy/sim-term/calendar-slope/v1")
+                 (assoc intent-fact
+                        :record/account-id "account/sim/vol-term"
+                        :record/strategy-id "strategy/sim-term/calendar-slope/v1")])
+        alignment (analysis/behavior-alignment
+                   {:live-rows live
+                    :replay-rows replay
+                    :bucket-seconds 60})
+        cohort (:cohort alignment)
+        checks (into {} (map (fn [row] [(:check row) row])
+                             (:checks cohort)))]
+    (is (= :alignment/invalid-cohort (:status alignment)))
+    (is (= :cohort/fail (:status cohort)))
+    (is (= :fail (:status (get checks :cohort/strategy-set))))
+    (is (= :fail (:status (get checks :cohort/account-set))))
+    (is (= :fail (:status (get checks :cohort/account-strategy-set))))))
+
+(deftest behavior-alignment-invalidates-identity-incomplete-alignable-rows
+  (let [live (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        bad-replay (mapv #(if (= "fill" (:event-type %))
+                            (assoc % :strategy-id nil)
+                            %)
+                         replay)
+        alignment (analysis/behavior-alignment
+                   {:live-rows live
+                    :replay-rows bad-replay
+                    :bucket-seconds 60})
+        checks (into {} (map (fn [row] [(:check row) row])
+                             (get-in alignment [:cohort :checks])))]
+    (is (= :alignment/invalid-cohort (:status alignment)))
+    (is (= :fail (:status (get checks :cohort/identity-complete))))
+    (is (= 1 (get-in checks
+                     [:cohort/identity-complete
+                      :details
+                      :replay-missing-identity])))))
+
+(deftest behavior-alignment-invalidates-event-count-drift
+  (let [live (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay (analysis/live-tape-rows [signal-fact intent-fact])
+        alignment (analysis/behavior-alignment
+                   {:live-rows live
+                    :replay-rows replay
+                    :bucket-seconds 60})
+        checks (into {} (map (fn [row] [(:check row) row])
+                             (get-in alignment [:cohort :checks])))]
+    (is (= :alignment/invalid-cohort (:status alignment)))
+    (is (= :fail (:status (get checks :cohort/event-counts))))
+    (is (= {"fill" 1 "intent" 1 "signal" 1}
+           (get-in checks [:cohort/event-counts :details :live])))
+    (is (= {"intent" 1 "signal" 1}
+           (get-in checks [:cohort/event-counts :details :replay])))))
+
+(deftest behavior-alignment-rejects-invalid-bucket-parameters
+  (let [rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])]
+    (doseq [bucket [0 -1 1.5 true false "60" nil]]
+      (try
+        (analysis/behavior-alignment
+         {:live-rows rows
+          :replay-rows rows
+          :bucket-seconds bucket})
+        (is false (str "expected invalid bucket to fail: " (pr-str bucket)))
+        (catch python/ValueError e
+          (is (not= -1 (.find (str e) "bucket-seconds must be a positive integer"))
+              (str bucket " -> " e)))))))
+
+(deftest analysis-schemas-reject-malformed-artifact-rows
+  (testing "tape rows require a known event type and timestamp"
+    (let [bad (assoc (first (analysis/live-tape-rows [signal-fact]))
+                     :event-type "profit"
+                     :occurred-at "")]
+      (is (false? (:valid? (analysis-schema/validation-result
+                            :analysis/tape-row bad))))))
+  (testing "episode rows require the canonical identity and forced-flatten flag"
+    (let [episode (first (analysis/episode-rows-fast
+                          (map-indexed (fn [idx fact] (raw-row (inc idx) fact))
+                                       [intent-fact fill-fact lot-open-fact
+                                        lot-close-fact])))
+          bad (dissoc episode :episode-id)]
+      (is (false? (:valid? (analysis-schema/validation-result
+                            :analysis/episode-row bad)))))))
+
+(defn- shifted-fact
+  [fact idx]
+  (let [ts (format "2026-06-25T14:%02d:00Z" (+ 10 idx))
+        suffix (str "-" idx)]
+    (-> fact
+        (assoc :fact/occurred-at ts)
+        (update :record/correlation-id #(when % (str % suffix)))
+        (update :record/id #(str % suffix))
+        (update-in [:fact/payload :decision/id] #(when % (str % suffix)))
+        (update-in [:fact/payload :order-intent/id] #(when % (str % suffix)))
+        (update-in [:fact/payload :order-intent/decision-id]
+                   #(when % (str % suffix)))
+        (update-in [:fact/payload :broker/order-id] #(when % (str % suffix)))
+        (update-in [:fact/payload :fill/id] #(when % (str % suffix))))))
+
+(defn- fuzz-session-facts
+  [n]
+  (vec
+   (mapcat
+    (fn [idx]
+      [(shifted-fact signal-fact idx)
+       (shifted-fact intent-fact idx)
+       (shifted-fact fill-fact idx)])
+    (range n))))
+
+(defn- valid-calibration-artifact
+  []
+  (let [rows [{:side :order-side/buy :spread 0.01 :improvement 0.02
+               :lag-seconds 1.0}
+              {:side :order-side/buy :spread 0.01 :improvement 0.01
+               :lag-seconds 2.0}
+              {:side :order-side/sell :spread 0.05 :improvement 0.00
+               :lag-seconds 1.5}]
+        global (analysis/summarize-calibration-rows rows)]
+    {:calibration/version 1
+     :calibration/kind :sim-fill/alpaca-paper-empirical-bayes-v1
+     :calibration/generated-at "2026-06-25T20:00:00+00:00"
+     :source/facts-dbs ["facts.db"]
+     :source/facts-fingerprints [{:path "facts.db" :sha256 (apply str (repeat 64 "0"))}]
+     :matching/max-lag-seconds 90.0
+     :estimator/prior-strength 30.0
+     :input/option-fills 3
+     :input/matched-fills 3
+     :global global
+     :buckets (analysis/bucket-summaries rows global 30.0)}))
+
+(defn- completed-episode-rows
+  []
+  (analysis/episode-rows-fast
+   (map-indexed (fn [idx fact] (raw-row (inc idx) fact))
+                [intent-fact fill-fact lot-open-fact lot-close-fact])))
+
+(defn- write-readiness-artifacts!
+  [dir {:keys [replay-rows calibration-artifact live-episodes replay-episodes]
+        :or {replay-rows nil calibration-artifact nil
+             live-episodes nil replay-episodes nil}}]
+  (let [live-path (os.path/join dir "live_tape.csv")
+        replay-path (os.path/join dir "replay_tape.csv")
+        live-episodes-path (os.path/join dir "live_episodes.csv")
+        replay-episodes-path (os.path/join dir "replay_episodes.csv")
+        calibration-path (os.path/join dir "calibration.edn")
+        live-rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay-rows (or replay-rows live-rows)
+        episodes (completed-episode-rows)
+        live-episodes (or live-episodes episodes)
+        replay-episodes (or replay-episodes episodes)
+        calibration-artifact (or calibration-artifact
+                                 (valid-calibration-artifact))]
+    (analysis/write-csv! live-path analysis/live-tape-columns live-rows)
+    (analysis/write-csv! replay-path analysis/live-tape-columns replay-rows)
+    (analysis/write-csv! live-episodes-path analysis/episode-columns live-episodes)
+    (analysis/write-csv! replay-episodes-path analysis/episode-columns replay-episodes)
+    (spit calibration-path (edn/write-string calibration-artifact))
+    {:live-tape live-path
+     :replay-tape replay-path
+     :live-episodes live-episodes-path
+     :replay-episodes replay-episodes-path
+     :calibration calibration-path
+     :require-provenance? false}))
+
+(defn- write-facts-db!
+  [path facts]
+  (let [conn (sqlite3/connect path)]
+    (.execute conn
+              (str "CREATE TABLE facts ("
+                   "\"offset\" INTEGER PRIMARY KEY, "
+                   "fact_type TEXT, account_id TEXT, strategy_id TEXT, "
+                   "instrument_id TEXT, order_intent_id TEXT, "
+                   "broker_order_id TEXT, occurred_at TEXT, "
+                   "correlation_id TEXT, record TEXT)"))
+    (doseq [[idx fact] (map-indexed vector facts)]
+      (let [pl (:fact/payload fact)]
+        (.execute conn
+                  (str "INSERT INTO facts "
+                       "(\"offset\", fact_type, account_id, strategy_id, "
+                       "instrument_id, order_intent_id, broker_order_id, "
+                       "occurred_at, correlation_id, record) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                  (python/tuple
+                   [(inc idx)
+                    (str (:record/type fact))
+                    (:record/account-id fact)
+                    (:record/strategy-id fact)
+                    (or (:record/instrument-id fact)
+                        (:fill/instrument-id pl)
+                        (:lot/instrument-id pl))
+                    (:order-intent/id pl)
+                    (:broker/order-id pl)
+                    (:fact/occurred-at fact)
+                    (:record/correlation-id fact)
+                    (edn/write-string fact)]))))
+    (.commit conn)
+    (.close conn)
+    path))
+
+(defn- exported-provenance-artifacts!
+  [dir]
+  (let [facts-db (os.path/join dir "facts.db")
+        live-tape (os.path/join dir "live_tape.csv")
+        replay-tape (os.path/join dir "replay_tape.csv")
+        live-episodes (os.path/join dir "live_episodes.csv")
+        replay-episodes (os.path/join dir "replay_episodes.csv")
+        calibration (os.path/join dir "calibration.edn")]
+    (write-facts-db! facts-db
+                     [signal-fact intent-fact fill-fact
+                      quote-fact lot-open-fact lot-close-fact])
+    (analysis/write-live-tape! {:facts-db facts-db :out live-tape})
+    (analysis/write-replay-tape! {:facts-db facts-db :out replay-tape})
+    (analysis/write-episodes! {:facts-db facts-db :out live-episodes})
+    (analysis/write-episodes! {:facts-db facts-db :out replay-episodes})
+    (analysis/write-calibration! {:facts-dbs [facts-db]
+                                  :out calibration
+                                  :max-lag-seconds 90.0
+                                  :prior-strength 30.0})
+    {:facts-db facts-db
+     :live-tape live-tape
+     :replay-tape replay-tape
+     :live-episodes live-episodes
+     :replay-episodes replay-episodes
+     :calibration calibration}))
+
+(deftest deterministic-fuzz-alignment-remains-exact-under-identical-tapes
+  (doseq [n [1 2 3 5 8 13 21 34]]
+    (let [rows (analysis/live-tape-rows (fuzz-session-facts n))
+          alignment (analysis/behavior-alignment
+                     {:live-rows rows
+                      :replay-rows rows
+                      :bucket-seconds 60})]
+      (is (= :alignment/pass-exact (:status alignment)) (str "n=" n))
+      (is (= 0 (:mismatch-count alignment)) (str "n=" n))
+      (is (= (* 3 n) (get-in alignment
+                             [:cohort :live :alignable-rows]))
+          (str "n=" n)))))
+
+(deftest deterministic-fuzz-alignment-detects-one-sided-losses
+  (doseq [n [2 5 13 34]]
+    (let [rows (analysis/live-tape-rows (fuzz-session-facts n))
+          replay (vec (butlast rows))
+          alignment (analysis/behavior-alignment
+                     {:live-rows rows
+                      :replay-rows replay
+                      :bucket-seconds 60})]
+      (is (= :alignment/invalid-cohort (:status alignment)) (str "n=" n))
+      (is (= :cohort/fail (get-in alignment [:cohort :status]))
+          (str "n=" n)))))
+
+(deftest behavior-alignment-writes-report-and-mismatch-csv
+  (let [dir (tempfile/mkdtemp)
+        live-path (os.path/join dir "live_tape.csv")
+        replay-path (os.path/join dir "replay_tape.csv")
+        report-path (os.path/join dir "alignment_report.md")
+        mismatch-path (os.path/join dir "mismatches.csv")
+        live (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay (analysis/live-tape-rows
+                [signal-fact
+                 intent-fact
+                 (assoc-in fill-fact
+                           [:fact/payload :fill/instrument-id]
+                           "option/OPRA/SPY/2026-06-25/P/730.000")])
+        _ (analysis/write-csv! live-path analysis/live-tape-columns live)
+        _ (analysis/write-csv! replay-path analysis/live-tape-columns replay)
+        summary (analysis/write-behavior-alignment!
+                 {:live-tape live-path
+                  :replay-tape replay-path
+                  :out report-path
+                  :mismatches-out mismatch-path
+                  :bucket-seconds 60})]
+    (is (= :alignment/review-mismatches
+           (get-in summary [:alignment :status])))
+    (is (= 1 (get-in summary [:alignment :mismatch-count])))
+    (is (os.path/exists report-path))
+    (is (os.path/exists mismatch-path))
+    (is (.startswith (slurp report-path) "# Behavior Alignment Report"))))
 
 (deftest calibration-matches-fill-to-nearest-quote
   (let [rows (analysis/matched-fill-rows [intent-fact fill-fact quote-fact] 90.0)
@@ -108,3 +523,1273 @@
     (is (every? #(>= (:shrunk-conservative-price-improvement %) 0.0)
                 buckets))))
 
+(deftest calibration-artifact-schema-catches-bad-artifacts
+  (let [valid (valid-calibration-artifact)
+        bad (assoc valid :input/matched-fills -1)]
+    (is (= {:valid? true}
+           (analysis/validate-artifact! :analysis/calibration-artifact valid)))
+    (is (thrown? python/Exception
+                 (analysis/validate-artifact!
+                  :analysis/calibration-artifact bad)))))
+
+(deftest same-pop-readiness-passes-valid-artifacts
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-pop-readiness paths)]
+    (is (true? (:valid? result)))
+    (is (= :same-pop/ready-for-stat-tests (:status result)))
+    (is (empty? (filter #(= :error (:severity %)) (:issues result))))
+    (is (= :alignment/pass-exact (get-in result [:alignment :status])))
+    (is (= 3 (get-in result [:artifact-counts :live-tape])))
+    (is (= 1 (get-in result [:artifact-counts :live-episodes])))))
+
+(deftest exported-artifact-provenance-passes-readiness
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)
+        result (analysis/same-pop-readiness paths)]
+    (is (true? (:valid? result)))
+    (is (= :same-pop/ready-for-stat-tests (:status result)))
+    (is (os.path/exists (str (:live-tape paths) ".manifest.edn")))
+    (is (os.path/exists (str (:live-episodes paths) ".manifest.edn")))))
+
+(deftest same-pop-readiness-blocks-missing-provenance-sidecar
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)]
+    (os/remove (str (:live-tape paths) ".manifest.edn"))
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(= :same-pop/missing-provenance-sidecar (:code %))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-artifact-mutated-after-export
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)]
+    (spit (:replay-tape paths) (str (slurp (:replay-tape paths)) "\n"))
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(= :same-pop/provenance-artifact-checksum-mismatch
+                    (:code %))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-noncanonical-csv-columns
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        lines (.splitlines (slurp (:live-tape paths)))
+        mutated-header (str (first lines) ",unexpected-extra-column")
+        mutated (bstr/join "\n" (cons mutated-header (rest lines)))]
+    (spit (:live-tape paths) (str mutated "\n"))
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(and (= :same-pop/invalid-artifact-columns (:code %))
+                      (= :analysis/tape-row
+                         (get-in % [:details :artifact/kind])))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-provenance-column-forgery
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)
+        sidecar-path (str (:live-episodes paths) ".manifest.edn")
+        sidecar (edn/read-string (slurp sidecar-path))
+        forged (assoc sidecar
+                      :artifact/columns
+                      (conj (:artifact/columns sidecar)
+                            "unexpected-extra-column"))]
+    (spit sidecar-path (str (edn/write-string forged) "\n"))
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(and (= :same-pop/provenance-column-mismatch (:code %))
+                      (= (mapv name analysis/episode-columns)
+                         (get-in % [:details :expected])))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-provenance-extra-key-forgery
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)
+        sidecar-path (str (:live-tape paths) ".manifest.edn")
+        sidecar (edn/read-string (slurp sidecar-path))
+        top-level-forgery (assoc sidecar
+                                 :legacy/validation-status
+                                 :looks-valid)
+        source-forgery (assoc-in sidecar
+                                 [:source/facts-db :legacy/row-count]
+                                 999)]
+    (doseq [[forged code field] [[top-level-forgery
+                                  :same-pop/provenance-sidecar-extra-keys
+                                  :legacy/validation-status]
+                                 [source-forgery
+                                  :same-pop/provenance-source-fingerprint-extra-keys
+                                  :legacy/row-count]]]
+      (spit sidecar-path (str (edn/write-string forged) "\n"))
+      (let [result (analysis/same-pop-readiness paths)]
+        (is (= :same-pop/blocked-data (:status result)))
+        (is (some #(and (= code (:code %))
+                        (= [field] (get-in % [:details :fields])))
+                  (:issues result)))))))
+
+(deftest deterministic-fuzz-provenance-sidecar-extra-key-mutations-fail
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)
+        artifacts [(:live-tape paths)
+                   (:replay-tape paths)
+                   (:live-episodes paths)
+                   (:replay-episodes paths)]
+        cases [[:top-level [:legacy/fuzz-marker]
+                :same-pop/provenance-sidecar-extra-keys]
+               [:source-fingerprint [:source/facts-db :legacy/fuzz-marker]
+                :same-pop/provenance-source-fingerprint-extra-keys]]]
+    (doseq [artifact-path artifacts
+            [label mutation-path expected-code] cases]
+      (let [sidecar-path (str artifact-path ".manifest.edn")
+            original (edn/read-string (slurp sidecar-path))
+            forged (assoc-in original mutation-path
+                             (str "forged-" (name label)))
+            field (last mutation-path)]
+        (spit sidecar-path (str (edn/write-string forged) "\n"))
+        (let [result (analysis/same-pop-readiness paths)]
+          (is (= :same-pop/blocked-data (:status result)))
+          (is (some #(and (= expected-code (:code %))
+                          (= [field] (get-in % [:details :fields])))
+                    (:issues result))))
+        (spit sidecar-path (str (edn/write-string original) "\n"))))))
+
+(deftest same-pop-readiness-blocks-source-facts-db-mutated-after-export
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)
+        conn (sqlite3/connect (:facts-db paths))]
+    (.execute conn
+              "UPDATE facts SET record = record || ' ' WHERE \"offset\" = 1")
+    (.commit conn)
+    (.close conn)
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(= :same-pop/provenance-source-checksum-mismatch
+                    (:code %))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-source-facts-db-missing-after-export
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)]
+    (os/remove (:facts-db paths))
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(= :same-pop/provenance-source-missing (:code %))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-calibration-without-source-fingerprints
+  (let [dir (tempfile/mkdtemp)
+        paths (exported-provenance-artifacts! dir)
+        calibration (dissoc (edn/read-string (slurp (:calibration paths)))
+                            :source/facts-fingerprints)]
+    (spit (:calibration paths) (edn/write-string calibration))
+    (let [result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status result)))
+      (is (some #(= :same-pop/invalid-artifact (:code %))
+                (:issues result))))))
+
+(deftest same-pop-readiness-blocks-missing-and-malformed-artifacts
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        missing (assoc paths :calibration
+                       (os.path/join dir "missing-calibration.edn"))
+        missing-result (analysis/same-pop-readiness missing)
+        bad-calibration-path (:calibration paths)]
+    (is (= :same-pop/blocked-data (:status missing-result)))
+    (is (some #(= :same-pop/missing-artifact (:code %))
+              (:issues missing-result)))
+    (spit bad-calibration-path "{:calibration/version 1")
+    (let [bad-result (analysis/same-pop-readiness paths)]
+      (is (= :same-pop/blocked-data (:status bad-result)))
+      (is (some #(= :same-pop/unreadable-artifact (:code %))
+                (:issues bad-result))))))
+
+(deftest same-pop-readiness-fails-behavior-before-stats
+  (let [dir (tempfile/mkdtemp)
+        live-rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay-rows (mapv #(if (= "fill" (:event-type %))
+                             (assoc % :instrument-id
+                                    "option/OPRA/SPY/2026-06-25/P/730.000")
+                             %)
+                          live-rows)
+        paths (write-readiness-artifacts! dir {:replay-rows replay-rows})
+        result (analysis/same-pop-readiness paths)]
+    (is (= :same-pop/fail-behavior (:status result)))
+    (is (some #(= :same-pop/behavior-not-aligned (:code %))
+              (:issues result)))
+    (is (= 1 (get-in result [:alignment :mismatch-count])))))
+
+(deftest same-pop-readiness-fails-unusable-fill-calibration
+  (let [dir (tempfile/mkdtemp)
+        calibration (assoc (valid-calibration-artifact)
+                           :input/matched-fills 0)
+        paths (write-readiness-artifacts!
+               dir {:calibration-artifact calibration})
+        result (analysis/same-pop-readiness paths)]
+    (is (= :same-pop/fail-fills (:status result)))
+    (is (some #(= :same-pop/no-quote-matched-fills (:code %))
+              (:issues result)))))
+
+(deftest same-pop-readiness-blocks-episode-cohort-that-does-not-match-behavior
+  (let [dir (tempfile/mkdtemp)
+        wrong-episodes (mapv #(assoc %
+                                      :account-id "account/alpaca/oak-paper"
+                                      :strategy-id "strategy/steve-v2/oak/v1")
+                             (completed-episode-rows))
+        paths (write-readiness-artifacts!
+               dir {:live-episodes wrong-episodes
+                    :replay-episodes wrong-episodes})
+        result (analysis/same-pop-readiness paths)]
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (some #(= :same-pop/episode-behavior-cohort-mismatch (:code %))
+              (:issues result)))
+    (is (nil? (:statistics (analysis/same-population-statistics paths))))))
+
+(deftest same-pop-readiness-blocks-live-replay-episode-cohort-drift
+  (let [dir (tempfile/mkdtemp)
+        replay-episodes (mapv #(assoc %
+                                       :account-id "account/alpaca/oak-paper"
+                                       :strategy-id "strategy/steve-v2/oak/v1")
+                              (completed-episode-rows))
+        paths (write-readiness-artifacts!
+               dir {:replay-episodes replay-episodes})
+        result (analysis/same-pop-readiness paths)]
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (some #(= :same-pop/episode-cohort-mismatch (:code %))
+              (:issues result)))))
+
+(defn- synthetic-episodes
+  [pnls]
+  (mapv (fn [idx pnl]
+          (let [base (first (completed-episode-rows))]
+            (assoc base
+                   :episode-id (str "episode/synthetic/" idx)
+                   :lot-id (str "lot-" idx)
+                   :order-intent-id (str "oi-" idx)
+                   :gross-pnl (format "%.2f" (float pnl))
+                   :net-pnl (format "%.2f" (float pnl)))))
+        (range)
+        pnls))
+
+(defn- write-csv-with-sidecar!
+  [path columns rows facts-db artifact-kind]
+  (analysis/write-csv! path columns rows)
+  (analysis/write-artifact-sidecar!
+   {:artifact-kind artifact-kind
+    :path path
+    :facts-db facts-db
+    :row-count (count rows)
+    :columns columns
+    :source-kind :source/test-facts})
+  path)
+
+(defn- write-provenance-readiness-artifacts!
+  [dir live-pnls replay-pnls]
+  (let [facts-db (os.path/join dir "facts.db")
+        live-path (os.path/join dir "live_tape.csv")
+        replay-path (os.path/join dir "replay_tape.csv")
+        live-episodes-path (os.path/join dir "live_episodes.csv")
+        replay-episodes-path (os.path/join dir "replay_episodes.csv")
+        calibration-path (os.path/join dir "calibration.edn")
+        tape-rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        live-episodes (synthetic-episodes live-pnls)
+        replay-episodes (synthetic-episodes replay-pnls)]
+    (write-facts-db! facts-db
+                     [signal-fact intent-fact fill-fact
+                      quote-fact lot-open-fact lot-close-fact])
+    (write-csv-with-sidecar! live-path analysis/live-tape-columns
+                             tape-rows facts-db :analysis/tape-row)
+    (write-csv-with-sidecar! replay-path analysis/live-tape-columns
+                             tape-rows facts-db :analysis/tape-row)
+    (write-csv-with-sidecar! live-episodes-path analysis/episode-columns
+                             live-episodes facts-db :analysis/episode-row)
+    (write-csv-with-sidecar! replay-episodes-path analysis/episode-columns
+                             replay-episodes facts-db :analysis/episode-row)
+    (analysis/write-calibration! {:facts-dbs [facts-db]
+                                  :out calibration-path
+                                  :max-lag-seconds 90.0
+                                  :prior-strength 30.0})
+    {:live-tape live-path
+     :replay-tape replay-path
+     :live-episodes live-episodes-path
+     :replay-episodes replay-episodes-path
+     :calibration calibration-path}))
+
+(deftest same-population-statistics-refuses-when-readiness-fails
+  (let [dir (tempfile/mkdtemp)
+        live-rows (analysis/live-tape-rows [signal-fact intent-fact fill-fact])
+        replay-rows (mapv #(if (= "fill" (:event-type %))
+                             (assoc % :instrument-id
+                                    "option/OPRA/SPY/2026-06-25/P/730.000")
+                             %)
+                          live-rows)
+        paths (write-readiness-artifacts! dir {:replay-rows replay-rows})
+        result (analysis/same-population-statistics paths)]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/fail-behavior (:status result)))
+    (is (nil? (:statistics result)))))
+
+(deftest same-population-statistics-watches-small-valid-samples
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts!
+               dir {:live-episodes (synthetic-episodes [1.0 2.0 3.0])
+                    :replay-episodes (synthetic-episodes [1.0 2.0 3.0])})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 100
+                       :permutation-reps 100
+                       :min-samples 30))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/watch (:status result)))
+    (is (= 3 (get-in result [:statistics :live :n])))
+    (is (= 0.0 (get-in result [:statistics :effect-sizes :mean-pnl-delta])))
+    (is (= {:valid? true}
+           (analysis/validate-artifact! :analysis/same-pop-manifest
+                                        (:manifest result))))
+    (is (= (os.path/abspath (:live-tape paths))
+           (get-in result [:manifest :artifacts :live-tape :path])))
+    (is (true? (boolean
+                (re/fullmatch
+                 #"[0-9a-f]{64}"
+                 (get-in result [:manifest :artifacts :live-tape :sha256])))))
+    (is (= 100
+           (get-in result [:manifest :parameters :bootstrap-reps])))
+    (is (= 100
+           (get-in result [:manifest :parameters :permutation-reps])))
+    (is (= 30
+           (get-in result [:manifest :parameters :min-samples])))
+    (is (true? (get-in result [:statistics :decision :small-sample?])))))
+
+(deftest same-pop-readiness-rejects-invalid-bucket-parameter
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-pop-readiness
+                (assoc paths :bucket-seconds 0))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (some #(and (= :same-pop/invalid-parameter (:code %))
+                    (= :bucket-seconds
+                       (get-in % [:details :parameter])))
+              (:issues result)))))
+
+(deftest same-pop-readiness-rejects-boolean-bucket-parameter
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-pop-readiness
+                (assoc paths :bucket-seconds true))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (some #(and (= :same-pop/invalid-parameter (:code %))
+                    (= :bucket-seconds
+                       (get-in % [:details :parameter]))
+                    (= true
+                       (get-in % [:details :value])))
+              (:issues result)))))
+
+(deftest same-population-statistics-rejects-invalid-stat-parameters
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts!
+               dir {:live-episodes (synthetic-episodes (repeat 40 1.0))
+                    :replay-episodes (synthetic-episodes (repeat 40 1.0))})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 0
+                       :permutation-reps -1
+                       :min-samples 0
+                       :practical-mean-threshold "nan"))
+        invalid-parameters (set (map #(get-in % [:details :parameter])
+                                     (filter #(= :same-pop/invalid-parameter
+                                                 (:code %))
+                                             (get-in result
+                                                     [:readiness :issues]))))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (nil? (:manifest result)))
+    (is (nil? (:statistics result)))
+    (is (= #{:bootstrap-reps :permutation-reps :min-samples
+             :practical-mean-threshold}
+           invalid-parameters))))
+
+(deftest same-population-statistics-rejects-boolean-stat-parameters
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts!
+               dir {:live-episodes (synthetic-episodes (repeat 40 1.0))
+                    :replay-episodes (synthetic-episodes (repeat 40 1.0))})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps true
+                       :permutation-reps true
+                       :min-samples true
+                       :practical-mean-threshold true))
+        invalid-parameters (set (map #(get-in % [:details :parameter])
+                                     (filter #(= :same-pop/invalid-parameter
+                                                 (:code %))
+                                             (get-in result
+                                                     [:readiness :issues]))))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (nil? (:manifest result)))
+    (is (nil? (:statistics result)))
+    (is (= #{:bootstrap-reps :permutation-reps :min-samples
+             :practical-mean-threshold}
+           invalid-parameters))))
+
+(deftest same-population-statistics-rejects-nonfinite-completed-pnl
+  (let [dir (tempfile/mkdtemp)
+        live-episodes (assoc-in (synthetic-episodes (repeat 40 1.0))
+                                [3 :gross-pnl]
+                                "nan")
+        paths (write-readiness-artifacts!
+               dir {:live-episodes live-episodes
+                    :replay-episodes (synthetic-episodes (repeat 40 1.0))})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 50
+                       :permutation-reps 50
+                       :min-samples 30))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (nil? (:manifest result)))
+    (is (nil? (:statistics result)))
+    (is (some #(and (= :same-pop/nonfinite-episode-pnl (:code %))
+                    (= "nan" (get-in % [:details :gross-pnl]))
+                    (= 4 (get-in % [:details :row-number])))
+              (get-in result [:readiness :issues])))))
+
+(deftest same-pop-readiness-blocks-impossible-completed-episode-timing
+  (let [dir (tempfile/mkdtemp)
+        base-episodes (synthetic-episodes (repeat 40 1.0))
+        negative-hold (-> base-episodes
+                          (assoc-in [0 :entry-time]
+                                    "2026-06-25T15:00:00Z")
+                          (assoc-in [0 :exit-time]
+                                    "2026-06-25T14:00:00Z"))
+        paths (write-readiness-artifacts!
+               dir {:live-episodes negative-hold
+                    :replay-episodes base-episodes})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 50
+                       :permutation-reps 50
+                       :min-samples 30))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (nil? (:manifest result)))
+    (is (nil? (:statistics result)))
+    (is (some #(and (= :same-pop/negative-episode-holding (:code %))
+                    (= 1 (get-in % [:details :row-number])))
+              (get-in result [:readiness :issues])))))
+
+(deftest same-pop-readiness-blocks-completed-episode-holding-mismatch
+  (let [dir (tempfile/mkdtemp)
+        base-episodes (synthetic-episodes (repeat 40 1.0))
+        bad-holding (assoc-in base-episodes [2 :holding-minutes] "999.0")
+        paths (write-readiness-artifacts!
+               dir {:live-episodes base-episodes
+                    :replay-episodes bad-holding})
+        result (analysis/same-pop-readiness paths)]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (some #(and (= :same-pop/episode-holding-mismatch (:code %))
+                    (= "replay" (get-in % [:details :side]))
+                    (= 3 (get-in % [:details :row-number])))
+              (:issues result)))))
+
+(deftest same-pop-readiness-blocks-unparseable-completed-episode-time
+  (let [dir (tempfile/mkdtemp)
+        base-episodes (synthetic-episodes (repeat 40 1.0))
+        bad-time (assoc-in base-episodes [4 :exit-time] "not-a-time")
+        paths (write-readiness-artifacts!
+               dir {:live-episodes bad-time
+                    :replay-episodes base-episodes})
+        result (analysis/same-pop-readiness paths)]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/blocked-data (:status result)))
+    (is (some #(and (= :same-pop/invalid-episode-time (:code %))
+                    (= "live" (get-in % [:details :side]))
+                    (= 5 (get-in % [:details :row-number])))
+              (:issues result)))))
+
+(deftest run-same-pop-stats-cli-exits-nonzero-on-small-sample-watch
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir [1.0 2.0 3.0] [1.0 2.0 3.0])
+        report-path (os.path/join dir "same_population_report.md")
+        manifest-path (os.path/join dir "same_population_manifest.edn")
+        cmd [".venv/bin/basilisp" "run" "scripts/run_same_pop_stats.lpy" "--"
+             "--live-tape" (:live-tape paths)
+             "--replay-tape" (:replay-tape paths)
+             "--live-episodes" (:live-episodes paths)
+             "--replay-episodes" (:replay-episodes paths)
+             "--calibration" (:calibration paths)
+             "--out" report-path
+             "--manifest-out" manifest-path
+             "--bootstrap-reps" "50"
+             "--permutation-reps" "50"
+             "--min-samples" "30"
+             "--practical-mean-threshold" "0.0"]
+        result (subprocess/run (python/list cmd)
+                               ** :capture_output true
+                                  :text true
+                                  :check false)]
+    (is (= 1 (.-returncode result)))
+    (is (not= -1 (.find (.-stdout result) ":same-pop/watch")))
+    (is (os.path/exists report-path))
+    (is (os.path/exists manifest-path))))
+
+(deftest same-pop-clis-reject-malformed-numeric-arguments-before-analysis
+  (let [dir (tempfile/mkdtemp)
+        missing (os.path/join dir "missing.csv")
+        report-path (os.path/join dir "same_population_report.md")
+        readiness-result
+        (subprocess/run
+         (python/list
+          [".venv/bin/basilisp" "run"
+           "scripts/validate_same_pop_readiness.lpy" "--"
+           "--live-tape" missing
+           "--replay-tape" missing
+           "--live-episodes" missing
+           "--replay-episodes" missing
+           "--calibration" missing
+           "--bucket-seconds" "1.5"])
+         ** :capture_output true
+            :text true
+            :check false)
+        stats-result
+        (subprocess/run
+         (python/list
+          [".venv/bin/basilisp" "run"
+           "scripts/run_same_pop_stats.lpy" "--"
+           "--live-tape" missing
+           "--replay-tape" missing
+           "--live-episodes" missing
+           "--replay-episodes" missing
+           "--calibration" missing
+           "--out" report-path
+           "--bootstrap-reps" "0"])
+         ** :capture_output true
+            :text true
+            :check false)
+        align-result
+        (subprocess/run
+         (python/list
+          [".venv/bin/basilisp" "run"
+           "scripts/align_behavior.lpy" "--"
+           "--live" missing
+           "--replay" missing
+           "--out" (os.path/join dir "alignment.md")
+           "--bucket-seconds" "nan"])
+         ** :capture_output true
+            :text true
+            :check false)]
+    (doseq [[result expected] [[readiness-result "invalid integer argument: 1.5"]
+                               [stats-result "invalid integer argument: 0"]
+                               [align-result "invalid integer argument: nan"]]]
+      (is (not= 0 (.-returncode result)))
+      (is (not= -1 (.find (str (.-stderr result) (.-stdout result))
+                          expected))
+          (str expected " in " (.-stderr result) (.-stdout result))))))
+
+(deftest same-pop-clis-reject-unknown-options-before-analysis
+  (let [cases [["scripts/validate_same_pop_readiness.lpy" "--liv-tape"]
+               ["scripts/run_same_pop_stats.lpy" "--manifestoutput"]
+               ["scripts/verify_same_pop_manifest.lpy" "--manfiest"]]]
+    (doseq [[script bad-flag] cases]
+      (let [result (subprocess/run
+                    (python/list
+                     [".venv/bin/basilisp" "run" script "--" bad-flag "x"])
+                    ** :capture_output true
+                       :text true
+                       :check false)
+            output (str (.-stderr result) (.-stdout result))]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find output (str "unknown argument: " bad-flag)))
+            (str script " should reject " bad-flag " before analysis: "
+                 output))))))
+
+(deftest same-pop-clis-reject-missing-option-values-before-analysis
+  (let [dir (tempfile/mkdtemp)
+        report-path (os.path/join dir "same_population_report.md")
+        manifest-path (os.path/join dir "same_population_manifest.edn")
+        cases [["scripts/validate_same_pop_readiness.lpy"
+                ["--live-tape" "live.csv"
+                 "--replay-tape" "replay.csv"
+                 "--live-episodes" "live_episodes.csv"
+                 "--replay-episodes" "replay_episodes.csv"
+                 "--calibration" "calibration.edn"
+                 "--bucket-seconds" "--out"]
+                "missing value for --bucket-seconds"]
+               ["scripts/run_same_pop_stats.lpy"
+                ["--live-tape" "live.csv"
+                 "--replay-tape" "replay.csv"
+                 "--live-episodes" "live_episodes.csv"
+                 "--replay-episodes" "replay_episodes.csv"
+                 "--calibration" "calibration.edn"
+                 "--out" "--bootstrap-reps"]
+                "missing value for --out"]
+               ["scripts/run_same_pop_stats.lpy"
+                ["--live-tape" "live.csv"
+                 "--replay-tape" "replay.csv"
+                 "--live-episodes" "live_episodes.csv"
+                 "--replay-episodes" "replay_episodes.csv"
+                 "--calibration" "calibration.edn"
+                 "--out" report-path
+                 "--manifest-out"]
+                "missing value for --manifest-out"]
+               ["scripts/verify_same_pop_manifest.lpy"
+                ["--manifest" "--out"]
+                "missing value for --manifest"]
+               ["scripts/verify_same_pop_manifest.lpy"
+                ["--manifest" manifest-path
+                 "--out"]
+                "missing value for --out"]]]
+    (doseq [[script args expected] cases]
+      (let [result (subprocess/run
+                    (python/list
+                     (concat [".venv/bin/basilisp" "run" script "--"] args))
+                    ** :capture_output true
+                       :text true
+                       :check false)
+            output (str (.-stderr result) (.-stdout result))]
+        (is (= 2 (.-returncode result))
+            (str script " should exit 2 for " expected ": " output))
+        (is (not= -1 (.find output expected))
+            (str script " should report " expected ": " output))))))
+
+(deftest run-same-pop-stats-cli-writes-verifiable-report-manifest
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        report-path (os.path/join dir "same_population_report.md")
+        manifest-path (os.path/join dir "same_population_manifest.edn")
+        cmd [".venv/bin/basilisp" "run" "scripts/run_same_pop_stats.lpy" "--"
+             "--live-tape" (:live-tape paths)
+             "--replay-tape" (:replay-tape paths)
+             "--live-episodes" (:live-episodes paths)
+             "--replay-episodes" (:replay-episodes paths)
+             "--calibration" (:calibration paths)
+             "--out" report-path
+             "--manifest-out" manifest-path
+             "--bootstrap-reps" "50"
+             "--permutation-reps" "50"
+             "--min-samples" "30"]
+        result (subprocess/run (python/list cmd)
+                               ** :capture_output true
+                                  :text true
+                                  :check false)
+        manifest (edn/read-string (slurp manifest-path))
+        verify-ok (subprocess/run
+                   (python/list
+                    [".venv/bin/basilisp" "run"
+                     "scripts/verify_same_pop_manifest.lpy" "--"
+                     "--manifest" manifest-path])
+                   ** :capture_output true
+                      :text true
+                      :check false)]
+    (is (= 0 (.-returncode result)))
+    (is (= (os.path/abspath report-path)
+           (get-in manifest [:artifacts :report :path])))
+    (is (not (contains? (:artifacts manifest) :report-out)))
+    (is (= 0 (.-returncode verify-ok)))
+    (os/remove (str (:live-tape paths) ".manifest.edn"))
+    (let [verify-missing-sidecar
+          (subprocess/run
+           (python/list
+            [".venv/bin/basilisp" "run"
+             "scripts/verify_same_pop_manifest.lpy" "--"
+             "--manifest" manifest-path])
+           ** :capture_output true
+              :text true
+              :check false)]
+      (is (= 1 (.-returncode verify-missing-sidecar)))
+      (is (not= -1 (.find (.-stdout verify-missing-sidecar)
+                          ":same-pop/missing-provenance-sidecar"))))
+    (spit report-path (str (slurp report-path) "\nmutated\n"))
+    (let [verify-mutated
+          (subprocess/run
+           (python/list
+            [".venv/bin/basilisp" "run"
+             "scripts/verify_same_pop_manifest.lpy" "--"
+             "--manifest" manifest-path])
+           ** :capture_output true
+              :text true
+              :check false)]
+      (is (= 1 (.-returncode verify-mutated)))
+      (is (not= -1 (.find (.-stdout verify-mutated)
+                          ":manifest/checksum-mismatch")))
+      (is (not= -1 (.find (.-stdout verify-mutated)
+                          ":report"))))))
+
+(deftest same-pop-clis-run-from-non-repo-cwd-with-real-artifacts
+  (let [dir (tempfile/mkdtemp)
+        cwd (tempfile/mkdtemp)
+        repo-root (os.path/abspath ".")
+        basilisp-bin (os.path/abspath ".venv/bin/basilisp")
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        readiness-path (os.path/join dir "same_population_readiness.edn")
+        report-path (os.path/join dir "same_population_report.md")
+        manifest-path (os.path/join dir "same_population_manifest.edn")
+        env (os.environ/copy)]
+    (.update env (python/dict {"STEVE_REPO_ROOT" repo-root}))
+    (let [readiness-result
+          (subprocess/run
+           (python/list
+            [basilisp-bin "run"
+             (os.path/join repo-root "scripts/validate_same_pop_readiness.lpy")
+             "--"
+             "--live-tape" (:live-tape paths)
+             "--replay-tape" (:replay-tape paths)
+             "--live-episodes" (:live-episodes paths)
+             "--replay-episodes" (:replay-episodes paths)
+             "--calibration" (:calibration paths)
+             "--out" readiness-path])
+           ** :capture_output true
+              :text true
+              :check false
+              :cwd cwd
+              :env env)
+          stats-result
+          (subprocess/run
+           (python/list
+            [basilisp-bin "run"
+             (os.path/join repo-root "scripts/run_same_pop_stats.lpy")
+             "--"
+             "--live-tape" (:live-tape paths)
+             "--replay-tape" (:replay-tape paths)
+             "--live-episodes" (:live-episodes paths)
+             "--replay-episodes" (:replay-episodes paths)
+             "--calibration" (:calibration paths)
+             "--out" report-path
+             "--manifest-out" manifest-path
+             "--bootstrap-reps" "50"
+             "--permutation-reps" "50"
+             "--min-samples" "30"])
+           ** :capture_output true
+              :text true
+              :check false
+              :cwd cwd
+              :env env)
+          verify-result
+          (subprocess/run
+           (python/list
+            [basilisp-bin "run"
+             (os.path/join repo-root "scripts/verify_same_pop_manifest.lpy")
+             "--"
+             "--manifest" manifest-path])
+           ** :capture_output true
+              :text true
+              :check false
+              :cwd cwd
+              :env env)
+          manifest (edn/read-string (slurp manifest-path))]
+      (is (= 0 (.-returncode readiness-result))
+          (str (.-stdout readiness-result) (.-stderr readiness-result)))
+      (is (= 0 (.-returncode stats-result))
+          (str (.-stdout stats-result) (.-stderr stats-result)))
+      (is (= 0 (.-returncode verify-result))
+          (str (.-stdout verify-result) (.-stderr verify-result)))
+      (is (os.path/exists readiness-path))
+      (is (os.path/exists report-path))
+      (is (os.path/exists manifest-path))
+      (is (not= "unknown" (:code/revision manifest)))
+      (is (= (os.path/abspath report-path)
+             (get-in manifest [:artifacts :report :path]))))))
+
+(deftest same-population-statistics-fails-material-underperformance
+  (let [dir (tempfile/mkdtemp)
+        live-pnls (repeat 40 -10.0)
+        replay-pnls (repeat 40 10.0)
+        paths (write-readiness-artifacts!
+               dir {:live-episodes (synthetic-episodes live-pnls)
+                    :replay-episodes (synthetic-episodes replay-pnls)})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 100
+                       :permutation-reps 100
+                       :min-samples 30
+                       :practical-mean-threshold 0.0))]
+    (is (false? (:valid? result)))
+    (is (= :same-pop/fail-performance (:status result)))
+    (is (= -20.0 (get-in result
+                         [:statistics :effect-sizes :mean-pnl-delta])))
+    (is (true? (get-in result
+                       [:statistics :decision :materially-worse?])))))
+
+(deftest run-same-pop-stats-cli-exits-nonzero-on-performance-failure
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 -10.0) (repeat 40 10.0))
+        report-path (os.path/join dir "same_population_report.md")
+        manifest-path (os.path/join dir "same_population_manifest.edn")
+        cmd [".venv/bin/basilisp" "run" "scripts/run_same_pop_stats.lpy" "--"
+             "--live-tape" (:live-tape paths)
+             "--replay-tape" (:replay-tape paths)
+             "--live-episodes" (:live-episodes paths)
+             "--replay-episodes" (:replay-episodes paths)
+             "--calibration" (:calibration paths)
+             "--out" report-path
+             "--manifest-out" manifest-path
+             "--bootstrap-reps" "50"
+             "--permutation-reps" "50"
+             "--min-samples" "30"
+             "--practical-mean-threshold" "0.0"]
+        result (subprocess/run (python/list cmd)
+                               ** :capture_output true
+                                  :text true
+                                  :check false)]
+    (is (= 1 (.-returncode result)))
+    (is (not= -1 (.find (.-stdout result) ":same-pop/fail-performance")))
+    (is (os.path/exists report-path))
+    (is (os.path/exists manifest-path))))
+
+(deftest written-same-pop-report-manifest-covers-report-output
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        report-path (os.path/join dir "same_population_report.md")
+        result (analysis/write-same-population-report!
+                (assoc paths
+                       :out report-path
+                       :bootstrap-reps 50
+                       :permutation-reps 50
+                       :min-samples 30))
+        verification (analysis/verify-same-pop-manifest (:manifest result))]
+    (is (true? (:valid? result)))
+    (is (os.path/exists report-path))
+    (is (= (os.path/abspath report-path)
+           (get-in result [:manifest :artifacts :report :path])))
+    (is (not (contains? (get-in result [:manifest :artifacts])
+                        :report-out)))
+    (is (not= nil (get-in result [:manifest :artifacts :report :sha256])))
+    (is (= :manifest/verified (:status verification)))))
+
+(deftest same-pop-manifest-verifier-fails-mutated-report-output
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        report-path (os.path/join dir "same_population_report.md")
+        result (analysis/write-same-population-report!
+                (assoc paths
+                       :out report-path
+                       :bootstrap-reps 50
+                       :permutation-reps 50
+                       :min-samples 30))]
+    (spit report-path (str (slurp report-path) "\nmutated\n"))
+    (let [verification (analysis/verify-same-pop-manifest (:manifest result))]
+      (is (= :manifest/failed (:status verification)))
+      (is (some #(and (= :manifest/checksum-mismatch (:code %))
+                      (= :report (get-in % [:details :artifact])))
+                (:issues verification))))))
+
+(deftest same-pop-manifest-verifier-fails-mutated-calibration-source
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 50
+                       :permutation-reps 50
+                       :min-samples 30))
+        conn (sqlite3/connect (os.path/join dir "facts.db"))]
+    (.execute conn
+              "UPDATE facts SET record = record || ' ' WHERE \"offset\" = 1")
+    (.commit conn)
+    (.close conn)
+    (let [verification (analysis/verify-same-pop-manifest (:manifest result))]
+      (is (= :manifest/failed (:status verification)))
+      (is (some #(= :same-pop/provenance-source-checksum-mismatch
+                    (:code %))
+                (:issues verification))))))
+
+(deftest same-population-report-renders-gate-failure-and-stats
+  (let [dir (tempfile/mkdtemp)
+        valid-paths (write-readiness-artifacts!
+                     dir {:live-episodes (synthetic-episodes [1.0 2.0 3.0])
+                          :replay-episodes (synthetic-episodes [1.0 2.0 3.0])})
+        valid-result (analysis/same-population-statistics
+                      (assoc valid-paths
+                             :bootstrap-reps 10
+                             :permutation-reps 10))
+        valid-report (analysis/same-population-report-md valid-result)
+        missing-result (analysis/same-population-statistics
+                        (assoc valid-paths
+                               :calibration
+                               (os.path/join dir "missing.edn")))
+        missing-report (analysis/same-population-report-md missing-result)]
+    (is (.startswith valid-report "# Same-Population Performance Report"))
+    (is (not= -1 (.find valid-report "## Manifest")))
+    (is (not= -1 (.find valid-report "code_revision")))
+    (is (not= -1 (.find valid-report "sha256=")))
+    (is (not= -1 (.find valid-report "## Tests")))
+    (is (not= -1 (.find missing-report "## Gate Failure")))))
+
+(deftest same-pop-manifest-schema-catches-parameter-drift
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths
+                       :bootstrap-reps 50
+                       :permutation-reps 60
+                       :min-samples 7
+                       :practical-mean-threshold 1.25))
+        manifest (:manifest result)
+        bad-reps (assoc-in manifest [:parameters :bootstrap-reps] 0)
+        bad-threshold (assoc-in manifest
+                                [:parameters :practical-mean-threshold]
+                                -0.01)]
+    (is (= 50 (get-in manifest [:parameters :bootstrap-reps])))
+    (is (= 60 (get-in manifest [:parameters :permutation-reps])))
+    (is (= 7 (get-in manifest [:parameters :min-samples])))
+    (is (= 1.25 (get-in manifest [:parameters :practical-mean-threshold])))
+    (is (= :same-population/performance-v1 (:manifest/kind manifest)))
+    (is (thrown? python/Exception
+                 (analysis/validate-artifact!
+                  :analysis/same-pop-manifest bad-reps)))
+    (is (thrown? python/Exception
+                 (analysis/validate-artifact!
+                  :analysis/same-pop-manifest bad-threshold)))))
+
+(deftest same-pop-manifest-checksums-detect-overwritten-artifacts
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result-a (analysis/same-population-statistics
+                  (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        digest-a (get-in result-a
+                         [:manifest :artifacts :live-episodes :sha256])
+        _ (spit (:live-episodes paths)
+                (str (slurp (:live-episodes paths)) "\n"))
+        result-b (analysis/same-population-statistics
+                  (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        digest-b (get-in result-b
+                         [:manifest :artifacts :live-episodes :sha256])]
+    (is (not= digest-a digest-b))
+    (is (= (os.path/abspath (:live-episodes paths))
+           (get-in result-b
+                   [:manifest :artifacts :live-episodes :path])))))
+
+(deftest same-pop-manifest-verifier-passes-current-artifacts
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        verification (analysis/verify-same-pop-manifest (:manifest result))]
+    (is (true? (:valid? verification)))
+    (is (= :manifest/verified (:status verification)))
+    (is (= 5 (:artifact-count verification)))
+    (is (empty? (:issues verification)))))
+
+(deftest same-pop-manifest-verifier-fails-overwritten-artifact
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        _ (spit (:replay-tape paths)
+                (str (slurp (:replay-tape paths)) "\n"))
+        verification (analysis/verify-same-pop-manifest (:manifest result))]
+    (is (false? (:valid? verification)))
+    (is (= :manifest/failed (:status verification)))
+    (is (some #(= :manifest/checksum-mismatch (:code %))
+              (:issues verification)))))
+
+(deftest same-pop-manifest-verifier-fails-missing-artifact
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        missing-path (os.path/join dir "missing-calibration.edn")
+        manifest (assoc-in (:manifest result)
+                           [:artifacts :calibration :path]
+                           missing-path)
+        verification (analysis/verify-same-pop-manifest manifest)]
+    (is (false? (:valid? verification)))
+    (is (= :manifest/failed (:status verification)))
+    (is (some #(= :manifest/missing-artifact (:code %))
+              (:issues verification)))))
+
+(deftest same-pop-manifest-verifier-rejects-artifact-outside-bundle
+  (let [dir (tempfile/mkdtemp)
+        outside (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        external-live-tape (os.path/join outside "live_tape.csv")
+        _ (spit external-live-tape (slurp (:live-tape paths)))
+        manifest (assoc-in (:manifest result)
+                           [:artifacts :live-tape]
+                           {:path external-live-tape
+                            :sha256 (analysis/artifact-sha256
+                                     external-live-tape)})
+        verification (analysis/verify-same-pop-manifest manifest)
+        codes (set (map :code (:issues verification)))]
+    (is (false? (:valid? verification)))
+    (is (= :manifest/failed (:status verification)))
+    (is (contains? codes :manifest/artifact-bundle-parent-mismatch))))
+
+(deftest same-pop-manifest-verifier-rejects-symlink-escape
+  (let [dir (tempfile/mkdtemp)
+        outside (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        original-live-tape (:live-tape paths)
+        external-live-tape (os.path/join outside "live_tape.csv")]
+    (spit external-live-tape (slurp original-live-tape))
+    (os/remove original-live-tape)
+    (os/symlink external-live-tape original-live-tape)
+    (let [manifest (assoc-in (:manifest result)
+                             [:artifacts :live-tape :sha256]
+                             (analysis/artifact-sha256 original-live-tape))
+          verification (analysis/verify-same-pop-manifest manifest)
+          codes (set (map :code (:issues verification)))]
+      (is (false? (:valid? verification)))
+      (is (= :manifest/failed (:status verification)))
+      (is (contains? codes :manifest/artifact-path-outside-bundle)))))
+
+(deftest deterministic-fuzz-same-pop-manifest-rejects-duplicate-artifact-roles
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)
+        artifact-keys [:live-tape :replay-tape :live-episodes
+                       :replay-episodes :calibration]]
+    (doseq [source-key artifact-keys
+            target-key artifact-keys
+            :when (not= source-key target-key)]
+      (let [forged (assoc-in manifest
+                             [:artifacts target-key]
+                             (get-in manifest [:artifacts source-key]))
+            verification (analysis/verify-same-pop-manifest forged)
+            duplicate-issues (filter #(= :manifest/duplicate-artifact-path
+                                         (:code %))
+                                     (:issues verification))]
+        (is (false? (:valid? verification))
+            (str "duplicate role should fail: " source-key " -> " target-key))
+        (is (= :manifest/failed (:status verification)))
+        (is (seq duplicate-issues)
+            (str "duplicate issue should be present for "
+                 source-key " -> " target-key))
+        (is (some #(= (set [source-key target-key])
+                      (set (get-in % [:details :artifacts])))
+                  duplicate-issues))))))
+
+(deftest same-pop-manifest-verifier-fails-invalid-shape
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        bad (update-in (:manifest result)
+                       [:artifacts :live-tape]
+                       dissoc :sha256)
+        verification (analysis/verify-same-pop-manifest bad)]
+    (is (false? (:valid? verification)))
+    (is (= :manifest/invalid (:status verification)))
+    (is (some #(= :manifest/invalid-shape (:code %))
+              (:issues verification)))))
+
+(deftest same-pop-manifest-verifier-rejects-malformed-nested-sections-cleanly
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)]
+    (doseq [[section forged-value] [[:artifacts "not-a-map"]
+                                    [:cohort ["not" "a" "map"]]
+                                    [:gates 42]
+                                    [:parameters false]]]
+      (let [verification (analysis/verify-same-pop-manifest
+                          (assoc manifest section forged-value))]
+        (is (false? (:valid? verification))
+            (str "section should fail: " section))
+        (is (= :manifest/invalid (:status verification)))
+        (is (some #(= :manifest/invalid-shape (:code %))
+                  (:issues verification)))))))
+
+(deftest same-pop-manifest-schema-rejects-malformed-artifact-digests
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)]
+    (doseq [bad-sha ["abc"
+                     (apply str (repeat 64 "A"))
+                     (apply str (repeat 64 "g"))
+                     1234]]
+      (let [forged (assoc-in manifest
+                             [:artifacts :live-tape :sha256]
+                             bad-sha)
+            verification (analysis/verify-same-pop-manifest forged)]
+        (is (false? (:valid? verification))
+            (str "bad sha should fail: " (pr-str bad-sha)))
+        (is (= :manifest/invalid (:status verification)))
+        (is (some #(= :manifest/invalid-shape (:code %))
+                  (:issues verification)))))))
+
+(deftest calibration-artifact-schema-rejects-malformed-source-digests
+  (let [artifact {:calibration/version 1
+                  :calibration/kind :sim-fill/calibration-v1
+                  :calibration/generated-at "2026-07-02T21:00:00Z"
+                  :source/facts-dbs ["facts.db"]
+                  :source/facts-fingerprints
+                  [{:path "facts.db"
+                    :sha256 (apply str (repeat 64 "0"))}]
+                  :matching/max-lag-seconds 90.0
+                  :estimator/prior-strength 20.0
+                  :input/option-fills 1
+                  :input/matched-fills 1
+                  :global {:n 1
+                           :conservative-price-improvement 0.0}
+                  :buckets []}]
+    (is (:valid? (analysis-schema/validation-result
+                  :analysis/calibration-artifact artifact)))
+    (doseq [bad-sha ["abc" (apply str (repeat 64 "Z")) false]]
+      (let [forged (assoc-in artifact
+                             [:source/facts-fingerprints 0 :sha256]
+                             bad-sha)
+            validation (analysis-schema/validation-result
+                        :analysis/calibration-artifact forged)]
+        (is (false? (:valid? validation))
+            (str "bad source sha should fail: " (pr-str bad-sha)))))))
+
+(deftest same-pop-manifest-verifier-rejects-extra-artifact-entry
+  (let [dir (tempfile/mkdtemp)
+        paths (write-readiness-artifacts! dir {})
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        extra-path (os.path/join dir "legacy-extra.txt")
+        _ (spit extra-path "legacy\n")
+        manifest (assoc-in (:manifest result)
+                           [:artifacts :legacy-extra]
+                           {:path extra-path
+                            :sha256 (analysis/artifact-sha256 extra-path)})
+        verification (analysis/verify-same-pop-manifest manifest)]
+    (is (false? (:valid? verification)))
+    (is (= :manifest/failed (:status verification)))
+    (is (some #(and (= :manifest/extra-artifact-entry (:code %))
+                    (= [:legacy-extra] (get-in % [:details :extra])))
+              (:issues verification)))))
+
+(deftest same-pop-manifest-verifier-rejects-extra-manifest-fields
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)
+        top-level (assoc manifest :legacy/status :looks-valid)
+        parameters (assoc-in manifest
+                             [:parameters :legacy-bootstrap-reps]
+                             10)
+        artifact-ref (assoc-in manifest
+                               [:artifacts :live-tape :legacy-size-bytes]
+                               1234)]
+    (doseq [[forged code field] [[top-level
+                                  :manifest/extra-top-level-keys
+                                  :legacy/status]
+                                 [parameters
+                                  :manifest/parameters-extra-keys
+                                  :legacy-bootstrap-reps]
+                                 [artifact-ref
+                                  :manifest/artifact-ref-extra-keys
+                                  :legacy-size-bytes]]]
+      (let [verification (analysis/verify-same-pop-manifest forged)]
+        (is (false? (:valid? verification)))
+        (is (= :manifest/failed (:status verification)))
+        (is (some #(and (= code (:code %))
+                        (= [field] (get-in % [:details :fields])))
+                  (:issues verification)))))))
+
+(deftest deterministic-fuzz-same-pop-manifest-extra-key-mutations-fail
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)
+        structural-cases [[[:legacy/fuzz-marker]
+                           :manifest/extra-top-level-keys]
+                          [[:cohort :legacy/fuzz-marker]
+                           :manifest/cohort-extra-keys]
+                          [[:gates :legacy/fuzz-marker]
+                           :manifest/gates-extra-keys]
+                          [[:parameters :legacy/fuzz-marker]
+                           :manifest/parameters-extra-keys]]
+        artifact-cases (mapv (fn [artifact-key]
+                               [[:artifacts artifact-key :legacy/fuzz-marker]
+                                :manifest/artifact-ref-extra-keys])
+                             [:live-tape :replay-tape :live-episodes
+                              :replay-episodes :calibration])
+        cases (concat structural-cases artifact-cases)]
+    (doseq [[mutation-path expected-code] cases]
+      (let [forged (assoc-in manifest mutation-path "forged-green")
+            field (last mutation-path)
+            verification (analysis/verify-same-pop-manifest forged)]
+        (is (false? (:valid? verification)))
+        (is (= :manifest/failed (:status verification)))
+        (is (some #(and (= expected-code (:code %))
+                        (= [field] (get-in % [:details :fields])))
+                  (:issues verification)))))))
+
+(deftest same-pop-manifest-verifier-rejects-semantic-forgery
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        wrong-kind (assoc (:manifest result)
+                          :manifest/kind :wrong/kind)
+        wrong-readiness (assoc-in (:manifest result)
+                                  [:gates :readiness-status]
+                                  :same-pop/watch)
+        wrong-alignment (assoc-in (:manifest result)
+                                  [:gates :alignment-status]
+                                  :alignment/review-mismatches)]
+    (doseq [manifest [wrong-kind wrong-readiness wrong-alignment]]
+      (let [verification (analysis/verify-same-pop-manifest manifest)]
+        (is (false? (:valid? verification)))
+        (is (= :manifest/invalid (:status verification)))
+        (is (some #(= :manifest/invalid-shape (:code %))
+                  (:issues verification)))))))
+
+(deftest same-pop-manifest-verifier-rejects-schema-valid-semantic-forgery
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)
+        forged-cohort (assoc-in manifest
+                                [:cohort :accounts]
+                                ["account/fake/schema-valid"])
+        forged-gates (assoc-in manifest
+                               [:gates :mismatch-count]
+                               42)]
+    (doseq [[manifest field] [[forged-cohort :cohort]
+                              [forged-gates :gates.mismatch-count]]]
+      (let [verification (analysis/verify-same-pop-manifest manifest)]
+        (is (false? (:valid? verification)))
+        (is (= :manifest/failed (:status verification)))
+        (is (some #(and (= :manifest/semantic-mismatch (:code %))
+                        (= field (get-in % [:details :field])))
+                  (:issues verification)))))))
+
+(deftest same-pop-manifest-verifier-rejects-impossible-generated-at
+  (let [dir (tempfile/mkdtemp)
+        paths (write-provenance-readiness-artifacts!
+               dir (repeat 40 1.0) (repeat 40 1.0))
+        result (analysis/same-population-statistics
+                (assoc paths :bootstrap-reps 10 :permutation-reps 10))
+        manifest (:manifest result)
+        future (assoc manifest :manifest/generated-at "2999-01-01T00:00:00Z")
+        malformed (assoc manifest :manifest/generated-at "not-a-timestamp")]
+    (doseq [[forged expected-code] [[future :manifest/generated-at-in-future]
+                                    [malformed
+                                     :manifest/generated-at-unparseable]]]
+      (let [verification (analysis/verify-same-pop-manifest forged)
+            codes (set (map :code (:issues verification)))]
+        (is (false? (:valid? verification)))
+        (is (= :manifest/failed (:status verification)))
+        (is (contains? codes expected-code))))))

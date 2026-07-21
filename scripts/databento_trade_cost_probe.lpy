@@ -1,0 +1,42 @@
+;; Read-only Databento metadata probe for trade-history cost boundaries.
+(import databento json os traceback)
+
+(def requests
+  [{"id" "glbx-es-options" "dataset" "GLBX.MDP3" "stype_in" "parent"
+    "symbols" ["ES.OPT"]}
+   {"id" "equs-mini" "dataset" "EQUS.MINI" "stype_in" "raw_symbol"
+    "symbols" ["SPY" "QQQ" "IWM" "AAPL" "MSFT" "NVDA" "AMD" "TSLA" "AMZN"
+               "META" "GOOGL" "NFLX" "AVGO" "PLTR" "XLF"]}
+   {"id" "glbx-futures" "dataset" "GLBX.MDP3" "stype_in" "parent"
+    "symbols" ["ES.FUT" "NQ.FUT" "RTY.FUT" "ZN.FUT" "ZB.FUT" "SR3.FUT"]}])
+
+(def windows
+  [["2025-06-01T00:00:00Z" "2025-07-01T00:00:00Z"]])
+
+(try
+  (let [key (os.environ/get "DATABENTO_API_KEY")
+        _ (when-not key (throw (python/RuntimeError "missing DATABENTO_API_KEY")))
+        historical (databento/Historical ** :key key)
+        results (python/list)]
+    (doseq [request requests [start end] windows]
+      (try
+        (let [cost (.get_cost (.-metadata historical)
+                              ** :schema "trades" :dataset (get request "dataset")
+                                 :symbols (python/list (get request "symbols"))
+                                 :stype_in (get request "stype_in") :start start :end end)
+              bytes (.get_billable_size (.-metadata historical)
+                                        ** :schema "trades" :dataset (get request "dataset")
+                                           :symbols (python/list (get request "symbols"))
+                                           :stype_in (get request "stype_in") :start start :end end)]
+          (.append results (python/dict
+                            [#py ("id" (get request "id")) #py ("start" start) #py ("end" end)
+                             #py ("quoted_cost_usd" (str cost)) #py ("billable_size_bytes" (int bytes))])))
+        (catch python/Exception error
+          (.append results (python/dict
+                            [#py ("id" (get request "id")) #py ("start" start) #py ("end" end)
+                             #py ("error" (str error))])))))
+    (println (json/dumps results ** :indent 2 :sort_keys true))
+    (python/exit 0))
+  (catch python/Exception error
+    (binding [*out* *err*] (println (str error "\n" (traceback/format_exc))))
+    (python/exit 3)))

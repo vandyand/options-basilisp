@@ -1,0 +1,154 @@
+;; Compare the deployed legacy feature engine with the native Basilisp port.
+;; This is a migration report, not live-vs-historical evidence.
+(import argparse csv datetime json math numpy os os.path sys)
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value)) (python/list (map ->jsonable value))
+    (python/isinstance value python/dict) (python/dict (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ value k))])) (.keys value)))
+    (python/isinstance value python/list) (python/list (map ->jsonable value))
+    :else value))
+
+(def csv-columns ["target_date" "feature" "feature_index" "status"
+                  "legacy_mean" "native_mean" "max_abs_deviation"
+                  "mean_abs_deviation" "p95_abs_deviation"
+                  "legacy_nonfinite_count" "native_nonfinite_count"
+                  "finite_mask_mismatch_count"])
+
+(defn read-npz [path]
+  (when-not (os.path/exists path)
+    (throw (python/ValueError (str "NPZ missing: " path))))
+  (let [payload (numpy/load path ** :allow_pickle true)]
+    (when-not (contains? (set (.-files payload)) "replay")
+      (throw (python/ValueError (str "NPZ missing replay array: " path))))
+    {"times" (if (contains? (set (.-files payload)) "times") (.__getitem__ payload "times") nil)
+     "replay" (numpy/asarray (.__getitem__ payload "replay") ** :dtype numpy/float64)}))
+
+(defn read-names [path]
+  (let [names (json/loads (slurp path))]
+    (when-not (python/isinstance names python/list)
+      (throw (python/ValueError "feature names must be a JSON list")))
+    (vec names)))
+
+(defn select-aligned [legacy native]
+  (let [legacy-values (get legacy "replay")
+        native-values (get native "replay")
+        legacy-times (get legacy "times")
+        native-times (get native "times")]
+    (when (not= (.__getitem__ (.-shape legacy-values) 1)
+                (.__getitem__ (.-shape native-values) 1))
+      (throw (python/ValueError "legacy/native feature counts differ")))
+    (if (and legacy-times native-times)
+      (let [native-index (into {} (map-indexed (fn [idx value] [(str value) idx]) native-times))
+            pairs (vec (keep-indexed (fn [idx value]
+                                       (when-let [native-idx (get native-index (str value))]
+                                         [idx native-idx]))
+                                     legacy-times))]
+        (when (empty? pairs)
+          (throw (python/ValueError "legacy/native replay tensors have no shared timestamps")))
+        [(numpy/vstack (python/list (map #(.__getitem__ legacy-values (first %)) pairs)))
+         (numpy/vstack (python/list (map #(.__getitem__ native-values (second %)) pairs)))
+         (vec (map #(str (.__getitem__ legacy-times (first %))) pairs))])
+      (do
+        (when (not= (.__getitem__ (.-shape legacy-values) 0)
+                    (.__getitem__ (.-shape native-values) 0))
+          (throw (python/ValueError "replay row counts differ and timestamps are unavailable")))
+        [legacy-values native-values []]))))
+
+(defn finite-or-zero-mean [values mask]
+  (let [selected (.__getitem__ values mask)]
+    (if (zero? (.-size selected)) 0.0 (float (numpy/mean selected)))))
+
+(defn feature-row [target-date names legacy native idx tolerance]
+  (let [left (.__getitem__ legacy #py ((slice nil nil) idx))
+        right (.__getitem__ native #py ((slice nil nil) idx))
+        left-finite (numpy/isfinite left)
+        right-finite (numpy/isfinite right)
+        both-finite (numpy/logical_and left-finite right-finite)
+        mask-mismatch (numpy/not_equal left-finite right-finite)
+        diffs (numpy/abs (- (.__getitem__ left both-finite) (.__getitem__ right both-finite)))
+        max-diff (if (zero? (.-size diffs)) 0.0 (float (numpy/max diffs)))
+        mean-diff (if (zero? (.-size diffs)) 0.0 (float (numpy/mean diffs)))
+        p95-diff (if (zero? (.-size diffs)) 0.0 (float (numpy/percentile diffs 95)))
+        finite-mask-mismatches (int (numpy/sum mask-mismatch))
+        status (if (and (zero? finite-mask-mismatches) (<= max-diff tolerance)) "EXACT_MATCH" "DIVERGED")]
+    {"target_date" target-date
+     "feature" (if (< idx (count names)) (nth names idx) (str "col_" idx))
+     "feature_index" idx
+     "status" status
+     "legacy_mean" (finite-or-zero-mean left left-finite)
+     "native_mean" (finite-or-zero-mean right right-finite)
+     "max_abs_deviation" max-diff
+     "mean_abs_deviation" mean-diff
+     "p95_abs_deviation" p95-diff
+     "legacy_nonfinite_count" (int (numpy/sum (numpy/logical_not left-finite)))
+     "native_nonfinite_count" (int (numpy/sum (numpy/logical_not right-finite)))
+     "finite_mask_mismatch_count" finite-mask-mismatches}))
+
+(defn write-csv! [path rows]
+  (with-open [fh (python/open path "w" ** :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer (python/dict (map (fn [column] (python/tuple [column (get row column)])) csv-columns)))))))
+
+(defn write-json! [path payload]
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn parser []
+  (let [p (argparse/ArgumentParser)]
+    (.add_argument p "--target-date" ** :required true)
+    (.add_argument p "--legacy-npz" ** :required true)
+    (.add_argument p "--native-npz" ** :required true)
+    (.add_argument p "--feature-names" ** :required true)
+    (.add_argument p "--out-dir" ** :required true)
+    (.add_argument p "--tolerance" ** :type float :default 0.0)
+    p))
+
+(defn main [& argv]
+  (let [argv0 (vec argv)
+        separator (first (keep-indexed (fn [idx value] (when (= value "--") idx)) argv0))
+        argv (if (some? separator) (subvec argv0 (inc separator)) argv0)
+        args (.parse_args (parser) (python/list argv))
+        target-date (.-target_date args)]
+    (try
+      (datetime.date/fromisoformat target-date)
+      (catch python/Exception _
+        (throw (python/ValueError "--target-date must be YYYY-MM-DD"))))
+    (let [[legacy native times] (select-aligned (read-npz (.-legacy_npz args)) (read-npz (.-native_npz args)))
+          names (read-names (.-feature_names args))
+          n-features (.__getitem__ (.-shape legacy) 1)
+          _ (when (not= n-features (count names))
+              (throw (python/ValueError "feature names count does not match replay tensor")))
+          rows (vec (map #(feature-row target-date names legacy native % (.-tolerance args)) (range n-features)))
+          diverged (vec (filter #(= "DIVERGED" (get % "status")) rows))
+          stamp (.replace target-date "-" "")
+          out-dir (.-out_dir args)
+          json-path (os.path/join out-dir (str "native_feature_migration_" stamp ".json"))
+          csv-path (os.path/join out-dir (str "native_feature_migration_" stamp ".csv"))
+          payload {"status" "ok"
+                   "target_date" target-date
+                   "generated_at" (.isoformat (datetime.datetime/now datetime.timezone/utc))
+                   "legacy_npz" (os.path/abspath (.-legacy_npz args))
+                   "native_npz" (os.path/abspath (.-native_npz args))
+                   "tolerance" (.-tolerance args)
+                   "summary" {"matched_rows" (.__getitem__ (.-shape legacy) 0)
+                              "feature_count" n-features
+                              "exact_match_count" (- n-features (count diverged))
+                              "diverged_feature_count" (count diverged)
+                              "max_abs_deviation" (if (seq rows) (apply max (map #(get % "max_abs_deviation") rows)) 0.0)}
+                   "matched_times" times
+                   "worst_features" (vec (take 50 (sort-by #(get % "max_abs_deviation") > diverged)))}]
+      (os/makedirs out-dir ** :exist_ok true)
+      (write-json! json-path payload)
+      (write-csv! csv-path rows)
+      (println (json/dumps (->jsonable (assoc (get payload "summary") "json_path" json-path "csv_path" csv-path)) ** :sort_keys true)))))
+
+(sys/exit
+ (try
+   (apply main (rest (.-argv sys)))
+   0
+   (catch python/Exception e
+     (binding [*out* *err*] (println (str e)))
+     1)))

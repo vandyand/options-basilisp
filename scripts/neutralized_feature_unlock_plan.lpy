@@ -1,0 +1,411 @@
+;; Read-only plan for unlocking currently neutralized Steve V2 features.
+(import csv datetime glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def default-ref
+  (or (os.environ/get "STEVE_REF_ROOT")
+      (let [vps-ref "/opt/stevetrading/shared/Data-Preprocessor"]
+        (if (os.path/isdir vps-ref)
+          vps-ref
+          (os.path/join (os.path/dirname repo-root) "SteveTrading/ref/Data-Preprocessor")))))
+(def default-accounts ["chestnut" "lynx" "moose"])
+(def stock-bar-prefixes #{"SPY" "HYG" "TLT" "VXX"})
+(def index-bar-prefixes #{"SPX" "VIX" "TNX"})
+(def stock-bar-suffixes
+  #{"price_open" "price_high" "price_low" "price_close"
+    "bid_open" "bid_high" "bid_low" "bid_close" "bid_avg" "bid_count" "bid_tot"
+    "ask_open" "ask_high" "ask_low" "ask_close" "ask_avg" "ask_count" "ask_tot"
+    "trade_avg" "trade_count" "trade_tot"
+    "sma_close_10" "ema_close_9" "ema_close_21" "rsi_14"
+    "bb_upper_20" "bb_lower_20" "bb_bandwidth_20" "cci_20" "adx_14"
+    "plus_di_14" "minus_di_14" "wt1_10_21" "wt2_10_21"
+    "vwap" "spread_relative" "spread_raw"})
+(def index-bar-suffixes
+  #{"price_open" "price_high" "price_low" "price_close"
+    "sma_close_10" "ema_close_9" "ema_close_21" "rsi_14"
+    "bb_upper_20" "bb_lower_20" "bb_bandwidth_20" "cci_20" "adx_14"
+    "plus_di_14" "minus_di_14" "wt1_10_21" "wt2_10_21"})
+(def supported-option-prefixes #{"SPY" "SPX" "VIX" "VIXW"})
+(def supported-greek-prefixes #{"SPY" "SPX" "SPXW" "VIX" "VIXW"})
+(def supported-option-suffixes
+  #{"atm_call_midprice" "atm_call_spread" "atm_call_spread_squared" "atm_implied_vol"
+    "atm_put_midprice" "atm_put_spread" "avg_midprice" "bid_ask_imbalance"
+    "butterfly_spread" "butterfly_times_volume" "call_volume_skew" "contract_count"
+    "dte_minutes" "dte_times_iv" "iv_squared" "iv_times_spread" "moneyness"
+    "moneyness_squared" "moneyness_times_iv" "near_far_put_ratio"
+    "otm_call_midprice" "otm_put_midprice" "put_call_midprice_ratio"
+    "put_call_parity_deviation" "put_call_spread_ratio" "put_call_volume_ratio"
+    "put_volume_skew" "skew_proxy" "skew_squared" "skew_times_term_structure"
+    "spread_ratio_squared" "spread_ratio_times_volume" "spread_skew" "spread_std"
+    "spread_times_volume" "term_structure_slope" "term_structure_squared"
+    "total_options_volume" "volume_concentration" "volume_concentration_times_skew"
+    "volume_ratio_squared" "volume_ratio_times_iv" "volume_times_skew"
+    "volume_weighted_dte" "volume_weighted_moneyness"})
+(def supported-greek-suffixes
+  #{"atm_call_delta" "atm_call_iv" "atm_call_theta" "atm_call_vega"
+    "atm_put_delta" "atm_put_iv" "atm_put_theta" "atm_put_vega"
+    "butterfly_times_skew" "delta_squared" "delta_std" "delta_times_iv"
+    "delta_vw_mean" "dollar_gamma_proxy" "iv_25d_spread" "iv_butterfly"
+    "iv_cubed" "iv_mean" "iv_range" "iv_skew_greeks" "iv_skew_squared"
+    "iv_skew_stat" "iv_squared" "iv_std" "iv_std_times_skew"
+    "near_far_iv_spread" "near_far_times_iv" "otm_call_iv" "otm_put_iv"
+    "put_call_iv_spread" "rho_mean" "rho_times_delta" "theta_delta_ratio"
+    "theta_mean" "theta_squared" "theta_times_iv" "theta_vega_ratio" "theta_vw"
+    "vega_concentration" "vega_delta_ratio" "vega_mean" "vega_squared"
+    "vega_theta_product"})
+(def reconstructable-greek-suffixes
+  #{"dollar_delta" "dollar_vega" "epsilon_exposure" "epsilon_mean"
+    "epsilon_times_delta" "lambda_mean" "lambda_times_iv" "lambda_weighted"
+    "rho_exposure" "skew_times_volume" "theta_exposure_ratio"
+    "vega_total_exposure"})
+(def supported-v2-grid-features
+  #{"vix_proxy" "vix_term_slope" "put_call_ratio" "vix_momentum_5" "vix_momentum_20"})
+(def v2-engine-replay-features
+  #{"realized_vol_20" "realized_vol_60" "vol_ratio" "hmm_state_0" "hmm_state_1" "hmm_state_2"})
+(def candidate-sources
+  #{"bar_buffer_replay" "option_chain_quote_formula" "option_surface_greek_grid_formula"
+    "option_surface_formula" "spy_greek_grid_formula" "v2_engine_replay" "v2_grid_formula"})
+(def greek-reconstruction-source "greek_reconstruction_candidate_formula")
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/neutralized_feature_unlock_plan.lpy -- "
+                "[--ref-root DIR] [--bundle DIR] [--accounts A ...] "
+                "[--bundle-suffix SUFFIX] [--usage-json PATH] [--out-dir DIR] "
+                "[--label LABEL] [--target-date YYYY-MM-DD]")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn values-until-option [remaining arg]
+  (let [values (vec (take-while #(not (.startswith (str %) "--")) (rest remaining)))]
+    (when (empty? values)
+      (throw (python/ValueError (str "missing value for " arg))))
+    values))
+
+(defn valid-target-date [value]
+  (let [s (str value)]
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError "expected YYYY-MM-DD calendar date"))))
+    s))
+
+(defn label-for [opts]
+  (or (:label opts)
+      (when-let [target-date (:target-date opts)]
+        (.replace (str target-date) "-" ""))
+      "current"))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+	         out {:ref-root default-ref
+	              :accounts default-accounts
+	              :bundle-suffix "_corrected"
+	              :out-dir (os.path/join repo-root "live_runtime/analysis")}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--ref-root") (recur (nnext remaining) (assoc out :ref-root (option-value remaining arg)))
+          (= arg "--bundle") (recur (nnext remaining) (assoc out :bundle (option-value remaining arg)))
+          (= arg "--bundle-suffix") (recur (nnext remaining) (assoc out :bundle-suffix (option-value remaining arg)))
+          (= arg "--usage-json") (recur (nnext remaining) (assoc out :usage-json (option-value remaining arg)))
+          (= arg "--out-dir") (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+          (= arg "--label") (recur (nnext remaining) (assoc out :label (option-value remaining arg)))
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (valid-target-date (option-value remaining arg))))
+          (= arg "--accounts") (let [values (values-until-option remaining arg)]
+                                  (recur (drop (inc (count values)) remaining)
+                                         (assoc out :accounts values)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn require-string-list [value label path]
+  (when-not (and (vector? value) (every? #(and (string? %) (pos? (count %))) value))
+    (throw (python/RuntimeError (str label " must be a non-empty string list: " path))))
+  (when (not= (count value) (count (set value)))
+    (throw (python/RuntimeError (str label " has duplicate names: " path))))
+  value)
+
+(defn load-bundle-inventory [bundle label]
+  (let [feature-path (os.path/join bundle "feature_names.json")
+        neutralized-path (os.path/join bundle "neutralize_features.json")]
+    (when-not (os.path/exists feature-path)
+      (throw (python/RuntimeError (str "missing feature_names.json for " label ": " feature-path))))
+    (when-not (os.path/exists neutralized-path)
+      (throw (python/RuntimeError (str "missing neutralize_features.json for " label ": " neutralized-path))))
+    (let [features (require-string-list (vec (fp/read-json feature-path)) "feature_names.json" feature-path)
+          neutralized (require-string-list (vec (fp/read-json neutralized-path)) "neutralize_features.json" neutralized-path)
+          unknown (vec (sort (remove (set features) neutralized)))]
+      (when (seq unknown)
+        (throw (python/RuntimeError
+                (str "neutralize_features.json contains names absent from feature_names.json for "
+                     label ": " (vec (take 20 unknown))))))
+      [features neutralized])))
+
+(defn account-bundle [ref-root account suffix]
+  (os.path/join ref-root "pipeline_data" (str "live_model_" account "_multihead" suffix)))
+
+(defn validate-default-account-alignment [ref-root accounts suffix]
+  (when (empty? accounts)
+    (throw (python/RuntimeError "--accounts must include at least one account when --bundle is not provided")))
+  (let [features-by (atom {})
+        neutralized-by (atom {})]
+    (doseq [account accounts]
+      (let [[features neutralized] (load-bundle-inventory (account-bundle ref-root account suffix)
+                                                          (str "account " account))]
+        (swap! features-by assoc account features)
+        (swap! neutralized-by assoc account neutralized)))
+    (let [anchor (first accounts)
+          anchor-features (get @features-by anchor)
+          anchor-neutralized (set (get @neutralized-by anchor))
+          drifts (atom [])]
+      (doseq [account (rest accounts)]
+        (when (not= (get @features-by account) anchor-features)
+          (swap! drifts conj {"account" account "kind" "feature_names_order" "expected_account" anchor}))
+        (let [current (set (get @neutralized-by account))]
+          (when (not= current anchor-neutralized)
+            (swap! drifts conj {"account" account
+                                "kind" "neutralize_features_set"
+                                "missing_from_account" (vec (take 20 (sort (remove current anchor-neutralized))))
+                                "extra_in_account" (vec (take 20 (sort (remove anchor-neutralized current))))}))))
+      (when (seq @drifts)
+        (throw (python/RuntimeError (str "default account neutralization bundles are not aligned: " @drifts))))
+      {"accounts" accounts
+       "bundle_suffix" suffix
+       "feature_count" (count anchor-features)
+       "neutralized_count" (count anchor-neutralized)
+       "aligned" true})))
+
+(defn load-usage [path]
+  (if (or (nil? path) (not (os.path/exists path)))
+    [{} {} {"usage_available" false "usage_path" path "usage_feature_rows" 0}]
+    (let [payload (fp/read-json path)
+          gain (atom {})
+          splits (atom {})
+          rows (get payload "features" [])]
+      (doseq [row rows]
+        (let [feature (get row "feature")]
+          (when feature
+            (swap! gain update feature (fnil + 0.0) (float (or (get row "total_gain") 0.0)))
+            (swap! splits update feature (fnil + 0) (int (float (or (get row "split_count") 0)))))))
+      [@gain @splits {"usage_available" true
+                      "usage_path" path
+                      "usage_feature_rows" (count rows)
+                      "usage_target_date" (get payload "target_date")}])))
+
+(defn split-prefix-suffix [name]
+  (let [[prefix suffix] (.split name "_" 1)]
+    [prefix (or suffix "")]))
+
+(defn supported-option-feature? [name]
+  (let [[prefix suffix] (split-prefix-suffix name)]
+    (and (contains? supported-option-prefixes prefix)
+         (.startswith suffix "opt_")
+         (contains? supported-option-suffixes (subs suffix 4)))))
+
+(defn supported-greek-feature? [name]
+  (let [[prefix suffix] (split-prefix-suffix name)]
+    (and (contains? supported-greek-prefixes prefix)
+         (.startswith suffix "greeks_")
+         (contains? supported-greek-suffixes (subs suffix 7)))))
+
+(defn reconstructable-greek-feature? [name]
+  (let [[prefix suffix] (split-prefix-suffix name)]
+    (and (contains? supported-greek-prefixes prefix)
+         (.startswith suffix "greeks_")
+         (contains? reconstructable-greek-suffixes (subs suffix 7)))))
+
+(defn classify-requirement [name]
+  (let [[prefix suffix] (split-prefix-suffix name)
+        family (fp/feature-family name)]
+    (cond
+      (supported-option-feature? name)
+      (if (= prefix "SPY")
+        ["awaiting-market-evidence" "option_chain_quote_formula" "SPY option_chain_json with bid/ask, sizes, volume, expirations"]
+        ["awaiting-market-evidence" "option_surface_formula" (str prefix " sidecar option_surfaces_json with bid/ask, sizes, volume, expirations")])
+
+      (supported-greek-feature? name)
+      (if (= prefix "SPY")
+        ["awaiting-market-evidence" "spy_greek_grid_formula" "SPY greeks grids from ThetaData/options_fetcher"]
+        ["awaiting-market-evidence" "option_surface_greek_grid_formula" (str prefix " sidecar option_surfaces_json sufficient to derive IV/greeks grid")])
+
+      (reconstructable-greek-feature? name)
+      ["awaiting-market-evidence" greek-reconstruction-source
+       "guarded Greek reconstruction formula; requires market-hours capture plus promotion gate before unmasking"]
+
+      (contains? supported-v2-grid-features name)
+      ["awaiting-market-evidence" "v2_grid_formula" "SPY greeks grid history"]
+
+      (contains? v2-engine-replay-features name)
+      ["awaiting-market-evidence" "v2_engine_replay" "SPY bar_buffers_json plus optional HMM bundle"]
+
+      (and (contains? stock-bar-prefixes prefix) (contains? stock-bar-suffixes suffix))
+      ["awaiting-market-evidence" "bar_buffer_replay" (str prefix " bar_buffers_json with OHLCV, quote/trade-count fields")]
+
+      (and (contains? index-bar-prefixes prefix) (contains? index-bar-suffixes suffix))
+      ["awaiting-market-evidence" "bar_buffer_replay" (str prefix " bar_buffers_json; currently live proxy-derived, audit must confirm semantics")]
+
+      (= family "v3-grid")
+      ["awaiting-market-evidence" "v3_grid_unlock_audit" "separate v3_grid_unlock_audit.lpy over captured greeks grid history"]
+
+      :else
+      ["needs-investigation" "unknown" "no trusted live/backtest-equivalent source mapped yet"])))
+
+(defn blocked-details [source]
+  (case source
+    "bar_buffer_replay"
+    ["market-hours capture-v2 bar_buffers_json must prove live replay semantics match the training feature"
+     "Run collect_market_evidence.sh during market hours; require capture_v2_sidecar_check PASS plus grid/matched parity before unmasking."]
+    "option_chain_quote_formula"
+    ["market-hours SPY option_chain_json must contain enough bid/ask/size/volume/expiration data to reproduce the training feature"
+     "Run collect_market_evidence.sh during market hours; require capture_v2_sidecar_check PASS and matched_feature_parity rows >= 60 with zero problem features."]
+    "option_surface_formula"
+    ["market-hours option_surfaces_json must contain the requested index/volatility surface contracts and quote fields"
+     "Run collect_market_evidence.sh with SPX/SPXW/VIX/VIXW surfaces; require capture_v2_sidecar_check to include required prefixes and matched parity to pass."]
+    "option_surface_greek_grid_formula"
+    ["market-hours option_surfaces_json must support IV/Greek grid reconstruction for this prefix"
+     "Run Greek reconstruction promotion and grid input parity after same-day ThetaData surface capture; require promotion gate coverage_ok and matched parity pass."]
+    "spy_greek_grid_formula"
+    ["market-hours SPY option chain must support IV/Greek grid reconstruction"
+     "Run Greek reconstruction promotion and grid input parity after same-day ThetaData capture; require promotion gate coverage_ok and matched parity pass."]
+    "greek_reconstruction_candidate_formula"
+    ["guarded Greek reconstruction formula exists but must be promoted only after same-day market capture proves coverage and parity"
+     "Run greek_reconstruction_promotion_gate.lpy during market evidence collection; require capture_ok, coverage_ok, and matched parity pass."]
+    "v2_engine_replay"
+    ["engine replay support exists, but same-day replayed cohort must match captured model inputs before unmasking"
+     "Run replay_captured_feature_cohort.lpy and matched_feature_parity_report.lpy on same-day capture; require matched rows >= 60 and zero problem features."]
+    "v2_grid_formula"
+    ["SPY Greeks grid-history feature needs same-day grid history parity evidence"
+     "Run grid_feature_input_parity.lpy after ThetaData historical cohort generation; require grid history sequence and matched parity pass."]
+    "v3_grid_unlock_audit"
+    ["V3 grid feature requires captured Greek grid-history audit before unmasking"
+     "Run v3_grid_unlock_audit.lpy on fresh capture-v2 sidecars; require candidate_count > 0 and prediction-delta gate within tolerance."]
+    "unsupported_greeks_exposure"
+    ["manifest-only/passthrough registration is not formula provenance"
+     "Find legacy training/cache code or archived per-feature training values for dollar/lambda/epsilon/exposure/volume greek semantics; then validate a live formula against market-hours capture-v2 sidecars before unmasking."]
+    "unknown"
+    ["no trusted live/backtest-equivalent source mapped"
+     "Trace feature generation provenance, then add a replay/formula audit gate."]
+    ["" ""]))
+
+(defn validate-awaiting-sources [rows]
+  (let [allowed (conj candidate-sources greek-reconstruction-source "v3_grid_unlock_audit")
+        bad (vec (sort (set (map #(get % "source_note")
+                                 (filter #(and (= (get % "unlock_status") "awaiting-market-evidence")
+                                               (not (contains? allowed (get % "source_note"))))
+                                         rows)))))]
+    (when (seq bad)
+      (throw (python/RuntimeError (str "awaiting-market-evidence source(s) are not backed by evidence gates: " bad))))))
+
+(defn write-csv [path rows]
+  (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+  (let [fields ["feature" "family" "unlock_status" "source_note" "requirement"
+                "blocker" "next_evidence" "model_gain" "model_split_count"]]
+    (with-open [fh (open (str path) ** :mode "w" :newline "")]
+      (let [writer (csv/DictWriter fh ** :fieldnames (python/list fields))]
+        (.writeheader writer)
+        (doseq [row rows]
+          (.writerow writer (python/dict (map (fn [k] (python/tuple [k (get row k "")])) fields))))))))
+
+(defn markdown [summary rows]
+  (str "# Neutralized Feature Unlock Plan\n\n"
+       "This is read-only planning output. It is not an unmask candidate list; "
+       "`raw_feature_unlock_audit.lpy` must still pass on fresh market-hours capture-v2 evidence.\n\n"
+       "- Neutralized total: `" (get summary "neutralized_total") "`\n"
+       "- Awaiting market evidence: `" (get summary "awaiting_market_evidence") "`\n"
+       "- Needs new implementation/data/formula work: `" (get summary "needs_new_work") "`\n\n"
+       "## Status Counts\n\n"
+       (fp/md-table (vec (concat [["Status" "Count"]] (map (fn [[k v]] [k v]) (get summary "status_counts"))))) "\n\n"
+       "## Source Counts\n\n"
+       (fp/md-table (vec (concat [["Source" "Count"]] (map (fn [[k v]] [k v]) (get summary "source_counts"))))) "\n\n"
+       "## Family Counts\n\n"
+       (fp/md-table (vec (concat [["Family" "Count"]] (map (fn [[k v]] [k v]) (get summary "family_counts"))))) "\n\n"
+       "## Top Blockers\n\n"
+       (fp/md-table
+        (vec (concat [["Status" "Source" "Family" "Feature" "Blocker" "Next Evidence"]]
+                     (map (fn [row]
+                            [(get row "unlock_status") (get row "source_note") (get row "family")
+                             (str "`" (get row "feature") "`") (get row "blocker") (get row "next_evidence")])
+                          (take 40 (filter #(not= (get % "unlock_status") "awaiting-market-evidence") rows))))))))
+
+(defn sorted-counts [values]
+  (into {} (sort (frequencies values))))
+
+(defn run-main [opts]
+  (let [ref-root (:ref-root opts)
+        [bundle alignment] (if (:bundle opts)
+                             [(:bundle opts) nil]
+                             (let [alignment (validate-default-account-alignment ref-root (:accounts opts) (:bundle-suffix opts))]
+                               [(account-bundle ref-root (first (:accounts opts)) (:bundle-suffix opts)) alignment]))
+        [features neutralized-values] (load-bundle-inventory bundle (str bundle))
+        neutralized (set neutralized-values)
+        [gain splits usage-meta] (load-usage (:usage-json opts))
+        rows (atom [])]
+    (doseq [feature features]
+      (when (contains? neutralized feature)
+        (let [[status source requirement] (classify-requirement feature)
+              [blocker next-evidence] (blocked-details source)]
+          (swap! rows conj {"feature" feature
+                            "family" (fp/feature-family feature)
+                            "unlock_status" status
+                            "source_note" source
+                            "requirement" requirement
+                            "blocker" blocker
+                            "next_evidence" next-evidence
+                            "model_gain" (float (get gain feature 0.0))
+                            "model_split_count" (int (get splits feature 0))}))))
+    (validate-awaiting-sources @rows)
+    (let [sorted-rows (vec (sort-by (fn [row]
+                                      [(not= (get row "unlock_status") "awaiting-market-evidence")
+                                       (- (float (get row "model_gain")))
+                                       (get row "feature")])
+                                    @rows))
+          status-counts (sorted-counts (map #(get % "unlock_status") sorted-rows))
+          source-counts (sorted-counts (map #(get % "source_note") sorted-rows))
+          family-counts (sorted-counts (map #(get % "family") sorted-rows))
+          blocked (filter #(not= (get % "unlock_status") "awaiting-market-evidence") sorted-rows)
+          summary (merge {"generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                          "target_date" (:target-date opts)
+                          "bundle" bundle
+                          "account_alignment" alignment
+                          "neutralized_total" (count sorted-rows)
+                          "awaiting_market_evidence" (get status-counts "awaiting-market-evidence" 0)
+                          "needs_new_work" (- (count sorted-rows) (get status-counts "awaiting-market-evidence" 0))
+                          "needs_new_work_model_gain" (float (reduce + (map #(float (get % "model_gain")) blocked)))
+                          "needs_new_work_model_split_count" (int (reduce + (map #(int (get % "model_split_count")) blocked)))
+                          "status_counts" status-counts
+                          "source_counts" source-counts
+                          "family_counts" family-counts}
+                         usage-meta)
+	          out-base (os.path/join (:out-dir opts) (str "neutralized_feature_unlock_plan_" (label-for opts)))
+          csv-path (str out-base ".csv")
+          json-path (str out-base ".json")
+          md-path (str out-base ".md")]
+      (os/makedirs (:out-dir opts) ** :exist_ok true)
+      (fp/clear-artifacts! [csv-path json-path md-path])
+      (write-csv csv-path sorted-rows)
+      (spit json-path (json/dumps (fp/->jsonable {"summary" summary "features" sorted-rows}) ** :indent 2 :sort_keys true))
+      (spit md-path (markdown summary sorted-rows))
+      (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+      (println (str "wrote " md-path))
+      (println (str "wrote " csv-path))
+      (println (str "wrote " json-path))
+      0)))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

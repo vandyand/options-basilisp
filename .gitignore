@@ -16,6 +16,7 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+*.egg-info/
 
 # Editor and OS noise
 .DS_Store
@@ -34,3 +35,10 @@ pipeline_data
 # Local operator/provisioner state
 .hetzner/
 uv.lock
+
+# Generated/vendor market-data evidence is retained locally, never published.
+/projects/ops/evidence/
+/resources/thetadata/payload_examples/
+
+# Accidental redirected test output.
+/utc-normalization

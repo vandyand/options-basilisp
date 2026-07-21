@@ -163,12 +163,18 @@
                       rights (.get doc "right")
                       bids (.get doc "bid")
                       asks (.get doc "ask")
+                      bid-sizes (.get doc "bid_size")
+                      ask-sizes (.get doc "ask_size")
                       n (python/len strikes)]
                   (map (fn [i]
                          {:strike (.__getitem__ strikes i)
                           :right (str (.__getitem__ rights i))
                           :bid (let [b (.__getitem__ bids i)] (if (nil? b) 0.0 (double b)))
                           :ask (let [a (.__getitem__ asks i)] (if (nil? a) 0.0 (double a)))
+                          :bid_size (let [s (when (some? bid-sizes) (.__getitem__ bid-sizes i))]
+                                      (when (some? s) (double s)))
+                          :ask_size (let [s (when (some? ask-sizes) (.__getitem__ ask-sizes i))]
+                                      (when (some? s) (double s)))
                           :expiration exp})
                        (range n))))
               exps))]

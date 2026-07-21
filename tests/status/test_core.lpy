@@ -1,0 +1,2269 @@
+(ns status.test-core
+  (:import datetime json os os.path sqlite3 tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.reporting.artifact-audit :as report-artifacts]
+            [stevetrading.status.core :as status]))
+
+(def et status/et)
+(def utc datetime.timezone/utc)
+(def original-analysis-dir (os.environ/pop "ANALYSIS_DIR" nil))
+
+(deftest strategy-status-marks-stale-during-market-hours
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        session (status/session-state now)
+        [state detail age] (status/strategy-status
+                            now
+                            session
+                            {:last-at (.astimezone (- now (datetime/timedelta ** :minutes 45)) utc)
+                             :counts {}
+                             :stale-minutes 15
+                             :source "test"})]
+    (is (= "bad" state))
+    (is (>= (.find detail "stale") 0))
+    (is (= 45.0 age))))
+
+(deftest session-state-marks-july-3-2026-observed-holiday-closed
+  (let [session (status/session-state (datetime/datetime 2026 7 3 10 0 0 0 et))]
+    (is (false? (get session "is_trading_day")))
+    (is (false? (get session "is_market_hours")))
+    (is (= "market-closed-holiday-or-weekend" (get session "label")))))
+
+(deftest session-state-uses-nyse-early-close-time
+  (let [open-session (status/session-state (datetime/datetime 2026 11 27 12 30 0 0 et))
+        closed-session (status/session-state (datetime/datetime 2026 11 27 14 0 0 0 et))]
+    (is (true? (get open-session "is_trading_day")))
+    (is (true? (get open-session "is_early_close")))
+    (is (= "early-close" (get open-session "session_kind")))
+    (is (= "2026-11-27T13:00-05:00" (get open-session "close_at")))
+    (is (= "market-open" (get open-session "label")))
+    (is (= "post-market" (get closed-session "label")))
+    (is (false? (get closed-session "is_market_hours")))))
+
+(deftest target-session-now-treats-past-date-as-completed-session
+  (let [generated-now (datetime/datetime 2026 7 5 4 0 0 0 et)
+        session-now (status/target-session-now (datetime/date 2026 7 2) generated-now)]
+    (is (= "2026-07-02T17:00:00-04:00" (.isoformat session-now ** :timespec "seconds")))))
+
+(deftest theta-remote-health-requires-successful-http-200-body
+  (is (= {:healthy? true :http-status "200" :body "{\"response\":[]}"}
+         (status/theta-remote-health 0 "{\"response\":[]}\n200")))
+  (is (false? (:healthy? (status/theta-remote-health 0 "<html>not found</html>\n404"))))
+  (is (false? (:healthy? (status/theta-remote-health 22 "curl: (22) failed\n404"))))
+  (is (false? (:healthy? (status/theta-remote-health 0 "{\"error\":\"down\"}\n200"))))
+  (is (false? (:healthy? (status/theta-remote-health 0 "\n200")))))
+
+(deftest active-always-systemd-timers-fail-closed-when-inactive
+  (let [session (status/session-state (datetime/datetime 2026 7 2 10 0 0 0 et))]
+    (with-redefs [status/run-cmd (fn [_cmd _timeout] [3 "inactive"])]
+      (let [row (status/systemctl-status "stevetrading-market-evidence-collect.timer"
+                                         {:remote nil
+                                          :expected "active always"
+                                          :session session})]
+        (is (= "bad" (get row "status")))
+        (is (>= (.find (get row "detail") "inactive") 0))))))
+
+(deftest scheduled-oneshot-systemd-services-surface-failed-last-runs
+  (let [session (status/session-state (datetime/datetime 2026 7 2 10 0 0 0 et))
+        expected "inactive unless scheduled; last run must not be failed"]
+    (with-redefs [status/run-cmd (fn [_cmd _timeout] [3 "inactive"])]
+      (let [row (status/systemctl-status "stevetrading-market-evidence-collect.service"
+                                         {:remote nil
+                                          :expected expected
+                                          :session session})]
+        (is (= "ok" (get row "status")))
+        (is (>= (.find (get row "detail") "last run not failed") 0))))
+    (with-redefs [status/run-cmd (fn [_cmd _timeout] [3 "failed"])]
+      (let [row (status/systemctl-status "stevetrading-market-evidence-collect.service"
+                                         {:remote nil
+                                          :expected expected
+                                          :session session})]
+        (is (= "bad" (get row "status")))
+        (is (>= (.find (get row "detail") "failed last run") 0))))))
+
+(deftest strategy-status-allows-idle-outside-market-hours
+  (let [now (datetime/datetime 2026 7 2 17 0 0 0 et)
+        session (status/session-state now)
+        [state detail age] (status/strategy-status
+                            now
+                            session
+                            {:last-at (.astimezone (- now (datetime/timedelta ** :minutes 65)) utc)
+                             :counts {}
+                             :stale-minutes 15
+                             :source "test"})]
+    (is (= "idle" state))
+    (is (>= (.find detail "market not open") 0))
+    (is (= 65.0 age))))
+
+(deftest strategy-status-surfaces-broker-rejects-even-post-market
+  (let [now (datetime/datetime 2026 7 2 17 0 0 0 et)
+        session (status/session-state now)
+        [state detail _] (status/strategy-status
+                          now
+                          session
+                          {:last-at (.astimezone (- now (datetime/timedelta ** :minutes 65)) utc)
+                           :counts {":fact/broker-ack-rejected" 2}
+                           :stale-minutes 15
+                           :source "test"})]
+    (is (= "warn" state))
+    (is (>= (.find detail "broker rejects=2") 0))))
+
+(deftest strategy-status-fails-no-facts-after-trading-session
+  (let [now (datetime/datetime 2026 7 2 17 0 0 0 et)
+        session (status/session-state now)
+        [state detail age] (status/strategy-status
+                            now
+                            session
+                            {:last-at nil
+                             :counts {}
+                             :stale-minutes 15
+                             :source "test"})]
+    (is (= "bad" state))
+    (is (>= (.find detail "completed trading session") 0))
+    (is (nil? age))))
+
+(deftest strategy-status-fails-stopped-before-close-post-market
+  (let [now (datetime/datetime 2026 7 2 17 0 0 0 et)
+        session (status/session-state now)
+        [state detail age] (status/strategy-status
+                            now
+                            session
+                            {:last-at (.astimezone (- now (datetime/timedelta ** :minutes 80)) utc)
+                             :counts {}
+                             :stale-minutes 15
+                             :source "test"})]
+    (is (= "bad" state))
+    (is (>= (.find detail "stopped before close") 0))
+    (is (= 80.0 age))))
+
+(deftest strategy-status-fails-future-last-fact
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        session (status/session-state now)
+        [state detail age] (status/strategy-status
+                            now
+                            session
+                            {:last-at (.astimezone (+ now (datetime/timedelta ** :minutes 5)) utc)
+                             :counts {}
+                             :stale-minutes 15
+                             :source "test"})]
+    (is (= "bad" state))
+    (is (>= (.find detail "future timestamp") 0))
+    (is (= -5.0 age))))
+
+(deftest facts-dbs-project-into-strategy-rows
+  (let [tmp (tempfile/TemporaryDirectory)
+        root (.-name tmp)
+        runtime (os.path/join root "live_runtime" "steve-session-2026-07-02")
+        facts (os.path/join runtime "facts.db")]
+    (try
+      (os/makedirs runtime ** :exist_ok true)
+      (let [con (sqlite3/connect facts)]
+        (.execute con "create table facts (strategy_id text, account_id text, order_intent_id text, fact_type text, occurred_at text)")
+        (.execute con
+                  "insert into facts values (?, ?, ?, ?, ?)"
+                  ["strategy/steve-v2/lynx/v1" "account/alpaca/lynx-paper" "oi-1" ":fact/signal-decision-produced" "2026-07-02T13:59:00Z"])
+        (.execute con
+                  "insert into facts values (?, ?, ?, ?, ?)"
+                  ["strategy/steve-v2/lynx/v1" "account/alpaca/lynx-paper" "oi-1" ":fact/order-intent-created" "2026-07-02T13:59:30Z"])
+        (.execute con
+                  "insert into facts values (?, ?, ?, ?, ?)"
+                  [nil "account/alpaca/lynx-paper" "oi-1" ":fact/fill-observed" "2026-07-02T14:00:00Z"])
+        (.commit con)
+        (.close con))
+      (let [now (datetime/datetime 2026 7 2 10 1 0 0 et)
+            session (status/session-state now)
+            [rows sources] (status/build-strategy-rows root now session)
+            lynx (first (filter #(= "LYNX" (get % "name")) rows))]
+        (is (= [facts] sources))
+        (is (= "ok" (get lynx "status")))
+        (is (= 3 (get lynx "facts")))
+        (is (= 1 (get lynx "signals")))
+        (is (= 1 (get lynx "intents")))
+        (is (= 1 (get lynx "fills"))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest corrupt-facts-db-is-surfaced-as-source-error
+  (let [tmp (tempfile/TemporaryDirectory)
+        root (.-name tmp)
+        runtime (os.path/join root "live_runtime" "steve-session-2026-07-02")
+        facts (os.path/join runtime "facts.db")]
+    (try
+      (os/makedirs runtime ** :exist_ok true)
+      (spit facts "not sqlite")
+      (let [now (datetime/datetime 2026 7 2 10 1 0 0 et)
+            session (status/session-state now)
+            [_ _ errors] (status/build-strategy-rows root now session)]
+        (is (= 1 (count errors)))
+        (is (>= (.find (first errors) "facts.db") 0)))
+      (finally
+        (.cleanup tmp)))))
+
+(defn write-market-evidence-status!
+  [root date payload]
+  (let [stamp (.replace date "-" "")
+        dir (os.path/join root "live_runtime" "analysis")
+        path (os.path/join dir (str "market_evidence_status_" stamp ".json"))
+        default-updated-at (datetime.datetime/fromisoformat (str date "T11:00:00-04:00"))
+        default-ts (.timestamp default-updated-at)]
+    (os/makedirs dir ** :exist_ok true)
+    (spit path (json/dumps (status/->jsonable payload) ** :indent 2 :sort_keys true))
+    (os/utime path (python/tuple [default-ts default-ts]))
+    path))
+
+(defn valid-market-evidence-readiness
+  []
+  {"verdict" "PASS"
+   "matched_feature_parity" {"available" true
+                             "matched_rows" 120
+                             "problem_feature_count" 0
+                             "max_abs_deviation" 0.0
+                             "min_correlation" 1.0
+                             "matched_start" "2026-07-02T13:30:00Z"
+                             "matched_end" "2026-07-02T15:30:00Z"}})
+
+(defn valid-market-evidence-proof-fields
+  []
+  {"matched_feature_parity_available" true
+   "matched_feature_parity_rows" 120
+   "matched_feature_parity_problem_count" 0
+   "matched_feature_parity_max_abs_deviation" 0.0
+   "matched_feature_parity_min_correlation" 1.0
+   "matched_feature_parity_start" "2026-07-02T13:30:00Z"
+   "matched_feature_parity_end" "2026-07-02T15:30:00Z"})
+
+(defn green-market-evidence-status
+  []
+  {"target_date" "2026-07-02"
+   "target_stamp" "20260702"
+   "generated_at" "2026-07-02T14:45:00Z"
+   "ok?" true
+   "status" "ok"
+   "reasons" []
+   "manifest" {"valid?" true
+               "target_matches_request?" true
+               "payload_example_count" 8
+               "diagnostics" {"prediction_delta" {"available" true}
+                              "parity_gate" {"available" false}
+                              "capture_v2_sidecars"
+                              {"ok" true
+                               "option_surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                               "sidecar_dtypes" {"bar_buffers_json" "object"
+                                                 "option_chain_json" "object"
+                                                 "option_surfaces_json" "object"
+                                                 "grid_history_json" "object"}
+                               "sidecar_malformed_contracts" {"option_chain_json" 0
+                                                              "option_surfaces_json" 0}
+                               "option_surface_malformed_contracts_by_prefix" {"SPX" 0
+                                                                               "SPXW" 0
+                                                                               "VIX" 0
+                                                                               "VIXW" 0}}}}
+   "manifest_verification" {"valid?" true
+                            "returncode" 0}
+   "readiness" (valid-market-evidence-readiness)
+   "unmask_apply_ready?" true
+   "unmask_apply_reasons" []
+   "verified_apply_validation" {"apply_safe" true
+                                "candidate_count" 4}})
+
+(defn write-market-evidence-preflight!
+  [root date payload]
+  (let [stamp (.replace date "-" "")
+        dir (os.path/join root "live_runtime" "analysis")
+        path (os.path/join dir (str "market_evidence_preflight_" stamp ".json"))]
+    (os/makedirs dir ** :exist_ok true)
+    (spit path (json/dumps (status/->jsonable payload) ** :indent 2 :sort_keys true))
+    path))
+
+(defn write-capture-smoke!
+  [root date payload]
+  (let [stamp (.replace date "-" "")
+        dir (os.path/join root "live_runtime" "analysis")
+        path (os.path/join dir (str "capture_v2_sidecar_smoke_" stamp ".json"))
+        default-updated-at (datetime.datetime/fromisoformat (str date "T09:46:00-04:00"))
+        default-ts (.timestamp default-updated-at)]
+    (os/makedirs dir ** :exist_ok true)
+    (spit path (json/dumps (status/->jsonable payload) ** :indent 2 :sort_keys true))
+    (os/utime path (python/tuple [default-ts default-ts]))
+    path))
+
+(defn write-daily-report!
+  [daily-dir date payload]
+  (let [stamp (.replace date "-" "")
+        validation-path (os.path/join daily-dir (str stamp ".validation.json"))
+        html-path (os.path/join daily-dir (str stamp ".html"))]
+    (os/makedirs daily-dir ** :exist_ok true)
+    (spit validation-path (json/dumps (status/->jsonable payload) ** :indent 2 :sort_keys true))
+    (spit html-path "<html>ok</html>\n")
+    validation-path))
+
+(defn write-daily-artifact-manifest!
+  [daily-dir date]
+  (report-artifacts/audit-daily-validations
+   {:daily-dir daily-dir
+    :date date
+    :write-manifests? true
+    :require-manifests? true}))
+
+(deftest daily-report-status-fails-missing-artifact-and-accepts-expected-report
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            now (datetime/datetime 2026 7 5 12 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (let [missing-row (status/daily-report-status now session generated-at)]
+            (is (= "bad" (get missing-row "status")))
+            (is (= "2026-07-02" (get-in missing-row ["evidence" "expected_date"])))
+            (is (false? (get-in missing-row ["evidence" "validation_exists"]))))
+          (write-daily-report!
+           daily-dir
+           "2026-07-02"
+           {"report/date" "2026-07-02"
+            "report/rendered?" true
+            "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                         "report/date" "2026-07-02"
+                         "trade/closed-count" 1
+                         "order/count" 2
+                         "positions/open-count" 0
+                         "positions/open" []
+                         "pnl/equity-day" "25.00"
+                         "pnl/realized" "25.00"
+                         "pnl/unrealized" "0.00"
+                         "pnl/closed-trades" "25.00"
+                         "broker/equity-observed?" true
+                         "report/explanations" []}]})
+          (write-daily-artifact-manifest! daily-dir "2026-07-02")
+          (let [ok-row (status/daily-report-status now session generated-at)]
+            (is (= "ok" (get ok-row "status")))
+            (is (= true (get-in ok-row ["evidence" "validation_exists"])))
+            (is (= true (get-in ok-row ["evidence" "html_exists"])))
+            (is (= "ok" (get-in ok-row ["evidence" "validation_status"])))
+            (is (= true (get-in ok-row ["evidence" "validation_valid"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest daily-report-status-checks-remote-artifacts-over-ssh
+  (let [now (datetime/datetime 2026 7 5 12 0 0 0 et)
+        session (status/session-state now)
+        generated-at (.isoformat now ** :timespec "seconds")
+        seen (atom [])]
+    (with-redefs [status/daily-reports-dir (fn [] "/remote/reports/daily")
+                  status/run-cmd (fn [cmd _timeout]
+                                   (swap! seen conj cmd)
+                                   (let [path (last cmd)]
+                                     (cond
+                                       (= "cat" (nth cmd (- (count cmd) 2)))
+                                       [0 (json/dumps (status/->jsonable
+                                                       {"report/date" "2026-07-02"
+                                                        "report/rendered?" true}))]
+
+                                       (contains? #{"/remote/reports/daily/20260702.validation.json"
+                                                    "/remote/reports/daily/20260702.html"
+                                                    "/remote/reports/daily/20260702.validation.json.manifest.edn"}
+                                                  path)
+                                       [0 ""]
+
+                                       :else
+                                       [1 "missing"])))]
+      (let [row (status/daily-report-status now session generated-at "bot@example")]
+        (is (= "ok" (get row "status")))
+        (is (= true (get-in row ["evidence" "validation_exists"])))
+        (is (= true (get-in row ["evidence" "html_exists"])))
+        (is (= true (get-in row ["evidence" "manifest_exists"])))
+        (is (= "ok" (get-in row ["evidence" "validation_status"])))
+        (is (= true (get-in row ["evidence" "validation_valid"])))
+        (is (some #(and (= "ssh" (first %))
+                        (= "bot@example" (nth % 5))
+                        (= "cat" (nth % (- (count %) 2))))
+                  @seen))))))
+
+(deftest daily-report-status-rejects-invalid-validation-artifact
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            now (datetime/datetime 2026 7 5 12 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (write-daily-report!
+           daily-dir
+           "2026-07-02"
+           {"report/date" "2026-07-02"
+            "report/rendered?" true
+            "accounts" []})
+          (let [row (status/daily-report-status now session generated-at)]
+            (is (= "bad" (get row "status")))
+            (is (= "error" (get-in row ["evidence" "validation_status"])))
+            (is (= false (get-in row ["evidence" "validation_valid"])))
+            (is (pos? (get-in row ["evidence" "validation_issue_count"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest daily-report-status-treats-warning-only-validation-as-warning
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            now (datetime/datetime 2026 7 5 12 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (write-daily-report!
+           daily-dir
+           "2026-07-02"
+           {"report/date" "2026-07-02"
+            "report/rendered?" true
+            "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                         "report/date" "2026-07-02"
+                         "trade/closed-count" 1
+                         "order/count" 2
+                         "positions/open-count" 0
+                         "positions/open" []
+                         "pnl/equity-day" "25.10"
+                         "pnl/realized" "25.00"
+                         "pnl/unrealized" "0.00"
+                         "pnl/closed-trades" "25.00"
+                         "broker/equity-observed?" true
+                         "report/explanations" []}]})
+          (write-daily-artifact-manifest! daily-dir "2026-07-02")
+          (let [row (status/daily-report-status now session generated-at)]
+            (is (= "warn" (get row "status")))
+            (is (= "warn" (get-in row ["evidence" "validation_status"])))
+            (is (= true (get-in row ["evidence" "validation_valid"])))
+            (is (pos? (get-in row ["evidence" "validation_issue_count"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest daily-report-status-rejects-missing-daily-artifact-manifest
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            now (datetime/datetime 2026 7 5 12 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (write-daily-report!
+           daily-dir
+           "2026-07-02"
+           {"report/date" "2026-07-02"
+            "report/rendered?" true
+            "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                         "report/date" "2026-07-02"
+                         "trade/closed-count" 1
+                         "order/count" 2
+                         "positions/open-count" 0
+                         "positions/open" []
+                         "pnl/equity-day" "25.00"
+                         "pnl/realized" "25.00"
+                         "pnl/unrealized" "0.00"
+                         "pnl/closed-trades" "25.00"
+                         "broker/equity-observed?" true
+                         "report/explanations" []}]})
+          (let [row (status/daily-report-status now session generated-at)]
+            (is (= "bad" (get row "status")))
+            (is (= "error" (get-in row ["evidence" "validation_status"])))
+            (is (= false (get-in row ["evidence" "validation_valid"])))
+            (is (pos? (get-in row ["evidence" "validation_issue_count"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest daily-report-status-targets-prior-report-before-close-and-today-after-report-build
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            morning (datetime/datetime 2026 7 2 10 0 0 0 et)
+            after-report (datetime/datetime 2026 7 2 17 0 0 0 et)
+            holiday (datetime/datetime 2026 7 5 12 0 0 0 et)]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (let [morning-row (status/daily-report-status morning
+                                                        (status/session-state morning)
+                                                        (.isoformat morning ** :timespec "seconds"))
+                after-row (status/daily-report-status after-report
+                                                      (status/session-state after-report)
+                                                      (.isoformat after-report ** :timespec "seconds"))
+                holiday-row (status/daily-report-status holiday
+                                                        (status/session-state holiday)
+                                                        (.isoformat holiday ** :timespec "seconds"))]
+            (is (= "2026-07-01" (get-in morning-row ["evidence" "expected_date"])))
+            (is (= "2026-07-02" (get-in after-row ["evidence" "expected_date"])))
+            (is (= "2026-07-02" (get-in holiday-row ["evidence" "expected_date"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest daily-report-status-uses-report-timer-due-on-early-close-days
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            after-early-close (datetime/datetime 2026 11 27 13 31 0 0 et)
+            before-report-timer (datetime/datetime 2026 11 27 16 4 0 0 et)
+            after-report-timer (datetime/datetime 2026 11 27 16 45 0 0 et)]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (doseq [dt [after-early-close before-report-timer]]
+            (let [row (status/daily-report-status dt
+                                                  (status/session-state dt)
+                                                  (.isoformat dt ** :timespec "seconds"))]
+              (is (= "2026-11-25" (get-in row ["evidence" "expected_date"])))))
+          (let [row (status/daily-report-status after-report-timer
+                                                (status/session-state after-report-timer)
+                                                (.isoformat after-report-timer ** :timespec "seconds"))]
+            (is (= "2026-11-27" (get-in row ["evidence" "expected_date"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest daily-report-status-calendar-stress-targets-reachable-report-days
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [daily-dir (.-name tmp)
+            start (datetime/date 2026 1 1)]
+        (with-redefs [status/daily-reports-dir (fn [] daily-dir)]
+          (doseq [offset (range 365)]
+            (let [day (+ start (datetime/timedelta ** :days offset))
+                  noon (datetime.datetime/combine day (datetime/time 12 0) et)
+                  after-report (datetime.datetime/combine day (datetime/time 17 0) et)
+                  noon-session (status/session-state noon)
+                  after-session (status/session-state after-report)
+                  noon-row (status/daily-report-status noon noon-session (.isoformat noon ** :timespec "seconds"))
+                  after-row (status/daily-report-status after-report after-session (.isoformat after-report ** :timespec "seconds"))
+                  noon-expected (datetime.date/fromisoformat (get-in noon-row ["evidence" "expected_date"]))
+                  after-expected (datetime.date/fromisoformat (get-in after-row ["evidence" "expected_date"]))]
+              (is (not (> (.toordinal noon-expected) (.toordinal day))))
+              (is (not (> (.toordinal after-expected) (.toordinal day))))
+              (when (get noon-session "is_trading_day")
+                (is (< (.toordinal noon-expected) (.toordinal day))))
+              (if (get after-session "is_trading_day")
+                (is (= day after-expected))
+                (is (< (.toordinal after-expected) (.toordinal day))))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-is-idle-before-collector-and-on-non-trading-days
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [holiday-now (datetime/datetime 2026 7 3 12 0 0 0 et)
+            holiday-session (status/session-state holiday-now)
+            pre-now (datetime/datetime 2026 7 2 9 0 0 0 et)
+            pre-session (status/session-state pre-now)
+            holiday-row (status/market-evidence-status (.-name tmp)
+                                                       holiday-now
+                                                       holiday-session
+                                                       (.isoformat holiday-now ** :timespec "seconds"))
+            pre-row (status/market-evidence-status (.-name tmp)
+                                                   pre-now
+                                                   pre-session
+                                                   (.isoformat pre-now ** :timespec "seconds"))]
+        (is (= "idle" (get holiday-row "status")))
+        (is (>= (.find (get holiday-row "detail") "non-trading day") 0))
+        (is (= "idle" (get pre-row "status")))
+        (is (>= (.find (get pre-row "detail") "not due yet") 0)))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-surfaces-stale-predue-preflight-artifact
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [pre-now (datetime/datetime 2026 7 8 9 0 0 0 et)
+            pre-session (status/session-state pre-now)
+            generated-at (.isoformat pre-now ** :timespec "seconds")]
+        (write-market-evidence-preflight!
+         (.-name tmp)
+         "2026-07-08"
+         {"generated_at" "2026-07-08T02:31:52Z"
+          "target_date" "2026-07-08"
+          "target_stamp" "20260708"
+          "mode" "preflight"
+          "status" "ok"
+          "returncode" 0
+          "detail" "manual too-early preflight"})
+        (let [row (status/market-evidence-status (.-name tmp)
+                                                 pre-now
+                                                 pre-session
+                                                 generated-at)
+              evidence (get row "evidence")]
+          (is (= "idle" (get row "status")))
+          (is (= "preflight-pending" (get evidence "phase")))
+          (is (= true (get evidence "preflight_present")))
+          (is (= "2026-07-07" (get evidence "preflight_generated_at_et_date")))
+          (is (= "preflight artifact generated_at is not same ET session date"
+                 (get evidence "preflight_pending_warning")))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-surfaces-preflight-before-collector
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")
+            missing-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+        (is (= "bad" (get missing-row "status")))
+        (is (>= (.find (get missing-row "detail") "missing due market-evidence preflight") 0))
+        (write-market-evidence-preflight!
+         (.-name tmp)
+         "2026-07-02"
+         {"generated_at" "2026-07-02T13:10:00Z"
+          "target_date" "2026-07-02"
+          "target_stamp" "20260702"
+          "status" "error"
+          "returncode" 1
+          "detail" "preflight failed"})
+        (let [failed-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+          (is (= "bad" (get failed-row "status")))
+          (is (>= (.find (get failed-row "detail") "preflight failed") 0)))
+        (write-market-evidence-preflight!
+         (.-name tmp)
+         "2026-07-02"
+         {"generated_at" "2026-07-02T13:10:00Z"
+          "target_date" "2026-07-02"
+          "target_stamp" "20260702"
+          "status" "ok"
+          "returncode" 0
+          "detail" "preflight passed"})
+        (let [passed-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+          (is (= "idle" (get passed-row "status")))
+          (is (>= (.find (get passed-row "detail") "preflight passed") 0))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-rejects-fresh-file-with-stale-preflight-generated-at
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")
+            path (write-market-evidence-preflight!
+                  (.-name tmp)
+                  "2026-07-02"
+                  {"generated_at" "2026-07-02T04:16:27Z"
+                   "target_date" "2026-07-02"
+                   "target_stamp" "20260702"
+                   "mode" "preflight"
+                   "status" "ok"
+                   "returncode" 0
+                   "detail" "stale payload in fresh file"})
+            fresh-ts (.timestamp (datetime.datetime/fromisoformat "2026-07-02T10:00:00-04:00"))]
+        (os/utime path (python/tuple [fresh-ts fresh-ts]))
+        (let [row (status/market-evidence-status (.-name tmp) now session generated-at)
+              evidence (get row "evidence")]
+          (is (= "bad" (get row "status")))
+          (is (= "preflight-stale" (get evidence "phase")))
+          (is (>= (.find (get row "detail") "predates scheduled 09:10 ET preflight") 0))
+          (is (= "2026-07-02T04:16:27Z" (get evidence "preflight_generated_at")))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-fails-when-due-artifact-is-missing-or-failed
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")
+            missing-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+        (is (= "bad" (get missing-row "status")))
+        (is (>= (.find (get missing-row "detail") "missing due") 0))
+        (write-market-evidence-status!
+         (.-name tmp)
+         "2026-07-02"
+         {"generated_at" "2026-07-02T14:45:00Z"
+          "target_date" "2026-07-02"
+          "target_stamp" "20260702"
+          "ok?" false
+          "status" "error"
+          "reasons" ["manifest verification failed"]})
+        (let [failed-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+          (is (= "bad" (get failed-row "status")))
+          (is (>= (.find (get failed-row "detail") "manifest verification failed") 0))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-rejects-fresh-file-with-stale-status-generated-at
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")
+            stale (assoc (green-market-evidence-status)
+                         "generated_at" "2026-07-02T13:30:00Z")
+            path (write-market-evidence-status! (.-name tmp) "2026-07-02" stale)
+            fresh-ts (.timestamp (datetime.datetime/fromisoformat "2026-07-02T11:00:00-04:00"))]
+        (os/utime path (python/tuple [fresh-ts fresh-ts]))
+        (let [row (status/market-evidence-status (.-name tmp) now session generated-at)
+              evidence (get row "evidence")]
+          (is (= "bad" (get row "status")))
+          (is (= "collector-stale" (get evidence "phase")))
+          (is (>= (.find (get row "detail") "predates scheduled 10:45 ET collector") 0))
+          (is (= "2026-07-02T13:30:00Z" (get evidence "status_generated_at")))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-passes-only-for-target-matching-ok-artifact
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")]
+        (write-market-evidence-status!
+         (.-name tmp)
+         "2026-07-02"
+         (green-market-evidence-status))
+        (let [ok-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+          (is (= "ok" (get ok-row "status")))
+          (is (= "ok" (get-in ok-row ["evidence" "artifact_status"])))
+          (is (= true (get-in ok-row ["evidence" "prediction_delta_available"])))
+          (is (= false (get-in ok-row ["evidence" "parity_gate_available"])))
+          (is (= true (get-in ok-row ["evidence" "capture_v2_ok"])))
+          (is (= true (get-in ok-row ["evidence" "capture_v2_required_option_surface_prefixes_present"])))
+          (is (= 0 (get-in ok-row ["evidence" "capture_v2_malformed_contract_count"])))
+          (is (= true (get-in ok-row ["evidence" "matched_feature_parity_available"])))
+          (is (= 120 (get-in ok-row ["evidence" "matched_feature_parity_rows"])))
+          (is (= 0 (get-in ok-row ["evidence" "matched_feature_parity_problem_count"])))
+          (is (= 0.0 (get-in ok-row ["evidence" "matched_feature_parity_max_abs_deviation"])))
+          (is (= 1.0 (get-in ok-row ["evidence" "matched_feature_parity_min_correlation"])))
+          (is (= "2026-07-02T13:30:00Z" (get-in ok-row ["evidence" "matched_feature_parity_start"])))
+          (is (= "2026-07-02T15:30:00Z" (get-in ok-row ["evidence" "matched_feature_parity_end"])))
+          (is (= true (get-in ok-row ["evidence" "unmask_apply_ready"])))
+          (is (= true (get-in ok-row ["evidence" "verified_apply_validation_apply_safe"])))
+          (is (= 4 (get-in ok-row ["evidence" "verified_apply_validation_candidate_count"])))
+          (is (>= (.find (get ok-row "detail") "payload_examples=8") 0)))
+        (write-market-evidence-status!
+         (.-name tmp)
+         "2026-07-02"
+         {"generated_at" "2026-07-02T14:45:00Z"
+          "target_date" "2026-07-01"
+          "target_stamp" "20260701"
+          "ok?" true
+          "status" "ok"})
+        (let [mismatch-row (status/market-evidence-status (.-name tmp) now session generated-at)]
+          (is (= "bad" (get mismatch-row "status")))
+          (is (>= (.find (get mismatch-row "detail") "target mismatch") 0))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-uses-analysis-dir-env-override
+  (let [root-tmp (tempfile/TemporaryDirectory)
+        analysis-tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")]
+        (os.environ/update (python/dict {"ANALYSIS_DIR" (.-name analysis-tmp)}))
+        (let [path (os.path/join (.-name analysis-tmp)
+                                 "market_evidence_status_20260702.json")
+              updated-at (datetime.datetime/fromisoformat "2026-07-02T11:00:00-04:00")
+              ts (.timestamp updated-at)]
+          (spit path (json/dumps (status/->jsonable (green-market-evidence-status))
+                                 ** :indent 2 :sort_keys true))
+          (os/utime path (python/tuple [ts ts])))
+        (let [row (status/market-evidence-status (.-name root-tmp) now session generated-at)]
+          (is (= "ok" (get row "status")))
+          (is (= (os.path/join (.-name analysis-tmp)
+                               "market_evidence_status_20260702.json")
+                 (get-in row ["evidence" "status_path"])))))
+      (finally
+        (os.environ/pop "ANALYSIS_DIR" nil)
+        (.cleanup root-tmp)
+        (.cleanup analysis-tmp)))))
+
+(deftest market-evidence-capture-smoke-status-validates-same-day-sidecar-artifact
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [generated-at "2026-07-02T10:00:00-04:00"
+            pending-now (datetime/datetime 2026 7 2 9 30 0 0 et)
+            due-now (datetime/datetime 2026 7 2 10 0 0 0 et)
+            pending-session (status/session-state pending-now)
+            due-session (status/session-state due-now)
+            good {"generated_at" "2026-07-02T13:45:00Z"
+                  "target_date" "2026-07-02"
+                  "ok" true
+                  "status" "ok"
+                  "row_count" 5
+                  "unique_time_count" 5
+                  "option_surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                  "sidecar_dtypes" {"bar_buffers_json" "object"
+                                    "option_chain_json" "object"
+                                    "option_surfaces_json" "object"
+                                    "grid_history_json" "object"}
+                  "sidecar_malformed_contracts" {"option_chain_json" 0
+                                                 "option_surfaces_json" 0}
+                  "option_surface_malformed_contracts_by_prefix" {"SPX" 0
+                                                                  "SPXW" 0
+                                                                  "VIX" 0
+                                                                  "VIXW" 0}}]
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) pending-now pending-session generated-at)]
+          (is (= "idle" (get row "status")))
+          (is (= "capture-smoke-pending" (get-in row ["evidence" "phase"]))))
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) due-now due-session generated-at)]
+          (is (= "bad" (get row "status")))
+          (is (= "capture-smoke-missing" (get-in row ["evidence" "phase"]))))
+        (write-capture-smoke! (.-name tmp) "2026-07-02" good)
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) due-now due-session generated-at)]
+          (is (= "ok" (get row "status")))
+          (is (= true (get-in row ["evidence" "capture_smoke_ok"])))
+          (is (= true (get-in row ["evidence" "sidecar_dtypes_ok"])))
+          (is (= 5.0 (get-in row ["evidence" "unique_time_count"]))))
+        (write-capture-smoke!
+         (.-name tmp)
+         "2026-07-02"
+         (assoc good "unique_time_count" 2 "row_count" 2))
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) due-now due-session generated-at)]
+          (is (= "bad" (get row "status")))
+          (is (= "capture-smoke-failed" (get-in row ["evidence" "phase"])))
+          (is (= 2.0 (get-in row ["evidence" "unique_time_count"]))))
+        (write-capture-smoke!
+         (.-name tmp)
+         "2026-07-02"
+         (assoc-in good ["sidecar_dtypes" "option_chain_json"] "<U1351078"))
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) due-now due-session generated-at)]
+          (is (= "bad" (get row "status")))
+          (is (= "capture-smoke-failed" (get-in row ["evidence" "phase"])))
+          (is (= false (get-in row ["evidence" "sidecar_dtypes_ok"])))
+          (is (= "<U1351078" (get-in row ["evidence" "sidecar_dtypes" "option_chain_json"]))))
+        (write-capture-smoke!
+         (.-name tmp)
+         "2026-07-02"
+         (assoc good "option_surface_prefixes" ["SPX" "SPXW"]))
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) due-now due-session generated-at)]
+          (is (= "bad" (get row "status")))
+          (is (= ["VIX" "VIXW"]
+                 (get-in row ["evidence" "missing_option_surface_prefixes"])))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-capture-smoke-status-rejects-fresh-file-with-stale-generated-at
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [generated-at "2026-07-02T10:00:00-04:00"
+            due-now (datetime/datetime 2026 7 2 10 0 0 0 et)
+            due-session (status/session-state due-now)
+            path (write-capture-smoke!
+                  (.-name tmp)
+                  "2026-07-02"
+                  {"generated_at" "2026-07-02T13:30:00Z"
+                   "target_date" "2026-07-02"
+                   "ok" true
+                   "status" "ok"
+                   "row_count" 5
+                   "unique_time_count" 5
+                   "option_surface_prefixes" ["SPX" "SPXW" "VIX" "VIXW"]
+                   "sidecar_dtypes" {"bar_buffers_json" "object"
+                                     "option_chain_json" "object"
+                                     "option_surfaces_json" "object"
+                                     "grid_history_json" "object"}
+                   "sidecar_malformed_contracts" {"option_chain_json" 0
+                                                  "option_surfaces_json" 0}
+                   "option_surface_malformed_contracts_by_prefix" {"SPX" 0
+                                                                   "SPXW" 0
+                                                                   "VIX" 0
+                                                                   "VIXW" 0}})
+            fresh-ts (.timestamp (datetime.datetime/fromisoformat "2026-07-02T10:00:00-04:00"))]
+        (os/utime path (python/tuple [fresh-ts fresh-ts]))
+        (let [row (status/market-evidence-capture-smoke-status
+                   (.-name tmp) due-now due-session generated-at)
+              evidence (get row "evidence")]
+          (is (= "bad" (get row "status")))
+          (is (= "capture-smoke-stale" (get evidence "phase")))
+          (is (>= (.find (get row "detail") "predates scheduled 09:45 ET smoke check") 0))
+          (is (= "2026-07-02T13:30:00Z" (get evidence "capture_smoke_generated_at")))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-rejects-forged-ok-artifacts
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")
+            green (green-market-evidence-status)
+            variants [(assoc-in green ["manifest" "valid?"] false)
+                      (assoc green "status" "error")
+                      (assoc green "reasons" ["forced reason"])
+                      (assoc-in green ["manifest_verification" "valid?"] false)
+                      (assoc-in green ["readiness" "verdict"] "FAIL")
+                      (assoc-in green ["manifest" "payload_example_count"] 0)
+                      (assoc-in green ["manifest" "payload_example_count"] true)
+                      (assoc-in green ["manifest" "diagnostics" "capture_v2_sidecars" "ok"] false)
+                      (assoc-in green ["manifest" "diagnostics" "capture_v2_sidecars" "option_surface_prefixes"]
+                                ["SPXW"])
+                      (assoc-in green ["manifest" "diagnostics" "capture_v2_sidecars" "sidecar_dtypes" "option_chain_json"]
+                                "<U1351078")
+                      (assoc-in green ["manifest" "diagnostics" "capture_v2_sidecars" "sidecar_malformed_contracts"]
+                                {"option_chain_json" 1
+                                 "option_surfaces_json" 0})
+                      (assoc-in green ["readiness" "matched_feature_parity" "available"] false)
+                      (assoc-in green ["readiness" "matched_feature_parity" "matched_rows"] 0)
+                      (assoc-in green ["readiness" "matched_feature_parity" "matched_rows"] 2)
+                      (assoc-in green ["readiness" "matched_feature_parity" "problem_feature_count"] 1)]]
+        (doseq [variant variants]
+          (write-market-evidence-status!
+           (.-name tmp)
+           "2026-07-02"
+           variant)
+          (let [row (status/market-evidence-status (.-name tmp) now session generated-at)]
+            (is (= "bad" (get row "status")))
+            (is (= false (get-in row ["evidence" "collector_ok"]))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-ignores-premature-and-rejects-predue-artifacts
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [pre-now (datetime/datetime 2026 7 2 10 30 0 0 et)
+            due-now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            pre-session (status/session-state pre-now)
+            due-session (status/session-state due-now)
+            generated-at (.isoformat due-now ** :timespec "seconds")
+            path (write-market-evidence-status!
+                  (.-name tmp)
+                  "2026-07-02"
+                  {"generated_at" "2026-07-02T14:45:00Z"
+                   "target_date" "2026-07-02"
+                   "target_stamp" "20260702"
+                   "ok?" true
+                   "status" "ok"
+                   "manifest" {"payload_example_count" 8}})
+            pre-due (datetime/datetime 2026 7 2 10 40 0 0 et)
+            pre-due-ts (.timestamp pre-due)]
+        (os/utime path (python/tuple [pre-due-ts pre-due-ts]))
+        (let [pre-row (status/market-evidence-status (.-name tmp) pre-now pre-session generated-at)]
+          (is (= "idle" (get pre-row "status")))
+          (is (>= (.find (get pre-row "detail") "ignoring premature") 0)))
+        (let [due-row (status/market-evidence-status (.-name tmp) due-now due-session generated-at)]
+          (is (= "bad" (get due-row "status")))
+          (is (>= (.find (get due-row "detail") "predates scheduled") 0))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest market-evidence-status-rejects-future-dated-status-artifacts
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            session (status/session-state now)
+            generated-at (.isoformat now ** :timespec "seconds")
+            path (write-market-evidence-status!
+                  (.-name tmp)
+                  "2026-07-02"
+                  {"generated_at" "2026-07-02T14:45:00Z"
+                   "target_date" "2026-07-02"
+                   "target_stamp" "20260702"
+                   "ok?" true
+                   "status" "ok"
+                   "reasons" []
+                   "manifest" {"valid?" true
+                               "target_matches_request?" true
+                               "payload_example_count" 8}
+                   "manifest_verification" {"valid?" true
+                                            "returncode" 0}
+                   "readiness" {"verdict" "PASS"}})
+            future-at (+ now (datetime/timedelta ** :minutes 5))
+            future-ts (.timestamp future-at)]
+        (os/utime path (python/tuple [future-ts future-ts]))
+        (let [row (status/market-evidence-status (.-name tmp) now session generated-at)]
+          (is (= "bad" (get row "status")))
+          (is (= "collector-future" (get-in row ["evidence" "phase"])))))
+      (finally
+        (.cleanup tmp)))))
+
+(defn minimal-valid-status-payload
+  [now]
+  (let [report-due (datetime/datetime 2026 7 2 16 5 0 0 et)
+        session-now (datetime/datetime 2026 7 2
+                                       (.-hour now)
+                                       (.-minute now)
+                                       (.-second now)
+                                       0
+                                       et)
+        expected-report-date (if (< (.timestamp now) (.timestamp report-due))
+                               "2026-07-01"
+                               "2026-07-02")
+        expected-report-stamp (.replace expected-report-date "-" "")]
+    {"generated_at" (.isoformat now ** :timespec "seconds")
+     "target_date" "2026-07-02"
+     "session" (status/session-state session-now)
+     "probes_enabled" true
+     "overall" {"status" "ok"}
+     "strategy_rows" (vec
+                      (concat
+                       (map (fn [s]
+                              {"name" (:name s)
+                               "status" "idle"
+                               "strategy_id" (:strategy-id s)
+                               "account_id" (:account-id s)
+                               "group" (:group s)
+                               "detail" "test"
+                               "last_fact_at" nil
+                               "age_minutes" nil
+                               "facts" 0
+                               "signals" 0
+                               "intents" 0
+                               "fills" 0
+                               "rejects" 0
+                               "faults" 0})
+                            status/steve-strategies)
+                       (map (fn [family]
+                              {"name" (:name family)
+                               "status" "idle"
+                               "strategy_id" (:prefix family)
+                               "account_id" "sim"
+                               "group" (:group family)
+                               "detail" "test"
+                               "last_fact_at" nil
+                               "age_minutes" nil
+                               "facts" 0
+                               "signals" 0
+                               "intents" 0
+                               "fills" 0
+                               "rejects" 0
+                               "faults" 0})
+                            status/sim-families)))
+     "dependencies" (vec
+                     (map (fn [name]
+                            (let [row {"name" name
+                                       "status" "ok"
+                                       "detail" "test"
+                                       "expected" "test"
+                                       "updated_at" (.isoformat now ** :timespec "seconds")}]
+                              (cond
+                                (= name "Daily Reports")
+                                (assoc row
+                                       "evidence"
+                                       {"expected_date" expected-report-date
+                                        "expected_stamp" expected-report-stamp
+                                        "due_at" "2026-07-02T16:05:00-04:00"
+                                        "daily_dir" "/tmp/reports/daily"
+                                        "validation_path" (str "/tmp/reports/daily/" expected-report-stamp ".validation.json")
+                                        "html_path" (str "/tmp/reports/daily/" expected-report-stamp ".html")
+                                        "validation_exists" true
+                                        "html_exists" true
+                                        "report_date" expected-report-date
+                                        "report_date_matches" true
+                                        "rendered" true
+                                        "validation_status" "ok"
+                                        "validation_valid" true
+                                        "validation_issue_count" 0})
+
+                                (= name "Market Evidence")
+                                (assoc row
+                                       "status" "idle"
+                                       "evidence"
+                                       {"phase" "preflight-pending"
+                                        "target_date" "2026-07-02"
+                                        "target_stamp" "20260702"
+                                        "preflight_due_at" "2026-07-02T09:10:00-04:00"
+                                        "collector_due_at" "2026-07-02T10:45:00-04:00"})
+
+                                :else
+                                row)))
+                          ["stevetrading-six.service"
+                           "stevetrading-watchdog.timer"
+                           "stevetrading-reports-build.timer"
+                           "Daily Reports"
+                           "stevetrading-status-dashboard.timer"
+                           "stevetrading-market-evidence-preflight.timer"
+                           "stevetrading-market-evidence-capture-smoke.service"
+                           "stevetrading-market-evidence-capture-smoke.timer"
+                           "Market Evidence Capture Smoke"
+                           "stevetrading-market-evidence-collect.service"
+                           "stevetrading-market-evidence-collect.timer"
+                           "ThetaData Terminal"
+                           "Market Evidence"]))
+     "initiatives" (status/initiatives)}))
+
+(defn write-valid-status-publication!
+  [dir]
+  (let [now (status/now-et)
+        reports-dir (os.path/dirname dir)
+        data (minimal-valid-status-payload now)
+        validation (status/validate-payload data {:now now})
+        data (assoc data "artifact_validation" validation)
+        status-json (json/dumps (status/->jsonable data) ** :indent 2 :sort_keys true)
+        validation-json (json/dumps (status/->jsonable validation) ** :indent 2 :sort_keys true)
+        html "<html>ok</html>"
+        artifacts {"status.json" status-json
+                   "status.validation.json" validation-json
+                   "index.html" html}
+        manifest-json (json/dumps
+                       (status/->jsonable (status/status-publication-manifest data artifacts))
+                       ** :indent 2 :sort_keys true)]
+    (doseq [target status/required-nav-targets]
+      (let [target-dir (os.path/join reports-dir target)]
+        (os/makedirs target-dir ** :exist_ok true)
+        (spit (os.path/join target-dir "index.html") "<html>ok</html>\n")))
+    (spit (os.path/join dir "status.json") status-json)
+    (spit (os.path/join dir "status.validation.json") validation-json)
+    (spit (os.path/join dir "index.html") html)
+    (spit (os.path/join dir "status.publish.json") manifest-json)))
+
+(deftest status-payload-validation-accepts-complete-fresh-payload
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        result (status/validate-payload (minimal-valid-status-payload now)
+                                        {:now now})]
+    (is (true? (:valid? result)))
+    (is (= [] (:issues result)))))
+
+(deftest status-payload-validation-allows-red-daily-reports-dependency
+  (let [now (datetime/datetime 2026 7 2 17 0 0 0 et)
+        base (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Daily Reports" (get dep "name"))
+                           (assoc dep
+                                  "status" "bad"
+                                  "detail" "missing expected daily validation artifact for 2026-07-02"
+                                  "evidence"
+                                  {"expected_date" "2026-07-02"
+                                   "expected_stamp" "20260702"
+                                   "due_at" "2026-07-05T16:05:00-04:00"
+                                   "daily_dir" "/tmp/reports/daily"
+                                   "validation_path" "/tmp/reports/daily/20260702.validation.json"
+                                   "html_path" "/tmp/reports/daily/20260702.html"
+                                   "validation_exists" false
+                                   "html_exists" false})
+                           dep))
+                       (get base "dependencies")))
+        data (assoc base
+                    "dependencies" deps
+                    "overall" (status/overall (get base "strategy_rows") deps))
+        result (status/validate-payload data {:now now})]
+    (is (= "bad" (get-in data ["overall" "status"])))
+    (is (true? (:valid? result)))
+    (is (= [] (:issues result)))))
+
+(deftest status-payload-validation-rejects-stale-generated-at
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (assoc (minimal-valid-status-payload now)
+                    "generated_at" (.isoformat (- now (datetime/timedelta ** :minutes 45)) ** :timespec "seconds"))
+        result (status/validate-payload data {:now now :max-age-minutes 20})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/generated-at-stale))))
+
+(deftest status-payload-validation-rejects-unexplained-session-date-drift
+  (let [now (datetime/datetime 2026 7 3 10 0 0 0 et)
+        base (minimal-valid-status-payload now)
+        data (assoc base
+                    "generated_at" (.isoformat now ** :timespec "seconds")
+                    "session" (assoc (get base "session") "date" "2026-07-02")
+                    "target_date" nil)
+        result (status/validate-payload data {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/session-date-unexplained-drift))))
+
+(deftest status-payload-validation-allows-explicit-target-date-drift
+  (let [now (datetime/datetime 2026 7 3 10 0 0 0 et)
+        base (minimal-valid-status-payload now)
+        data (assoc base
+                    "generated_at" (.isoformat now ** :timespec "seconds")
+                    "session" (assoc (get base "session") "date" "2026-07-02")
+                    "target_date" "2026-07-02")
+        result (status/validate-payload data {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (not (contains? codes :status/session-date-unexplained-drift)))
+    (is (not (contains? codes :status/target-date-session-mismatch)))))
+
+(deftest status-payload-validation-rejects-target-date-session-mismatch
+  (let [now (datetime/datetime 2026 7 3 10 0 0 0 et)
+        base (minimal-valid-status-payload now)
+        data (assoc base
+                    "generated_at" (.isoformat now ** :timespec "seconds")
+                    "session" (assoc (get base "session") "date" "2026-07-02")
+                    "target_date" "2026-07-01")
+        result (status/validate-payload data {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/target-date-session-mismatch))))
+
+(deftest status-payload-validation-rejects-malformed-session-shapes
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        cases [["scalar session"
+                "not-a-session"
+                :status/session-invalid-shape]
+               ["missing label"
+                (dissoc (get data "session") "label")
+                :status/session-missing-keys]
+               ["bad market-hours boolean"
+                (assoc (get data "session") "is_market_hours" "true")
+                :status/session-market-hours-invalid]
+               ["bad label"
+                (assoc (get data "session") "label" "definitely-open")
+                :status/session-label-invalid]
+               ["bad session kind"
+                (assoc (get data "session") "session_kind" "half-day-ish")
+                :status/session-kind-invalid]
+               ["bad close"
+                (assoc (get data "session") "close_at" "not-a-time")
+                :status/session-close-at-invalid]]]
+    (doseq [[label session expected-code] cases]
+      (testing label
+        (let [result (status/validate-payload (assoc data "session" session)
+                                              {:now now})
+              codes (set (map :code (:issues result)))]
+	          (is (false? (:valid? result)))
+	          (is (contains? codes expected-code)))))))
+
+(deftest status-payload-validation-rejects-contradictory-session-semantics
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        session (get data "session")
+        cases [["market-open but not market-hours"
+                (assoc session "is_market_hours" false)
+                :status/session-label-state-mismatch]
+               ["post-market while market-hours"
+                (assoc session
+                       "label" "post-market"
+                       "is_market_hours" true)
+                :status/session-label-state-mismatch]
+               ["early-close flag on regular session"
+                (assoc session
+                       "session_kind" "regular"
+                       "is_early_close" true)
+                :status/session-kind-state-mismatch]
+               ["regular kind on closed holiday"
+                (assoc session
+                       "label" "market-closed-holiday-or-weekend"
+                       "is_trading_day" false
+                       "is_market_hours" false
+                       "session_kind" "regular")
+                :status/session-kind-state-mismatch]
+               ["close before open"
+                (assoc session
+                       "open_at" "2026-07-02T16:00:00-04:00"
+                       "close_at" "2026-07-02T09:30:00-04:00")
+                :status/session-window-invalid]
+               ["window date drift"
+                (assoc session
+                       "open_at" "2026-07-01T09:30:00-04:00")
+                :status/session-window-date-mismatch]]]
+    (doseq [[label forged-session expected-code] cases]
+      (testing label
+        (let [result (status/validate-payload
+                      (assoc data "session" forged-session)
+                      {:now now})
+              codes (set (map :code (:issues result)))]
+          (is (false? (:valid? result)))
+          (is (contains? codes expected-code)
+              (str label " expected " expected-code " got " codes)))))))
+
+(deftest status-payload-validation-rejects-partial-strategy-watchers
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (assoc (minimal-valid-status-payload now)
+                    "strategy_rows" [(first (get (minimal-valid-status-payload now) "strategy_rows"))])
+        result (status/validate-payload data {:now now})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/strategy-rows-partial))))
+
+(deftest status-payload-validation-rejects-duplicate-or-unknown-strategy-watchers
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        rows (get data "strategy_rows")
+        duplicate-data (assoc data "strategy_rows"
+                              (vec (concat [(first rows)] (butlast rows))))
+        unknown-data (assoc data "strategy_rows"
+                            (assoc rows 0 (assoc (first rows)
+                                                 "strategy_id" "strategy/unknown")))]
+    (let [result (status/validate-payload duplicate-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/strategy-rows-duplicate)))
+    (let [result (status/validate-payload unknown-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/strategy-rows-unknown)))))
+
+(deftest status-payload-validation-rejects-invalid-strategy-row-metrics
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        rows (get data "strategy_rows")
+        mutate-first-row (fn [f]
+                           (assoc data "strategy_rows"
+                                  (assoc rows 0 (f (first rows)))))]
+    (doseq [[label mutated expected-code]
+            [["negative facts"
+              (mutate-first-row #(assoc % "facts" -1))
+              :status/strategy-row-counter-invalid]
+             ["string facts"
+              (mutate-first-row #(assoc % "facts" "1"))
+              :status/strategy-row-counter-invalid]
+             ["boolean facts"
+              (mutate-first-row #(assoc % "facts" true))
+              :status/strategy-row-counter-invalid]
+             ["fills exceed facts"
+              (mutate-first-row #(assoc % "facts" 1 "fills" 2))
+              :status/strategy-row-counter-exceeds-facts]
+             ["bad age"
+              (mutate-first-row #(assoc % "age_minutes" "fresh"))
+              :status/strategy-row-age-invalid]]]
+      (testing label
+        (let [result (status/validate-payload mutated {:now now})
+              codes (set (map :code (:issues result)))]
+          (is (false? (:valid? result)))
+          (is (contains? codes expected-code)))))))
+
+(deftest status-payload-validation-rejects-blank-strategy-row-fields
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        rows (get data "strategy_rows")
+        mutated (assoc data "strategy_rows"
+                       (assoc rows 0 (assoc (first rows)
+                                            "detail" "   ")))
+        result (status/validate-payload mutated {:now now})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/strategy-row-blank-field))))
+
+(deftest status-payload-validation-rejects-stale-dependency-probe
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (cons (assoc (first (get data "dependencies"))
+                               "updated_at" (.isoformat (- now (datetime/timedelta ** :minutes 45)) ** :timespec "seconds"))
+                        (rest (get data "dependencies"))))
+        result (status/validate-payload (assoc data "dependencies" deps)
+                                        {:now now :max-age-minutes 20})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/dependency-stale))))
+
+(deftest status-payload-validation-rejects-duplicate-or-unknown-dependencies
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (get data "dependencies")
+        duplicate-data (assoc data "dependencies"
+                              (vec (concat [(first deps)] (butlast deps))))
+        unknown-data (assoc data "dependencies"
+                            (assoc deps 0 (assoc (first deps) "name" "Fake Probe")))]
+    (let [result (status/validate-payload duplicate-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/dependencies-duplicate)))
+    (let [result (status/validate-payload unknown-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/dependencies-unknown)))))
+
+(deftest status-payload-validation-rejects-blank-dependency-fields
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (get data "dependencies")
+        mutated (assoc data "dependencies"
+                       (assoc deps 0 (assoc (first deps)
+                                           "detail" ""
+                                           "expected" "   ")))
+        result (status/validate-payload mutated {:now now})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/dependency-blank-field))))
+
+(deftest status-payload-validation-requires-current-initiatives
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        missing-data (assoc data
+                            "initiatives"
+                            (vec (remove #(= "L4 Options Paper Brokerage" (get % "name"))
+                                         (get data "initiatives"))))
+        unknown-data (assoc data
+                            "initiatives"
+                            (conj (get data "initiatives")
+                                  {"priority" "P9"
+                                   "name" "Fake Initiative"
+                                   "status" "active"
+                                   "detail" "should fail"}))
+        malformed-data (assoc data
+                              "initiatives"
+                              (assoc (get data "initiatives") 0
+                                     (dissoc (first (get data "initiatives"))
+                                             "detail")))]
+    (let [result (status/validate-payload missing-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/initiatives-required-missing)))
+    (let [result (status/validate-payload unknown-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/initiatives-unknown)))
+    (let [result (status/validate-payload malformed-data {:now now})]
+      (is (false? (:valid? result)))
+      (is (contains? (set (map :code (:issues result)))
+                     :status/initiative-malformed)))))
+
+(deftest status-payload-validation-rejects-blank-initiative-fields
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        initiatives (get data "initiatives")
+        mutated (assoc data
+                       "initiatives"
+                       (assoc initiatives 0 (assoc (first initiatives)
+                                                   "priority" " "
+                                                   "detail" "")))
+        result (status/validate-payload mutated {:now now})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/initiative-blank-field))))
+
+(deftest status-payload-validation-rejects-daily-reports-ok-without-structured-evidence
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Daily Reports" (get dep "name"))
+                           {"name" "Daily Reports"
+                            "status" "ok"
+                            "detail" "forged green"
+                            "expected" "test"
+                            "updated_at" (.isoformat now ** :timespec "seconds")}
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps) {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/daily-reports-missing-evidence))))
+
+(deftest status-payload-validation-rejects-daily-reports-ok-with-false-evidence
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Daily Reports" (get dep "name"))
+                           (assoc dep
+                                  "status" "ok"
+                                  "evidence" (assoc (get dep "evidence")
+                                                    "validation_exists" false))
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps) {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/daily-reports-validation-missing))))
+
+(deftest status-payload-validation-rejects-market-evidence-ok-without-structured-evidence
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Market Evidence" (get dep "name"))
+                           {"name" "Market Evidence"
+                            "status" "ok"
+                            "detail" "forged green"
+                            "expected" "test"
+                            "updated_at" (.isoformat now ** :timespec "seconds")}
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps) {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/market-evidence-missing-evidence))))
+
+(deftest status-payload-validation-rejects-market-evidence-ok-with-false-evidence
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        bad-evidence (merge (valid-market-evidence-proof-fields)
+                            {"phase" "collector-ok"
+                             "target_date" "2026-07-02"
+                             "target_stamp" "20260702"
+                             "collector_due_at" "2026-07-02T10:45:00-04:00"
+                             "status_path" "/tmp/market_evidence_status_20260702.json"
+                             "status_updated_at" "2026-07-02T11:00:00-04:00"
+                             "collector_ok" true
+                             "ok" true
+                             "artifact_status" "ok"
+                             "manifest_valid" false
+                             "manifest_verified" true
+                             "target_matches_request" true
+                             "readiness_verdict" "PASS"
+                             "payload_example_count" 8})
+        deps (vec (map (fn [dep]
+                         (if (= "Market Evidence" (get dep "name"))
+                           (assoc dep
+                                  "status" "ok"
+                                  "evidence" bad-evidence)
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps) {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/market-evidence-manifest-invalid))))
+
+(deftest status-payload-validation-rejects-market-evidence-ok-with-future-or-bad-artifact-status
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        base-evidence (merge (valid-market-evidence-proof-fields)
+                             {"phase" "collector-ok"
+                              "target_date" "2026-07-02"
+                              "target_stamp" "20260702"
+                              "collector_due_at" "2026-07-02T10:45:00-04:00"
+                              "status_path" "/tmp/market_evidence_status_20260702.json"
+                              "status_updated_at" "2026-07-02T11:00:00-04:00"
+                              "collector_ok" true
+                              "ok" true
+                              "artifact_status" "ok"
+                              "manifest_valid" true
+                              "manifest_verified" true
+                              "target_matches_request" true
+                              "readiness_verdict" "PASS"
+                              "payload_example_count" 8})
+        mk-data (fn [evidence]
+                  (let [data (minimal-valid-status-payload now)]
+                    (assoc data "dependencies"
+                           (vec (map (fn [dep]
+                                        (if (= "Market Evidence" (get dep "name"))
+                                          (assoc dep
+                                                 "status" "ok"
+                                                 "evidence" evidence)
+                                          dep))
+                                      (get data "dependencies"))))))]
+    (let [future-result (status/validate-payload
+                         (mk-data (assoc base-evidence
+                                         "status_updated_at" "2026-07-02T11:05:00-04:00"))
+                         {:now now})
+          future-codes (set (map :code (:issues future-result)))]
+      (is (false? (:valid? future-result)))
+      (is (contains? future-codes :status/market-evidence-status-updated-at-in-future)))
+    (let [bad-status-result (status/validate-payload
+                             (mk-data (assoc base-evidence "artifact_status" "error"))
+                             {:now now})
+          bad-status-codes (set (map :code (:issues bad-status-result)))]
+      (is (false? (:valid? bad-status-result)))
+      (is (contains? bad-status-codes :status/market-evidence-artifact-status-not-ok)))))
+
+(deftest status-payload-validation-rejects-malformed-market-evidence-diagnostic-flags
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        base-evidence (merge (valid-market-evidence-proof-fields)
+                             {"phase" "collector-ok"
+                              "target_date" "2026-07-02"
+                              "target_stamp" "20260702"
+                              "collector_due_at" "2026-07-02T10:45:00-04:00"
+                              "status_path" "/tmp/market_evidence_status_20260702.json"
+                              "status_updated_at" "2026-07-02T11:00:00-04:00"
+                              "collector_ok" true
+                              "ok" true
+                              "artifact_status" "ok"
+                              "manifest_valid" true
+                              "manifest_verified" true
+                              "target_matches_request" true
+                              "readiness_verdict" "PASS"
+                              "payload_example_count" 8
+                              "prediction_delta_available" "true"
+                              "parity_gate_available" true})
+        data (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Market Evidence" (get dep "name"))
+                           (assoc dep
+                                  "status" "ok"
+                                  "evidence" base-evidence)
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps) {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/market-evidence-prediction-delta-available-invalid))))
+
+(deftest status-payload-validation-rejects-market-evidence-ok-with-missing-matched-proof-fields
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        base-evidence (merge (valid-market-evidence-proof-fields)
+                             {"phase" "collector-ok"
+                              "target_date" "2026-07-02"
+                              "target_stamp" "20260702"
+                              "collector_due_at" "2026-07-02T10:45:00-04:00"
+                              "status_path" "/tmp/missing-market-evidence-status.json"
+                              "status_updated_at" "2026-07-02T11:00:00-04:00"
+                              "collector_ok" true
+                              "ok" true
+                              "artifact_status" "ok"
+                              "manifest_valid" true
+                              "manifest_verified" true
+                              "target_matches_request" true
+                              "readiness_verdict" "PASS"
+                              "payload_example_count" 8
+                              "prediction_delta_available" true
+                              "parity_gate_available" true
+                              "capture_v2_ok" true
+                              "capture_v2_required_option_surface_prefixes_present" true
+                              "capture_v2_sidecar_dtypes_ok" true
+                              "capture_v2_malformed_contract_count" 0
+                              "unmask_apply_ready" true
+                              "verified_apply_validation_apply_safe" true
+                              "verified_apply_validation_candidate_count" 4})
+        mk-result (fn [evidence]
+                    (let [data (minimal-valid-status-payload now)
+                          deps (vec (map (fn [dep]
+                                           (if (= "Market Evidence" (get dep "name"))
+                                             (assoc dep "status" "ok" "evidence" evidence)
+                                             dep))
+                                         (get data "dependencies")))]
+                      (status/validate-payload (assoc data "dependencies" deps) {:now now})))]
+    (doseq [[evidence expected-code]
+            [[(dissoc base-evidence "matched_feature_parity_max_abs_deviation")
+              :status/market-evidence-matched-parity-max-abs-dev-missing]
+             [(dissoc base-evidence "matched_feature_parity_min_correlation")
+              :status/market-evidence-matched-parity-min-corr-missing]
+             [(dissoc base-evidence "matched_feature_parity_start")
+              :status/market-evidence-matched-parity-start-missing]
+             [(dissoc base-evidence "matched_feature_parity_end")
+              :status/market-evidence-matched-parity-end-missing]]]
+      (let [result (mk-result evidence)
+            codes (set (map :code (:issues result)))]
+        (is (false? (:valid? result)))
+        (is (contains? codes expected-code))))))
+
+(deftest status-payload-validation-rejects-green-market-evidence-with-missing-status-path
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        missing-path (os.path/join (tempfile/mkdtemp) "missing-market-evidence-status.json")
+        deps (vec (map (fn [dep]
+                         (if (= "Market Evidence" (get dep "name"))
+                           (assoc dep
+                                  "status" "ok"
+                                  "evidence"
+                                  (merge (valid-market-evidence-proof-fields)
+                                         {"phase" "collector-ok"
+                                          "target_date" "2026-07-02"
+                                          "target_stamp" "20260702"
+                                          "collector_due_at" "2026-07-02T10:45:00-04:00"
+                                          "status_path" missing-path
+                                          "status_updated_at" "2026-07-02T11:00:00-04:00"
+                                          "collector_ok" true
+                                          "ok" true
+                                          "artifact_status" "ok"
+                                          "manifest_valid" true
+                                          "manifest_verified" true
+                                          "target_matches_request" true
+                                          "readiness_verdict" "PASS"
+                                          "payload_example_count" 8
+                                          "prediction_delta_available" true
+                                          "parity_gate_available" true}))
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps)
+                                        {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/market-evidence-status-path-missing))))
+
+(deftest status-payload-validation-reopens-green-market-evidence-status-path
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            status-path (os.path/join (.-name tmp) "market_evidence_status_20260702.json")
+            base-status {"target_date" "2026-07-02"
+                         "target_stamp" "20260702"
+                         "ok?" true
+                         "status" "ok"
+                         "manifest" {"valid?" true
+                                     "target_matches_request?" true
+                                     "payload_example_count" 8
+                                     "diagnostics" {"prediction_delta" {"available" true}
+                                                    "parity_gate" {"available" true}}}
+                         "manifest_verification" {"valid?" true}
+                         "readiness" (valid-market-evidence-readiness)
+                         "unmask_apply_ready?" true
+                         "unmask_apply_reasons" []
+                         "verified_apply_validation" {"apply_safe" true
+                                                      "candidate_count" 4}}
+            base-evidence (merge (valid-market-evidence-proof-fields)
+                                 {"phase" "collector-ok"
+                                  "target_date" "2026-07-02"
+                                  "target_stamp" "20260702"
+                                  "collector_due_at" "2026-07-02T10:45:00-04:00"
+                                  "status_path" status-path
+                                  "status_updated_at" "2026-07-02T11:00:00-04:00"
+                                  "collector_ok" true
+                                  "ok" true
+                                  "artifact_status" "ok"
+                                  "manifest_valid" true
+                                  "manifest_verified" true
+                                  "target_matches_request" true
+                                  "readiness_verdict" "PASS"
+                                  "payload_example_count" 8
+                                  "prediction_delta_available" true
+                                  "parity_gate_available" true
+                                  "unmask_apply_ready" true
+                                  "verified_apply_validation_apply_safe" true
+                                  "verified_apply_validation_candidate_count" 4})
+            mk-data (fn []
+                      (let [data (minimal-valid-status-payload now)]
+                        (assoc data "dependencies"
+                               (vec (map (fn [dep]
+                                            (if (= "Market Evidence" (get dep "name"))
+                                              (assoc dep
+                                                     "status" "ok"
+                                                     "evidence" base-evidence)
+                                              dep))
+                                          (get data "dependencies"))))))]
+        (doseq [[mutated expected-code]
+                [[(assoc base-status "ok?" false)
+                  :status/market-evidence-status-file-not-ok]
+                 [(assoc base-status "target_stamp" "20260701")
+                  :status/market-evidence-status-file-target-stamp-mismatch]
+                 [(assoc-in base-status ["manifest_verification" "valid?"] false)
+                  :status/market-evidence-status-file-manifest-not-verified]
+                 [(assoc-in base-status ["readiness" "verdict"] "FAIL")
+                  :status/market-evidence-status-file-readiness-not-pass]
+                 [(assoc-in base-status ["manifest" "payload_example_count"] 1)
+                  :status/market-evidence-status-file-payload-count-mismatch]
+                 [(assoc-in base-status ["manifest" "diagnostics" "prediction_delta" "available"] false)
+                  :status/market-evidence-status-file-prediction-delta-mismatch]
+                 [(assoc-in base-status ["manifest" "diagnostics" "parity_gate" "available"] false)
+                  :status/market-evidence-status-file-parity-gate-mismatch]
+                 [(assoc-in base-status ["readiness" "matched_feature_parity" "max_abs_deviation"] 1.25)
+                  :status/market-evidence-status-file-matched-parity-max-abs-dev-mismatch]
+                 [(assoc-in base-status ["readiness" "matched_feature_parity" "min_correlation"] 0.5)
+                  :status/market-evidence-status-file-matched-parity-min-corr-mismatch]
+                 [(assoc-in base-status ["readiness" "matched_feature_parity" "matched_start"] "2026-07-02T13:31:00Z")
+                  :status/market-evidence-status-file-matched-parity-start-mismatch]
+                 [(assoc-in base-status ["readiness" "matched_feature_parity" "matched_end"] "2026-07-02T15:31:00Z")
+                  :status/market-evidence-status-file-matched-parity-end-mismatch]
+                 [(assoc base-status "unmask_apply_ready?" false)
+                  :status/market-evidence-status-file-unmask-apply-ready-mismatch]
+                 [(assoc-in base-status ["verified_apply_validation" "apply_safe"] false)
+                  :status/market-evidence-status-file-verified-apply-safe-mismatch]
+                 [(assoc-in base-status ["verified_apply_validation" "candidate_count"] 3)
+                  :status/market-evidence-status-file-verified-apply-candidate-count-mismatch]]]
+          (spit status-path (json/dumps (status/->jsonable mutated) ** :indent 2 :sort_keys true))
+          (let [result (status/validate-payload (mk-data) {:now now})
+                codes (set (map :code (:issues result)))]
+            (is (false? (:valid? result)))
+            (is (contains? codes expected-code)))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-payload-validation-rejects-ok-market-evidence-without-safe-unmask
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+            status-path (os.path/join (.-name tmp) "market_evidence_status_20260702.json")
+            base-status {"target_date" "2026-07-02"
+                         "target_stamp" "20260702"
+                         "ok?" true
+                         "status" "ok"
+                         "manifest" {"valid?" true
+                                     "target_matches_request?" true
+                                     "payload_example_count" 8
+                                     "diagnostics" {"prediction_delta" {"available" true}
+                                                    "parity_gate" {"available" true}}}
+                         "manifest_verification" {"valid?" true}
+                         "readiness" (valid-market-evidence-readiness)
+                         "unmask_apply_ready?" true
+                         "unmask_apply_reasons" []
+                         "verified_apply_validation" {"apply_safe" true
+                                                      "candidate_count" 4}}
+            base-evidence (merge (valid-market-evidence-proof-fields)
+                                 {"phase" "collector-ok"
+                                  "target_date" "2026-07-02"
+                                  "target_stamp" "20260702"
+                                  "collector_due_at" "2026-07-02T10:45:00-04:00"
+                                  "status_path" status-path
+                                  "status_updated_at" "2026-07-02T11:00:00-04:00"
+                                  "collector_ok" true
+                                  "ok" true
+                                  "artifact_status" "ok"
+                                  "manifest_valid" true
+                                  "manifest_verified" true
+                                  "target_matches_request" true
+                                  "readiness_verdict" "PASS"
+                                  "payload_example_count" 8
+                                  "prediction_delta_available" true
+                                  "parity_gate_available" true
+                                  "unmask_apply_ready" true
+                                  "verified_apply_validation_apply_safe" true
+                                  "verified_apply_validation_candidate_count" 4})
+            mk-data (fn [evidence]
+                      (let [data (minimal-valid-status-payload now)]
+                        (assoc data "dependencies"
+                               (vec (map (fn [dep]
+                                            (if (= "Market Evidence" (get dep "name"))
+                                              (assoc dep "status" "ok" "evidence" evidence)
+                                              dep))
+                                          (get data "dependencies"))))))]
+        (doseq [[mutated-evidence mutated-status expected-code]
+                [[(assoc base-evidence "unmask_apply_ready" false)
+                  (assoc base-status "unmask_apply_ready?" false)
+                  :status/market-evidence-unmask-apply-not-ready]
+                 [(assoc base-evidence "verified_apply_validation_apply_safe" false)
+                  (assoc-in base-status ["verified_apply_validation" "apply_safe"] false)
+                  :status/market-evidence-verified-apply-not-safe]]]
+          (spit status-path (json/dumps (status/->jsonable mutated-status) ** :indent 2 :sort_keys true))
+          (let [result (status/validate-payload (mk-data mutated-evidence) {:now now})
+                codes (set (map :code (:issues result)))]
+            (is (false? (:valid? result)))
+            (is (contains? codes expected-code)))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-payload-validation-rejects-boolean-market-evidence-payload-count
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Market Evidence" (get dep "name"))
+                           (assoc dep
+                                  "status" "ok"
+                                  "evidence"
+                                  {"phase" "collector-ok"
+                                   "target_date" "2026-07-02"
+                                   "target_stamp" "20260702"
+                                   "collector_due_at" "2026-07-02T10:45:00-04:00"
+                                   "status_path" "/tmp/market_evidence_status_20260702.json"
+                                   "status_updated_at" "2026-07-02T11:00:00-04:00"
+                                   "collector_ok" true
+                                   "ok" true
+                                   "artifact_status" "ok"
+                                   "manifest_valid" true
+                                   "manifest_verified" true
+                                   "target_matches_request" true
+                                   "readiness_verdict" "PASS"
+                                   "payload_example_count" true})
+                           dep))
+                       (get data "dependencies")))
+        result (status/validate-payload (assoc data "dependencies" deps)
+                                        {:now now})
+        codes (set (map :code (:issues result)))]
+    (is (false? (:valid? result)))
+    (is (contains? codes :status/market-evidence-no-payload-examples))))
+
+(deftest status-payload-validation-stress-checks-required-identity-sets
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        rows (get data "strategy_rows")
+        deps (get data "dependencies")
+        reversed-data (assoc data
+                             "strategy_rows" (vec (reverse rows))
+                             "dependencies" (vec (reverse deps)))]
+    (is (true? (:valid? (status/validate-payload reversed-data {:now now}))))
+    (doseq [idx (range (count rows))]
+      (let [mutated (assoc data "strategy_rows"
+                           (assoc rows idx (assoc (get rows idx)
+                                                  "strategy_id"
+                                                  (str "strategy/fuzz/" idx))))
+            result (status/validate-payload mutated {:now now})
+            codes (set (map :code (:issues result)))]
+        (is (false? (:valid? result)))
+        (is (contains? codes :status/strategy-rows-required-missing))
+        (is (contains? codes :status/strategy-rows-unknown))))
+    (doseq [idx (range (count deps))]
+      (let [mutated (assoc data "dependencies"
+                           (assoc deps idx (assoc (get deps idx)
+                                                  "name"
+                                                  (str "Fake Probe " idx))))
+            result (status/validate-payload mutated {:now now})
+            codes (set (map :code (:issues result)))]
+        (is (false? (:valid? result)))
+        (is (contains? codes :status/dependencies-required-missing))
+        (is (contains? codes :status/dependencies-unknown))))))
+
+(deftest deterministic-fuzz-status-payload-rejects-scalar-containers-and-rows
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        cases [["strategy_rows" "not-a-vector" :status/strategy-rows-missing]
+               ["dependencies" 42 :status/dependencies-missing]
+               ["initiatives" true :status/initiatives-missing]
+               ["strategy_rows" [(first (get data "strategy_rows")) "scalar-row"] :status/strategy-row-malformed]
+               ["dependencies" [(first (get data "dependencies")) "scalar-dep"] :status/dependency-malformed]
+               ["initiatives" [(first (get data "initiatives")) "scalar-initiative"] :status/initiative-malformed]]]
+    (doseq [[field value expected-code] cases]
+      (let [result (status/validate-payload (assoc data field value) {:now now})
+            codes (set (map :code (:issues result)))]
+        (is (false? (:valid? result)))
+        (is (contains? codes expected-code))))))
+
+(deftest status-payload-validation-rejects-future-dependency-probe
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (cons (assoc (first (get data "dependencies"))
+                               "updated_at" (.isoformat (+ now (datetime/timedelta ** :minutes 5)) ** :timespec "seconds"))
+                        (rest (get data "dependencies"))))
+        result (status/validate-payload (assoc data "dependencies" deps)
+                                        {:now now :max-age-minutes 20})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/dependency-updated-at-in-future))))
+
+(deftest status-payload-validation-rejects-overall-status-mismatch
+  (let [now (datetime/datetime 2026 7 2 10 0 0 0 et)
+        data (assoc (minimal-valid-status-payload now)
+                    "dependencies" (assoc (get (minimal-valid-status-payload now) "dependencies")
+                                          0
+                                          (assoc (first (get (minimal-valid-status-payload now) "dependencies"))
+                                                 "status" "bad")))
+        result (status/validate-payload data {:now now})]
+    (is (false? (:valid? result)))
+    (is (contains? (set (map :code (:issues result)))
+                   :status/overall-status-mismatch))))
+
+(deftest no-probe-payload-is-invalid-for-publication
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [data (status/payload {:root (.-name tmp)
+                                  :target-date (datetime/date 2026 7 3)
+                                  :probe-dependencies false})
+            validation (status/validate-payload data)]
+        (is (= "warn" (get-in data ["overall" "status"])))
+        (is (= false (get data "probes_enabled")))
+        (is (= "Dependency Probes" (get-in data ["dependencies" 0 "name"])))
+        (is (false? (:valid? validation)))
+        (is (contains? (set (map :code (:issues validation)))
+                       :status/dependency-probes-disabled)))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest missing-sim-fleet-is-bad-after-completed-trading-session
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [data (status/payload {:root (.-name tmp)
+                                  :target-date (datetime/date 2026 7 2)
+                                  :probe-dependencies false})
+            sim-row (first (filter #(= "Local Sim Fleet" (get % "name"))
+                                   (get data "strategy_rows")))]
+        (is (= "post-market" (get-in data ["session" "label"])))
+        (is (= "bad" (get sim-row "status")))
+        (is (>= (.find (get sim-row "detail") "completed trading session") 0))
+        (is (= "bad" (get-in data ["overall" "status"]))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-writes-auditable-manifest
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (let [manifest-path (os.path/join (.-name tmp) "status.publish.json")
+            manifest (json/loads (slurp manifest-path))
+            audit (status/audit-status-publication (.-name tmp))]
+        (is (true? (os.path/exists manifest-path)))
+        (is (= 1 (get manifest "manifest_version")))
+        (is (= "stevetrading/status-publication/v1" (get manifest "manifest_kind")))
+        (is (= #{"status.json" "status.validation.json" "index.html"}
+               (set (.keys (get manifest "artifacts")))))
+        (is (true? (:valid? audit)))
+        (is (= [] (:issues audit))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-mutated-artifact
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (spit (os.path/join (.-name tmp) "status.json") "{\"mutated\":true}")
+      (let [audit (status/audit-status-publication (.-name tmp))]
+        (is (false? (:valid? audit)))
+        (is (contains? (set (map :code (:issues audit)))
+                       :status/published-artifact-checksum-mismatch)))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-missing-nav-target
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (os/remove (os.path/join (os.path/dirname (.-name tmp)) "daily" "index.html"))
+      (let [audit (status/audit-status-publication (.-name tmp))]
+        (is (false? (:valid? audit)))
+        (is (contains? (set (map :code (:issues audit)))
+                       :status/nav-target-missing)))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest render-html-surfaces-market-evidence-diagnostics
+  (let [now (datetime/datetime 2026 7 2 11 0 0 0 et)
+        data (minimal-valid-status-payload now)
+        deps (vec (map (fn [dep]
+                         (if (= "Market Evidence" (get dep "name"))
+                           (assoc dep
+                                  "status" "ok"
+                                  "evidence"
+                                  {"phase" "collector-ok"
+                                   "prediction_delta_available" true
+                                   "parity_gate_available" false
+                                   "matched_feature_parity_rows" 120
+                                   "matched_feature_parity_problem_count" 0
+                                   "matched_feature_parity_max_abs_deviation" 0.0
+                                   "matched_feature_parity_min_correlation" 1.0
+                                   "matched_feature_parity_start" "2026-07-02T13:30:00Z"
+                                   "matched_feature_parity_end" "2026-07-02T15:30:00Z"
+                                   "unmask_apply_ready" true})
+                           dep))
+                       (get data "dependencies")))
+        html (status/render-html (assoc data "dependencies" deps))]
+    (is (>= (.find html "Diagnostics: prediction_delta=true") 0))
+    (is (>= (.find html "parity_gate=false") 0))
+    (is (>= (.find html "matched_rows=120") 0))
+    (is (>= (.find html "matched_problems=0") 0))
+    (is (>= (.find html "max_abs_dev=0.0") 0))
+    (is (>= (.find html "min_corr=1.0") 0))
+    (is (>= (.find html "matched_window=2026-07-02T13:30:00Z..2026-07-02T15:30:00Z") 0))
+    (is (>= (.find html "unmask_apply_ready=true") 0))))
+
+(deftest status-publication-audit-fails-tampered-validation-artifact
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (spit (os.path/join (.-name tmp) "status.validation.json")
+            (json/dumps (status/->jsonable
+                         {"valid?" true
+                          "issues" [{"severity" "bad"
+                                     "code" "status/fake-clean"
+                                     "detail" "tampered"}]})))
+      (let [old-manifest (json/loads (slurp (os.path/join (.-name tmp) "status.publish.json")))
+            status-json (slurp (os.path/join (.-name tmp) "status.json"))
+            validation-json (slurp (os.path/join (.-name tmp) "status.validation.json"))
+            html (slurp (os.path/join (.-name tmp) "index.html"))
+            entry (fn [content]
+                    {"sha256" (status/sha256-text content)
+                     "bytes" (count (.encode content "utf-8"))})
+            manifest {"generated_at" (get old-manifest "generated_at")
+                      "published_at" (get old-manifest "published_at")
+                      "artifacts" {"status.json" (entry status-json)
+                                   "status.validation.json" (entry validation-json)
+                                   "index.html" (entry html)}}]
+        (spit (os.path/join (.-name tmp) "status.publish.json")
+              (json/dumps (status/->jsonable manifest)))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/published-validation-issues-mismatch))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-tampered-embedded-validation
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (let [status-path (os.path/join (.-name tmp) "status.json")
+            status-data (json/loads (slurp status-path))]
+        (aset status-data "artifact_validation"
+              (status/->jsonable
+               {"valid?" true
+                "issues" [{"severity" "bad"
+                           "code" "status/fake-dashboard-clean"
+                           "detail" "tampered embedded validation"}]
+                "checked_at" (get status-data "generated_at")}))
+        (spit status-path
+              (json/dumps status-data ** :indent 2 :sort_keys true))
+        (let [old-manifest (json/loads (slurp (os.path/join (.-name tmp) "status.publish.json")))
+              status-json (slurp status-path)
+              validation-json (slurp (os.path/join (.-name tmp) "status.validation.json"))
+              html (slurp (os.path/join (.-name tmp) "index.html"))
+              entry (fn [content]
+                      {"sha256" (status/sha256-text content)
+                       "bytes" (count (.encode content "utf-8"))})
+              manifest {"manifest_version" 1
+                        "manifest_kind" "stevetrading/status-publication/v1"
+                        "generated_at" (get old-manifest "generated_at")
+                        "published_at" (get old-manifest "published_at")
+                        "artifacts" {"status.json" (entry status-json)
+                                     "status.validation.json" (entry validation-json)
+                                     "index.html" (entry html)}}]
+          (spit (os.path/join (.-name tmp) "status.publish.json")
+                (json/dumps (status/->jsonable manifest) ** :indent 2 :sort_keys true))
+          (let [audit (status/audit-status-publication (.-name tmp))]
+            (is (false? (:valid? audit)))
+            (is (contains? (set (map :code (:issues audit)))
+                           :status/published-embedded-validation-issues-mismatch)))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-wrong-manifest-kind-or-version
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (let [manifest-path (os.path/join (.-name tmp) "status.publish.json")
+            manifest (json/loads (slurp manifest-path))]
+        (doseq [[field bad-value expected-code] [["manifest_kind" "wrong/status-kind" :status/publish-manifest-kind-invalid]
+                                                 ["manifest_version" 999 :status/publish-manifest-version-invalid]]]
+          (aset manifest field bad-value)
+          (spit manifest-path
+                (json/dumps manifest))
+          (let [audit (status/audit-status-publication (.-name tmp))]
+            (is (false? (:valid? audit)))
+            (is (contains? (set (map :code (:issues audit)))
+                           expected-code)))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-rejects-manifest-extra-and-missing-keys
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (let [manifest-path (os.path/join (.-name tmp) "status.publish.json")
+            manifest (json/loads (slurp manifest-path))]
+        (aset manifest "unexpected" true)
+        (spit manifest-path (json/dumps manifest))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-extra-keys)))
+        (.pop manifest "unexpected")
+        (.pop manifest "generated_at")
+        (spit manifest-path (json/dumps manifest))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-missing-keys))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-rejects-artifact-entry-extra-and-missing-keys
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (let [manifest-path (os.path/join (.-name tmp) "status.publish.json")
+            manifest (json/loads (slurp manifest-path))
+            artifacts (get manifest "artifacts")
+            status-entry (get artifacts "status.json")]
+        (aset status-entry "unexpected" "fake")
+        (spit manifest-path (json/dumps manifest))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-artifact-extra-keys)))
+        (.pop status-entry "unexpected")
+        (.pop status-entry "sha256")
+        (spit manifest-path (json/dumps manifest))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-artifact-missing-keys))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-rejects-malformed-manifest-shapes
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (write-valid-status-publication! (.-name tmp))
+      (let [manifest-path (os.path/join (.-name tmp) "status.publish.json")
+            manifest (json/loads (slurp manifest-path))]
+        (spit manifest-path (json/dumps (status/->jsonable ["not" "an" "object"])))
+        (let [audit (status/audit-status-publication (.-name tmp))
+              codes (set (map :code (:issues audit)))]
+          (is (false? (:valid? audit)))
+          (is (contains? codes :status/publish-manifest-invalid-shape)))
+        (aset manifest "artifacts" (status/->jsonable ["not" "an" "object"]))
+        (spit manifest-path (json/dumps manifest))
+        (let [audit (status/audit-status-publication (.-name tmp))
+              codes (set (map :code (:issues audit)))]
+          (is (false? (:valid? audit)))
+          (is (contains? codes :status/publish-manifest-artifacts-invalid-shape)))
+        (write-valid-status-publication! (.-name tmp))
+        (let [manifest (json/loads (slurp manifest-path))]
+        (aset (get manifest "artifacts") "status.json" "not an artifact entry")
+        (spit manifest-path (json/dumps manifest))
+        (let [audit (status/audit-status-publication (.-name tmp))
+              codes (set (map :code (:issues audit)))]
+          (is (false? (:valid? audit)))
+          (is (contains? codes :status/publish-manifest-artifact-invalid-shape)))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-stale-self-consistent-bundle
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [old-now (- (status/now-et) (datetime/timedelta ** :minutes 45))
+            data (minimal-valid-status-payload old-now)
+            validation (status/validate-payload data {:now old-now})
+            data (assoc data "artifact_validation" validation)
+            status-json (json/dumps (status/->jsonable data) ** :indent 2 :sort_keys true)
+            validation-json (json/dumps (status/->jsonable validation) ** :indent 2 :sort_keys true)
+            html "<html>stale</html>"
+            artifacts {"status.json" status-json
+                       "status.validation.json" validation-json
+                       "index.html" html}
+            manifest (assoc (status/status-publication-manifest data artifacts)
+                            "published_at" (.isoformat old-now ** :timespec "seconds"))]
+        (spit (os.path/join (.-name tmp) "status.json") status-json)
+        (spit (os.path/join (.-name tmp) "status.validation.json") validation-json)
+        (spit (os.path/join (.-name tmp) "index.html") html)
+        (spit (os.path/join (.-name tmp) "status.publish.json")
+              (json/dumps (status/->jsonable manifest)))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/published-status-validation-failed))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-published-at-stale))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-missing-manifest
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [audit (status/audit-status-publication (.-name tmp))]
+        (is (false? (:valid? audit)))
+        (is (contains? (set (map :code (:issues audit)))
+                       :status/publish-manifest-unreadable)))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-requires-all-published-artifact-entries
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [status-json "{\"ok\":true}\n"
+            validation-json "{\"valid\":true}\n"
+            manifest {"generated_at" "2026-07-05T12:00:00-04:00"
+                      "published_at" "2026-07-05T12:00:00-04:00"
+                      "artifacts" {"status.json" {"sha256" (status/sha256-text status-json)
+                                                  "bytes" (count (.encode status-json "utf-8"))}
+                                   "status.validation.json" {"sha256" (status/sha256-text validation-json)
+                                                             "bytes" (count (.encode validation-json "utf-8"))}}}]
+        (spit (os.path/join (.-name tmp) "status.json") status-json)
+        (spit (os.path/join (.-name tmp) "status.validation.json") validation-json)
+        (spit (os.path/join (.-name tmp) "status.publish.json")
+              (json/dumps (status/->jsonable manifest)))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-missing-artifact-entry))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-fails-size-mismatch
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [status-json "{\"ok\":true}\n"
+            validation-json "{\"valid\":true}\n"
+            html "<html>ok</html>\n"
+            manifest {"generated_at" "2026-07-05T12:00:00-04:00"
+                      "published_at" "2026-07-05T12:00:00-04:00"
+                      "artifacts" {"status.json" {"sha256" (status/sha256-text status-json)
+                                                  "bytes" 0}
+                                   "status.validation.json" {"sha256" (status/sha256-text validation-json)
+                                                             "bytes" (count (.encode validation-json "utf-8"))}
+                                   "index.html" {"sha256" (status/sha256-text html)
+                                                 "bytes" (count (.encode html "utf-8"))}}}]
+        (spit (os.path/join (.-name tmp) "status.json") status-json)
+        (spit (os.path/join (.-name tmp) "status.validation.json") validation-json)
+        (spit (os.path/join (.-name tmp) "index.html") html)
+        (spit (os.path/join (.-name tmp) "status.publish.json")
+              (json/dumps (status/->jsonable manifest)))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/published-artifact-size-mismatch))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest status-publication-audit-rejects-unsafe-artifact-names
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [status-json "{\"ok\":true}\n"
+            validation-json "{\"valid\":true}\n"
+            html "<html>ok</html>\n"
+            evil "stolen\n"
+            manifest {"generated_at" "2026-07-05T12:00:00-04:00"
+                      "published_at" "2026-07-05T12:00:00-04:00"
+                      "artifacts" {"status.json" {"sha256" (status/sha256-text status-json)
+                                                  "bytes" (count (.encode status-json "utf-8"))}
+                                   "status.validation.json" {"sha256" (status/sha256-text validation-json)
+                                                             "bytes" (count (.encode validation-json "utf-8"))}
+                                   "index.html" {"sha256" (status/sha256-text html)
+                                                 "bytes" (count (.encode html "utf-8"))}
+                                   "../outside.json" {"sha256" (status/sha256-text evil)
+                                                      "bytes" (count (.encode evil "utf-8"))}}}]
+        (spit (os.path/join (.-name tmp) "status.json") status-json)
+        (spit (os.path/join (.-name tmp) "status.validation.json") validation-json)
+        (spit (os.path/join (.-name tmp) "index.html") html)
+        (spit (os.path/join (.-name tmp) "status.publish.json")
+              (json/dumps (status/->jsonable manifest)))
+        (let [audit (status/audit-status-publication (.-name tmp))]
+          (is (false? (:valid? audit)))
+          (is (contains? (set (map :code (:issues audit)))
+                         :status/publish-manifest-unsafe-artifact-name))))
+      (finally
+        (.cleanup tmp)))))

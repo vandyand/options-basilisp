@@ -1,0 +1,41 @@
+;; Basilisp CLI for one cost-gated immutable Databento event request.
+(import argparse glob os os.path sys)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.market-data.databento :as databento])
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--dataset" ** :required true)
+    (.add_argument parser "--class-id" ** :required true)
+    (.add_argument parser "--admission" ** :choices (python/list ["hard" "probationary"]) :required true)
+    (.add_argument parser "--symbols" ** :required true)
+    (.add_argument parser "--stype-in" ** :required true)
+    (.add_argument parser "--schemas" ** :required true)
+    (.add_argument parser "--start" ** :required true)
+    (.add_argument parser "--end" ** :required true)
+    (.add_argument parser "--out-root" ** :default "D:\\SteveTradingData\\raw\\v1")
+    (.add_argument parser "--manifest-root" ** :default "D:\\SteveTradingData\\manifests\\v1")
+    (.add_argument parser "--max-total-cost-usd" ** :default "0")
+    (.add_argument parser "--max-total-billable-bytes" ** :type int :default 268435456)
+    (.add_argument parser "--api-key-env" ** :default "DATABENTO_API_KEY")
+    (.parse_args parser (python/list argv))))
+
+(try
+  (let [args (parse-args (vec *command-line-args*))
+        result (databento/collect!
+                {"dataset" (.-dataset args) "class-id" (.-class_id args) "admission" (.-admission args)
+                 "symbols" (.-symbols args) "stype-in" (.-stype_in args) "schemas" (.-schemas args)
+                 "start" (.-start args) "end" (.-end args) "out-root" (.-out_root args)
+                 "manifest-root" (.-manifest_root args) "max-total-cost-usd" (.-max_total_cost_usd args)
+                 "max-total-billable-bytes" (.-max_total_billable_bytes args) "api-key-env" (.-api_key_env args)})]
+    (println (databento/json-text result))
+    (python/exit 0))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 3)))

@@ -1,0 +1,2749 @@
+(ns stevetrading.status.core
+  "Read-only mission-control status dashboard projection."
+  (:import collections datetime glob hashlib json os os.path re sqlite3 subprocess
+           urllib.request zoneinfo)
+  (:require [basilisp.string :as bstr]
+            [stevetrading.reporting.artifact-audit :as report-artifacts]
+            [stevetrading.reporting.core :as reporting]))
+
+(def et (zoneinfo/ZoneInfo "America/New_York"))
+(def utc datetime.timezone/utc)
+
+(def steve-strategies
+  [{:name "CHESTNUT" :strategy-id "strategy/steve-v2/chestnut/v1" :account-id "account/alpaca/chestnut-paper" :group "alpaca-paper" :stale-minutes 15}
+   {:name "LYNX" :strategy-id "strategy/steve-v2/lynx/v1" :account-id "account/alpaca/lynx-paper" :group "alpaca-paper" :stale-minutes 15}
+   {:name "MOOSE" :strategy-id "strategy/steve-v2/moose/v1" :account-id "account/alpaca/moose-paper" :group "alpaca-paper" :stale-minutes 15}
+   {:name "OAK" :strategy-id "strategy/steve-v2/oak/v1" :account-id "account/alpaca/oak-paper" :group "alpaca-paper" :stale-minutes 15}
+   {:name "PARROT" :strategy-id "strategy/steve-v2/parrot/v1" :account-id "account/alpaca/parrot-paper" :group "alpaca-paper" :stale-minutes 15}
+   {:name "DOLPHIN" :strategy-id "strategy/steve-v2/dolphin/v1" :account-id "account/alpaca/dolphin-paper" :group "alpaca-paper" :stale-minutes 15}])
+
+(def sim-families
+  [{:name "Local Sim Fleet" :prefix "sim-local-fleet" :group "local-sim" :stale-minutes 30}
+   {:name "V2 Vol/Term Sim" :prefix "sim-vt-session" :group "local-sim" :stale-minutes 60}])
+
+(def required-strategy-row-count (+ (count steve-strategies) (count sim-families)))
+(def required-dependency-probe-count 13)
+(def artifact-max-age-minutes 20)
+(def status-values #{"ok" "warn" "bad" "unknown" "idle"})
+(def required-publication-artifacts #{"status.json" "status.validation.json" "index.html"})
+(def required-publication-manifest-keys #{"manifest_version"
+                                          "manifest_kind"
+                                          "generated_at"
+                                          "published_at"
+                                          "artifacts"})
+(def required-publication-artifact-entry-keys #{"sha256"
+                                                "bytes"})
+(def required-nav-targets ["daily" "weekly" "accounts"])
+(def required-session-keys #{"date" "label" "is_trading_day"
+                             "is_market_hours" "session_kind"
+                             "is_early_close" "open_at" "close_at"})
+(def session-label-values #{"market-open" "pre-market" "post-market"
+                            "market-closed-holiday-or-weekend"})
+(def session-kind-values #{"regular" "early-close" "closed" "invalid"})
+(def required-initiative-names #{"ThetaData Feature Unlock"
+                                 "Live Safety"
+                                 "Execution Fixes"
+                                 "Evidence Pipeline"
+                                 "Feature/Behavior Parity"
+                                 "Same-Population Stats"
+                                 "L4 Options Paper Brokerage"})
+(def initiative-status-values #{"active" "watch" "blocked" "needed"})
+(def required-market-evidence-option-surface-prefixes #{"SPX" "SPXW" "VIX" "VIXW"})
+(def required-capture-v2-object-sidecars #{"bar_buffers_json"
+                                           "option_chain_json"
+                                           "option_surfaces_json"
+                                           "grid_history_json"})
+(def required-market-evidence-matched-parity-min-rows 60)
+(def required-market-evidence-capture-smoke-min-rows 5)
+(def required-dependency-names #{"stevetrading-six.service"
+                                 "stevetrading-watchdog.timer"
+                                 "stevetrading-reports-build.timer"
+                                 "stevetrading-status-dashboard.timer"
+                                 "stevetrading-market-evidence-preflight.timer"
+                                 "stevetrading-market-evidence-capture-smoke.service"
+                                 "stevetrading-market-evidence-capture-smoke.timer"
+                                 "stevetrading-market-evidence-collect.service"
+                                 "stevetrading-market-evidence-collect.timer"
+                                 "ThetaData Terminal"
+                                 "Daily Reports"
+                                 "Market Evidence Capture Smoke"
+                                 "Market Evidence"})
+(def optional-dependency-names #{"Facts DB Sources"})
+
+(def expected-strategy-identities
+  (set
+   (concat
+    (map (fn [s] [(:name s) (:strategy-id s) (:account-id s) (:group s)])
+         steve-strategies)
+    (map (fn [family] [(:name family) (:prefix family) "sim" (:group family)])
+         sim-families))))
+
+(defn now-et [] (datetime.datetime/now et))
+
+(defn parse-dt
+  [s]
+  (when (seq (or s ""))
+    (try
+      (if (.endswith s "Z")
+        (datetime.datetime/fromisoformat (.replace s "Z" "+00:00"))
+        (datetime.datetime/fromisoformat s))
+      (catch python/Exception _ nil))))
+
+(defn iso-et
+  [dt]
+  (when dt (.isoformat (.astimezone dt et) ** :timespec "seconds")))
+
+(defn- minutes-between
+  [newer older]
+  (/ (- (.timestamp (.astimezone newer utc))
+        (.timestamp (.astimezone older utc)))
+     60.0))
+
+(defn- post-market?
+  [session]
+  (= "post-market" (get session "label")))
+
+(defn- session-close-dt
+  [session]
+  (parse-dt (get session "close_at")))
+
+(defn session-state
+  [now]
+  (let [today (.date now)
+        today-s (.isoformat today)
+        market-session (reporting/market-session today-s)
+        trading-day (:trading-day? market-session)
+        open-at (datetime.datetime/combine today (:market/open-time market-session) et)
+        close-at (datetime.datetime/combine today (:market/close-time market-session) et)
+        market-hours (and trading-day
+                          (not (< (.timestamp now) (.timestamp open-at)))
+                          (not (> (.timestamp now) (.timestamp close-at))))
+        label (cond
+                (not trading-day) "market-closed-holiday-or-weekend"
+                market-hours "market-open"
+                (< (.timestamp now) (.timestamp open-at)) "pre-market"
+                :else "post-market")]
+    {"date" today-s
+     "label" label
+     "is_trading_day" trading-day
+     "is_market_hours" market-hours
+     "session_kind" (name (:market/session market-session))
+     "is_early_close" (= :early-close (:market/session market-session))
+     "market_reason" (:market/reason market-session)
+     "open_at" (.isoformat open-at ** :timespec "minutes")
+     "close_at" (.isoformat close-at ** :timespec "minutes")}))
+
+(defn target-session-now
+  [target-date generated-now]
+  (if-not target-date
+    generated-now
+    (let [generated-date (.date generated-now)]
+      (cond
+        (< (.toordinal target-date) (.toordinal generated-date))
+        (datetime.datetime/combine target-date (datetime/time 17 0) et)
+
+        (> (.toordinal target-date) (.toordinal generated-date))
+        (datetime.datetime/combine target-date (datetime/time 12 0) et)
+
+        :else
+        generated-now))))
+
+(defn ^:redef run-cmd
+  [cmd timeout]
+  (try
+    (let [p (subprocess/run cmd ** :text true :stdout subprocess/PIPE
+                            :stderr subprocess/STDOUT :timeout timeout
+                            :check false)]
+      [(.-returncode p) (.strip (.-stdout p))])
+    (catch python/Exception e
+      [127 (str (type e) ": " e)])))
+
+(defn remote-file-exists?
+  [remote path]
+  (let [[code _] (run-cmd ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=5"
+                           remote "test" "-f" path]
+                          7)]
+    (= code 0)))
+
+(defn remote-slurp
+  [remote path]
+  (let [[code out] (run-cmd ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=5"
+                             remote "cat" path]
+                            12)]
+    (when-not (= code 0)
+      (throw (python/OSError (str "remote cat failed for " path ": " out))))
+    out))
+
+(defn systemctl-status
+  [unit {:keys [remote expected session]}]
+  (let [now (.isoformat (now-et) ** :timespec "seconds")
+        source (if remote remote "local")
+        cmd (if remote
+              ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=5"
+               remote "systemctl" "is-active" unit]
+              ["systemctl" "is-active" unit])
+        [code out] (run-cmd cmd 6)
+        active (last (.splitlines out))]
+    (cond
+      (and (= code 0) (= active "active"))
+      {"name" unit "status" "ok" "detail" (str "active on " source)
+       "expected" expected "updated_at" now}
+
+      (and (.startswith (str expected) "inactive unless scheduled")
+           (= active "inactive"))
+      {"name" unit "status" "ok" "detail" (str "inactive on " source "; last run not failed")
+       "expected" expected "updated_at" now}
+
+      (and (.startswith (str expected) "inactive unless scheduled")
+           (= active "failed"))
+      {"name" unit "status" "bad" "detail" (str "failed last run on " source)
+       "expected" expected "updated_at" now}
+
+      (and (= expected "active during market hours")
+           (not (get session "is_market_hours"))
+           (= active "inactive"))
+      {"name" unit "status" "idle" "detail" (str "inactive on " source "; market not open")
+       "expected" expected "updated_at" now}
+
+      (and (= expected "active always")
+           (contains? #{"inactive" "failed" "activating" "deactivating"} active))
+      {"name" unit "status" "bad" "detail" (str active " on " source)
+       "expected" expected "updated_at" now}
+
+      (contains? #{"inactive" "failed" "activating" "deactivating"} active)
+      {"name" unit "status" "warn" "detail" (str active " on " source)
+       "expected" expected "updated_at" now}
+
+      :else
+      {"name" unit "status" "unknown"
+       "detail" (str "probe unavailable on " source ": " (if (seq out) out "no output"))
+       "expected" expected "updated_at" now})))
+
+(defn theta-remote-health
+  [code out]
+  (let [lines (.splitlines (or out ""))
+        http-status (when (seq lines) (last lines))
+        body-lines (if (> (count lines) 1) (butlast lines) [])
+        body (bstr/join "\n" body-lines)
+        healthy (and (= code 0)
+                     (= http-status "200")
+                     (seq body)
+                     (< (.find (.lower body) "error") 0))]
+    {:healthy? (boolean healthy)
+     :http-status http-status
+     :body body}))
+
+(defn theta-status
+  [session remote]
+  (let [now (.isoformat (now-et) ** :timespec "seconds")
+        url (or (os/getenv "STATUS_THETA_HEALTH_URL")
+                "http://127.0.0.1:25503/v3/option/list/expirations?symbol=SPY")
+        expected "healthy during market hours; expected off outside market hours"]
+    (if remote
+      (let [[code out] (run-cmd ["ssh" "-o" "BatchMode=yes" "-o" "ConnectTimeout=5"
+                                 remote "curl" "-fsS" "--max-time" "8"
+                                 "-w" "\n%{http_code}" url]
+                                12)
+            {:keys [healthy? http-status]} (theta-remote-health code out)]
+        (cond
+          (and healthy? (get session "is_market_hours"))
+          {"name" "ThetaData Terminal" "status" "ok" "detail" (str "healthy via " remote) "expected" expected "updated_at" now}
+          healthy?
+          {"name" "ThetaData Terminal" "status" "warn" "detail" (str "responding outside regular market hours via " remote "; confirm intentional") "expected" expected "updated_at" now}
+          (get session "is_market_hours")
+          {"name" "ThetaData Terminal" "status" "bad" "detail" (str "no healthy response via " remote " (http=" (or http-status "n/a") "): " (subs out 0 (min 160 (count out)))) "expected" expected "updated_at" now}
+          :else
+          {"name" "ThetaData Terminal" "status" "idle" "detail" (str "not responding via " remote " outside market hours") "expected" expected "updated_at" now}))
+      (try
+        (let [resp (urllib.request/urlopen url ** :timeout 8)
+              body (.decode (.read resp 512) "utf-8" "replace")
+              healthy (and (= (.-status resp) 200)
+                           (seq body)
+                           (< (.find (.lower body) "error") 0))]
+          (cond
+            (and healthy (get session "is_market_hours"))
+            {"name" "ThetaData Terminal" "status" "ok" "detail" "healthy local endpoint" "expected" expected "updated_at" now}
+            healthy
+            {"name" "ThetaData Terminal" "status" "warn" "detail" "responding outside regular market hours; confirm this is intentional" "expected" expected "updated_at" now}
+            (get session "is_market_hours")
+            {"name" "ThetaData Terminal" "status" "bad" "detail" (str "unexpected local response: " (subs body 0 (min 160 (count body)))) "expected" expected "updated_at" now}
+            :else
+            {"name" "ThetaData Terminal" "status" "warn" "detail" (str "unexpected response: " (subs body 0 (min 160 (count body)))) "expected" expected "updated_at" now}))
+        (catch python/Exception e
+          (if (get session "is_market_hours")
+            {"name" "ThetaData Terminal" "status" "bad" "detail" (str "no local response: " (.-__name__ (type e))) "expected" expected "updated_at" now}
+            {"name" "ThetaData Terminal" "status" "idle" "detail" "not responding outside market hours" "expected" expected "updated_at" now}))))))
+
+(defn facts-candidates
+  [root target-date]
+  (let [live-runtime (os.path/join root "live_runtime")
+        d (.isoformat target-date)
+        patterns [(os.path/join live-runtime (str "steve-session-" d "*") "facts.db")
+                  (os.path/join live-runtime (str "sim-local-fleet-" d "*") "facts.db")
+                  (os.path/join live-runtime (str "sim-vt-session-" d "*") "facts.db")
+                  (os.path/join live-runtime "hetzner-snapshots" (str "*" d "*facts.db"))]
+        paths (atom #{})]
+    (doseq [pattern patterns
+            p (glob/glob pattern)]
+      (when (os.path/exists p) (swap! paths conj (os.path/abspath p))))
+    (when-let [extra (os/getenv "STATUS_FACTS_DB")]
+      (doseq [p (.split extra os/pathsep)]
+        (when (and (seq p) (os.path/exists p))
+          (swap! paths conj (os.path/abspath p)))))
+    (vec (sort @paths))))
+
+(defn- empty-summary
+  []
+  {"total" 0 "last_fact_at" nil "counts" {} "sources" []})
+
+(defn facts-summary
+  [path]
+  (let [out (atom {})]
+    (try
+      (let [con (sqlite3/connect path)]
+        (set! (.-row_factory con) sqlite3/Row)
+        (let [rows (.fetchall
+                   (.execute con
+                             "select strategy_id, account_id, order_intent_id, fact_type, occurred_at from facts where strategy_id is not null or account_id is not null"))
+              intent-owner (atom {})]
+          (doseq [r rows]
+            (let [strategy-id (nth r 0)
+                  account-id (nth r 1)
+                  order-intent-id (nth r 2)]
+              (when (and order-intent-id strategy-id)
+                (swap! intent-owner assoc order-intent-id
+                       [strategy-id account-id]))))
+          (doseq [r rows]
+            (let [strategy-id (nth r 0)
+                  account-id (nth r 1)
+                  order-intent-id (nth r 2)
+                  fact-type (nth r 3)
+                  occurred-at (nth r 4)
+                  key (if (and (nil? strategy-id)
+                               (contains? @intent-owner order-intent-id))
+                        (get @intent-owner order-intent-id)
+                        [strategy-id account-id])
+                  dt (parse-dt occurred-at)]
+              (swap! out update key #(or % (empty-summary)))
+              (swap! out update-in [key "total"] inc)
+              (swap! out update-in [key "counts" fact-type] (fnil inc 0))
+              (when (and dt (or (nil? (get-in @out [key "last_fact_at"]))
+                                (> (.timestamp dt)
+                                   (.timestamp (get-in @out [key "last_fact_at"])))))
+                (swap! out assoc-in [key "last_fact_at"] dt)))))
+        (.close con))
+      (catch python/Exception e
+        (reset! out {[nil nil] {"error" (str path ": " (type e) ": " e)}})))
+    @out))
+
+(defn strategy-status
+  [now session {:keys [last-at counts stale-minutes source]}]
+  (if (nil? last-at)
+    [(cond
+       (get session "is_market_hours") "unknown"
+       (post-market? session) "bad"
+       :else "idle")
+     (if (post-market? session)
+       (str "no facts found in " source " for completed trading session")
+       (str "no facts found in " source))
+     nil]
+    (let [age (/ (- (.timestamp (.astimezone now utc))
+                    (.timestamp (.astimezone last-at utc)))
+                 60.0)
+          close-at (session-close-dt session)
+          minutes-before-close (when close-at (minutes-between close-at last-at))
+          rejects (get counts ":fact/broker-ack-rejected" 0)
+          faults (get counts ":fact/fault-recorded" 0)]
+      (cond
+        (< age -1)
+        ["bad" (str "future timestamp: last fact " (python/format (- age) ".1f") "m ahead; rejects=" rejects ", faults=" faults) age]
+        (and (get session "is_market_hours") (> age stale-minutes))
+        ["bad" (str "stale: last fact " (python/format age ".1f") "m ago; rejects=" rejects ", faults=" faults) age]
+        (and (post-market? session)
+             minutes-before-close
+             (> minutes-before-close stale-minutes))
+        ["bad" (str "stopped before close: last fact "
+                    (python/format minutes-before-close ".1f")
+                    "m before close; rejects=" rejects ", faults=" faults) age]
+        (> faults 0)
+        ["warn" (str "session has faults=" faults ", rejects=" rejects "; last fact " (python/format age ".1f") "m ago") age]
+        (> rejects 0)
+        ["warn" (str "session has broker rejects=" rejects "; last fact " (python/format age ".1f") "m ago") age]
+        (get session "is_market_hours")
+        ["ok" (str "fresh: last fact " (python/format age ".1f") "m ago") age]
+        :else
+        ["idle" (str "last fact " (python/format age ".1f") "m ago; market not open") age]))))
+
+(defn build-strategy-rows
+  [root now session]
+  (let [paths (facts-candidates root (.date now))
+        merged (atom {})
+        errors (atom [])]
+    (doseq [path paths
+            [key item] (facts-summary path)]
+      (if (contains? item "error")
+        (swap! errors conj (get item "error"))
+        (do
+        (swap! merged update key #(or % (empty-summary)))
+        (swap! merged update-in [key "total"] + (get item "total" 0))
+        (doseq [[k v] (get item "counts" {})]
+          (swap! merged update-in [key "counts" k] (fnil + 0) v))
+        (swap! merged update-in [key "sources"] conj path)
+        (when (and (get item "last_fact_at")
+                   (or (nil? (get-in @merged [key "last_fact_at"]))
+                       (> (.timestamp (get item "last_fact_at"))
+                          (.timestamp (get-in @merged [key "last_fact_at"])))))
+          (swap! merged assoc-in [key "last_fact_at"] (get item "last_fact_at"))))))
+    [(vec
+      (concat
+       (map (fn [s]
+              (let [item (get @merged [(:strategy-id s) (:account-id s)] (empty-summary))
+                    counts (get item "counts" {})
+                    [status detail age] (strategy-status now session
+                                                         {:last-at (get item "last_fact_at")
+                                                          :counts counts
+                                                          :stale-minutes (:stale-minutes s)
+                                                          :source (if (seq (get item "sources"))
+                                                                    (bstr/join ", " (get item "sources"))
+                                                                    "today's facts DBs")})]
+                {"name" (:name s)
+                 "strategy_id" (:strategy-id s)
+                 "account_id" (:account-id s)
+                 "group" (:group s)
+                 "status" status
+                 "detail" detail
+                 "last_fact_at" (iso-et (get item "last_fact_at"))
+                 "age_minutes" age
+                 "facts" (get item "total" 0)
+                 "signals" (get counts ":fact/signal-decision-produced" 0)
+                 "intents" (get counts ":fact/order-intent-created" 0)
+                 "fills" (get counts ":fact/fill-observed" 0)
+                 "rejects" (get counts ":fact/broker-ack-rejected" 0)
+                 "faults" (get counts ":fact/fault-recorded" 0)}))
+            steve-strategies)
+       (map (fn [family]
+              (let [matches (filter (fn [[_ v]]
+                                      (some #(>= (.find % (:prefix family)) 0)
+                                            (get v "sources" [])))
+                                    @merged)]
+                (if-not (seq matches)
+                  (let [[status detail age] (strategy-status now session
+                                                             {:last-at nil
+                                                              :counts {}
+                                                              :stale-minutes (:stale-minutes family)
+                                                              :source (str (:prefix family) " facts DB for " (.isoformat (.date now)))})]
+                    {"name" (:name family)
+                     "strategy_id" (:prefix family)
+                     "account_id" "sim"
+                     "group" (:group family)
+                     "status" status
+                     "detail" detail
+                     "last_fact_at" nil "age_minutes" age
+                     "facts" 0 "signals" 0 "intents" 0 "fills" 0 "rejects" 0 "faults" 0})
+                  (let [last-at (reduce (fn [acc [_ v]]
+                                          (let [dt (get v "last_fact_at")]
+                                            (if (and dt (or (nil? acc)
+                                                            (> (.timestamp dt) (.timestamp acc))))
+                                              dt
+                                              acc)))
+                                        nil
+                                        matches)
+                        counts (reduce (fn [acc [_ v]]
+                                         (reduce (fn [inner [k n]]
+                                                   (update inner k (fnil + 0) n))
+                                                 acc
+                                                 (get v "counts" {})))
+                                       {}
+                                       matches)
+                        total (reduce + 0 (map #(get (second %) "total" 0) matches))
+                        [status detail age] (strategy-status now session
+                                                             {:last-at last-at
+                                                              :counts counts
+                                                              :stale-minutes (:stale-minutes family)
+                                                              :source (:prefix family)})]
+                    {"name" (:name family)
+                     "strategy_id" (:prefix family)
+                     "account_id" "sim"
+                     "group" (:group family)
+                     "status" status
+                     "detail" detail
+                     "last_fact_at" (iso-et last-at)
+                     "age_minutes" age
+                     "facts" total
+                     "signals" (get counts ":fact/signal-decision-produced" 0)
+                     "intents" (get counts ":fact/order-intent-created" 0)
+                     "fills" (get counts ":fact/fill-observed" 0)
+                     "rejects" (get counts ":fact/broker-ack-rejected" 0)
+                     "faults" (get counts ":fact/fault-recorded" 0)}))))
+           sim-families)))
+     paths
+     @errors]))
+
+(defn initiatives
+  []
+  [{"priority" "P0" "name" "ThetaData Feature Unlock" "status" "active"
+    "detail" "Probe option quote/OHLC/open-interest/native-Greek/index/stock surfaces, map entitlement gaps, and only unmask features after fresh parity gates pass."}
+   {"priority" "P0" "name" "Live Safety" "status" "active"
+    "detail" "Keep Alpaca paper and local sim running; verify no stuck positions, stale facts, rejected exits, or report blind spots."}
+   {"priority" "P0" "name" "Execution Fixes" "status" "active"
+    "detail" "Verify forced option exits use market liquidation, Parrot SPY share shorting works, and no session-close lots are stranded in the next full session."}
+   {"priority" "P1" "name" "Evidence Pipeline" "status" "active"
+    "detail" "Export live tapes, replay tapes, fill alignment, and matched cohorts from facts DBs."}
+   {"priority" "P1" "name" "Feature/Behavior Parity" "status" "watch"
+    "detail" "Keep Steve V2 live-vs-replay feature parity on WATCH until exact replay behavior is generated and aligned."}
+   {"priority" "P2" "name" "Same-Population Stats" "status" "blocked"
+    "detail" "Do not run performance significance tests until data, behavior, and execution parity gates are green."}
+   {"priority" "P2" "name" "L4 Options Paper Brokerage" "status" "needed"
+    "detail" "Open or configure a Level-4 options paper account for naked puts/short-vol and other volatility bots Alpaca cannot support."}])
+
+(defn overall
+  [rows probes]
+  (let [statuses (concat (map #(get % "status") rows)
+                         (map #(get % "status") probes))
+        label (cond
+                (some #{"bad"} statuses) "bad"
+                (some #{"warn" "unknown"} statuses) "warn"
+                :else "ok")
+        freqs (frequencies statuses)]
+    {"status" label
+     "ok" (get freqs "ok" 0)
+     "warn" (get freqs "warn" 0)
+     "bad" (get freqs "bad" 0)
+     "unknown" (get freqs "unknown" 0)
+     "idle" (get freqs "idle" 0)}))
+
+(defn probes-disabled-status
+  [generated-at]
+  {"name" "Dependency Probes"
+   "status" "unknown"
+   "detail" "dependency probes were disabled for this build; service and ThetaData health were not checked"
+   "expected" "enabled for published mission-control dashboard"
+   "updated_at" generated-at})
+
+(defn facts-source-status
+  [generated-at errors]
+  (when (seq errors)
+    {"name" "Facts DB Sources"
+     "status" "warn"
+     "detail" (str "one or more facts DBs could not be read: "
+                   (bstr/join " | " (map #(subs % 0 (min 180 (count %))) errors)))
+     "expected" "all discovered facts DBs readable"
+     "updated_at" generated-at}))
+
+(defn- read-json
+  [path]
+  (json/loads (slurp (str path))))
+
+(defn- compact-date
+  [iso-date]
+  (.replace (str iso-date) "-" ""))
+
+(defn- previous-trading-date
+  [date]
+  (loop [candidate (- date (datetime/timedelta ** :days 1))
+         remaining 21]
+    (cond
+      (neg? remaining)
+      (throw (python/RuntimeError
+              (str "could not find previous trading day before " (.isoformat date))))
+
+      (reporting/trading-day? (.isoformat candidate))
+      candidate
+
+      :else
+      (recur (- candidate (datetime/timedelta ** :days 1))
+             (dec remaining)))))
+
+(defn- daily-report-due-at
+  [session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))]
+    ;; Matches stevetrading-reports-build.timer; this is report-build due time,
+    ;; not market-close time on early-close sessions.
+    (datetime.datetime/combine session-date (datetime/time 16 5) et)))
+
+(defn- expected-daily-report-date
+  [now session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))
+        session-iso (.isoformat session-date)
+        trading-day? (if (contains? session "is_trading_day")
+                       (get session "is_trading_day")
+                       (reporting/trading-day? session-iso))
+        due-at (daily-report-due-at session)]
+    (if (and trading-day?
+             (not (< (.timestamp now) (.timestamp due-at))))
+      session-date
+      (previous-trading-date session-date))))
+
+(defn ^:redef daily-reports-dir
+  []
+  (or (os/getenv "STATUS_DAILY_REPORTS_DIR")
+      (os.path/join (or (os/getenv "STEVE_REF_ROOT")
+                        (os/getenv "REF_ROOT")
+                        "/opt/stevetrading/shared/Data-Preprocessor")
+                    "report-viewer"
+                    "public"
+                    "reports"
+                    "daily")))
+
+(defn daily-report-status
+  ([now session generated-at]
+   (daily-report-status now session generated-at nil))
+  ([now session generated-at remote]
+  (let [expected-date (expected-daily-report-date now session)
+        expected-iso (.isoformat expected-date)
+        stamp (compact-date expected-iso)
+        daily-dir (daily-reports-dir)
+        validation-path (os.path/join daily-dir (str stamp ".validation.json"))
+        html-path (os.path/join daily-dir (str stamp ".html"))
+        manifest-path (str validation-path ".manifest.edn")
+        expected (str "daily report validation artifact for " expected-iso)
+        evidence-base {"expected_date" expected-iso
+                       "expected_stamp" stamp
+                       "due_at" (iso-et (daily-report-due-at session))
+                       "daily_dir" daily-dir
+                       "validation_path" validation-path
+                       "html_path" html-path
+                       "manifest_path" manifest-path}]
+    (try
+      (let [validation-exists (if remote
+                                (remote-file-exists? remote validation-path)
+                                (os.path/exists validation-path))
+            html-exists (if remote
+                          (remote-file-exists? remote html-path)
+                          (os.path/exists html-path))
+            manifest-exists (if remote
+                              (remote-file-exists? remote manifest-path)
+                              (os.path/exists manifest-path))]
+        (if-not validation-exists
+          {"name" "Daily Reports"
+           "status" "bad"
+           "detail" (str "missing expected daily validation artifact for " expected-iso)
+           "expected" expected
+           "updated_at" generated-at
+           "evidence" (assoc evidence-base
+                             "validation_exists" false
+                             "html_exists" html-exists
+                             "manifest_exists" manifest-exists)}
+          (let [audit-result (if remote
+                               {:status (if (and html-exists manifest-exists) :ok :bad)
+                                :valid? (and html-exists manifest-exists)
+                                :issues (if (and html-exists manifest-exists) [] [:missing-remote-artifact])
+                                :checked 1
+                                :manifest-writes (if manifest-exists [manifest-path] [])}
+                               (report-artifacts/audit-daily-validations
+                                {:daily-dir daily-dir
+                                 :date expected-iso
+                                 :require-html? true
+                                 :require-manifests? true}))
+                payload (if remote
+                          (json/loads (remote-slurp remote validation-path))
+                          (read-json validation-path))
+                report-date (get payload "report/date")
+                rendered? (= true (get payload "report/rendered?"))
+                date-matches? (= report-date expected-iso)
+                validation-ok? (= :ok (:status audit-result))
+                validation-warn? (= :warn (:status audit-result))
+                status (cond
+                         (and html-exists rendered? date-matches? validation-ok?)
+                         "ok"
+
+                         (and html-exists rendered? date-matches? validation-warn?)
+                         "warn"
+
+                         :else
+                         "bad")
+                detail (cond
+                         (not date-matches?)
+                         (str "daily validation artifact date " report-date
+                              " does not match expected " expected-iso)
+
+                         (not rendered?)
+                         (str "daily validation artifact for " expected-iso
+                              " was not rendered")
+
+                         (not html-exists)
+                         (str "daily report html missing for " expected-iso)
+
+                         (not manifest-exists)
+                         (str "daily report validation manifest missing for " expected-iso)
+
+                         (not validation-ok?)
+                         (str "daily validation artifact for " expected-iso
+                              " has status " (name (:status audit-result)))
+
+                         :else
+                         (if remote
+                           (str "daily report artifacts present via " remote " for " expected-iso)
+                           (str "daily report artifact present for " expected-iso)))]
+            {"name" "Daily Reports"
+             "status" status
+             "detail" detail
+             "expected" expected
+             "updated_at" generated-at
+             "evidence" (assoc evidence-base
+                               "validation_exists" true
+                               "html_exists" html-exists
+                               "manifest_exists" manifest-exists
+                               "report_date" report-date
+                               "report_date_matches" date-matches?
+                               "rendered" rendered?
+                               "validation_status" (name (:status audit-result))
+                               "validation_valid" (:valid? audit-result)
+                               "validation_issue_count" (count (:issues audit-result))
+                               "validation_checked_count" (:checked audit-result)
+                               "manifest_write_count" (count (:manifest-writes audit-result)))})))
+      (catch python/Exception e
+        {"name" "Daily Reports"
+         "status" "bad"
+         "detail" (str "could not read daily validation artifact for "
+                       expected-iso ": " (type e) ": " e)
+         "expected" expected
+         "updated_at" generated-at
+         "evidence" (assoc evidence-base
+                           "validation_exists" (if remote
+                                                 (remote-file-exists? remote validation-path)
+                                                 (os.path/exists validation-path))
+                           "html_exists" (if remote
+                                           (remote-file-exists? remote html-path)
+                                           (os.path/exists html-path))
+                           "manifest_exists" (if remote
+                                               (remote-file-exists? remote manifest-path)
+                                               (os.path/exists manifest-path))
+                           "unreadable" true)})))))
+
+(defn- market-evidence-due?
+  [now session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))
+        due-at (datetime.datetime/combine session-date (datetime/time 10 45) et)]
+    (not (< (.timestamp now) (.timestamp due-at)))))
+
+(defn- market-evidence-preflight-due?
+  [now session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))
+        due-at (datetime.datetime/combine session-date (datetime/time 9 10) et)]
+    (not (< (.timestamp now) (.timestamp due-at)))))
+
+(defn- market-evidence-due-at
+  [session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))]
+    (datetime.datetime/combine session-date (datetime/time 10 45) et)))
+
+(defn- market-evidence-preflight-due-at
+  [session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))]
+    (datetime.datetime/combine session-date (datetime/time 9 10) et)))
+
+(defn- market-evidence-capture-smoke-due?
+  [now session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))
+        due-at (datetime.datetime/combine session-date (datetime/time 9 45) et)]
+    (not (< (.timestamp now) (.timestamp due-at)))))
+
+(defn- market-evidence-capture-smoke-due-at
+  [session]
+  (let [session-date (datetime.date/fromisoformat (get session "date"))]
+    (datetime.datetime/combine session-date (datetime/time 9 45) et)))
+
+(defn- market-evidence-status-path
+  [root session]
+  (os.path/join (or (os.environ/get "ANALYSIS_DIR")
+                    (os.path/join root "live_runtime" "analysis"))
+                (str "market_evidence_status_"
+                     (compact-date (get session "date"))
+                     ".json")))
+
+(defn- market-evidence-preflight-status-path
+  [root session]
+  (os.path/join (or (os.environ/get "ANALYSIS_DIR")
+                    (os.path/join root "live_runtime" "analysis"))
+                (str "market_evidence_preflight_"
+                     (compact-date (get session "date"))
+                     ".json")))
+
+(defn- market-evidence-capture-smoke-status-path
+  [root session]
+  (os.path/join (or (os.environ/get "ANALYSIS_DIR")
+                    (os.path/join root "live_runtime" "analysis"))
+                (str "capture_v2_sidecar_smoke_"
+                     (compact-date (get session "date"))
+                     ".json")))
+
+(defn- pending-preflight-evidence
+  [path session]
+  (let [base {"preflight_path" path
+              "preflight_present" (os.path/exists path)}]
+    (if-not (os.path/exists path)
+      base
+      (try
+        (let [payload (read-json path)
+              generated-at (get payload "generated_at")
+              generated-dt (when generated-at
+                             (datetime.datetime/fromisoformat
+                              (.replace (str generated-at) "Z" "+00:00")))
+              generated-et (when generated-dt (.astimezone generated-dt et))
+              generated-et-date (when generated-et (.isoformat (.date generated-et)))
+              expected-date (get session "date")
+              expected-stamp (compact-date expected-date)
+              target-matches? (and (= expected-date (get payload "target_date"))
+                                   (= expected-stamp (get payload "target_stamp")))
+              warning (cond
+                        (not target-matches?)
+                        "preflight artifact target does not match current session"
+                        (not= generated-et-date expected-date)
+                        "preflight artifact generated_at is not same ET session date"
+                        :else nil)]
+          (cond-> (assoc base
+                         "preflight_target_date" (get payload "target_date")
+                         "preflight_target_stamp" (get payload "target_stamp")
+                         "preflight_generated_at" generated-at
+                         "preflight_generated_at_et_date" generated-et-date
+                         "preflight_returncode" (get payload "returncode")
+                         "preflight_artifact_target_matches" target-matches?)
+            warning (assoc "preflight_pending_warning" warning)))
+        (catch python/Exception e
+          (assoc base
+                 "preflight_pending_warning"
+                 (str "could not read pending preflight artifact: " (type e) ": " e)))))))
+
+(defn- dependency-base-row
+  [name status detail expected generated-at evidence]
+  {"name" name
+   "status" status
+   "detail" detail
+   "expected" expected
+   "updated_at" generated-at
+   "evidence" evidence})
+
+(defn- market-evidence-base-row
+  [status detail expected generated-at evidence]
+  (dependency-base-row "Market Evidence" status detail expected generated-at evidence))
+
+(defn- num-value
+  [x]
+  (try
+    (cond
+      (nil? x) nil
+      (boolean? x) nil
+      (string? x) (python/float x)
+      :else (python/float x))
+    (catch python/Exception _ nil)))
+
+(defn- capture-v2-sidecar-dtypes-ok?
+  [sidecar-dtypes]
+  (and sidecar-dtypes
+       (every? #(= "object" (get sidecar-dtypes %))
+               required-capture-v2-object-sidecars)))
+
+(defn market-evidence-capture-smoke-status
+  [root now session generated-at]
+  (let [path (market-evidence-capture-smoke-status-path root session)
+        expected "same-day capture-v2 sidecar smoke artifact after scheduled 09:45 ET check"]
+    (cond
+      (not (get session "is_trading_day"))
+      (dependency-base-row
+       "Market Evidence Capture Smoke"
+       "idle"
+       (str "not expected on non-trading day " (get session "date"))
+       expected
+       generated-at
+       {"phase" "capture-smoke-non-trading-day"
+        "target_date" (get session "date")
+        "target_stamp" (compact-date (get session "date"))
+        "trading_day" false})
+
+      (not (market-evidence-capture-smoke-due? now session))
+      (dependency-base-row
+       "Market Evidence Capture Smoke"
+       "idle"
+       "capture smoke not due yet; scheduled for 09:45 ET"
+       expected
+       generated-at
+       {"phase" "capture-smoke-pending"
+        "target_date" (get session "date")
+        "target_stamp" (compact-date (get session "date"))
+        "capture_smoke_due_at" (iso-et (market-evidence-capture-smoke-due-at session))
+        "capture_smoke_path" path
+        "capture_smoke_ok" false})
+
+      (not (os.path/exists path))
+      (dependency-base-row
+       "Market Evidence Capture Smoke"
+       "bad"
+       (str "missing due capture-v2 smoke artifact: " path)
+       expected
+       generated-at
+       {"phase" "capture-smoke-missing"
+        "target_date" (get session "date")
+        "target_stamp" (compact-date (get session "date"))
+        "capture_smoke_due_at" (iso-et (market-evidence-capture-smoke-due-at session))
+        "capture_smoke_path" path
+        "capture_smoke_ok" false})
+
+      :else
+      (try
+        (let [payload (read-json path)
+              stamp (compact-date (get session "date"))
+              payload-stamp (or (get payload "target_stamp")
+                                (when-let [payload-date (get payload "target_date")]
+                                  (compact-date payload-date)))
+              payload-generated-at (get payload "generated_at")
+              payload-generated-dt (when payload-generated-at
+                                     (datetime.datetime/fromisoformat
+                                      (.replace (str payload-generated-at) "Z" "+00:00")))
+              payload-generated-et (when payload-generated-dt
+                                     (.astimezone payload-generated-dt et))
+              payload-generated-et-date (when payload-generated-et
+                                          (.isoformat (.date payload-generated-et)))
+              artifact-updated-dt (datetime.datetime/fromtimestamp
+                                   (os.path/getmtime path)
+                                   et)
+              artifact-updated (iso-et artifact-updated-dt)
+              due-at (market-evidence-capture-smoke-due-at session)
+              target-matches? (and (= stamp payload-stamp)
+                                   (= (get session "date") (get payload "target_date")))
+              prefixes (set (get payload "option_surface_prefixes" []))
+              missing-prefixes (vec (sort (filter #(not (contains? prefixes %))
+                                                   required-market-evidence-option-surface-prefixes)))
+              sidecar-dtypes (get payload "sidecar_dtypes" {})
+              sidecar-dtypes-ok? (capture-v2-sidecar-dtypes-ok? sidecar-dtypes)
+              malformed-sidecars (get payload "sidecar_malformed_contracts" {})
+              malformed-prefixes (get payload "option_surface_malformed_contracts_by_prefix" {})
+              malformed-count (+ (reduce + 0 (map #(or (num-value %) 0)
+                                                   (.values malformed-sidecars)))
+                                 (reduce + 0 (map #(or (num-value %) 0)
+                                                   (.values malformed-prefixes))))
+              unique-rows (or (num-value (get payload "unique_time_count"))
+                              (num-value (get payload "row_count"))
+                              0)
+              ok? (and (= true (get payload "ok"))
+                       (= "ok" (get payload "status"))
+                       target-matches?
+                       (>= unique-rows required-market-evidence-capture-smoke-min-rows)
+                       (empty? missing-prefixes)
+                       sidecar-dtypes-ok?
+                       (= 0 malformed-count))]
+          (cond
+            (nil? payload-generated-dt)
+            (dependency-base-row
+             "Market Evidence Capture Smoke"
+             "bad"
+             (str "capture smoke artifact generated_at missing or unreadable at " path)
+             expected
+             generated-at
+             {"phase" "capture-smoke-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" payload-stamp
+              "capture_smoke_due_at" (iso-et due-at)
+              "capture_smoke_path" path
+              "capture_smoke_generated_at" payload-generated-at
+              "status_updated_at" artifact-updated
+              "capture_smoke_ok" false})
+
+            (not= payload-generated-et-date (get session "date"))
+            (dependency-base-row
+             "Market Evidence Capture Smoke"
+             "bad"
+             (str "capture smoke artifact generated_at ET date "
+                  payload-generated-et-date
+                  " does not match session date " (get session "date")
+                  " at " path)
+             expected
+             generated-at
+             {"phase" "capture-smoke-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" payload-stamp
+              "capture_smoke_due_at" (iso-et due-at)
+              "capture_smoke_path" path
+              "capture_smoke_generated_at" payload-generated-at
+              "capture_smoke_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "capture_smoke_ok" false})
+
+            (< (.timestamp payload-generated-et) (.timestamp due-at))
+            (dependency-base-row
+             "Market Evidence Capture Smoke"
+             "bad"
+             (str "capture smoke artifact generated_at " (.isoformat payload-generated-et)
+                  " predates scheduled 09:45 ET smoke check at " path)
+             expected
+             generated-at
+             {"phase" "capture-smoke-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" payload-stamp
+              "capture_smoke_due_at" (iso-et due-at)
+              "capture_smoke_path" path
+              "capture_smoke_generated_at" payload-generated-at
+              "capture_smoke_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "capture_smoke_ok" false})
+
+            (< (.timestamp artifact-updated-dt) (.timestamp due-at))
+            (dependency-base-row
+             "Market Evidence Capture Smoke"
+             "bad"
+             (str "capture smoke artifact predates scheduled 09:45 ET check at " path
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "capture-smoke-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" payload-stamp
+              "capture_smoke_due_at" (iso-et due-at)
+              "capture_smoke_path" path
+              "capture_smoke_generated_at" payload-generated-at
+              "capture_smoke_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "capture_smoke_ok" false})
+
+            ok?
+            (dependency-base-row
+             "Market Evidence Capture Smoke"
+             "ok"
+             (str "capture-v2 smoke passed; unique_rows=" unique-rows
+                  "; prefixes=" (bstr/join "," (sort prefixes))
+                  "; sidecar_dtypes=object"
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "capture-smoke-ok"
+              "target_date" (get payload "target_date")
+              "target_stamp" payload-stamp
+              "capture_smoke_due_at" (iso-et due-at)
+              "capture_smoke_path" path
+              "capture_smoke_generated_at" payload-generated-at
+              "capture_smoke_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "capture_smoke_ok" true
+              "artifact_status" (get payload "status")
+              "ok" (= true (get payload "ok"))
+              "unique_time_count" unique-rows
+              "row_count" (or (num-value (get payload "row_count")) 0)
+              "required_min_rows" required-market-evidence-capture-smoke-min-rows
+              "required_option_surface_prefixes_present" (empty? missing-prefixes)
+              "missing_option_surface_prefixes" missing-prefixes
+              "sidecar_dtypes" sidecar-dtypes
+              "sidecar_dtypes_ok" sidecar-dtypes-ok?
+              "malformed_contract_count" malformed-count})
+
+            :else
+            (dependency-base-row
+             "Market Evidence Capture Smoke"
+             "bad"
+             (str "capture-v2 smoke failed: status=" (get payload "status")
+                  ", ok=" (get payload "ok")
+                  ", unique_rows=" unique-rows
+                  ", missing_prefixes=" (pr-str missing-prefixes)
+                  ", sidecar_dtypes_ok=" sidecar-dtypes-ok?
+                  ", sidecar_dtypes=" (pr-str sidecar-dtypes)
+                  ", malformed_contracts=" malformed-count
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "capture-smoke-failed"
+              "target_date" (get payload "target_date")
+              "target_stamp" payload-stamp
+              "capture_smoke_due_at" (iso-et due-at)
+              "capture_smoke_path" path
+              "capture_smoke_generated_at" payload-generated-at
+              "capture_smoke_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "capture_smoke_ok" false
+              "artifact_status" (get payload "status")
+              "ok" (= true (get payload "ok"))
+              "target_matches_request" target-matches?
+              "unique_time_count" unique-rows
+              "row_count" (or (num-value (get payload "row_count")) 0)
+              "required_min_rows" required-market-evidence-capture-smoke-min-rows
+              "required_option_surface_prefixes_present" (empty? missing-prefixes)
+              "missing_option_surface_prefixes" missing-prefixes
+              "sidecar_dtypes" sidecar-dtypes
+              "sidecar_dtypes_ok" sidecar-dtypes-ok?
+              "malformed_contract_count" malformed-count
+              "issues" (get payload "issues" [])})))
+        (catch python/Exception e
+          (dependency-base-row
+           "Market Evidence Capture Smoke"
+           "bad"
+           (str "could not read capture-v2 smoke artifact: " (type e) ": " e)
+           expected
+           generated-at
+           {"phase" "capture-smoke-unreadable"
+            "target_date" (get session "date")
+            "target_stamp" (compact-date (get session "date"))
+            "capture_smoke_path" path
+            "capture_smoke_ok" false}))))))
+
+(defn- preflight-market-evidence-status
+  [root now session generated-at expected]
+  (let [path (market-evidence-preflight-status-path root session)]
+    (cond
+      (not (market-evidence-preflight-due? now session))
+      (market-evidence-base-row
+       "idle"
+       "preflight not due yet; scheduled for 09:10 ET"
+       expected
+       generated-at
+       (merge
+        {"phase" "preflight-pending"
+         "target_date" (get session "date")
+         "target_stamp" (compact-date (get session "date"))
+         "preflight_due_at" (iso-et (market-evidence-preflight-due-at session))
+         "collector_due_at" (iso-et (market-evidence-due-at session))}
+        (pending-preflight-evidence path session)))
+
+      (not (os.path/exists path))
+      (market-evidence-base-row
+       "bad"
+       (str "missing due market-evidence preflight artifact: " path)
+       expected
+       generated-at
+       {"phase" "preflight-missing"
+        "target_date" (get session "date")
+        "target_stamp" (compact-date (get session "date"))
+        "preflight_due_at" (iso-et (market-evidence-preflight-due-at session))
+        "collector_due_at" (iso-et (market-evidence-due-at session))
+        "preflight_path" path
+        "preflight_ok" false})
+
+      :else
+      (try
+        (let [payload (read-json path)
+              stamp (compact-date (get session "date"))
+              payload-generated-at (get payload "generated_at")
+              payload-generated-dt (when payload-generated-at
+                                     (datetime.datetime/fromisoformat
+                                      (.replace (str payload-generated-at) "Z" "+00:00")))
+              payload-generated-et (when payload-generated-dt
+                                     (.astimezone payload-generated-dt et))
+              payload-generated-et-date (when payload-generated-et
+                                          (.isoformat (.date payload-generated-et)))
+              artifact-updated-dt (datetime.datetime/fromtimestamp
+                                   (os.path/getmtime path)
+                                   et)
+              artifact-updated (iso-et artifact-updated-dt)
+              due-at (market-evidence-preflight-due-at session)
+              target-matches? (and (= stamp (get payload "target_stamp"))
+                                   (= (get session "date") (get payload "target_date")))
+              ok? (and (= "ok" (get payload "status"))
+                       (= 0 (get payload "returncode")))]
+          (cond
+            (nil? payload-generated-dt)
+            (market-evidence-base-row
+             "bad"
+             (str "preflight artifact generated_at missing or unreadable at " path)
+             expected
+             generated-at
+             {"phase" "preflight-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "preflight_due_at" (iso-et due-at)
+              "collector_due_at" (iso-et (market-evidence-due-at session))
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" false
+              "returncode" (get payload "returncode")})
+
+            (not= payload-generated-et-date (get session "date"))
+            (market-evidence-base-row
+             "bad"
+             (str "preflight artifact generated_at ET date "
+                  payload-generated-et-date
+                  " does not match session date " (get session "date")
+                  " at " path)
+             expected
+             generated-at
+             {"phase" "preflight-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "preflight_due_at" (iso-et due-at)
+              "collector_due_at" (iso-et (market-evidence-due-at session))
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_generated_at_et_date" payload-generated-et-date
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" false
+              "returncode" (get payload "returncode")})
+
+            (< (.timestamp payload-generated-et) (.timestamp due-at))
+            (market-evidence-base-row
+             "bad"
+             (str "preflight artifact generated_at " (.isoformat payload-generated-et)
+                  " predates scheduled 09:10 ET preflight at " path)
+             expected
+             generated-at
+             {"phase" "preflight-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "preflight_due_at" (iso-et due-at)
+              "collector_due_at" (iso-et (market-evidence-due-at session))
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_generated_at_et_date" payload-generated-et-date
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" false
+              "returncode" (get payload "returncode")})
+
+            (< (.timestamp artifact-updated-dt) (.timestamp due-at))
+            (market-evidence-base-row
+             "bad"
+             (str "preflight artifact predates scheduled 09:10 ET preflight at " path
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "preflight-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "preflight_due_at" (iso-et due-at)
+              "collector_due_at" (iso-et (market-evidence-due-at session))
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_generated_at_et_date" payload-generated-et-date
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" false
+              "returncode" (get payload "returncode")})
+
+            (not target-matches?)
+            (market-evidence-base-row
+             "bad"
+             (str "preflight artifact target mismatch at " path
+                  "; artifact target=" (get payload "target_date")
+                  " stamp=" (get payload "target_stamp"))
+             expected
+             generated-at
+             {"phase" "preflight-target-mismatch"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "expected_target_date" (get session "date")
+              "expected_target_stamp" stamp
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_generated_at_et_date" payload-generated-et-date
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" false
+              "returncode" (get payload "returncode")})
+
+            ok?
+            (market-evidence-base-row
+             "idle"
+             (str "preflight passed; collector scheduled for 10:45 ET"
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "preflight-passed"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "preflight_due_at" (iso-et due-at)
+              "collector_due_at" (iso-et (market-evidence-due-at session))
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_generated_at_et_date" payload-generated-et-date
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" true
+              "returncode" (get payload "returncode")})
+
+            :else
+            (market-evidence-base-row
+             "bad"
+             (str "market-evidence preflight failed: "
+                  (get payload "detail" (get payload "status" "error"))
+                  "; returncode=" (get payload "returncode")
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "preflight-failed"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "preflight_due_at" (iso-et due-at)
+              "collector_due_at" (iso-et (market-evidence-due-at session))
+              "preflight_path" path
+              "preflight_generated_at" payload-generated-at
+              "preflight_generated_at_et_date" payload-generated-et-date
+              "preflight_updated_at" artifact-updated
+              "preflight_ok" false
+              "returncode" (get payload "returncode")})))
+        (catch python/Exception e
+          (market-evidence-base-row
+           "bad"
+           (str "could not read market-evidence preflight artifact: "
+                (type e) ": " e)
+           expected
+           generated-at
+           {"phase" "preflight-unreadable"
+            "target_date" (get session "date")
+            "target_stamp" (compact-date (get session "date"))
+            "preflight_path" path
+            "preflight_ok" false}))))))
+
+(defn market-evidence-status
+  [root now session generated-at]
+  (let [path (market-evidence-status-path root session)
+        expected "fresh market-evidence status artifact after scheduled 10:45 ET collector"]
+    (cond
+      (not (get session "is_trading_day"))
+      (market-evidence-base-row
+       "idle"
+       (str "not expected on non-trading day " (get session "date"))
+       expected
+       generated-at
+       {"phase" "non-trading-day"
+        "target_date" (get session "date")
+        "target_stamp" (compact-date (get session "date"))
+        "trading_day" false})
+
+      (not (market-evidence-due? now session))
+      (if (os.path/exists path)
+        (market-evidence-base-row
+         "idle"
+         (str "collector not due yet; ignoring premature status artifact: " path)
+         expected
+         generated-at
+         {"phase" "collector-premature"
+          "target_date" (get session "date")
+          "target_stamp" (compact-date (get session "date"))
+          "collector_due_at" (iso-et (market-evidence-due-at session))
+          "status_path" path
+          "collector_ok" false})
+        (preflight-market-evidence-status root now session generated-at expected))
+
+      (not (os.path/exists path))
+      (market-evidence-base-row
+       "bad"
+       (str "missing due market-evidence status artifact: " path)
+       expected
+       generated-at
+       {"phase" "collector-missing"
+        "target_date" (get session "date")
+        "target_stamp" (compact-date (get session "date"))
+        "collector_due_at" (iso-et (market-evidence-due-at session))
+        "status_path" path
+        "collector_ok" false})
+
+      :else
+      (try
+        (let [payload (read-json path)
+              stamp (compact-date (get session "date"))
+              payload-generated-at (get payload "generated_at")
+              payload-generated-dt (when payload-generated-at
+                                     (datetime.datetime/fromisoformat
+                                      (.replace (str payload-generated-at) "Z" "+00:00")))
+              payload-generated-et (when payload-generated-dt
+                                     (.astimezone payload-generated-dt et))
+              payload-generated-et-date (when payload-generated-et
+                                          (.isoformat (.date payload-generated-et)))
+              artifact-updated-dt (datetime.datetime/fromtimestamp
+                                   (os.path/getmtime path)
+                                   et)
+              artifact-updated (iso-et artifact-updated-dt)
+              due-at (market-evidence-due-at session)
+              target-matches? (and (= stamp (get payload "target_stamp"))
+                                   (= (get session "date") (get payload "target_date")))
+              reasons (get payload "reasons" [])
+              payload-example-count (get-in payload ["manifest" "payload_example_count"] 0)
+              manifest-valid? (= true (get-in payload ["manifest" "valid?"]))
+              manifest-verified? (= true (get-in payload ["manifest_verification" "valid?"]))
+              manifest-target-verified? (= true (get-in payload ["manifest" "target_matches_request?"]))
+              readiness-pass? (= "PASS" (get-in payload ["readiness" "verdict"]))
+              prediction-delta-available? (= true (get-in payload ["manifest" "diagnostics" "prediction_delta" "available"]))
+              parity-gate-available? (= true (get-in payload ["manifest" "diagnostics" "parity_gate" "available"]))
+              neutralized-evidence (get-in payload ["manifest" "diagnostics" "neutralized_feature_evidence"] {})
+              capture-v2 (get-in payload ["manifest" "diagnostics" "capture_v2_sidecars"] {})
+              capture-v2-ok? (= true (get capture-v2 "ok"))
+              capture-v2-sidecar-dtypes (get capture-v2 "sidecar_dtypes" {})
+              capture-v2-sidecar-dtypes-ok? (capture-v2-sidecar-dtypes-ok? capture-v2-sidecar-dtypes)
+              capture-v2-prefixes (set (get capture-v2 "option_surface_prefixes" []))
+              capture-v2-missing-prefixes (vec (sort (filter #(not (contains? capture-v2-prefixes %))
+                                                            required-market-evidence-option-surface-prefixes)))
+              capture-v2-required-prefixes-present? (empty? capture-v2-missing-prefixes)
+              malformed-sidecars (get capture-v2 "sidecar_malformed_contracts" {})
+              malformed-prefixes (get capture-v2 "option_surface_malformed_contracts_by_prefix" {})
+              capture-v2-malformed-count (+ (reduce + 0 (map #(or (num-value %) 0)
+                                                              (.values malformed-sidecars)))
+                                            (reduce + 0 (map #(or (num-value %) 0)
+                                                              (.values malformed-prefixes))))
+              capture-v2-clean? (and capture-v2-ok?
+                                     capture-v2-required-prefixes-present?
+                                     capture-v2-sidecar-dtypes-ok?
+                                     (= 0 capture-v2-malformed-count))
+              matched-parity (get-in payload ["readiness" "matched_feature_parity"] {})
+              matched-parity-available? (= true (get matched-parity "available"))
+              matched-parity-rows (or (num-value (get matched-parity "matched_rows")) 0)
+              matched-parity-problems (or (num-value (get matched-parity "problem_feature_count")) 0)
+              matched-parity-max-abs-dev (get matched-parity "max_abs_deviation")
+              matched-parity-min-corr (get matched-parity "min_correlation")
+              matched-parity-start (get matched-parity "matched_start")
+              matched-parity-end (get matched-parity "matched_end")
+              matched-parity-clean? (and matched-parity-available?
+                                         (>= matched-parity-rows
+                                             required-market-evidence-matched-parity-min-rows)
+                                         (= 0 matched-parity-problems))
+              unmask-apply-ready? (= true (get payload "unmask_apply_ready?"))
+              unmask-apply-reasons (get payload "unmask_apply_reasons" [])
+              validation-apply-safe? (= true (get-in payload ["verified_apply_validation" "apply_safe"]))
+              validation-candidate-count (get-in payload ["verified_apply_validation" "candidate_count"] 0)
+              status-ok? (= "ok" (get payload "status"))
+              collector-ok? (and (= true (get payload "ok?"))
+                                 status-ok?
+                                 (not (seq reasons))
+                                 manifest-valid?
+                                 manifest-verified?
+                                 manifest-target-verified?
+                                 readiness-pass?
+                                 capture-v2-clean?
+                                 matched-parity-clean?
+                                 (> (or (num-value payload-example-count) 0) 0))]
+          (cond
+            (nil? payload-generated-dt)
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact generated_at missing or unreadable at " path)
+             expected
+             generated-at
+             {"phase" "collector-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            (not= payload-generated-et-date (get session "date"))
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact generated_at ET date "
+                  payload-generated-et-date
+                  " does not match session date " (get session "date")
+                  " at " path)
+             expected
+             generated-at
+             {"phase" "collector-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            (< (.timestamp payload-generated-et) (.timestamp due-at))
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact generated_at " (.isoformat payload-generated-et)
+                  " predates scheduled 10:45 ET collector at " path)
+             expected
+             generated-at
+             {"phase" "collector-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            (> (minutes-between payload-generated-et now) 1)
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact generated_at is in the future at " path
+                  "; status_generated_at=" (.isoformat payload-generated-et))
+             expected
+             generated-at
+             {"phase" "collector-future"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            (< (.timestamp artifact-updated-dt) (.timestamp due-at))
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact predates scheduled 10:45 ET collector at " path
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "collector-stale"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            (> (minutes-between artifact-updated-dt now) 1)
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact timestamp is in the future at " path
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "collector-future"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            (not target-matches?)
+            (market-evidence-base-row
+             "bad"
+             (str "status artifact target mismatch at " path
+                  "; artifact target=" (get payload "target_date")
+                  " stamp=" (get payload "target_stamp"))
+             expected
+             generated-at
+             {"phase" "collector-target-mismatch"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "expected_target_date" (get session "date")
+              "expected_target_stamp" stamp
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false})
+
+            collector-ok?
+            (market-evidence-base-row
+             "ok"
+             (str "verified " (get payload "target_date")
+                  "; payload_examples="
+                  payload-example-count
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "collector-ok"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" true
+              "ok" (= true (get payload "ok?"))
+              "artifact_status" (get payload "status")
+              "manifest_valid" manifest-valid?
+              "manifest_verified" manifest-verified?
+              "manifest_returncode" (get-in payload ["manifest_verification" "returncode"])
+              "target_matches_request" manifest-target-verified?
+              "readiness_verdict" (get-in payload ["readiness" "verdict"])
+              "prediction_delta_available" prediction-delta-available?
+              "parity_gate_available" parity-gate-available?
+              "neutralized_feature_current_status_counts" (get neutralized-evidence "current_status_counts" {})
+              "neutralized_feature_missing_market_evidence_by_source" (get neutralized-evidence "missing_market_evidence_by_source" {})
+              "neutralized_feature_missing_market_evidence_reason_counts" (get neutralized-evidence "missing_market_evidence_reason_counts" {})
+              "capture_v2_ok" capture-v2-ok?
+              "capture_v2_required_option_surface_prefixes_present" capture-v2-required-prefixes-present?
+              "capture_v2_missing_option_surface_prefixes" capture-v2-missing-prefixes
+              "capture_v2_sidecar_dtypes" capture-v2-sidecar-dtypes
+              "capture_v2_sidecar_dtypes_ok" capture-v2-sidecar-dtypes-ok?
+              "capture_v2_malformed_contract_count" capture-v2-malformed-count
+              "matched_feature_parity_available" matched-parity-available?
+              "matched_feature_parity_rows" matched-parity-rows
+              "matched_feature_parity_problem_count" matched-parity-problems
+              "matched_feature_parity_max_abs_deviation" matched-parity-max-abs-dev
+              "matched_feature_parity_min_correlation" matched-parity-min-corr
+              "matched_feature_parity_start" matched-parity-start
+              "matched_feature_parity_end" matched-parity-end
+              "unmask_apply_ready" unmask-apply-ready?
+              "unmask_apply_reasons" unmask-apply-reasons
+              "verified_apply_validation_apply_safe" validation-apply-safe?
+              "verified_apply_validation_candidate_count" validation-candidate-count
+              "payload_example_count" payload-example-count})
+
+            :else
+            (market-evidence-base-row
+             "bad"
+             (str "market-evidence status failed: "
+                  (if (seq reasons)
+                    (bstr/join " | " (map #(subs (str %) 0 (min 120 (count (str %)))) reasons))
+                    (get payload "status" "error"))
+                  "; artifact_updated_at=" artifact-updated)
+             expected
+             generated-at
+             {"phase" "collector-failed"
+              "target_date" (get payload "target_date")
+              "target_stamp" (get payload "target_stamp")
+              "collector_due_at" (iso-et due-at)
+              "status_path" path
+              "status_generated_at" payload-generated-at
+              "status_generated_at_et_date" payload-generated-et-date
+              "status_updated_at" artifact-updated
+              "collector_ok" false
+              "ok" (= true (get payload "ok?"))
+              "artifact_status" (get payload "status")
+              "manifest_valid" manifest-valid?
+              "manifest_verified" manifest-verified?
+              "target_matches_request" manifest-target-verified?
+              "readiness_verdict" (get-in payload ["readiness" "verdict"])
+              "prediction_delta_available" prediction-delta-available?
+              "parity_gate_available" parity-gate-available?
+              "neutralized_feature_current_status_counts" (get neutralized-evidence "current_status_counts" {})
+              "neutralized_feature_missing_market_evidence_by_source" (get neutralized-evidence "missing_market_evidence_by_source" {})
+              "neutralized_feature_missing_market_evidence_reason_counts" (get neutralized-evidence "missing_market_evidence_reason_counts" {})
+              "capture_v2_ok" capture-v2-ok?
+              "capture_v2_required_option_surface_prefixes_present" capture-v2-required-prefixes-present?
+              "capture_v2_missing_option_surface_prefixes" capture-v2-missing-prefixes
+              "capture_v2_sidecar_dtypes" capture-v2-sidecar-dtypes
+              "capture_v2_sidecar_dtypes_ok" capture-v2-sidecar-dtypes-ok?
+              "capture_v2_malformed_contract_count" capture-v2-malformed-count
+              "matched_feature_parity_available" matched-parity-available?
+              "matched_feature_parity_rows" matched-parity-rows
+              "matched_feature_parity_problem_count" matched-parity-problems
+              "matched_feature_parity_max_abs_deviation" matched-parity-max-abs-dev
+              "matched_feature_parity_min_correlation" matched-parity-min-corr
+              "matched_feature_parity_start" matched-parity-start
+              "matched_feature_parity_end" matched-parity-end
+              "unmask_apply_ready" unmask-apply-ready?
+              "unmask_apply_reasons" unmask-apply-reasons
+              "verified_apply_validation_apply_safe" validation-apply-safe?
+              "verified_apply_validation_candidate_count" validation-candidate-count
+              "payload_example_count" payload-example-count
+              "reasons" reasons})))
+        (catch python/Exception e
+          (market-evidence-base-row
+           "bad"
+           (str "could not read market-evidence status artifact: "
+                (type e) ": " e)
+           expected
+           generated-at
+           {"phase" "collector-unreadable"
+            "target_date" (get session "date")
+            "target_stamp" (compact-date (get session "date"))
+            "status_path" path
+            "collector_ok" false}))))))
+
+(defn payload
+  [{:keys [root target-date remote probe-dependencies]}]
+  (let [generated-now (now-et)
+        session-now (target-session-now target-date generated-now)
+        generated-at (.isoformat generated-now ** :timespec "seconds")
+        session (session-state session-now)
+        [rows sources source-errors] (build-strategy-rows root session-now session)
+        remote (let [r (if (nil? remote)
+                         (or (os/getenv "STATUS_REMOTE_SSH") "bot@167.233.141.61")
+                         remote)]
+                 (when (seq (.strip r)) r))
+        probes (vec
+                (concat
+                 (if (false? probe-dependencies)
+                   [(probes-disabled-status generated-at)]
+	                   [(systemctl-status "stevetrading-six.service" {:remote remote :expected "active during market hours" :session session})
+	                    (systemctl-status "stevetrading-watchdog.timer" {:remote remote :expected "active always" :session session})
+	                    (systemctl-status "stevetrading-reports-build.timer" {:remote remote :expected "active always" :session session})
+	                    (daily-report-status session-now session generated-at remote)
+                    (systemctl-status "stevetrading-status-dashboard.timer" {:remote remote :expected "active always" :session session})
+                    (systemctl-status "stevetrading-market-evidence-preflight.timer" {:remote remote :expected "active always" :session session})
+                    (systemctl-status "stevetrading-market-evidence-capture-smoke.service" {:remote remote :expected "inactive unless scheduled; last run must not be failed" :session session})
+                    (systemctl-status "stevetrading-market-evidence-capture-smoke.timer" {:remote remote :expected "active always" :session session})
+                    (market-evidence-capture-smoke-status root session-now session generated-at)
+                    (systemctl-status "stevetrading-market-evidence-collect.service" {:remote remote :expected "inactive unless scheduled; last run must not be failed" :session session})
+                    (systemctl-status "stevetrading-market-evidence-collect.timer" {:remote remote :expected "active always" :session session})
+                    (theta-status session remote)
+                    (market-evidence-status root session-now session generated-at)])
+                 (if-let [facts-status (facts-source-status generated-at source-errors)]
+                   [facts-status]
+                   [])))]
+    {"generated_at" generated-at
+     "target_date" (when target-date (.isoformat target-date))
+     "session" session
+     "probes_enabled" (not (false? probe-dependencies))
+     "overall" (overall rows probes)
+     "strategy_rows" rows
+     "dependencies" probes
+     "initiatives" (initiatives)
+     "sources" sources
+     "source_errors" source-errors}))
+
+(defn- status-issue
+  [severity code detail]
+  {:severity severity :code code :detail detail})
+
+(defn- required-keys-missing
+  [m keys]
+  (vec (filter #(not (contains? m %)) keys)))
+
+(defn- nonblank-text?
+  [x]
+  (and (string? x)
+       (seq (bstr/trim x))))
+
+(defn- blank-text-keys
+  [m keys]
+  (vec (filter #(not (nonblank-text? (get m %))) keys)))
+
+(def strategy-row-counter-fields ["facts" "signals" "intents" "fills" "rejects" "faults"])
+
+(defn- non-negative-int-value?
+  [x]
+  (and (not (boolean? x))
+       (try
+         (let [n (python/int x)]
+           (and (= x n) (not (< n 0))))
+         (catch python/Exception _ false))))
+
+(defn- sha256-string?
+  [x]
+  (and (string? x)
+       (some? (re/fullmatch #"[0-9a-f]{64}" x))))
+
+(defn- numeric-value?
+  [x]
+  (and (not (boolean? x))
+       (some? (num-value x))))
+
+(defn- json-object?
+  [x]
+  (or (map? x) (python/isinstance x python/dict)))
+
+(defn- json-object-keys
+  [x]
+  (if (map? x) (keys x) (.keys x)))
+
+(defn- json-object-items
+  [x]
+  (if (map? x) x (.items x)))
+
+(defn- session-shape-issues
+  [session]
+  (let [issues (atom [])]
+    (if-not (or (map? session) (python/isinstance session python/dict))
+      (swap! issues conj (status-issue "bad" :status/session-invalid-shape
+                                       "status payload session must be a JSON object"))
+      (let [session-keys (set (json-object-keys session))
+            missing (vec (sort (remove session-keys required-session-keys)))]
+        (when (seq missing)
+          (swap! issues conj (status-issue "bad" :status/session-missing-keys
+                                           (str "status payload session is missing required keys: "
+                                                (pr-str missing)))))
+        (when-not (contains? session-label-values (get session "label"))
+          (swap! issues conj (status-issue "bad" :status/session-label-invalid
+                                           (str "status payload session.label is invalid: "
+                                                (get session "label")))))
+        (when-not (contains? session-kind-values (get session "session_kind"))
+          (swap! issues conj (status-issue "bad" :status/session-kind-invalid
+                                           (str "status payload session.session_kind is invalid: "
+                                                (get session "session_kind")))))
+        (doseq [[field code] [["is_trading_day" :status/session-trading-day-invalid]
+                              ["is_market_hours" :status/session-market-hours-invalid]
+                              ["is_early_close" :status/session-early-close-invalid]]]
+          (when-not (contains? #{true false} (get session field))
+            (swap! issues conj (status-issue "bad" code
+                                             (str "status payload session." field
+                                                  " must be boolean")))))
+        (doseq [[field code] [["open_at" :status/session-open-at-invalid]
+                              ["close_at" :status/session-close-at-invalid]]]
+          (when-not (parse-dt (get session field))
+            (swap! issues conj (status-issue "bad" code
+                                             (str "status payload session." field
+                                                  " is missing or unparseable")))))
+        (let [label (get session "label")
+              kind (get session "session_kind")
+              trading-day? (get session "is_trading_day")
+              market-hours? (get session "is_market_hours")
+              early-close? (get session "is_early_close")
+              open-at (parse-dt (get session "open_at"))
+              close-at (parse-dt (get session "close_at"))
+              valid-label? (contains? session-label-values label)
+              valid-kind? (contains? session-kind-values kind)
+              boolean-state? (and (contains? #{true false} trading-day?)
+                                  (contains? #{true false} market-hours?)
+                                  (contains? #{true false} early-close?))]
+          (when (and open-at close-at
+                     (not (< (.timestamp open-at) (.timestamp close-at))))
+            (swap! issues conj
+                   (status-issue "bad" :status/session-window-invalid
+                                 "status payload session open_at must be before close_at")))
+          (when (and open-at close-at (string? (get session "date"))
+                     (or (not= (get session "date")
+                               (.isoformat (.date open-at)))
+                         (not= (get session "date")
+                               (.isoformat (.date close-at)))))
+            (swap! issues conj
+                   (status-issue "bad" :status/session-window-date-mismatch
+                                 "status payload session open_at/close_at dates must match session.date")))
+          (when (and valid-label? boolean-state?)
+            (doseq [issue
+                    (cond
+                      (= label "market-open")
+                      (keep identity
+                            [(when-not trading-day?
+                               (status-issue "bad"
+                                             :status/session-label-state-mismatch
+                                             "market-open label requires trading day"))
+                             (when-not market-hours?
+                               (status-issue "bad"
+                                             :status/session-label-state-mismatch
+                                             "market-open label requires market hours"))])
+
+                      (contains? #{"pre-market" "post-market"} label)
+                      (keep identity
+                            [(when-not trading-day?
+                               (status-issue "bad"
+                                             :status/session-label-state-mismatch
+                                             (str label " label requires trading day")))
+                             (when market-hours?
+                               (status-issue "bad"
+                                             :status/session-label-state-mismatch
+                                             (str label " label requires market hours false")))])
+
+                      (= label "market-closed-holiday-or-weekend")
+                      (keep identity
+                            [(when trading-day?
+                               (status-issue "bad"
+                                             :status/session-label-state-mismatch
+                                             "closed label requires non-trading day"))
+                             (when market-hours?
+                               (status-issue "bad"
+                                             :status/session-label-state-mismatch
+                                             "closed label requires market hours false"))])
+
+                      :else [])]
+              (swap! issues conj issue)))
+          (when (and valid-kind? boolean-state?)
+            (doseq [issue
+                    (keep identity
+                          [(when (and early-close? (not= kind "early-close"))
+                             (status-issue "bad"
+                                           :status/session-kind-state-mismatch
+                                           "is_early_close requires early-close session_kind"))
+                           (when (and (= kind "early-close") (not early-close?))
+                             (status-issue "bad"
+                                           :status/session-kind-state-mismatch
+                                           "early-close session_kind requires is_early_close true"))
+                           (when (and (= kind "closed") trading-day?)
+                             (status-issue "bad"
+                                           :status/session-kind-state-mismatch
+                                           "closed session_kind requires non-trading day"))
+                           (when (and (contains? #{"regular" "early-close"} kind)
+                                      (not trading-day?))
+                             (status-issue "bad"
+                                           :status/session-kind-state-mismatch
+                                           (str kind " session_kind requires trading day")))])]
+              (swap! issues conj issue))))))
+    @issues))
+
+(defn- market-evidence-dependency-issues
+  [dep session now]
+  (let [issues (atom [])
+        evidence (get dep "evidence")
+        session-date (get session "date")
+        target-stamp (when session-date (compact-date session-date))
+        status (get dep "status")]
+    (if-not (or (map? evidence) (python/isinstance evidence python/dict))
+      (swap! issues conj (status-issue "bad" :status/market-evidence-missing-evidence
+                                       "Market Evidence dependency row is missing structured evidence"))
+      (let [phase (get evidence "phase")
+            target-date (get evidence "target_date")
+            target-stamp-value (get evidence "target_stamp")]
+        (when-not (= target-date session-date)
+          (swap! issues conj (status-issue "bad" :status/market-evidence-target-date-mismatch
+                                           (str "Market Evidence target_date=" target-date
+                                                " does not match session.date=" session-date))))
+        (when-not (= target-stamp-value target-stamp)
+          (swap! issues conj (status-issue "bad" :status/market-evidence-target-stamp-mismatch
+                                           (str "Market Evidence target_stamp=" target-stamp-value
+                                                " does not match expected " target-stamp))))
+        (when (= status "ok")
+          (let [updated-at (parse-dt (get evidence "status_updated_at"))
+                collector-due-at (parse-dt (get evidence "collector_due_at"))
+                payload-count (num-value (get evidence "payload_example_count"))
+                status-path (get evidence "status_path")]
+            (when-not (= "collector-ok" phase)
+              (swap! issues conj (status-issue "bad" :status/market-evidence-ok-phase-invalid
+                                               (str "Market Evidence ok row must have phase=collector-ok, got " phase))))
+            (doseq [[field code] [["status_path" :status/market-evidence-ok-missing-status-path]
+                                  ["status_updated_at" :status/market-evidence-ok-missing-status-updated-at]
+                                  ["collector_due_at" :status/market-evidence-ok-missing-collector-due-at]]]
+              (when-not (seq (str (or (get evidence field) "")))
+                (swap! issues conj (status-issue "bad" code
+                                                 (str "Market Evidence ok row missing " field)))))
+            (when (and (seq (str (or status-path "")))
+                       (not (os.path/exists (str status-path))))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-status-path-missing
+                                               (str "Market Evidence status_path does not exist: "
+                                                    status-path))))
+            (when (and (seq (str (or status-path "")))
+                       (os.path/exists (str status-path)))
+              (try
+                (let [status-payload (read-json status-path)]
+                  (doseq [[actual expected code detail]
+                          [[(get status-payload "target_date")
+                            target-date
+                            :status/market-evidence-status-file-target-date-mismatch
+                            "status file target_date does not match row evidence"]
+                           [(get status-payload "target_stamp")
+                            target-stamp-value
+                            :status/market-evidence-status-file-target-stamp-mismatch
+                            "status file target_stamp does not match row evidence"]
+                           [(get status-payload "status")
+                            "ok"
+                            :status/market-evidence-status-file-status-not-ok
+                            "status file status must be ok"]
+                           [(get status-payload "ok?")
+                            true
+                            :status/market-evidence-status-file-not-ok
+                            "status file ok? must be true"]
+                           [(get-in status-payload ["manifest" "valid?"])
+                            true
+                            :status/market-evidence-status-file-manifest-invalid
+                            "status file manifest.valid? must be true"]
+                           [(get-in status-payload ["manifest_verification" "valid?"])
+                            true
+                            :status/market-evidence-status-file-manifest-not-verified
+                            "status file manifest_verification.valid? must be true"]
+                           [(get-in status-payload ["manifest" "target_matches_request?"])
+                            true
+                            :status/market-evidence-status-file-target-not-verified
+                            "status file manifest.target_matches_request? must be true"]
+                           [(get-in status-payload ["readiness" "verdict"])
+                            "PASS"
+                            :status/market-evidence-status-file-readiness-not-pass
+                            "status file readiness.verdict must be PASS"]
+                           [(get-in status-payload ["manifest" "payload_example_count"])
+                            (get evidence "payload_example_count")
+                            :status/market-evidence-status-file-payload-count-mismatch
+                            "status file payload_example_count does not match row evidence"]
+                           [(get-in status-payload ["manifest" "diagnostics" "prediction_delta" "available"])
+                            (get evidence "prediction_delta_available")
+                            :status/market-evidence-status-file-prediction-delta-mismatch
+                            "status file prediction_delta availability does not match row evidence"]
+                           [(get-in status-payload ["manifest" "diagnostics" "parity_gate" "available"])
+                            (get evidence "parity_gate_available")
+                            :status/market-evidence-status-file-parity-gate-mismatch
+                            "status file parity_gate availability does not match row evidence"]
+                           [(get-in status-payload ["manifest" "diagnostics" "capture_v2_sidecars" "ok"])
+                            (get evidence "capture_v2_ok")
+                            :status/market-evidence-status-file-capture-v2-ok-mismatch
+                            "status file capture_v2_sidecars.ok does not match row evidence"]
+                           [(empty? (vec (filter #(not (contains? (set (get-in status-payload ["manifest" "diagnostics" "capture_v2_sidecars" "option_surface_prefixes"] [])) %))
+                                                  required-market-evidence-option-surface-prefixes)))
+                            (get evidence "capture_v2_required_option_surface_prefixes_present")
+                            :status/market-evidence-status-file-capture-v2-prefixes-mismatch
+                            "status file capture_v2 required option surface prefix presence does not match row evidence"]
+                           [(capture-v2-sidecar-dtypes-ok? (get-in status-payload ["manifest" "diagnostics" "capture_v2_sidecars" "sidecar_dtypes"] {}))
+                            (get evidence "capture_v2_sidecar_dtypes_ok")
+                            :status/market-evidence-status-file-capture-v2-sidecar-dtypes-mismatch
+                            "status file capture_v2 sidecar dtype health does not match row evidence"]
+                           [(+ (reduce + 0 (map #(or (num-value %) 0)
+                                                (.values (get-in status-payload ["manifest" "diagnostics" "capture_v2_sidecars" "sidecar_malformed_contracts"] {}))))
+                               (reduce + 0 (map #(or (num-value %) 0)
+                                                (.values (get-in status-payload ["manifest" "diagnostics" "capture_v2_sidecars" "option_surface_malformed_contracts_by_prefix"] {})))))
+                            (get evidence "capture_v2_malformed_contract_count")
+                            :status/market-evidence-status-file-capture-v2-malformed-mismatch
+                            "status file capture_v2 malformed contract count does not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "available"])
+                            (get evidence "matched_feature_parity_available")
+                            :status/market-evidence-status-file-matched-parity-available-mismatch
+                            "status file matched feature parity availability does not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "matched_rows"])
+                            (get evidence "matched_feature_parity_rows")
+                            :status/market-evidence-status-file-matched-parity-rows-mismatch
+                            "status file matched feature parity rows do not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "problem_feature_count"])
+                            (get evidence "matched_feature_parity_problem_count")
+                            :status/market-evidence-status-file-matched-parity-problems-mismatch
+                            "status file matched feature parity problem count does not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "max_abs_deviation"])
+                            (get evidence "matched_feature_parity_max_abs_deviation")
+                            :status/market-evidence-status-file-matched-parity-max-abs-dev-mismatch
+                            "status file matched feature parity max_abs_deviation does not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "min_correlation"])
+                            (get evidence "matched_feature_parity_min_correlation")
+                            :status/market-evidence-status-file-matched-parity-min-corr-mismatch
+                            "status file matched feature parity min_correlation does not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "matched_start"])
+                            (get evidence "matched_feature_parity_start")
+                            :status/market-evidence-status-file-matched-parity-start-mismatch
+                            "status file matched feature parity matched_start does not match row evidence"]
+                           [(get-in status-payload ["readiness" "matched_feature_parity" "matched_end"])
+                            (get evidence "matched_feature_parity_end")
+                            :status/market-evidence-status-file-matched-parity-end-mismatch
+                            "status file matched feature parity matched_end does not match row evidence"]
+                           [(get status-payload "unmask_apply_ready?")
+                            (get evidence "unmask_apply_ready")
+                            :status/market-evidence-status-file-unmask-apply-ready-mismatch
+                            "status file unmask_apply_ready? does not match row evidence"]
+                           [(get-in status-payload ["verified_apply_validation" "apply_safe"])
+                            (get evidence "verified_apply_validation_apply_safe")
+                            :status/market-evidence-status-file-verified-apply-safe-mismatch
+                            "status file verified_apply_validation.apply_safe does not match row evidence"]
+                           [(get-in status-payload ["verified_apply_validation" "candidate_count"])
+                            (get evidence "verified_apply_validation_candidate_count")
+                            :status/market-evidence-status-file-verified-apply-candidate-count-mismatch
+                            "status file verified_apply_validation.candidate_count does not match row evidence"]]]
+                    (when-not (= expected actual)
+                      (swap! issues conj (status-issue "bad" code
+                                                       (str "Market Evidence " detail
+                                                            ": expected " expected
+                                                            ", got " actual))))))
+                (catch python/Exception e
+                  (swap! issues conj (status-issue "bad" :status/market-evidence-status-file-unreadable
+                                                   (str "Market Evidence status_path is unreadable: "
+                                                        (type e) ": " e))))))
+            (when-not updated-at
+              (swap! issues conj (status-issue "bad" :status/market-evidence-status-updated-at-unparseable
+                                               "Market Evidence status_updated_at is missing or unparseable")))
+            (when-not collector-due-at
+              (swap! issues conj (status-issue "bad" :status/market-evidence-collector-due-at-unparseable
+                                               "Market Evidence collector_due_at is missing or unparseable")))
+            (when (and updated-at collector-due-at
+                       (< (.timestamp updated-at) (.timestamp collector-due-at)))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-status-predates-collector
+                                               "Market Evidence status artifact predates collector due time")))
+            (when (and updated-at
+                       (> (minutes-between updated-at now) 1))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-status-updated-at-in-future
+                                               "Market Evidence status_updated_at is in the future")))
+            (doseq [[field code detail] [["collector_ok" :status/market-evidence-collector-not-ok "collector_ok must be true"]
+                                         ["ok" :status/market-evidence-status-not-ok "ok must be true"]
+                                         ["manifest_valid" :status/market-evidence-manifest-invalid "manifest_valid must be true"]
+                                         ["manifest_verified" :status/market-evidence-manifest-not-verified "manifest_verified must be true"]
+                                         ["target_matches_request" :status/market-evidence-target-not-verified "target_matches_request must be true"]]]
+              (when-not (= true (get evidence field))
+                (swap! issues conj (status-issue "bad" code
+                                                 (str "Market Evidence ok row invalid: " detail)))))
+            (doseq [[field code] [["prediction_delta_available" :status/market-evidence-prediction-delta-available-invalid]
+                                  ["parity_gate_available" :status/market-evidence-parity-gate-available-invalid]
+                                  ["capture_v2_ok" :status/market-evidence-capture-v2-ok-invalid]
+                                  ["capture_v2_required_option_surface_prefixes_present" :status/market-evidence-capture-v2-prefixes-invalid]
+                                  ["capture_v2_sidecar_dtypes_ok" :status/market-evidence-capture-v2-sidecar-dtypes-invalid]
+                                  ["matched_feature_parity_available" :status/market-evidence-matched-parity-available-invalid]]]
+              (when-not (contains? #{true false} (get evidence field))
+                (swap! issues conj (status-issue "bad" code
+                                                 (str "Market Evidence ok row " field
+                                                      " must be boolean")))))
+            (when-not (= true (get evidence "capture_v2_ok"))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-capture-v2-not-ok
+                                               "Market Evidence ok row invalid: capture_v2_ok must be true")))
+            (when-not (= true (get evidence "capture_v2_required_option_surface_prefixes_present"))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-capture-v2-prefixes-missing
+                                               (str "Market Evidence ok row invalid: missing capture-v2 option surface prefixes "
+                                                    (pr-str (get evidence "capture_v2_missing_option_surface_prefixes"))))))
+            (when-not (= true (get evidence "capture_v2_sidecar_dtypes_ok"))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-capture-v2-sidecar-dtypes-bad
+                                               (str "Market Evidence ok row invalid: capture-v2 sidecar dtypes must all be object, got "
+                                                    (pr-str (get evidence "capture_v2_sidecar_dtypes"))))))
+            (when-not (= 0 (or (num-value (get evidence "capture_v2_malformed_contract_count")) -1))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-capture-v2-malformed-contracts
+                                               (str "Market Evidence ok row invalid: capture_v2_malformed_contract_count must be 0, got "
+                                                    (get evidence "capture_v2_malformed_contract_count")))))
+            (when-not (= true (get evidence "matched_feature_parity_available"))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-missing
+                                               "Market Evidence ok row invalid: matched_feature_parity_available must be true")))
+            (when-not (>= (or (num-value (get evidence "matched_feature_parity_rows")) 0)
+                          required-market-evidence-matched-parity-min-rows)
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-empty
+                                               (str "Market Evidence ok row invalid: matched_feature_parity_rows must be at least "
+                                                    required-market-evidence-matched-parity-min-rows))))
+            (when-not (= 0 (or (num-value (get evidence "matched_feature_parity_problem_count")) -1))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-problems
+                                               (str "Market Evidence ok row invalid: matched_feature_parity_problem_count must be 0, got "
+                                                    (get evidence "matched_feature_parity_problem_count")))))
+            (when (nil? (num-value (get evidence "matched_feature_parity_max_abs_deviation")))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-max-abs-dev-missing
+                                               "Market Evidence ok row invalid: matched_feature_parity_max_abs_deviation must be numeric")))
+            (when (nil? (num-value (get evidence "matched_feature_parity_min_correlation")))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-min-corr-missing
+                                               "Market Evidence ok row invalid: matched_feature_parity_min_correlation must be numeric")))
+            (when (zero? (count (str (or (get evidence "matched_feature_parity_start") ""))))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-start-missing
+                                               "Market Evidence ok row invalid: matched_feature_parity_start must be present")))
+            (when (zero? (count (str (or (get evidence "matched_feature_parity_end") ""))))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-matched-parity-end-missing
+                                               "Market Evidence ok row invalid: matched_feature_parity_end must be present")))
+            (doseq [[field code detail] [["unmask_apply_ready"
+                                           :status/market-evidence-unmask-apply-not-ready
+                                           "unmask_apply_ready must be true"]
+                                          ["verified_apply_validation_apply_safe"
+                                           :status/market-evidence-verified-apply-not-safe
+                                           "verified_apply_validation_apply_safe must be true"]]]
+              (when-not (= true (get evidence field))
+                (swap! issues conj (status-issue "bad" code
+                                                 (str "Market Evidence ok row invalid: " detail)))))
+            (when-not (= "ok" (get evidence "artifact_status"))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-artifact-status-not-ok
+                                               (str "Market Evidence artifact_status must be ok, got "
+                                                    (get evidence "artifact_status")))))
+            (when-not (= "PASS" (get evidence "readiness_verdict"))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-readiness-not-pass
+                                               (str "Market Evidence readiness_verdict is "
+                                                    (get evidence "readiness_verdict")))))
+            (when-not (and payload-count (> payload-count 0))
+              (swap! issues conj (status-issue "bad" :status/market-evidence-no-payload-examples
+	                                               "Market Evidence ok row must report positive payload_example_count")))))))
+	    @issues))
+
+(defn- daily-report-dependency-issues
+  [dep session now]
+  (let [issues (atom [])
+        evidence (get dep "evidence")
+        status (get dep "status")
+        expected-date (try
+                        (.isoformat (expected-daily-report-date now session))
+                        (catch python/Exception _ nil))
+        expected-stamp (when expected-date (compact-date expected-date))]
+    (if (or (map? evidence) (python/isinstance evidence python/dict))
+      (let [evidence-date (get evidence "expected_date")
+            evidence-stamp (get evidence "expected_stamp")]
+        (when-not (= evidence-date expected-date)
+          (swap! issues conj (status-issue "bad" :status/daily-reports-expected-date-mismatch
+                                           (str "Daily Reports expected_date=" evidence-date
+                                                " does not match expected " expected-date))))
+        (when-not (= evidence-stamp expected-stamp)
+          (swap! issues conj (status-issue "bad" :status/daily-reports-expected-stamp-mismatch
+                                           (str "Daily Reports expected_stamp=" evidence-stamp
+                                                " does not match expected " expected-stamp))))
+        (when (= status "ok")
+          (doseq [[field code detail] [["validation_exists" :status/daily-reports-validation-missing "validation_exists must be true"]
+                                       ["html_exists" :status/daily-reports-html-missing "html_exists must be true"]
+                                       ["report_date_matches" :status/daily-reports-date-not-verified "report_date_matches must be true"]
+                                       ["rendered" :status/daily-reports-not-rendered "rendered must be true"]
+                                       ["validation_valid" :status/daily-reports-validation-invalid "validation_valid must be true"]]]
+            (when-not (= true (get evidence field))
+              (swap! issues conj (status-issue "bad" code
+                                               (str "Daily Reports ok row invalid: " detail)))))
+          (when-not (= "ok" (get evidence "validation_status"))
+            (swap! issues conj (status-issue "bad" :status/daily-reports-validation-status-not-ok
+                                             (str "Daily Reports ok row invalid: validation_status must be ok, got "
+                                                  (get evidence "validation_status")))))))
+      (swap! issues conj (status-issue "bad" :status/daily-reports-missing-evidence
+                                       "Daily Reports dependency row is missing structured evidence")))
+    @issues))
+
+(defn validate-payload
+  ([data] (validate-payload data {}))
+  ([data {:keys [now max-age-minutes]}]
+   (let [now (or now (now-et))
+         max-age-minutes (or max-age-minutes artifact-max-age-minutes)
+         issues (atom [])
+         generated-at (parse-dt (get data "generated_at"))
+         generated-date (when generated-at (.isoformat (.date (.astimezone generated-at et))))
+         session (get data "session")
+         session-date (get-in data ["session" "date"])
+         target-date (get data "target_date")
+         rows (get data "strategy_rows")
+        dependencies (get data "dependencies")
+         initiatives (get data "initiatives")
+         overall-status (get-in data ["overall" "status"])
+         rows-seq? (and rows (or (vector? rows) (seq? rows) (python/isinstance rows python/list)))
+         dependencies-seq? (and dependencies (or (vector? dependencies) (seq? dependencies) (python/isinstance dependencies python/list)))
+         initiatives-seq? (and initiatives (or (vector? initiatives) (seq? initiatives) (python/isinstance initiatives python/list)))]
+     (when-not generated-at
+       (swap! issues conj (status-issue "bad" :status/generated-at-missing
+                                        "status payload is missing a parseable generated_at timestamp")))
+     (when generated-at
+       (let [age (minutes-between now generated-at)]
+         (when (< age -1)
+           (swap! issues conj (status-issue "bad" :status/generated-at-in-future
+                                            (str "status payload generated_at is in the future by "
+                                                 (python/format (- age) ".1f") " minutes"))))
+         (when (> age max-age-minutes)
+           (swap! issues conj (status-issue "bad" :status/generated-at-stale
+                                            (str "status payload is stale: generated "
+                                                 (python/format age ".1f") " minutes ago"))))))
+     (when-not session-date
+       (swap! issues conj (status-issue "bad" :status/session-date-missing
+                                        "status payload is missing session.date")))
+     (doseq [issue (session-shape-issues session)]
+       (swap! issues conj issue))
+     (when (and target-date (not= target-date session-date))
+       (swap! issues conj (status-issue "bad" :status/target-date-session-mismatch
+                                        (str "status payload target_date=" target-date
+                                             " does not match session.date=" session-date))))
+     (when (and generated-date session-date
+                (not= generated-date session-date)
+                (not= target-date session-date))
+       (swap! issues conj (status-issue "bad" :status/session-date-unexplained-drift
+                                        (str "status payload session.date=" session-date
+                                             " differs from generated_at date="
+                                             generated-date
+                                             " without matching target_date"))))
+     (when-not (contains? status-values overall-status)
+       (swap! issues conj (status-issue "bad" :status/overall-status-invalid
+                                        (str "overall.status is invalid: " overall-status))))
+     (if-not rows-seq?
+       (swap! issues conj (status-issue "bad" :status/strategy-rows-missing
+                                        "status payload is missing strategy_rows"))
+       (do
+         (when (not= (count rows) required-strategy-row-count)
+           (swap! issues conj (status-issue "bad" :status/strategy-rows-partial
+                                            (str "status payload has " (count rows)
+                                                 " strategy rows; expected exactly "
+                                                 required-strategy-row-count))))
+         (let [identities (map (fn [row]
+                                 [(get row "name")
+                                  (get row "strategy_id")
+                                  (get row "account_id")
+                                  (get row "group")])
+                               rows)
+               identity-set (set identities)
+               missing (vec (filter #(not (contains? identity-set %))
+                                    expected-strategy-identities))
+               unknown (vec (filter #(not (contains? expected-strategy-identities %))
+                                    identity-set))
+               duplicates (vec (map first
+                                    (filter (fn [[_ n]] (> n 1))
+                                            (frequencies identities))))]
+           (when (seq missing)
+             (swap! issues conj (status-issue "bad" :status/strategy-rows-required-missing
+                                              (str "status payload is missing required strategy rows: "
+                                                   (pr-str missing)))))
+           (when (seq unknown)
+             (swap! issues conj (status-issue "bad" :status/strategy-rows-unknown
+                                              (str "status payload contains unknown strategy rows: "
+                                                   (pr-str unknown)))))
+           (when (seq duplicates)
+             (swap! issues conj (status-issue "bad" :status/strategy-rows-duplicate
+                                              (str "status payload contains duplicate strategy rows: "
+                                                   (pr-str duplicates))))))
+         (doseq [row rows]
+           (let [missing (required-keys-missing row ["name" "status" "strategy_id" "account_id" "group" "detail"])]
+             (when (seq missing)
+               (swap! issues conj (status-issue "bad" :status/strategy-row-malformed
+                                                (str "strategy row missing keys: " missing))))
+             (let [blank (blank-text-keys row ["name" "strategy_id" "account_id" "group" "detail"])]
+               (when (seq blank)
+                 (swap! issues conj (status-issue "bad" :status/strategy-row-blank-field
+                                                  (str "strategy row has blank text fields: " blank)))))
+             (when-not (contains? status-values (get row "status"))
+               (swap! issues conj (status-issue "bad" :status/strategy-status-invalid
+                                                (str "strategy row has invalid status: " (get row "status")))))
+             (when (and (contains? row "age_minutes")
+                        (some? (get row "age_minutes"))
+                        (not (numeric-value? (get row "age_minutes"))))
+               (swap! issues conj (status-issue "bad" :status/strategy-row-age-invalid
+                                                (str "strategy row has invalid age_minutes for "
+                                                     (get row "name") ": "
+                                                     (get row "age_minutes")))))
+             (doseq [field strategy-row-counter-fields]
+               (when-not (non-negative-int-value? (get row field))
+                 (swap! issues conj (status-issue "bad" :status/strategy-row-counter-invalid
+                                                  (str "strategy row has invalid " field
+                                                       " for " (get row "name")
+                                                       ": " (get row field))))))
+             (when (non-negative-int-value? (get row "facts"))
+               (doseq [field (remove #(= "facts" %) strategy-row-counter-fields)]
+                 (when (and (non-negative-int-value? (get row field))
+                            (> (python/int (get row field))
+                               (python/int (get row "facts"))))
+                   (swap! issues conj (status-issue "bad" :status/strategy-row-counter-exceeds-facts
+                                                    (str "strategy row " field
+                                                         "=" (get row field)
+                                                         " exceeds facts="
+                                                         (get row "facts")
+                                                         " for " (get row "name")))))))))))
+     (if-not dependencies-seq?
+       (swap! issues conj (status-issue "bad" :status/dependencies-missing
+                                        "status payload is missing dependencies"))
+       (do
+         (when-not (get data "probes_enabled")
+           (swap! issues conj (status-issue "bad" :status/dependency-probes-disabled
+                                            "dependency probes were disabled; published status must be treated as incomplete")))
+         (when (get data "probes_enabled")
+           (let [names (map #(get % "name") dependencies)
+                 name-set (set names)
+                 allowed (into required-dependency-names optional-dependency-names)
+                 missing (vec (filter #(not (contains? name-set %))
+                                      required-dependency-names))
+                 unknown (vec (filter #(not (contains? allowed %))
+                                      name-set))
+                 duplicates (vec (map first
+                                      (filter (fn [[_ n]] (> n 1))
+                                              (frequencies names))))]
+             (when (seq missing)
+               (swap! issues conj (status-issue "bad" :status/dependencies-required-missing
+                                                (str "status payload is missing required dependency probes: "
+                                                     (pr-str missing)))))
+             (when (seq unknown)
+               (swap! issues conj (status-issue "bad" :status/dependencies-unknown
+                                                (str "status payload contains unknown dependency probes: "
+                                                     (pr-str unknown)))))
+             (when (seq duplicates)
+               (swap! issues conj (status-issue "bad" :status/dependencies-duplicate
+                                                (str "status payload contains duplicate dependency probes: "
+                                                     (pr-str duplicates)))))))
+         (doseq [dep dependencies]
+           (let [missing (required-keys-missing dep ["name" "status" "detail" "expected" "updated_at"])
+                 updated-at (parse-dt (get dep "updated_at"))]
+             (when (seq missing)
+               (swap! issues conj (status-issue "bad" :status/dependency-malformed
+                                                (str "dependency row missing keys: " missing))))
+             (let [blank (blank-text-keys dep ["name" "detail" "expected"])]
+               (when (seq blank)
+                 (swap! issues conj (status-issue "bad" :status/dependency-blank-field
+                                                  (str "dependency row has blank text fields: " blank)))))
+             (when-not (contains? status-values (get dep "status"))
+               (swap! issues conj (status-issue "bad" :status/dependency-status-invalid
+                                                (str "dependency row has invalid status: " (get dep "status")))))
+             (when-not updated-at
+               (swap! issues conj (status-issue "bad" :status/dependency-updated-at-missing
+                                                (str "dependency row is missing parseable updated_at: " (get dep "name")))))
+             (when updated-at
+               (let [age (minutes-between now updated-at)]
+                 (when (< age -1)
+                   (swap! issues conj (status-issue "bad" :status/dependency-updated-at-in-future
+                                                    (str "dependency row is in the future: " (get dep "name")
+                                                         " updated " (python/format (- age) ".1f")
+                                                         " minutes ahead"))))
+                 (when (> age max-age-minutes)
+                   (swap! issues conj (status-issue "bad" :status/dependency-stale
+                                                    (str "dependency row is stale: " (get dep "name")
+                                                         " updated " (python/format age ".1f")
+                                                         " minutes ago"))))))
+	             (when (= "Market Evidence" (get dep "name"))
+	               (doseq [issue (market-evidence-dependency-issues dep (get data "session" {}) now)]
+	                 (swap! issues conj issue)))
+             (when (= "Daily Reports" (get dep "name"))
+               (doseq [issue (daily-report-dependency-issues dep (get data "session" {}) now)]
+                 (swap! issues conj issue)))))))
+     (if-not initiatives-seq?
+       (swap! issues conj (status-issue "bad" :status/initiatives-missing
+                                        "status payload is missing initiatives"))
+       (let [names (map #(get % "name") initiatives)
+             name-set (set names)
+             missing (vec (filter #(not (contains? name-set %))
+                                  required-initiative-names))
+             unknown (vec (filter #(not (contains? required-initiative-names %))
+                                  name-set))
+             duplicates (vec (map first
+                                  (filter (fn [[_ n]] (> n 1))
+                                          (frequencies names))))]
+         (when (seq missing)
+           (swap! issues conj (status-issue "bad" :status/initiatives-required-missing
+                                            (str "status payload is missing required initiatives: "
+                                                 (pr-str missing)))))
+         (when (seq unknown)
+           (swap! issues conj (status-issue "bad" :status/initiatives-unknown
+                                            (str "status payload contains unknown initiatives: "
+                                                 (pr-str unknown)))))
+         (when (seq duplicates)
+           (swap! issues conj (status-issue "bad" :status/initiatives-duplicate
+                                            (str "status payload contains duplicate initiatives: "
+                                                 (pr-str duplicates)))))
+         (doseq [initiative initiatives]
+           (let [missing (required-keys-missing initiative ["priority" "name" "status" "detail"])]
+             (when (seq missing)
+               (swap! issues conj (status-issue "bad" :status/initiative-malformed
+                                                (str "initiative missing keys: " missing))))
+             (let [blank (blank-text-keys initiative ["priority" "name" "detail"])]
+               (when (seq blank)
+                 (swap! issues conj (status-issue "bad" :status/initiative-blank-field
+                                                  (str "initiative has blank text fields: " blank)))))
+             (when-not (contains? initiative-status-values (get initiative "status"))
+               (swap! issues conj (status-issue "bad" :status/initiative-status-invalid
+                                                (str "initiative has invalid status: "
+                                                     (get initiative "status")))))))))
+     (when (and rows-seq? dependencies-seq? (contains? status-values overall-status))
+       (let [expected-status (get (overall rows dependencies) "status")]
+         (when-not (= expected-status overall-status)
+           (swap! issues conj (status-issue "bad" :status/overall-status-mismatch
+                                            (str "overall.status=" overall-status
+                                                 " does not match row/dependency status=" expected-status))))))
+     (let [bad? (boolean (some #(= "bad" (:severity %)) @issues))]
+       {:valid? (not bad?)
+        :issues (vec @issues)
+        :checked_at (iso-et now)
+        :max_age_minutes max-age-minutes}))))
+
+(defn- html-escape
+  [s]
+  (-> (str (or s ""))
+      (.replace "&" "&amp;")
+      (.replace "<" "&lt;")
+      (.replace ">" "&gt;")
+      (.replace "\"" "&quot;")
+      (.replace "'" "&#39;")))
+
+(defn- diagnostic-available-text
+  [value]
+  (cond
+    (true? value) "true"
+    (false? value) "false"
+    :else (str value)))
+
+(defn- compact-count-map
+  [m]
+  (if (and m (or (map? m) (python/isinstance m python/dict)) (seq m))
+    (let [items (if (python/isinstance m python/dict) (.items m) m)]
+      (bstr/join ", "
+                 (map (fn [[k v]] (str k "=" v))
+                      (take 5 (sort-by (fn [[_ v]] (- (or (num-value v) 0)))
+                                       items)))))
+    "none"))
+
+(defn- market-evidence-diagnostic-html
+  [dep]
+  (let [evidence (get dep "evidence")]
+    (when (or (map? evidence) (python/isinstance evidence python/dict))
+      (str "<div class=\"small\">Diagnostics: prediction_delta="
+           (html-escape (diagnostic-available-text
+                         (get evidence "prediction_delta_available" "unknown")))
+           " · parity_gate="
+           (html-escape (diagnostic-available-text
+                         (get evidence "parity_gate_available" "unknown")))
+           " · matched_rows="
+           (html-escape (diagnostic-available-text
+                         (get evidence "matched_feature_parity_rows" "unknown")))
+           " · matched_problems="
+           (html-escape (diagnostic-available-text
+                         (get evidence "matched_feature_parity_problem_count" "unknown")))
+           " · max_abs_dev="
+           (html-escape (diagnostic-available-text
+                         (get evidence "matched_feature_parity_max_abs_deviation" "unknown")))
+           " · min_corr="
+           (html-escape (diagnostic-available-text
+                         (get evidence "matched_feature_parity_min_correlation" "unknown")))
+           " · matched_window="
+           (html-escape (str (get evidence "matched_feature_parity_start" "unknown")
+                             ".."
+                             (get evidence "matched_feature_parity_end" "unknown")))
+           " · unmask_apply_ready="
+           (html-escape (diagnostic-available-text
+                         (get evidence "unmask_apply_ready" "unknown")))
+           "</div><div class=\"small\">Neutralized blockers: missing_sources="
+           (html-escape (compact-count-map
+                         (get evidence "neutralized_feature_missing_market_evidence_by_source")))
+           " · missing_reasons="
+           (html-escape (compact-count-map
+                         (get evidence "neutralized_feature_missing_market_evidence_reason_counts")))
+           "</div>"))))
+
+(defn- dependency-card-html
+  [dep]
+  (str "<div class=\"status-card\"><strong>" (html-escape (get dep "name"))
+       "</strong> <span class=\"status-dot " (html-escape (get dep "status")) "\">"
+       (html-escape (get dep "status")) "</span><div class=\"muted\">"
+       (html-escape (get dep "detail")) "</div><div class=\"small\">Expected: "
+       (html-escape (get dep "expected")) "</div>"
+       (if (= "Market Evidence" (get dep "name"))
+         (or (market-evidence-diagnostic-html dep) "")
+         "")
+       "</div>"))
+
+(defn render-html
+  [data]
+  (let [rows (get data "strategy_rows" [])
+        deps (get data "dependencies" [])
+        initiatives (get data "initiatives" [])
+        sources (get data "sources" [])
+        validation (get data "artifact_validation" {})
+        validation-issues (:issues validation)
+        status (get-in data ["overall" "status"] "unknown")]
+    (str "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+         "<title>SteveTrading Status Dashboard</title><style>"
+         "body{background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0}.site-header{background:#161b22;border-bottom:1px solid #30363d}.site-header-inner,.container{max-width:1280px;margin:0 auto;padding:18px 24px}.site-nav{display:flex;gap:18px;justify-content:flex-end}.site-nav a{color:#58a6ff;text-decoration:none}.section{margin:28px 0}.status-hero,.status-card,.initiative-card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px}.status-hero{display:flex;justify-content:space-between;gap:18px;border-left:5px solid #8b949e}.status-ok{border-left-color:#3fb950}.status-warn{border-left-color:#d29922}.status-bad{border-left-color:#f85149}.muted,.small{color:#8b949e}.small{font-size:11px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:9px 12px;border-bottom:1px solid #30363d;text-align:left}th{color:#8b949e;text-transform:uppercase;font-size:11px}.num{text-align:right}.status-dot,.pill{display:inline-block;border:1px solid #30363d;border-radius:999px;padding:2px 8px;font-size:11px}.ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}.unknown{color:#8b949e}.idle{color:#8b949e}.status-grid,.initiative-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}code{color:#79c0ff}</style></head><body>"
+         "<header class=\"site-header\"><div class=\"site-header-inner\"><h1>SteveTrading Status Dashboard</h1><nav class=\"site-nav\"><a href=\"/reports/daily/\">Daily</a><a href=\"/reports/weekly/\">Weekly</a><a href=\"/reports/accounts/\">Accounts</a><a href=\"/reports/status/\">System</a></nav></div></header>"
+         "<main class=\"container\"><section class=\"section\"><div class=\"status-hero status-" (html-escape status) "\"><div><div class=\"small\">Mission Control</div><h2>Overall: " (.upper (html-escape status)) "</h2><p class=\"muted\">" (html-escape (get-in data ["session" "label"])) " · " (html-escape (get-in data ["session" "date"])) " · generated " (html-escape (get data "generated_at")) "</p></div><div>"
+         (bstr/join " " (map (fn [k] (str "<span class=\"pill " k "\">" (get-in data ["overall" k] 0) " " k "</span>"))
+                              ["ok" "warn" "bad" "unknown" "idle"]))
+         "</div></div>"
+         (if (seq validation-issues)
+           (str "<div class=\"status-card\" style=\"margin-top:12px\"><strong>Artifact Validation</strong><ul>"
+                (bstr/join "" (map (fn [i]
+                                      (str "<li><span class=\"status-dot " (html-escape (:severity i)) "\">"
+                                           (html-escape (:severity i)) "</span> "
+                                           (html-escape (:code i)) " · "
+                                           (html-escape (:detail i)) "</li>"))
+                                    validation-issues))
+                "</ul></div>")
+           "")
+         "</section><section class=\"section\"><h2>Strategy Watchers</h2><table><thead><tr><th>Status</th><th>Strategy</th><th>Group</th><th>Account</th><th class=\"num\">Age</th><th class=\"num\">Facts</th><th class=\"num\">Signals</th><th class=\"num\">Intents</th><th class=\"num\">Fills</th><th class=\"num\">Rejects</th><th class=\"num\">Faults</th><th>Detail</th></tr></thead><tbody>"
+         (bstr/join "" (map (fn [r]
+                               (str "<tr><td><span class=\"status-dot " (html-escape (get r "status")) "\">" (html-escape (get r "status")) "</span></td><td><strong>" (html-escape (get r "name")) "</strong><div class=\"muted small\">" (html-escape (get r "strategy_id")) "</div></td><td>" (html-escape (get r "group")) "</td><td>" (html-escape (get r "account_id")) "</td><td class=\"num\">" (if (nil? (get r "age_minutes")) "—" (str (python/format (get r "age_minutes") ".1f") "m")) "</td><td class=\"num\">" (get r "facts" 0) "</td><td class=\"num\">" (get r "signals" 0) "</td><td class=\"num\">" (get r "intents" 0) "</td><td class=\"num\">" (get r "fills" 0) "</td><td class=\"num\">" (get r "rejects" 0) "</td><td class=\"num\">" (get r "faults" 0) "</td><td>" (html-escape (get r "detail")) "</td></tr>"))
+                             rows))
+         "</tbody></table></section><section class=\"section\"><h2>Dependencies</h2><div class=\"status-grid\">"
+         (bstr/join "" (map dependency-card-html deps))
+         "</div></section><section class=\"section\"><h2>Current Initiatives</h2><div class=\"initiative-grid\">"
+         (bstr/join "" (map (fn [i]
+                               (str "<div class=\"initiative-card\"><div class=\"small\">" (html-escape (get i "priority")) "</div><h3>" (html-escape (get i "name")) "</h3><span class=\"status-dot " (html-escape (get i "status")) "\">" (html-escape (get i "status")) "</span><p>" (html-escape (get i "detail")) "</p></div>"))
+                             initiatives))
+         "</div></section><section class=\"section\"><h2>Telemetry Sources</h2><ul>"
+         (if (seq sources)
+           (bstr/join "" (map #(str "<li><code>" (html-escape %) "</code></li>") sources))
+           "<li>No facts DB found for this session date.</li>")
+         "</ul></section></main></body></html>")))
+
+(defn ->jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (let [ks (str k)]
+                       (python/tuple [(if (.startswith ks ":") (subs ks 1) ks)
+                                      (->jsonable v)])))
+                   x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (keyword? x) (let [s (str x)] (if (.startswith s ":") (subs s 1) s))
+    (python/isinstance x (.-datetime datetime)) (iso-et x)
+    :else x))
+
+(defn- spit-atomic
+  [path content]
+  (let [tmp (str path ".tmp." (os/getpid))]
+    (spit tmp content)
+    (os/replace tmp path)))
+
+(defn sha256-text
+  [text]
+  (.hexdigest (hashlib/sha256 (.encode (str text) "utf-8"))))
+
+(defn- artifact-entry
+  [content]
+  {"sha256" (sha256-text content)
+   "bytes" (count (.encode (str content) "utf-8"))})
+
+(defn status-publication-manifest
+  [data artifacts]
+  {"manifest_version" 1
+   "manifest_kind" "stevetrading/status-publication/v1"
+   "generated_at" (get data "generated_at")
+   "published_at" (.isoformat (now-et) ** :timespec "seconds")
+   "artifacts" (into {}
+                     (map (fn [[name content]]
+                            [name (artifact-entry content)])
+                          artifacts))})
+
+(defn- normalized-issue-code
+  [issue]
+  (let [code (or (:code issue) (get issue "code"))
+        s (str code)]
+    (if (.startswith s ":") (subs s 1) s)))
+
+(defn- issue-codes
+  [issues]
+  (set (map normalized-issue-code (or issues []))))
+
+(defn- same-issue-codes?
+  [a b]
+  (= (issue-codes a) (issue-codes b)))
+
+(defn- nav-target-issues
+  [out-dir]
+  (let [reports-dir (os.path/dirname (str out-dir))]
+    (vec
+     (keep (fn [target]
+             (let [path (os.path/join reports-dir target "index.html")]
+               (when-not (os.path/isfile path)
+                 (status-issue "bad" :status/nav-target-missing
+                               (str "status nav target is missing: "
+                                    target " at " path)))))
+           required-nav-targets))))
+
+(defn- path-inside-dir?
+  [dir path]
+  (let [dir-real (os.path/realpath (str dir))
+        path-real (os.path/realpath (str path))]
+    (or (= path-real dir-real)
+        (.startswith path-real (str dir-real os/sep)))))
+
+(defn audit-status-publication
+  [out-dir]
+  (let [manifest-path (os.path/join (str out-dir) "status.publish.json")
+        issues (atom [])]
+    (try
+      (let [manifest (read-json manifest-path)
+            manifest-object? (json-object? manifest)
+            manifest-keys (if manifest-object? (set (json-object-keys manifest)) #{})
+            missing-manifest-keys (vec (sort (remove manifest-keys
+                                                     required-publication-manifest-keys)))
+            extra-manifest-keys (vec (sort (remove required-publication-manifest-keys
+                                                   manifest-keys)))
+            raw-artifacts (when manifest-object? (get manifest "artifacts" {}))
+            artifacts-object? (json-object? raw-artifacts)
+            artifacts (if artifacts-object? raw-artifacts {})]
+        (when-not manifest-object?
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-invalid-shape
+                                           "status publish manifest must be a JSON object")))
+        (when (seq missing-manifest-keys)
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-missing-keys
+                                           (str "status publish manifest is missing required keys: "
+                                                (bstr/join ", " missing-manifest-keys)))))
+        (when (seq extra-manifest-keys)
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-extra-keys
+                                           (str "status publish manifest contains unexpected keys: "
+                                                (bstr/join ", " extra-manifest-keys)))))
+        (when-not (= 1 (get manifest "manifest_version"))
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-version-invalid
+                                           (str "status publish manifest has invalid manifest_version: "
+                                                (get manifest "manifest_version")))))
+        (when-not (= "stevetrading/status-publication/v1"
+                     (get manifest "manifest_kind"))
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-kind-invalid
+                                           (str "status publish manifest has invalid manifest_kind: "
+                                                (get manifest "manifest_kind")))))
+        (when-not artifacts-object?
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-artifacts-invalid-shape
+                                           "status publish manifest artifacts must be a JSON object")))
+        (when-not (seq artifacts)
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-empty
+                                           "status publish manifest has no artifacts")))
+        (doseq [issue (nav-target-issues out-dir)]
+          (swap! issues conj issue))
+        (doseq [name required-publication-artifacts]
+          (when-not (contains? artifacts name)
+            (swap! issues conj (status-issue "bad" :status/publish-manifest-missing-artifact-entry
+                                             (str "status publish manifest is missing required artifact entry: " name)))))
+        (doseq [name (filter #(not (contains? required-publication-artifacts %))
+                              (keys artifacts))]
+          (swap! issues conj (status-issue "bad" :status/publish-manifest-extra-artifact-entry
+                                           (str "status publish manifest contains unexpected artifact entry: " name))))
+        (doseq [[name entry] (json-object-items artifacts)]
+          (when-not (json-object? entry)
+            (swap! issues conj (status-issue "bad" :status/publish-manifest-artifact-invalid-shape
+                                             (str "status publish manifest artifact entry must be a JSON object for "
+                                                  name))))
+          (when (json-object? entry)
+            (let [entry-keys (set (json-object-keys entry))
+                  missing-entry-keys (vec (sort (remove entry-keys
+                                                         required-publication-artifact-entry-keys)))
+                  extra-entry-keys (vec (sort (remove required-publication-artifact-entry-keys
+                                                       entry-keys)))]
+              (when (seq missing-entry-keys)
+                (swap! issues conj (status-issue "bad" :status/publish-manifest-artifact-missing-keys
+                                                 (str "status publish manifest artifact entry is missing required keys for "
+                                                      name ": " (bstr/join ", " missing-entry-keys)))))
+              (when (seq extra-entry-keys)
+                (swap! issues conj (status-issue "bad" :status/publish-manifest-artifact-extra-keys
+                                                 (str "status publish manifest artifact entry contains unexpected keys for "
+                                                      name ": " (bstr/join ", " extra-entry-keys)))))
+              (when (and (contains? entry "bytes")
+                         (not (non-negative-int-value? (get entry "bytes"))))
+                (swap! issues conj (status-issue "bad" :status/publish-manifest-artifact-bytes-invalid
+                                                 (str "status publish manifest artifact bytes must be a non-negative integer for "
+                                                      name))))
+              (when (and (contains? entry "sha256")
+                         (not (sha256-string? (get entry "sha256"))))
+                (swap! issues conj (status-issue "bad" :status/publish-manifest-artifact-sha256-invalid
+                                                 (str "status publish manifest artifact sha256 must be a lowercase 64-character SHA-256 hex string for "
+                                                      name))))))
+          (if (or (os.path/isabs name)
+                  (not= name (os.path/basename name)))
+            (swap! issues conj (status-issue "bad" :status/publish-manifest-unsafe-artifact-name
+                                             (str "status publish manifest contains unsafe artifact name: " name)))
+            (let [path (os.path/join (str out-dir) name)]
+              (if-not (os.path/exists path)
+                (swap! issues conj (status-issue "bad" :status/published-artifact-missing
+                                                 (str "published artifact is missing: " name)))
+                (do
+                  (when-not (path-inside-dir? out-dir path)
+                    (swap! issues conj (status-issue "bad" :status/published-artifact-path-escape
+                                                     (str "published artifact resolves outside status out-dir: " name))))
+                  (when (json-object? entry)
+                    (let [content (slurp path)
+                          expected (get entry "sha256")
+                          actual (sha256-text content)
+                          expected-bytes (get entry "bytes")
+                          actual-bytes (count (.encode (str content) "utf-8"))]
+                      (when-not (= expected actual)
+                        (swap! issues conj (status-issue "bad" :status/published-artifact-checksum-mismatch
+                                                         (str "published artifact checksum mismatch: " name))))
+                      (when-not (= expected-bytes actual-bytes)
+                        (swap! issues conj (status-issue "bad" :status/published-artifact-size-mismatch
+                                                         (str "published artifact size mismatch: " name)))))))))))
+        (let [status-path (os.path/join (str out-dir) "status.json")
+              validation-path (os.path/join (str out-dir) "status.validation.json")
+              published-at (parse-dt (get manifest "published_at"))]
+          (if-not published-at
+            (swap! issues conj (status-issue "bad" :status/publish-manifest-published-at-missing
+                                             "status publish manifest is missing a parseable published_at timestamp"))
+            (let [age (minutes-between (now-et) published-at)]
+              (when (< age -1)
+                (swap! issues conj (status-issue "bad" :status/publish-manifest-published-at-in-future
+                                                 (str "status publish manifest published_at is in the future by "
+                                                      (python/format (- age) ".1f") " minutes"))))
+              (when (> age artifact-max-age-minutes)
+                (swap! issues conj (status-issue "bad" :status/publish-manifest-published-at-stale
+                                                 (str "status publish manifest is stale: published "
+                                                      (python/format age ".1f") " minutes ago"))))))
+          (when (os.path/exists status-path)
+            (try
+              (let [status-data (read-json status-path)
+                    recomputed (validate-payload status-data)
+                    embedded-validation (get status-data "artifact_validation")
+                    recorded-validation (when (os.path/exists validation-path)
+                                          (read-json validation-path))
+                    manifest-generated-at (get manifest "generated_at")
+                    payload-generated-at (get status-data "generated_at")]
+                (when-not (= manifest-generated-at payload-generated-at)
+                  (swap! issues conj (status-issue "bad" :status/publish-manifest-generated-at-mismatch
+                                                   "status publish manifest generated_at does not match status payload generated_at")))
+                (when-not (:valid? recomputed)
+                  (swap! issues conj (status-issue "bad" :status/published-status-validation-failed
+                                                   "published status.json fails payload validation")))
+                (if-not (json-object? embedded-validation)
+                  (swap! issues conj (status-issue "bad" :status/published-embedded-validation-unreadable
+                                                   "published status.json is missing embedded artifact_validation"))
+                  (do
+                    (when-not (= (:valid? recomputed)
+                                 (get embedded-validation "valid?"))
+                      (swap! issues conj (status-issue "bad" :status/published-embedded-validation-result-mismatch
+                                                       "published embedded artifact_validation valid? does not match recomputed validation")))
+                    (when-not (same-issue-codes? (:issues recomputed)
+                                                 (get embedded-validation "issues" []))
+                      (swap! issues conj (status-issue "bad" :status/published-embedded-validation-issues-mismatch
+                                                       "published embedded artifact_validation issue codes do not match recomputed validation")))))
+                (if-not recorded-validation
+                  (swap! issues conj (status-issue "bad" :status/published-validation-artifact-unreadable
+                                                   "published status.validation.json is missing or unreadable"))
+                  (do
+                    (when-not (= (:valid? recomputed) (get recorded-validation "valid?"))
+                      (swap! issues conj (status-issue "bad" :status/published-validation-result-mismatch
+                                                       "published validation valid? does not match recomputed validation")))
+                    (when-not (same-issue-codes? (:issues recomputed)
+                                                 (get recorded-validation "issues" []))
+                      (swap! issues conj (status-issue "bad" :status/published-validation-issues-mismatch
+                                                       "published validation issue codes do not match recomputed validation"))))))
+              (catch python/Exception e
+                (swap! issues conj (status-issue "bad" :status/published-status-unreadable
+                                                 (str "published status artifacts could not be parsed or validated: "
+                                                      (type e) ": " e)))))))
+        (let [bad? (boolean (some #(= "bad" (:severity %)) @issues))]
+          {:valid? (not bad?)
+           :manifest manifest-path
+           :checked_at (iso-et (now-et))
+           :issues (vec @issues)}))
+      (catch python/Exception e
+        {:valid? false
+         :manifest manifest-path
+         :checked_at (iso-et (now-et))
+         :issues [(status-issue "bad" :status/publish-manifest-unreadable
+                                (str "status publish manifest unreadable: " (type e) ": " e))]}))))
+
+(defn write-status!
+  [{:keys [out-dir] :as opts}]
+  (let [data (payload opts)
+        validation (validate-payload data)
+        data (assoc data "artifact_validation" validation)
+        out-dir (or out-dir (os.path/join (os/getcwd) "report-viewer" "public" "reports" "status"))
+        status-json (json/dumps (->jsonable data) ** :indent 2 :sort_keys true)
+        validation-json (json/dumps (->jsonable validation) ** :indent 2 :sort_keys true)
+        html (render-html data)
+        artifacts {"status.json" status-json
+                   "status.validation.json" validation-json
+                   "index.html" html}
+        manifest-json (json/dumps (->jsonable (status-publication-manifest data artifacts))
+                                  ** :indent 2 :sort_keys true)]
+    (when-not (:valid? validation)
+      (throw (ex-info "status payload validation failed" validation)))
+    (os/makedirs out-dir ** :exist_ok true)
+    (doseq [[name content] artifacts]
+      (spit-atomic (os.path/join out-dir name) content))
+    ;; Publish the manifest last so mixed-generation artifacts are detectable.
+    (spit-atomic (os.path/join out-dir "status.publish.json") manifest-json)
+    (let [publish-audit (audit-status-publication out-dir)]
+      (when-not (:valid? publish-audit)
+        (throw (ex-info "status publication audit failed" publish-audit))))
+    (os.path/join out-dir "index.html")))

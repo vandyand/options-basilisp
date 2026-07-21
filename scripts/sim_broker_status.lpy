@@ -1,0 +1,66 @@
+;; Summarize durable sim broker journals under live_runtime.
+;;
+;; Read-only diagnostic equivalent of scripts/sim_broker_status.py.
+(import glob os os.path sqlite3)
+
+(def root "live_runtime")
+
+(defn one
+  ([sql-path sql] (one sql-path sql []))
+  ([sql-path sql params]
+   (try
+     (let [conn (sqlite3/connect sql-path)]
+       (try
+         (let [row (.fetchone (.execute conn sql (python/tuple params)))]
+           (if row (nth row 0) nil))
+         (finally
+           (.close conn))))
+     (catch sqlite3/Error _
+       nil))))
+
+(defn fact-count
+  [facts-db fact-type]
+  (python/int
+   (or (one facts-db
+            "select count(*) from facts where fact_type = ?"
+            [fact-type])
+       0)))
+
+(defn journal-text
+  [sql-path]
+  (try
+    (let [conn (sqlite3/connect sql-path)]
+      (try
+        (let [row (.fetchone (.execute conn
+                                       "select record from sim_journal where id = 'main'"))]
+          (if row (nth row 0) ""))
+        (finally
+          (.close conn))))
+    (catch sqlite3/Error _
+      "")))
+
+(defn main
+  []
+  (let [paths (vec (sort (glob/glob (os.path/join root "*" "sim-broker.db"))))]
+    (if (empty? paths)
+      (do
+        (println "No durable sim broker journals found under live_runtime/*/sim-broker.db")
+        1)
+      (do
+        (println "SIM BROKER JOURNALS")
+        (println "session | updated_at | journal_bytes | settlements | order_intents | fills")
+        (println (apply str (repeat 86 "-")))
+        (doseq [path paths]
+          (let [session (os.path/basename (os.path/dirname path))
+                updated (one path "select updated_at from sim_journal where id = 'main'")
+                size (one path "select length(record) from sim_journal where id = 'main'")
+                settlements (.count (journal-text path) ":fact/option-settlement-recorded")
+                facts-db (os.path/join (os.path/dirname path) "facts.db")
+                has-facts (os.path/exists facts-db)
+                intents (if has-facts (fact-count facts-db ":fact/order-intent-created") 0)
+                fills (if has-facts (fact-count facts-db ":fact/fill-observed") 0)]
+            (println (str session " | " (or updated "-") " | " (or size 0) " | "
+                          settlements " | " intents " | " fills))))
+        0))))
+
+(python/exit (main))

@@ -1,0 +1,11 @@
+[Unit]
+Description=Collect SteveTrading market evidence during market hours
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 10:45:00 America/New_York
+AccuracySec=1min
+Persistent=true
+Unit=stevetrading-market-evidence-collect.service
+
+[Install]
+WantedBy=timers.target

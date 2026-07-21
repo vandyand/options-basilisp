@@ -1,0 +1,172 @@
+;; Strict post-generation checks for market_evidence_status JSON.
+(import argparse json os sys)
+(require '[clojure.string :as str])
+
+(defn reject-duplicate-json-object
+  [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining)
+               (conj seen k)
+               (assoc out k v))))))
+
+(defn read-json
+  [path]
+  (json/loads (slurp path) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn as-int
+  ([value] (as-int value nil))
+  ([value default]
+   (if (or (nil? value) (boolean? value))
+     default
+     (try
+       (python/int value)
+       (catch python/Exception _
+         default)))))
+
+(defn as-float
+  ([value] (as-float value nil))
+  ([value default]
+   (if (or (nil? value) (boolean? value))
+     default
+     (try
+       (python/float value)
+       (catch python/Exception _
+         default)))))
+
+(defn parse-args
+  [argv]
+  (let [parser (argparse/ArgumentParser
+                ** :description "Strictly verify market evidence status JSON")]
+    (.add_argument parser "--status-json" ** :required true)
+    (.add_argument parser "--require-unmask-apply" ** :action "store_true")
+    (.parse_args parser (python/list argv))))
+
+(defn status-fail
+  [path message]
+  (binding [*out* *err*]
+    (println (str "ERROR: status JSON is invalid: " path ": " message)))
+  (python/exit 1))
+
+(defn require-status-ok!
+  [path payload]
+  (when-not (map? payload)
+    (status-fail path "payload is not an object"))
+  (when-not (true? (get payload "ok?"))
+    (let [reasons (get payload "reasons")
+          reason-text (if (and reasons (seq reasons))
+                        (str/join "; " (map str reasons))
+                        "no reason provided")]
+      (status-fail path (str "not ok: " reason-text))))
+  (when-not (= "ok" (get payload "status"))
+    (status-fail path (str "status is not ok: " (pr-str (get payload "status"))))))
+
+(defn verify-parity-proof!
+  [path payload]
+  (let [manifest (or (get payload "manifest") {})
+        diagnostics (or (get manifest "diagnostics") {})
+        matched (or (get diagnostics "matched_feature_parity") {})
+        readiness (or (get payload "readiness") {})
+        readiness-matched (or (get readiness "matched_feature_parity") {})
+        matched-rows (as-int (get matched "matched_rows"))
+        feature-count (as-int (get matched "feature_count"))
+        feature-row-count (as-int (get matched "feature_row_count"))
+        problem-count (as-int (get matched "problem_feature_count"))
+        problem-row-count (as-int (get matched "problem_feature_row_count"))
+        status-counts (get matched "status_counts")
+        row-status-counts (get matched "row_status_counts")
+        max-abs-dev (as-float (get matched "max_abs_deviation"))
+        min-corr (as-float (get matched "min_correlation"))
+        matched-start (get matched "matched_start")
+        matched-end (get matched "matched_end")
+        errors (atom [])]
+    (when-not (true? (get matched "available"))
+      (swap! errors conj "matched_feature_parity.available is not true"))
+    (when (false? (get matched "json_valid"))
+      (swap! errors conj "matched_feature_parity JSON is invalid"))
+    (when (false? (get matched "target_matches_request"))
+      (swap! errors conj "matched_feature_parity target does not match request"))
+    (when (or (nil? matched-rows) (< matched-rows 60))
+      (swap! errors conj (str "matched_feature_parity matched_rows must be >= 60, got "
+                              (pr-str (get matched "matched_rows")))))
+    (when (or (nil? feature-count) (<= feature-count 0))
+      (swap! errors conj (str "matched_feature_parity feature_count must be positive, got "
+                              (pr-str (get matched "feature_count")))))
+    (when (and feature-row-count feature-count (not= feature-row-count feature-count))
+      (swap! errors conj "matched_feature_parity feature_count does not match feature rows"))
+    (when (or (nil? problem-count) (not= 0 problem-count))
+      (swap! errors conj (str "matched_feature_parity problem_feature_count must be 0, got "
+                              (pr-str (get matched "problem_feature_count")))))
+    (when (and problem-row-count problem-count (not= problem-row-count problem-count))
+      (swap! errors conj "matched_feature_parity problem_feature_count does not match feature rows"))
+    (when (and (map? status-counts) (map? row-status-counts) (not= status-counts row-status-counts))
+      (swap! errors conj "matched_feature_parity status_counts does not match feature rows"))
+    (when (nil? max-abs-dev)
+      (swap! errors conj "matched_feature_parity max_abs_deviation is missing or non-numeric"))
+    (when (nil? min-corr)
+      (swap! errors conj "matched_feature_parity min_correlation is missing or non-numeric"))
+    (when-not (and (string? matched-start) (not (str/blank? matched-start)))
+      (swap! errors conj "matched_feature_parity matched_start is missing"))
+    (when-not (and (string? matched-end) (not (str/blank? matched-end)))
+      (swap! errors conj "matched_feature_parity matched_end is missing"))
+    (when-not (true? (get readiness-matched "available"))
+      (swap! errors conj "readiness.matched_feature_parity.available is not true"))
+    (when (not= (as-int (get readiness-matched "matched_rows")) matched-rows)
+      (swap! errors conj "readiness matched rows do not match manifest diagnostic"))
+    (when (not= (as-int (get readiness-matched "problem_feature_count")) problem-count)
+      (swap! errors conj "readiness matched problem count does not match manifest diagnostic"))
+    (when (not= (as-float (get readiness-matched "max_abs_deviation")) max-abs-dev)
+      (swap! errors conj "readiness matched max_abs_deviation does not match manifest diagnostic"))
+    (when (not= (as-float (get readiness-matched "min_correlation")) min-corr)
+      (swap! errors conj "readiness matched min_correlation does not match manifest diagnostic"))
+    (when (not= (get readiness-matched "matched_start") matched-start)
+      (swap! errors conj "readiness matched_start does not match manifest diagnostic"))
+    (when (not= (get readiness-matched "matched_end") matched-end)
+      (swap! errors conj "readiness matched_end does not match manifest diagnostic"))
+    (when (seq @errors)
+      (status-fail path (str "matched parity proof is invalid: "
+                             (str/join "; " @errors))))
+    (println (str "MARKET_EVIDENCE_PARITY "
+                  "rows=" matched-rows " "
+                  "features=" feature-count " "
+                  "problems=" problem-count " "
+                  "max_abs_dev=" (get matched "max_abs_deviation") " "
+                  "min_corr=" (get matched "min_correlation") " "
+                  "window=" matched-start ".." matched-end))))
+
+(defn verify-unmask-apply!
+  [path payload]
+  (when-not (true? (get payload "unmask_apply_ready?"))
+    (let [reasons (get payload "unmask_apply_reasons")
+          reason-text (if (and reasons (seq reasons))
+                        (str/join "; " (map str reasons))
+                        "no reason provided")]
+      (status-fail path (str "not unmask-apply-ready: " reason-text))))
+  (let [validation (get payload "verified_apply_validation")]
+    (when-not (and (map? validation) (true? (get validation "apply_safe")))
+      (status-fail path "verified_apply_validation.apply_safe is not true"))))
+
+(try
+  (let [parsed (parse-args (vec *command-line-args*))
+        path (.-status_json parsed)]
+    (when-not (os.path/exists path)
+      (status-fail path "file does not exist"))
+    (let [payload (read-json path)]
+      (require-status-ok! path payload)
+      (verify-parity-proof! path payload)
+      (when (.-require_unmask_apply parsed)
+        (verify-unmask-apply! path payload))))
+  (catch python/SystemExit e
+    (throw e))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str "ERROR: " e)))
+    (python/exit 1)))

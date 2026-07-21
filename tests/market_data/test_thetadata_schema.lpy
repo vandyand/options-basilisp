@@ -1,0 +1,710 @@
+(ns market-data.test-thetadata-schema
+  (:import json os os.path subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [stevetrading.market-data.thetadata-schema :as ts]))
+
+(def valid-quote
+  {"strike" ["550.0" "555.0"]
+   "right" ["PUT" "CALL"]
+   "bid" ["2.15" "1.4"]
+   "ask" ["2.20" "1.45"]
+   "bid_size" [5 2]
+   "ask_size" [7 2]
+   "expiration" ["2026-06-12" "2026-06-12"]
+   "timestamp" ["2026-06-10T15:30:00.100" nil]
+   "vendor_extra" ["kept" "kept"]})
+
+(def valid-ohlc
+  {"strike" ["550.0" "555.0"]
+   "right" ["PUT" "CALL"]
+   "open" ["2.10" "1.35"]
+   "high" ["2.30" "1.55"]
+   "low" ["2.00" "1.20"]
+   "close" ["2.18" "1.41"]
+   "volume" ["120" "90"]
+   "count" ["42" "31"]
+   "expiration" ["2026-06-12" "2026-06-12"]
+   "timestamp" ["2026-06-10T15:30:00.100" nil]})
+
+(def valid-open-interest
+  {"strike" ["550.0" "555.0"]
+   "right" ["PUT" "CALL"]
+   "open_interest" ["1250" "991"]
+   "expiration" ["2026-06-12" "2026-06-12"]})
+
+(def valid-greeks
+  {"strike" ["550.0" "555.0"]
+   "right" ["PUT" "CALL"]
+   "implied_vol" ["0.181" "0.176"]
+   "delta" ["-0.42" "0.35"]
+   "vega" ["0.25" "0.22"]
+   "theta" ["-0.08" "-0.07"]
+   "rho" ["-0.04" "0.03"]
+   "expiration" ["2026-06-12" "2026-06-12"]
+   "timestamp" ["2026-06-10T15:30:00.100" nil]})
+
+(def valid-market-quote
+  {"bid" ["621.20" "621.22"]
+   "ask" ["621.21" "621.23"]
+   "bid_size" ["10" "12"]
+   "ask_size" ["9" "11"]
+   "timestamp" ["2026-06-10T15:30:00.100" "2026-06-10T15:31:00.100"]})
+
+(def valid-market-price
+  {"price" ["621.20" "621.25"]
+   "size" ["100" "80"]
+   "timestamp" ["2026-06-10T15:30:00.100" "2026-06-10T15:31:00.100"]})
+
+(def valid-market-ohlc
+  {"open" ["621.10" "621.20"]
+   "high" ["621.30" "621.40"]
+   "low" ["621.00" "621.10"]
+   "close" ["621.20" "621.25"]
+   "volume" ["1200" "900"]
+   "timestamp" ["2026-06-10T15:30:00.100" "2026-06-10T15:31:00.100"]})
+
+(deftest expiration-list-schema
+  (testing "accepts ThetaData columnar expiration lists plus vendor extras"
+    (is (true? (ts/validate :thetadata/expiration-list
+                            {"expiration" ["2026-06-12" "2026-06-19"]
+                             "symbol" ["SPY" "SPY"]}))))
+  (testing "requires an expiration vector"
+    (let [result (ts/validation-result :thetadata/expiration-list
+                                       {"symbol" ["SPY"]})]
+      (is (false? (:valid? result)))
+      (is (some? (:schema/errors result)))))
+  (testing "rejects empty or malformed expiration rows"
+    (doseq [payload [{"expiration" []}
+                     {"expiration" ["not-a-date"]}]]
+      (let [result (ts/validation-result :thetadata/expiration-list payload)]
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result)))))))
+
+(deftest quote-snapshot-schema
+  (testing "accepts parse_float=str numeric columns and preserves adapter right-dropping semantics"
+    (is (true? (ts/validate :thetadata/quote-snapshot valid-quote))))
+  (testing "rejects non-numeric quote values at the wire boundary"
+    (let [payload (assoc valid-quote "bid" ["2.15" "bad"])
+          result (ts/validation-result :thetadata/quote-snapshot payload)]
+      (is (false? (:valid? result)))
+      (is (>= (.find (str (:schema/errors result)) "bid") 0))))
+  (testing "rejects mismatched column lengths"
+    (let [payload (assoc valid-quote "ask" ["2.20"])
+          result (ts/validation-result :thetadata/quote-snapshot payload)]
+      (is (false? (:valid? result)))
+      (is (>= (.find (str (:schema/errors result)) "equal length") 0))))
+  (testing "rejects invalid option rights, expirations, timestamps, and empty rows"
+    (doseq [payload [(assoc valid-quote "right" ["PUT" "???"])
+                     (assoc valid-quote "expiration" ["2026-06-12" "not-a-date"])
+                     (assoc valid-quote "expiration" ["2026-06-12" "20260612"])
+                     (assoc valid-quote "timestamp" ["2026-06-10T15:30:00.100" "not-a-ts"])
+                     (assoc valid-quote "timestamp" ["2026-06-10T15:30:00.100" "20260610T153000"])
+                     (assoc valid-quote "timestamp" ["2026-06-10T15:30:00.100" "2026-06-10T15:30:00Z"])
+                     {"strike" [] "right" [] "bid" [] "ask" [] "expiration" []}]]
+      (let [result (ts/validation-result :thetadata/quote-snapshot payload)]
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result)))))))
+
+(deftest option-surface-schemas
+  (testing "accepts option OHLC, open-interest, and Greek/IV surface payloads"
+    (is (true? (ts/validate :thetadata/option-ohlc valid-ohlc)))
+    (is (true? (ts/validate :thetadata/option-open-interest valid-open-interest)))
+    (is (true? (ts/validate :thetadata/option-open-interest
+                            (-> valid-open-interest
+                                (dissoc "open_interest")
+                                (assoc "oi" ["1250" "991"])))))
+    (is (true? (ts/validate :thetadata/option-greeks valid-greeks)))
+    (is (true? (ts/validate :thetadata/option-greeks
+                            {"strike" ["550.0"]
+                             "right" ["PUT"]
+                             "gamma" ["0.019"]}))))
+  (testing "rejects option surfaces missing strike/right or usable surface columns"
+    (doseq [[kind payload] [[:thetadata/option-ohlc (dissoc valid-ohlc "strike")]
+                            [:thetadata/option-ohlc {"strike" ["550.0"] "right" ["PUT"]}]
+                            [:thetadata/option-open-interest (dissoc valid-open-interest "right")]
+                            [:thetadata/option-open-interest {"strike" ["550.0"] "right" ["PUT"]}]
+                            [:thetadata/option-greeks (dissoc valid-greeks "strike")]
+                            [:thetadata/option-greeks {"strike" ["550.0"] "right" ["PUT"]}]]]
+      (let [result (ts/validation-result kind payload)]
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result))))))
+  (testing "rejects nonnumeric surface values and mismatched column lengths"
+    (doseq [[kind payload] [[:thetadata/option-ohlc (assoc valid-ohlc "volume" ["bad" "90"])]
+                            [:thetadata/option-ohlc (assoc valid-ohlc "close" ["2.18"])]
+                            [:thetadata/option-open-interest (assoc valid-open-interest "open_interest" ["nan" "991"])]
+                            [:thetadata/option-open-interest (assoc valid-open-interest "open_interest" ["1250"])]
+                            [:thetadata/option-greeks (assoc valid-greeks "delta" ["bad" "0.35"])]
+                            [:thetadata/option-greeks (assoc valid-greeks "delta" ["-0.42"])]]]
+      (let [result (ts/validation-result kind payload)]
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result)))))))
+
+(deftest option-surface-probes-normalize-and-validate
+  (testing "header/response OHLC and Greek surfaces validate through probe schemas"
+    (let [ohlc {"header" {"format" ["strike" "right" "open" "high" "low" "close" "volume"]}
+                "response" [["550.0" "PUT" "2.1" "2.3" "2.0" "2.18" "120"]
+                            ["555.0" "CALL" "1.3" "1.5" "1.2" "1.41" "90"]]}
+          greeks {"header" {"format" ["strike" "right" "iv" "delta" "gamma"]}
+                  "response" [["550.0" "PUT" "0.181" "-0.42" "0.019"]
+                              ["555.0" "CALL" "0.176" "0.35" "0.016"]]}]
+      (is (true? (ts/validate (ts/probe-schema-kind "option.snapshot.ohlc") ohlc)))
+      (is (true? (ts/validate (ts/probe-schema-kind "bulk.option.greeks") greeks)))))
+  (testing "newly schema-backed probes fail instead of skipping malformed payloads"
+    (doseq [probe ["option.snapshot.ohlc"
+                   "option.snapshot.open_interest"
+                   "bulk.option.open_interest"
+                   "option.snapshot.greeks"
+                   "option.snapshot.greeks_second_order"
+                   "option.snapshot.greeks_third_order"
+                   "bulk.option.greeks"]]
+      (let [result (ts/verify-payload-example
+                    {"probe" probe
+                     "payload" {"strike" ["550.0"]}})]
+        (is (= :error (:status result)))
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result)))))))
+
+(deftest stock-and-index-surface-schemas
+  (testing "accepts stock/index quote, price/trade, and OHLC payloads"
+    (is (true? (ts/validate :thetadata/market-quote valid-market-quote)))
+    (is (true? (ts/validate :thetadata/market-quote {"last" ["621.20"]})))
+    (is (true? (ts/validate :thetadata/market-price valid-market-price)))
+    (is (true? (ts/validate :thetadata/market-price {"trade_price" ["621.20"]})))
+    (is (true? (ts/validate :thetadata/market-ohlc valid-market-ohlc))))
+  (testing "rejects missing usable market columns, bad numerics, bad timestamps, and mismatched lengths"
+    (doseq [[kind payload] [[:thetadata/market-quote {"symbol" ["SPY"]}]
+                            [:thetadata/market-quote (assoc valid-market-quote "bid" ["bad" "621.22"])]
+                            [:thetadata/market-quote (assoc valid-market-quote "ask" ["621.21"])]
+                            [:thetadata/market-quote (assoc valid-market-quote "timestamp" ["2026-06-10T15:30:00Z" "2026-06-10T15:31:00.100"])]
+                            [:thetadata/market-price {"size" ["100"]}]
+                            [:thetadata/market-price (assoc valid-market-price "price" ["nan" "621.25"])]
+                            [:thetadata/market-price (assoc valid-market-price "price" ["621.20"])]
+                            [:thetadata/market-ohlc {"symbol" ["SPY"]}]
+                            [:thetadata/market-ohlc (assoc valid-market-ohlc "close" ["bad" "621.25"])]
+                            [:thetadata/market-ohlc (assoc valid-market-ohlc "volume" ["1200"])]]]
+      (let [result (ts/validation-result kind payload)]
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result))))))
+  (testing "stock/index probe names validate instead of skipping"
+    (doseq [[probe payload] [["index.snapshot.quote" {"last" ["621.20"]}]
+                             ["index.snapshot.price" {"price" ["621.20"]}]
+                             ["stock.snapshot.quote" valid-market-quote]
+                             ["stock.snapshot.trade" {"trade_price" ["621.20"]}]
+                             ["stock.snapshot.ohlc" valid-market-ohlc]]]
+      (let [result (ts/verify-payload-example {"probe" probe "payload" payload})]
+        (is (= :ok (:status result)))
+        (is (true? (:valid? result))))))
+  (testing "malformed stock/index probe examples fail closed"
+    (doseq [probe ["index.snapshot.quote"
+                   "index.snapshot.price"
+                   "stock.snapshot.quote"
+                   "stock.snapshot.trade"
+                   "stock.snapshot.ohlc"]]
+      (let [result (ts/verify-payload-example
+                    {"probe" probe
+                     "payload" {"symbol" ["SPY"]}})]
+        (is (= :error (:status result)))
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result)))))))
+
+(deftest header-response-payloads-normalize-and-validate
+  (let [payload {"header" {"format" ["strike" "right" "bid" "ask" "expiration" "timestamp"]}
+                 "response" [["550.0" "PUT" "2.15" "2.20" "2026-06-12" "2026-06-10T15:30:00.100"]
+                             ["555.0" "CALL" "1.40" "1.45" "2026-06-12" nil]]}
+        normalized (ts/normalize-table payload)]
+    (is (= ["550.0" "555.0"] (get normalized "strike")))
+    (is (= ["PUT" "CALL"] (get normalized "right")))
+    (is (true? (ts/validate :thetadata/quote-snapshot payload)))))
+
+(deftest row-dict-payloads-normalize-and-validate
+  (let [payload [{"strike" "550.0" "right" "PUT" "bid" "2.15"
+                  "ask" "2.20" "expiration" "2026-06-12"}
+                 {"strike" "555.0" "right" "CALL" "bid" "1.40"
+                  "ask" "1.45" "expiration" "2026-06-12"}]
+        normalized (ts/normalize-table payload)]
+    (is (= ["2.15" "1.40"] (get normalized "bid")))
+    (is (true? (ts/validate :thetadata/quote-snapshot payload)))))
+
+(deftest header-response-length-mismatch-is-rejected
+  (let [payload {"header" {"format" ["strike" "right" "bid" "ask" "expiration"]}
+                 "response" [["550.0" "PUT" "2.15" "2.20" "2026-06-12"]
+                             ["555.0" "CALL" "1.40"]] }
+        result (ts/validation-result :thetadata/quote-snapshot payload)]
+    (is (false? (:valid? result)))
+    (is (some? (:schema/errors result)))))
+
+(deftest header-response-wide-rows-are-rejected
+  (let [payload {"header" {"format" ["strike" "right" "bid" "ask" "expiration"]}
+                 "response" [["550.0" "PUT" "2.15" "2.20" "2026-06-12" "EXTRA"]]}
+        result (ts/validation-result :thetadata/quote-snapshot payload)]
+    (is (false? (:valid? result)))
+    (is (some? (:schema/errors result)))))
+
+(deftest python-json-containers-are-validatable
+  (let [payload (python/dict
+                 {"strike" (python/list ["550.0" "555.0"])
+                  "right" (python/list ["PUT" "CALL"])
+                  "bid" (python/list ["2.15" "1.4"])
+                  "ask" (python/list ["2.20" "1.45"])
+                  "bid_size" (python/list [5 2])
+                  "ask_size" (python/list [7 2])
+                  "expiration" (python/list ["2026-06-12" "2026-06-12"])
+                  "timestamp" (python/list ["2026-06-10T15:30:00.100" nil])
+                  "vendor_extra" (python/list ["kept" "kept"])})]
+    (is (true? (ts/validate :thetadata/quote-snapshot payload)))
+    (is (= valid-quote (ts/wire->data payload)))))
+
+(deftest numeric-wire-predicate
+  (is (true? (ts/numeric-wire? "2.15")))
+  (is (true? (ts/numeric-wire? 2.15)))
+  (is (false? (ts/numeric-wire? "nan")))
+  (is (false? (ts/numeric-wire? "bad")))
+  (is (false? (ts/numeric-wire? true))))
+
+(deftest payload-example-verifier
+  (testing "valid supported probe example passes"
+    (let [result (ts/verify-payload-example
+                  {"probe" "option.snapshot.quote"
+                   "payload" valid-quote})]
+      (is (true? (:valid? result)))
+      (is (= :ok (:status result)))
+      (is (= :thetadata/quote-snapshot (:schema/kind result)))))
+  (testing "unsupported probe examples fail closed instead of silently certifying evidence"
+    (let [result (ts/verify-payload-example
+                  {"probe" "unsupported.snapshot.example"
+                   "payload" {"value" ["1.0"]}})]
+      (is (false? (:valid? result)))
+      (is (= :error (:status result)))
+      (is (= :thetadata/no-schema-for-probe (:reason result)))))
+  (testing "missing or blank probe identity is an error, not an unsupported skip"
+    (doseq [item [{"payload" valid-quote}
+                  {"probe" ""
+                   "payload" valid-quote}
+                  {"probe" "   "
+                   "payload" valid-quote}]]
+      (let [result (ts/verify-payload-example item)]
+        (is (false? (:valid? result)))
+        (is (= :error (:status result)))
+        (is (= :thetadata/missing-probe (:reason result))))))
+  (testing "malformed supported examples fail"
+    (let [result (ts/verify-payload-example
+                  {"probe" "option.snapshot.quote"
+                   "payload" (assoc valid-quote "bid" ["bad" "1.0"])})]
+      (is (false? (:valid? result)))
+      (is (= :error (:status result)))
+      (is (some? (:schema/errors result)))))
+  (testing "schema-backed examples not explicitly marked usable cannot certify evidence"
+    (doseq [usable-value [false "false" 0]]
+      (let [result (ts/verify-payload-example
+                    {"probe" "option.snapshot.quote"
+                     "usable" usable-value
+                     "payload" valid-quote})]
+        (is (false? (:valid? result)))
+        (is (= :error (:status result)))
+        (is (= :thetadata/payload-example-not-marked-usable (:reason result))))))
+  (testing "usable metadata may be omitted or true for valid schema-backed examples"
+    (doseq [usable-value [nil true]]
+      (let [item (cond-> {"probe" "option.snapshot.quote"
+                          "payload" valid-quote}
+                   (some? usable-value) (assoc "usable" usable-value))
+            result (ts/verify-payload-example item)]
+        (is (true? (:valid? result)))
+        (is (= :ok (:status result))))))
+  (testing "target date metadata does not mask stale generated_at"
+    (let [result (ts/verify-payload-example
+                  {"probe" "option.snapshot.quote"
+                   "target_date" "2026-07-05"
+                   "generated_at" "2026-07-04T14:01:00Z"
+                   "payload" valid-quote})]
+      (is (= "20260704" (:example/generated_date result)))
+      (is (= "20260705" (:example/target_date_compact result))))))
+
+(deftest payload-example-coverage-requires-core-schema-backed-probes
+  (testing "quote-only examples are not enough to certify a saved ThetaData set"
+    (let [result (ts/verify-payload-examples
+                  [{"probe" "option.snapshot.quote"
+                    "payload" valid-quote}])
+          issue (first (:issues result))]
+      (is (false? (:valid? result)))
+      (is (= :error (:status result)))
+      (is (= 1 (:checked result)))
+      (is (= :thetadata/payload-examples-required-probes-missing (:code issue)))
+      (is (= ["option.expirations"] (:missing_probes issue)))))
+  (testing "unsupported-only examples fail closed and do not provide usable coverage"
+    (let [result (ts/verify-payload-examples
+                  [{"probe" "unsupported.snapshot.example"
+                    "payload" {"value" ["1.0"]}}])
+          issue (first (:issues result))]
+      (is (false? (:valid? result)))
+      (is (= 1 (:checked result)))
+      (is (= 0 (:skipped result)))
+      (is (= 1 (:invalid result)))
+      (is (= ["option.expirations" "option.snapshot.quote"] (:missing_probes issue)))))
+  (testing "expiration plus quote satisfies required saved-payload coverage"
+    (let [result (ts/verify-payload-examples
+                  [{"probe" "option.snapshot.quote"
+                    "payload" valid-quote}
+                   {"probe" "option.expirations"
+                    "payload" {"expiration" ["2026-06-12" "2026-06-19"]}}])]
+      (is (true? (:valid? result)))
+      (is (= :ok (:status result)))
+      (is (= [] (:issues result))))))
+
+(defn- quote-row
+  [i]
+  {"strike" (str (+ 550 i) ".0")
+   "right" (if (even? i) "PUT" "CALL")
+   "bid" (str (+ 1 (/ i 10.0)))
+   "ask" (str (+ 1.05 (/ i 10.0)))
+   "bid_size" (str (+ 1 i))
+   "ask_size" (str (+ 2 i))
+   "expiration" "2026-06-12"
+   "timestamp" (str "2026-06-10T15:" (python/format i "02d") ":00.100")})
+
+(defn- option-surface-row
+  [i]
+  (merge (quote-row i)
+         {"open" (str (+ 1 (/ i 10.0)))
+          "high" (str (+ 1.2 (/ i 10.0)))
+          "low" (str (+ 0.9 (/ i 10.0)))
+          "close" (str (+ 1.05 (/ i 10.0)))
+          "volume" (str (+ 100 i))
+          "count" (str (+ 10 i))
+          "open_interest" (str (+ 1000 i))
+          "implied_vol" (str (+ 0.18 (/ i 1000.0)))
+          "delta" (str (- (/ i 100.0) 0.5))
+          "vega" (str (+ 0.2 (/ i 100.0)))
+          "theta" (str (- -0.05 (/ i 1000.0)))
+          "rho" (str (/ i 100.0))
+          "gamma" (str (+ 0.01 (/ i 1000.0)))
+          "vanna" (str (+ 0.02 (/ i 1000.0)))
+          "charm" (str (- 0.01 (/ i 1000.0)))
+          "speed" (str (+ 0.001 (/ i 10000.0)))
+          "zomma" (str (+ 0.003 (/ i 10000.0)))
+          "color" (str (- 0.002 (/ i 10000.0)))}))
+
+(defn- market-row
+  [i]
+  {"bid" (str (+ 621 (/ i 100.0)))
+   "ask" (str (+ 621.01 (/ i 100.0)))
+   "bid_size" (str (+ 10 i))
+   "ask_size" (str (+ 11 i))
+   "price" (str (+ 621.005 (/ i 100.0)))
+   "trade_price" (str (+ 621.006 (/ i 100.0)))
+   "size" (str (+ 100 i))
+   "open" (str (+ 620.9 (/ i 100.0)))
+   "high" (str (+ 621.2 (/ i 100.0)))
+   "low" (str (+ 620.8 (/ i 100.0)))
+   "close" (str (+ 621.0 (/ i 100.0)))
+   "volume" (str (+ 1000 i))
+   "timestamp" (str "2026-06-10T15:" (python/format i "02d") ":00.100")})
+
+(defn- columnar
+  ([rows]
+   (columnar rows ["strike" "right" "bid" "ask" "bid_size" "ask_size" "expiration" "timestamp"]))
+  ([rows fields]
+  (into {}
+        (map (fn [k] [k (mapv #(get % k) rows)])
+             fields))))
+
+(defn- header-response
+  ([rows]
+   (header-response rows ["strike" "right" "bid" "ask" "bid_size" "ask_size" "expiration" "timestamp"]))
+  ([rows fields]
+    {"header" {"format" fields}
+     "response" (mapv (fn [row] (mapv #(get row %) fields)) rows)}))
+
+(deftest deterministic-fuzz-supported-quote-encodings-validate
+  (doseq [n (range 1 25)]
+    (let [rows (mapv quote-row (range n))]
+      (doseq [payload [(columnar rows)
+                       (header-response rows)
+                       rows
+                       (python/dict (columnar rows))]]
+        (let [summary (ts/table-summary payload)]
+          (is (true? (ts/validate :thetadata/quote-snapshot payload)))
+          (is (= n (:row-count summary)))
+          (is (true? (:equal-lengths? summary))))))))
+
+(deftest deterministic-fuzz-adversarial-quote-mutations-fail
+  (let [base (columnar (mapv quote-row (range 6)))
+        bad-payloads (vec
+                      (concat
+                       (map (fn [col] (assoc base col (subvec (get base col) 1)))
+                            ["strike" "right" "bid" "ask" "expiration"])
+                       (map (fn [col] (assoc base col (assoc (get base col) 2 "not-a-number")))
+                            ["strike" "bid" "ask" "bid_size" "ask_size"])
+                       [(assoc base "right" (assoc (get base "right") 0 ""))
+                        (assoc base "right" (assoc (get base "right") 0 "???"))
+                        (assoc base "expiration" (assoc (get base "expiration") 0 ""))
+                        (assoc base "expiration" (assoc (get base "expiration") 0 "not-a-date"))
+                        (assoc base "expiration" (assoc (get base "expiration") 0 "20260612"))
+                        (assoc base "timestamp" (assoc (get base "timestamp") 0 "not-a-ts"))
+                        (assoc base "timestamp" (assoc (get base "timestamp") 0 "20260610T153000"))
+                        (assoc base "timestamp" (assoc (get base "timestamp") 0 "2026-06-10T15:30:00Z"))
+                        {"strike" [] "right" [] "bid" [] "ask" [] "expiration" []}
+                        {"header" {"format" ["strike" "right" "bid" "ask" "expiration"]}
+                         "response" [["550.0" "PUT" "1.0" "1.1" "2026-06-12"]
+                                     ["551.0" "CALL" "1.2"]]}
+                        {"header" {"format" ["strike" "right" "bid" "ask" "expiration"]}
+                         "response" [["550.0" "PUT" "1.0" "1.1" "2026-06-12" "EXTRA"]]}]))]
+    (is (= 21 (count bad-payloads)))
+    (doseq [payload bad-payloads]
+      (let [result (ts/validation-result :thetadata/quote-snapshot payload)]
+        (is (false? (:valid? result)))
+        (is (some? (:schema/errors result)))))))
+
+(deftest deterministic-fuzz-option-surface-schemas
+  (let [surface-cases [[:thetadata/option-ohlc
+                        ["strike" "right" "open" "high" "low" "close" "volume" "count" "expiration" "timestamp"]
+                        "close"]
+                       [:thetadata/option-open-interest
+                        ["strike" "right" "open_interest" "expiration" "timestamp"]
+                        "open_interest"]
+                       [:thetadata/option-greeks
+                        ["strike" "right" "implied_vol" "delta" "vega" "theta" "rho" "expiration" "timestamp"]
+                        "delta"]]]
+    (doseq [n (range 1 18)]
+      (let [rows (mapv option-surface-row (range n))]
+        (doseq [[kind fields mutable-col] surface-cases]
+          (doseq [payload [(columnar rows fields)
+                           (header-response rows fields)]]
+            (let [summary (ts/table-summary payload)]
+              (is (true? (ts/validate kind payload)))
+              (is (= n (:row-count summary)))
+              (is (true? (:equal-lengths? summary)))))
+          (let [base (columnar rows fields)
+                bad-values [(assoc base mutable-col
+                                   (assoc (get base mutable-col) 0 "not-a-number"))
+                            (assoc base mutable-col
+                                   (subvec (get base mutable-col) 1))
+                            (dissoc base "right")
+                            (select-keys base ["strike" "right" "expiration"])]]
+            (doseq [payload bad-values]
+              (let [result (ts/validation-result kind payload)]
+                (is (false? (:valid? result)))
+                (is (some? (:schema/errors result)))))))))))
+
+(deftest deterministic-fuzz-market-surface-schemas
+  (let [surface-cases [[:thetadata/market-quote
+                        ["bid" "ask" "bid_size" "ask_size" "timestamp"]
+                        "bid"]
+                       [:thetadata/market-price
+                        ["price" "size" "timestamp"]
+                        "price"]
+                       [:thetadata/market-ohlc
+                        ["open" "high" "low" "close" "volume" "timestamp"]
+                        "close"]]]
+    (doseq [n (range 1 18)]
+      (let [rows (mapv market-row (range n))]
+        (doseq [[kind fields mutable-col] surface-cases]
+          (doseq [payload [(columnar rows fields)
+                           (header-response rows fields)]]
+            (let [summary (ts/table-summary payload)]
+              (is (true? (ts/validate kind payload)))
+              (is (= n (:row-count summary)))
+              (is (true? (:equal-lengths? summary)))))
+          (let [base (columnar rows fields)
+                bad-values [(assoc base mutable-col
+                                   (assoc (get base mutable-col) 0 "not-a-number"))
+                            (assoc base mutable-col
+                                   (subvec (get base mutable-col) 1))
+                            (select-keys base ["timestamp"])]]
+            (doseq [payload bad-values]
+              (let [result (ts/validation-result kind payload)]
+                (is (false? (:valid? result)))
+                (is (some? (:schema/errors result)))))))))))
+
+(deftest deterministic-fuzz-payload-example-verifier-counts
+  (let [items (vec
+               (concat
+                (map (fn [n]
+                       {"probe" "option.snapshot.quote"
+                        "payload" (columnar (mapv quote-row (range 1 (inc n))))})
+                     (range 1 12))
+                [{"probe" "option.snapshot.quote"
+                 "payload" (assoc (columnar (mapv quote-row (range 3)))
+                                   "bid" ["bad" "1.0" "1.1"])}
+                 {"probe" "option.expirations"
+                  "payload" {"expiration" ["2026-06-12" "2026-06-19"]}}
+                 {"probe" "option.expirations"
+                  "payload" {"expiration" []}}
+                 {"probe" "unsupported.snapshot.example"
+                  "payload" {"value" ["1.0"]}}]))
+        result (ts/verify-payload-examples items)]
+    (is (false? (:valid? result)))
+    (is (= :error (:status result)))
+    (is (= 15 (:total result)))
+    (is (= 15 (:checked result)))
+    (is (= 0 (:skipped result)))
+    (is (= 3 (:invalid result)))))
+
+(defn- jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]]
+                     (python/tuple [(if (keyword? k) (name k) (str k))
+                                    (jsonable v)]))
+                   x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    (set? x) (python/list (map jsonable x))
+    (keyword? x) (name x)
+    :else x))
+
+(defn- write-json-file
+  [path payload]
+  (spit path (json/dumps (jsonable payload) ** :indent 2 :sort_keys true))
+  path)
+
+(defn- run-verifier-cli
+  [payload-dir out-dir]
+  (subprocess/run
+   (python/list [(or (os.environ/get "BASILISP_BIN") ".venv/bin/basilisp")
+                 "run" "scripts/verify_thetadata_payload_examples.lpy" "--"
+                 "--examples-dir" payload-dir
+                 "--target-date" "2026-07-05"
+                 "--out-dir" out-dir])
+   ** :capture_output true
+      :text true
+      :check false))
+
+(deftest payload-example-verifier-cli-exits-zero-for-valid-supported-examples
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [payload-dir (os.path/join (.-name tmp) "examples")
+            dated-dir (os.path/join payload-dir "20260705")
+            out-dir (os.path/join (.-name tmp) "out")]
+        (os/makedirs dated-dir ** :exist_ok true)
+        (write-json-file (os.path/join dated-dir "quote.json")
+                         {"probe" "option.snapshot.quote"
+                          "generated_at" "2026-07-05T14:01:00Z"
+                          "payload" (columnar [(quote-row 0)])})
+        (write-json-file (os.path/join dated-dir "expirations.json")
+                         {"probe" "option.expirations"
+                          "generated_at" "2026-07-05T14:01:00Z"
+                          "payload" {"expiration" ["2026-06-12" "2026-06-19"]}})
+        (let [result (run-verifier-cli payload-dir out-dir)
+              payload (json/loads (.-stdout result))]
+          (is (= 0 (.-returncode result)))
+          (is (= true (get payload "valid?")))
+          (is (= "ok" (get payload "status")))
+          (is (= 2 (get payload "checked")))
+          (is (= 0 (get payload "invalid")))
+          (is (zero? (count (get payload "issues"))))
+          (is (= 2 (get (get payload "example_generated_date_counts") "20260705")))
+          (is (= 2 (get (get payload "example_path_date_counts") "20260705")))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest payload-example-verifier-cli-fails-invalid-supported-examples
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [payload-dir (os.path/join (.-name tmp) "examples")
+            out-dir (os.path/join (.-name tmp) "out")]
+        (os/makedirs payload-dir ** :exist_ok true)
+        (write-json-file (os.path/join payload-dir "bad.json")
+                         {"probe" "option.snapshot.quote"
+                          "generated_at" "2026-07-05T14:01:00Z"
+                          "payload" {"strike" ["550.0"]
+                                     "right" ["PUT"]
+                                     "bid" ["1.0"]
+                                     "ask" ["1.1"]
+                                     "expiration" ["20260612"]
+                                     "timestamp" ["2026-06-10T15:30:00Z"]}})
+        (let [result (run-verifier-cli payload-dir out-dir)
+              payload (json/loads (.-stdout result))]
+          (is (= 1 (.-returncode result)))
+          (is (= false (get payload "valid?")))
+          (is (= "error" (get payload "status")))
+          (is (= 1 (get payload "invalid")))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest payload-example-verifier-cli-fails-missing-required-supported-probe-coverage
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [payload-dir (os.path/join (.-name tmp) "examples")
+            dated-dir (os.path/join payload-dir "20260705")
+            out-dir (os.path/join (.-name tmp) "out")]
+        (os/makedirs dated-dir ** :exist_ok true)
+        (write-json-file (os.path/join dated-dir "quote.json")
+                         {"probe" "option.snapshot.quote"
+                          "generated_at" "2026-07-05T14:01:00Z"
+                          "payload" (columnar [(quote-row 0)])})
+        (let [result (run-verifier-cli payload-dir out-dir)
+              payload (json/loads (.-stdout result))
+              issue (first (get payload "issues"))]
+          (is (= 1 (.-returncode result)))
+          (is (= false (get payload "valid?")))
+          (is (= "payload-examples-required-probes-missing" (get issue "code")))
+          (is (= 1 (count (get issue "missing_probes"))))
+          (is (= "option.expirations" (first (get issue "missing_probes"))))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest payload-example-verifier-cli-fails-corrupt-example-without-probe-identity
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [payload-dir (os.path/join (.-name tmp) "examples")
+            dated-dir (os.path/join payload-dir "20260705")
+            out-dir (os.path/join (.-name tmp) "out")]
+        (os/makedirs dated-dir ** :exist_ok true)
+        (write-json-file (os.path/join dated-dir "quote.json")
+                         {"probe" "option.snapshot.quote"
+                          "generated_at" "2026-07-05T14:01:00Z"
+                          "payload" (columnar [(quote-row 0)])})
+        (write-json-file (os.path/join dated-dir "expirations.json")
+                         {"probe" "option.expirations"
+                          "generated_at" "2026-07-05T14:01:00Z"
+                          "payload" {"expiration" ["2026-06-12"]}})
+        (write-json-file (os.path/join dated-dir "corrupt.json")
+                         {"generated_at" "2026-07-05T14:01:00Z"
+                          "payload" valid-quote})
+        (let [result (run-verifier-cli payload-dir out-dir)
+              payload (json/loads (.-stdout result))
+              reasons (mapv #(get % "reason") (get payload "results"))]
+          (is (= 1 (.-returncode result)))
+          (is (= false (get payload "valid?")))
+          (is (= 1 (get payload "invalid")))
+          (is (some #(= "missing-probe" %) reasons))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest payload-example-verifier-cli-fails-stale-or-wrong-directory-examples
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [payload-dir (os.path/join (.-name tmp) "examples")
+            stale-dir (os.path/join payload-dir "20260704")
+            out-dir (os.path/join (.-name tmp) "out")]
+        (os/makedirs stale-dir ** :exist_ok true)
+        (write-json-file (os.path/join stale-dir "quote.json")
+                         {"probe" "option.snapshot.quote"
+                          "generated_at" "2026-07-04T14:01:00Z"
+                          "payload" (columnar [(quote-row 0)])})
+        (let [result (run-verifier-cli payload-dir out-dir)
+              payload (json/loads (.-stdout result))
+              codes (mapv #(get % "code") (get payload "issues"))]
+          (is (= 1 (.-returncode result)))
+          (is (= false (get payload "valid?")))
+          (is (= 1 (get payload "checked")))
+          (is (some #(= "payload-examples-not-generated-on-target-date" %) codes))
+          (is (some #(= "payload-examples-outside-target-date-directory" %) codes))))
+      (finally
+        (.cleanup tmp)))))
+
+(deftest payload-example-verifier-cli-fails-empty-directories
+  (let [tmp (tempfile/TemporaryDirectory)]
+    (try
+      (let [payload-dir (os.path/join (.-name tmp) "examples")
+            out-dir (os.path/join (.-name tmp) "out")]
+        (os/makedirs payload-dir ** :exist_ok true)
+        (let [result (run-verifier-cli payload-dir out-dir)
+              payload (json/loads (.-stdout result))]
+          (is (= 1 (.-returncode result)))
+          (is (= false (get payload "valid?")))
+          (is (= 0 (get payload "total")))
+          (is (= ["no-payload-examples"]
+                 (mapv #(get % "code") (get payload "issues"))))))
+      (finally
+        (.cleanup tmp)))))

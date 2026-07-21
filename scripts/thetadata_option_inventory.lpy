@@ -1,0 +1,115 @@
+;; Read-only current-chain inventory through a ThetaData terminal.
+(import argparse collections.abc datetime json os urllib.parse urllib.request)
+
+(defn py-list? [value] (python/isinstance value python/list))
+(defn py-dict? [value] (python/isinstance value python/dict))
+(defn py-mapping? [value] (python/isinstance value collections.abc/Mapping))
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    (py-dict? value) (python/dict (map (fn [key] (python/tuple [(str key) (->jsonable (.get value key))])) (.keys value)))
+    (py-mapping? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) (.items value)))
+    :else value))
+
+(defn request-url [base path params]
+  (str (.rstrip base "/") path "?"
+       (urllib.parse/urlencode
+        (python/list (map (fn [[k v]] (python/tuple [(str k) (str v)])) (sort-by first params))))))
+
+(defn http-json [url timeout-s]
+  (try
+    (with-open [response (urllib.request/urlopen (urllib.request/Request url ** :headers {"Accept" "application/json"}) ** :timeout timeout-s)]
+      {"ok" true "payload" (json/loads (.decode (.read response) "utf-8" "strict"))})
+    (catch python/Exception e {"ok" false "error" (str e)})))
+
+(defn header-columns [payload]
+  (let [header (when (py-dict? payload) (.get payload "header"))
+        columns (when (py-dict? header) (or (.get header "format") (.get header "columns") (.get header "fields")))]
+    (when (py-list? columns) (vec (map str columns)))))
+
+(defn table-rows [payload]
+  (cond
+    (py-list? payload) (vec (filter py-dict? payload))
+    (and (py-dict? payload) (py-list? (.get payload "response")) (seq (header-columns payload)))
+    (let [columns (header-columns payload)]
+      (vec (keep (fn [row]
+                   (when (py-list? row)
+                     (into {} (map-indexed (fn [i column] [column (when (< i (count row)) (nth row i))]) columns))))
+                 (.get payload "response"))))
+    (py-dict? payload)
+    (let [columns (vec (filter #(py-list? (.get payload %)) (.keys payload)))
+          n (if (seq columns) (apply max (map #(count (.get payload %)) columns)) 0)]
+      (vec (for [i (range n)]
+             (into {} (map (fn [column] [column (when (< i (count (.get payload column)))
+                                                  (nth (.get payload column) i))]) columns)))))
+    :else []))
+
+(defn compact-date [value] (.replace (str value) "-" ""))
+(defn parse-csv [value] (vec (filter #(pos? (count %)) (map #(.upper (.strip %)) (.split value ",")))))
+
+(defn valid-expirations [payload as-of max-listing-days]
+  (let [last-date (.plus_days as-of max-listing-days)]
+  (vec (sort (keep (fn [row]
+                     (let [value (get row "expiration")]
+                       (try (let [expiration (datetime.date/fromisoformat (str value))]
+                              (when (and (not (neg? (compare expiration as-of)))
+                                         (not (pos? (compare expiration last-date))))
+                                (.isoformat expiration)))
+                            (catch python/Exception _ nil))))
+                   (table-rows payload))))))
+
+(defn contract-key [root expiration row]
+  (let [right (.upper (str (or (get row "right") "")))
+        strike (get row "strike")]
+    (when (and (contains? #{"C" "CALL" "P" "PUT"} right) (some? strike))
+      [root expiration (str strike) (if (contains? #{"C" "CALL"} right) "C" "P")])))
+
+(defn root-inventory [base root timeout-s as-of max-listing-days]
+  (let [exp-result (http-json (request-url base "/v3/option/list/expirations" {"symbol" root "format" "json"}) timeout-s)]
+    (if-not (get exp-result "ok")
+      {"root" root "ok" false "error" (get exp-result "error")}
+      (let [expirations (valid-expirations (get exp-result "payload") as-of max-listing-days)
+            snapshots
+            (vec (for [expiration expirations]
+                   (let [response (http-json (request-url base "/v3/option/snapshot/quote"
+                                                          {"symbol" root "expiration" (compact-date expiration) "format" "json"}) timeout-s)
+                         rows (if (get response "ok") (table-rows (get response "payload")) [])]
+                     {"expiration" expiration
+                      "ok" (get response "ok")
+                      "error" (get response "error")
+                      "contracts" (vec (keep #(contract-key root expiration %) rows))})))
+            all-contracts (set (mapcat #(get % "contracts" []) snapshots))
+            calls (count (filter #(= "C" (nth % 3)) all-contracts))
+            puts (count (filter #(= "P" (nth % 3)) all-contracts))
+            failed (vec (filter #(not (get % "ok")) snapshots))]
+        {"root" root "ok" (empty? failed)
+         "expiration_count" (count expirations)
+         "expirations_with_successful_snapshot" (- (count expirations) (count failed))
+         "call_contracts" calls "put_contracts" puts "plain_option_contracts" (+ calls puts)
+         "failed_expirations" (mapv #(select-keys % ["expiration" "error"]) failed)}))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--base-url" ** :default "http://127.0.0.1:25503")
+    (.add_argument parser "--symbols" ** :default "SPY,SPX,SPXW,VIX,VIXW")
+    (.add_argument parser "--timeout-s" ** :type float :default 25.0)
+    (.add_argument parser "--as-of" ** :default (.isoformat (datetime.date/today)))
+    (.add_argument parser "--max-listing-days" ** :type int :default 730)
+    (.add_argument parser "--out" ** :required true)
+    (.parse_args parser (python/list argv))))
+
+(let [args (parse-args (vec *command-line-args*))
+      roots (parse-csv (.-symbols args))
+      as-of (datetime.date/fromisoformat (.-as_of args))
+      _ (when (<= (.-max_listing_days args) 0) (throw (python/ValueError "--max-listing-days must be positive")))
+      items (vec (map #(root-inventory (.-base_url args) % (.-timeout_s args) as-of (.-max_listing_days args)) roots))
+      payload {"kind" "thetadata-current-option-chain-inventory-v1"
+               "collected_at_utc" (.isoformat (datetime.datetime/now datetime.timezone/utc))
+               "base_url" (.-base_url args) "as_of" (.-as_of args)
+               "max_listing_days" (.-max_listing_days args) "roots" items}
+      target (.-out args)]
+  (os/makedirs (os.path/dirname target) ** :exist_ok true)
+  (spit target (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+  (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true)))

@@ -1,0 +1,1308 @@
+;; Read-only operator status summary for a market evidence bundle.
+(import datetime glob hashlib json math os os.path shutil subprocess sys)
+(require '[clojure.string :as str])
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.feature-parity.evidence-status :as evidence-status])
+
+(def diagnostic-artifacts
+  {"prediction_delta" ["live_feature_prediction_delta_aggregate.json"
+                       "live_feature_prediction_delta_aggregate.csv"
+                       "live_feature_prediction_delta_aggregate.md"]
+   "parity_gate" ["live_feature_parity_gate.json"
+                  "live_feature_parity_gate.md"]
+   "unlock_plan" ["neutralized_feature_unlock_plan.json"
+                  "neutralized_feature_unlock_plan.csv"
+                  "neutralized_feature_unlock_plan.md"]
+   "neutralized_feature_evidence" ["neutralized_feature_evidence_report.json"
+                                   "neutralized_feature_evidence_report.csv"
+                                   "neutralized_feature_evidence_report.md"]
+   "blocked_provenance" ["blocked_feature_provenance_audit.json"
+                         "blocked_feature_provenance_audit.csv"
+                         "blocked_feature_provenance_audit.md"]
+   "legacy_greek_formula_search" ["legacy_greek_formula_search.json"
+                                  "legacy_greek_formula_search.csv"
+                                  "legacy_greek_formula_search.md"]
+   "greek_feature_reconstruction" ["greek_feature_reconstruction_audit.json"
+                                   "greek_feature_reconstruction_audit.csv"
+                                   "greek_feature_reconstruction_audit.md"]
+   "capture_v2_sidecars" ["capture_v2_sidecar_check.json"]
+   "option_surface_sidecar" ["option_surface_sidecar.json"
+                             "option_surface_sidecar.npz"
+                             "option_surface_sidecar_check.json"]
+   "replayed_feature_cohort" ["replayed_feature_cohort.json"
+                              "replayed_feature_cohort.npz"]
+   "historical_feature_cohort" ["historical_feature_cohort.json"
+                                "historical_features.npz"]
+   "grid_feature_input_parity" ["grid_feature_input_parity.json"
+                                "grid_feature_input_parity.md"]
+   "matched_feature_parity" ["matched_feature_parity.json"
+                             "matched_feature_parity.csv"
+                             "matched_feature_parity.md"]
+   "matched_feature_parity_summary" ["matched_feature_parity_summary.json"
+                                     "matched_feature_parity_summary.md"]
+   "greek_reconstruction_promotion" ["greek_reconstruction_promotion_gate.json"
+                                     "greek_reconstruction_promotion_gate.csv"
+                                     "greek_reconstruction_promotion_gate.md"]
+   "capture_v2_runtime_preflight" ["capture_v2_runtime_preflight.json"]
+   "v3_unlock" ["v3_grid_unlock_audit.json"
+                "v3_grid_unlock_audit.csv"
+                "v3_grid_unlock_audit.md"]})
+
+(def raw-unlock-artifacts
+  ["raw_feature_unlock_audit.json"
+   "raw_feature_unlock_audit.csv"
+   "raw_feature_unlock_audit.md"
+   "raw_feature_unlock_candidates.json"
+   "neutralization_unmask_dry_run.json"])
+
+(def expected-unmask-accounts
+  ["chestnut" "lynx" "moose"])
+
+(def expected-unmask-account-set
+  (set expected-unmask-accounts))
+
+(defn usage []
+  (println "usage: basilisp run scripts/market_evidence_status.lpy -- --target-date YYYY-MM-DD [--analysis-dir DIR] [--payload-dir DIR] [--manifest manifest.json] [--out status.json] [--md-out status.md]"))
+
+(defn compact-date
+  [date-str]
+  (let [s (str date-str)]
+    (cond
+      (and (= 8 (count s)) (.isdigit s))
+      (let [iso (str (subs s 0 4) "-" (subs s 4 6) "-" (subs s 6 8))]
+        (datetime.date/fromisoformat iso)
+        s)
+
+      (= 10 (count s))
+      (do
+        (datetime.date/fromisoformat s)
+        (.replace s "-" ""))
+
+      :else
+      (throw (python/ValueError (str "invalid date: " s))))))
+
+(defn cli-target-date
+  [value]
+  (let [s (str value)]
+    (when-not (= 10 (count s))
+      (throw (python/ValueError
+              (str "invalid --target-date: " s
+                   " (expected YYYY-MM-DD calendar date)"))))
+    (try
+      (datetime.date/fromisoformat s)
+      (catch python/Exception _
+        (throw (python/ValueError
+                (str "invalid --target-date: " s
+                     " (expected YYYY-MM-DD calendar date)")))))
+    s))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:analysis-dir (os.path/join repo-root "live_runtime" "analysis")
+              :payload-dir (os.path/join repo-root "resources" "thetadata" "payload_examples")}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--target-date")
+          (recur (nnext remaining)
+                 (assoc out :target-date
+                        (cli-target-date (option-value remaining arg))))
+
+          (= arg "--analysis-dir")
+          (recur (nnext remaining) (assoc out :analysis-dir (option-value remaining arg)))
+
+          (= arg "--payload-dir")
+          (recur (nnext remaining) (assoc out :payload-dir (option-value remaining arg)))
+
+          (= arg "--manifest")
+          (recur (nnext remaining) (assoc out :manifest (option-value remaining arg)))
+
+          (= arg "--out")
+          (recur (nnext remaining) (assoc out :out (option-value remaining arg)))
+
+          (= arg "--md-out")
+          (recur (nnext remaining) (assoc out :md-out (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn reject-duplicate-json-object
+  [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining)
+               (conj seen k)
+               (assoc out k v))))))
+
+(defn read-json
+  [path]
+  (json/loads (slurp path) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn json-out
+  [x]
+  (letfn [(jsonable [v]
+            (cond
+              (map? v) (python/dict
+                        (map (fn [[k vv]]
+                               (python/tuple [(str k) (jsonable vv)]))
+                             v))
+              (python/isinstance v python/dict) (python/dict
+                                                 (map (fn [[k vv]]
+                                                        (python/tuple [(str k) (jsonable vv)]))
+                                                      (.items v)))
+              (python/isinstance v python/list) (python/list (map jsonable v))
+              (or (vector? v) (seq? v) (set? v)) (python/list (map jsonable v))
+              :else v))]
+    (json/dumps (jsonable x) ** :indent 2 :sort_keys true)))
+
+(defn sha256-file
+  [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (open path "rb")]
+      (loop [chunk (.read fh 1048576)]
+        (when (pos? (count chunk))
+          (.update h chunk)
+          (recur (.read fh 1048576)))))
+    (.hexdigest h)))
+
+(defn manifest-path
+  [analysis-dir stamp explicit]
+  (or explicit
+      (os.path/join analysis-dir (str "market_evidence_manifest_" stamp ".json"))))
+
+(defn readiness-path
+  [analysis-dir stamp]
+  (os.path/join analysis-dir (str "market_evidence_readiness_" stamp ".json")))
+
+(defn probe-path
+  [analysis-dir stamp]
+  (os.path/join analysis-dir (str "thetadata_capability_probe_" stamp ".json")))
+
+(defn verification-path
+  [analysis-dir stamp]
+  (os.path/join analysis-dir (str "thetadata_payload_verification_" stamp ".json")))
+
+(defn neutralization-path
+  [analysis-dir stamp]
+  (os.path/join analysis-dir (str "neutralization_audit_" stamp ".json")))
+
+(defn verified-apply-validation-path
+  [analysis-dir stamp]
+  (os.path/join analysis-dir (str "neutralization_verified_apply_validation_" stamp ".json")))
+
+(defn capture-runtime-preflight-path
+  [analysis-dir stamp]
+  (os.path/join analysis-dir (str "capture_v2_runtime_preflight_" stamp ".json")))
+
+(defn load-json-if-exists
+  [path]
+  (when (os.path/exists path)
+    (try
+      (read-json path)
+      (catch python/Exception e
+        {"_read_error" (str e)}))))
+
+(defn executable?
+  [path]
+  (and path (os.path/exists path) (os/access path os/X_OK)))
+
+(defn resolve-runner
+  [env-name repo-relative path-name]
+  (let [env-value (os.environ/get env-name)
+        repo-candidate (os.path/join repo-root ".venv" "bin" repo-relative)
+        python-candidate (os.path/join (os.path/dirname sys/executable) repo-relative)
+        path-candidate (or (shutil/which path-name) "")]
+    (cond
+      (and env-value (pos? (count env-value))) env-value
+      (executable? repo-candidate) repo-candidate
+      (executable? python-candidate) python-candidate
+      (pos? (count path-candidate)) path-candidate
+      :else repo-candidate)))
+
+(defn run-manifest-verify
+  [manifest analysis-dir payload-dir target-date]
+  (let [basilisp (resolve-runner "BASILISP_BIN" "basilisp" "basilisp")
+        proc (subprocess/run (python/list [basilisp "run" "scripts/market_evidence_manifest.lpy" "--"
+                                           "--target-date" target-date
+                                           "--verify" manifest
+                                           "--analysis-dir" analysis-dir
+                                           "--payload-dir" payload-dir])
+                             ** :cwd repo-root
+                                :text true
+                                :capture_output true
+                                :check false)
+        stdout (.-stdout proc)]
+    (try
+      (let [payload (json/loads stdout ** :object_pairs_hook reject-duplicate-json-object)]
+        {"valid?" (get payload "valid?")
+         "status" (get payload "status")
+         "manifest" (get payload "manifest")
+         "issues" (get payload "issues" [])
+         "returncode" (.-returncode proc)
+         "stderr" (.-stderr proc)})
+      (catch python/Exception e
+        {"valid?" false
+         "status" "error"
+         "returncode" (.-returncode proc)
+         "stdout" stdout
+         "stderr" (.-stderr proc)
+         "issues" [{"severity" "bad"
+                    "code" "market-evidence/status-manifest-verify-unreadable"
+                    "error" (str e)}]}))))
+
+(defn payload-artifact-count
+  [manifest]
+  (count (filter #(.startswith % "payload_examples/")
+                 (.keys (get manifest "artifacts" {})))))
+
+(defn artifact-count
+  [manifest]
+  (count (.keys (get manifest "artifacts" {}))))
+
+(defn json-object?
+  [x]
+  (or (map? x) (python/isinstance x python/dict)))
+
+(defn finite-number?
+  [x]
+  (try
+    (math/isfinite (python/float x))
+    (catch python/Exception _ false)))
+
+(defn nonblank-string?
+  [x]
+  (and (string? x) (pos? (count (str/trim x)))))
+
+(defn first-n
+  [xs n]
+  (vec (take n (or xs []))))
+
+(defn shell-quote
+  [x]
+  (let [s (str x)]
+    (if (re-matches #"[A-Za-z0-9_./:=@%+-]+" s)
+      s
+      (str "'" (.replace s "'" "'\"'\"'") "'"))))
+
+(defn verified-apply-command
+  [target-date analysis-dir manifest-path status-path]
+  (let [basilisp-bin (or (os.environ/get "BASILISP_BIN") "basilisp")
+        ref-root (os.environ/get "STEVE_REF_ROOT")
+        validation-path (os.path/join analysis-dir
+                                      (str "neutralization_verified_apply_validation_"
+                                           (compact-date target-date)
+                                           ".json"))
+        command (vec (concat [basilisp-bin
+                              "run"
+                              "scripts/apply_verified_neutralization_unmask.lpy"
+                              "--"
+                              "--target-date" target-date
+                              "--analysis-dir" analysis-dir
+                              "--manifest-json" manifest-path
+                              "--status-json" status-path
+                              "--require-validation-json" validation-path]
+                             (when (and ref-root (pos? (count ref-root)))
+                               ["--ref-root" ref-root])
+                             ["--apply"]))]
+    {"argv" command
+     "text" (str/join " " (map shell-quote command))}))
+
+(defn safe-compact-date
+  [value]
+  (try
+    (when value
+      (compact-date value))
+    (catch python/Exception _ nil)))
+
+(defn timestamp-stamp
+  [value]
+  (try
+    (when value
+      (.strftime
+       (.date
+        (datetime.datetime/fromisoformat
+         (.replace (str value) "Z" "+00:00")))
+       "%Y%m%d"))
+    (catch python/Exception _ nil)))
+
+(defn diagnostic-target-check
+  [name payload target-stamp]
+  (let [generated-stamp (timestamp-stamp (get payload "generated_at"))
+        target-date-stamp (safe-compact-date (get payload "target_date"))
+        candidate-dates (when (json-object? (get payload "candidate_by_date"))
+                          (set (.keys (get payload "candidate_by_date"))))
+        require-generated-date? (and (not target-date-stamp)
+                                     (not= name "prediction_delta"))
+        reasons (vec
+                 (filter identity
+                         [(when (and require-generated-date?
+                                     (not generated-stamp))
+                            (str name " generated_at is missing or unparseable"))
+                          (when (and require-generated-date?
+                                     generated-stamp
+                                     (not= target-stamp generated-stamp))
+                            (str name " generated_at is not target date"))
+                          (when (and (= name "parity_gate")
+                                     (not target-date-stamp))
+                            (str name " target_date is missing or unparseable"))
+                          (when (and target-date-stamp
+                                     (not= target-stamp target-date-stamp))
+                            (str name " target_date is not target date"))
+                          (when (and (= name "prediction_delta")
+                                     (nil? candidate-dates))
+                            (str name " candidate_by_date is missing or invalid"))
+                          (when (and candidate-dates
+                                     (not= #{target-stamp} candidate-dates))
+                            (str name " candidate_by_date is not exactly target date"))]))]
+    {"target_matches_request" (empty? reasons)
+     "target_mismatch_reasons" reasons}))
+
+(defn diagnostic-json-summary
+  [name entry target-date]
+  (let [path (get entry "path")]
+    (try
+      (let [payload (read-json path)
+            target-stamp (compact-date target-date)
+            target-check (diagnostic-target-check name payload target-stamp)]
+        (cond
+          (= name "parity_gate")
+          (merge {"json_valid" true
+                  "verdict" (get payload "verdict")
+                  "reason_count" (count (get payload "reasons" []))
+                  "reasons" (vec (take 10 (get payload "reasons" [])))
+                  "prediction_delta_available" (= true (get-in payload ["prediction_delta" "available"]))}
+                 target-check)
+
+          (= name "prediction_delta")
+          (merge {"json_valid" true
+                  "status" (get payload "status" "available")
+                  "unavailable_reason" (get payload "unavailable_reason")
+                  "candidate_mode" (get payload "candidate_mode")
+                  "row_count" (count (get payload "rows" []))
+                  "candidate_date_count" (if (json-object? (get payload "candidate_by_date"))
+                                           (count (.keys (get payload "candidate_by_date")))
+                                           0)}
+                 target-check)
+
+          (= name "v3_unlock")
+          (let [summary (get payload "summary" {})]
+            (merge {"json_valid" true
+                    "status" (get summary "status" "available")
+                    "available_status" (not= "unavailable" (get summary "status"))
+                    "unavailable_reason" (get summary "unavailable_reason")
+                    "neutralized_v3_features" (get summary "neutralized_v3_features" 0)
+                    "recomputed_candidate_now" (get summary "recomputed_candidate_now" 0)
+                    "recomputed_non_degenerate" (get summary "recomputed_non_degenerate" 0)
+                    "candidate_model_gain" (get summary "candidate_model_gain" 0)
+                    "prediction_delta_p95_abs_seed_z" (get summary "prediction_delta_p95_abs_seed_z" 0)}
+                   target-check))
+
+          (= name "unlock_plan")
+          (let [summary (get payload "summary" {})]
+            (merge {"json_valid" true
+                    "neutralized_total" (get summary "neutralized_total" 0)
+                    "awaiting_market_evidence" (get summary "awaiting_market_evidence" 0)
+                    "needs_new_work" (get summary "needs_new_work" 0)}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          (= name "neutralized_feature_evidence")
+          (let [summary (get payload "summary" {})]
+            (merge {"json_valid" true
+                    "neutralized_total" (get summary "neutralized_total" 0)
+                    "current_status_counts" (get summary "current_status_counts" {})
+                    "current_status_by_source" (get summary "current_status_by_source" {})
+                    "current_status_by_family" (get summary "current_status_by_family" {})
+                    "missing_market_evidence_by_source" (get summary "missing_market_evidence_by_source" {})
+                    "missing_market_evidence_by_family" (get summary "missing_market_evidence_by_family" {})
+                    "missing_market_evidence_reason_counts" (get summary "missing_market_evidence_reason_counts" {})
+                    "raw_supported_neutralized" (get summary "raw_supported_neutralized" 0)
+                    "raw_unsupported_neutralized" (get summary "raw_unsupported_neutralized" 0)
+                    "v3_neutralized_features" (get summary "v3_neutralized_features" 0)
+                    "readiness_verdict" (get summary "readiness_verdict")
+                    "readiness_reason_count" (get summary "readiness_reason_count" 0)}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          (= name "blocked_provenance")
+          (let [summary (get payload "summary" {})
+                suffixes (vec (take 12 (get payload "suffixes" [])))]
+            (merge {"json_valid" true
+                    "blocked_total" (get summary "blocked_total" 0)
+                    "blocked_suffix_total" (get summary "blocked_suffix_total" 0)
+                    "blocked_model_gain" (get summary "blocked_model_gain" 0)
+                    "blocked_model_split_count" (get summary "blocked_model_split_count" 0)
+                    "formula_provenance_found" (get summary "formula_provenance_found" 0)
+                    "formula_provenance_missing" (get summary "formula_provenance_missing" 0)
+                    "nonzero_train_std" (get summary "nonzero_train_std" 0)
+                    "top_suffixes" suffixes}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          (= name "legacy_greek_formula_search")
+          (let [summary (get payload "summary" {})]
+            (merge {"json_valid" true
+                    "candidate_formula_hits" (get summary "candidate_formula_hits" 0)
+                    "legacy_formula_provenance_hits" (get summary "legacy_formula_provenance_hits"
+                                                            (get summary "candidate_formula_hits" 0))
+                    "candidate_reconstruction_hits" (get summary "candidate_reconstruction_hits" 0)
+                    "manifest_reference_count" (get summary "manifest_reference_count" 0)
+                    "manifest_impl_classes_found" (get summary "manifest_impl_classes_found" 0)
+                    "manifest_impl_classes_missing" (get summary "manifest_impl_classes_missing" 0)
+                    "hit_count" (get summary "hit_count" 0)}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          (= name "greek_feature_reconstruction")
+          (let [summary (get payload "summary" {})]
+            (merge {"json_valid" true
+                    "status" (get summary "status" "available")
+                    "unavailable_reason" (get summary "unavailable_reason")
+                    "blocked_total" (get summary "blocked_total" 0)
+                    "candidate_reconstructable" (get summary "candidate_reconstructable" 0)
+                    "formula_provenance_required" (get summary "formula_provenance_required" 0)
+                    "raw_inputs_present" (get summary "raw_inputs_present" 0)
+                    "auto_unmaskable" (get summary "auto_unmaskable" 0)
+                    "status_counts" (get summary "status_counts" {})
+                    "sidecar_support_counts" (get summary "sidecar_support_counts" {})}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          (= name "capture_v2_sidecars")
+          (merge {"json_valid" true
+                  "ok" (= true (get payload "ok"))
+                  "status" (get payload "status")
+                  "capture_version" (get payload "capture_version")
+                  "row_count" (get payload "row_count" 0)
+                  "unique_time_count" (get payload "unique_time_count"
+                                            (get payload "row_count" 0))
+                  "duplicate_time_count" (get payload "duplicate_time_count" 0)
+                  "duplicate_times" (get payload "duplicate_times" [])
+                  "sidecar_nonblank_rows" (get payload "sidecar_nonblank_rows" {})
+                  "sidecar_useful_rows" (get payload "sidecar_useful_rows" {})
+                  "sidecar_total_contracts" (get payload "sidecar_total_contracts" {})
+                  "sidecar_malformed_contracts" (get payload "sidecar_malformed_contracts" {})
+                  "required_option_surface_prefixes" (get payload "required_option_surface_prefixes" [])
+                  "option_surface_prefixes" (get payload "option_surface_prefixes" [])
+                  "option_surface_contracts_by_prefix" (get payload "option_surface_contracts_by_prefix" {})
+                  "option_surface_malformed_contracts_by_prefix"
+                  (get payload "option_surface_malformed_contracts_by_prefix" {})
+                  "issue_count" (count (get payload "issues" []))
+                  "warning_count" (count (get payload "warnings" []))}
+                 target-check)
+
+          (= name "capture_v2_runtime_preflight")
+          (merge {"json_valid" true
+                  "ok" (= true (get payload "ok"))
+                  "status" (get payload "status")
+                  "sidecar_every" (get payload "sidecar_every")
+                  "target_capture_ok" (get-in payload ["target_capture_check" "ok"])
+                  "target_capture_status" (get-in payload ["target_capture_check" "status"])
+                  "target_capture_row_count" (get-in payload ["target_capture_check" "row_count"])
+                  "target_capture_issue_count" (count (get-in payload ["target_capture_check" "issues"] []))
+                  "issue_count" (count (get payload "issues" []))
+                  "warning_count" (count (get payload "warnings" []))}
+                 target-check)
+
+          (= name "historical_feature_cohort")
+          (merge {"json_valid" true
+                  "ok" (= true (get payload "ok"))
+                  "status" (get payload "status")
+                  "reason" (get payload "reason")
+                  "start_time" (get payload "start_time")
+                  "end_time" (get payload "end_time")
+                  "first_time" (get payload "first_time")
+                  "last_time" (get payload "last_time")
+                  "rows" (get payload "rows" 0)
+                  "features" (get payload "features" 0)
+                  "stock_rows" (get payload "stock_rows" {})
+                  "chain_horizon_days" (get payload "chain_horizon_days")
+                  "surface_horizon_days" (get payload "surface_horizon_days")
+                  "spy_strike_range" (get payload "spy_strike_range")
+                  "spy_expirations" (get payload "spy_expirations" 0)
+                  "spy_chain_minutes" (get payload "spy_chain_minutes" 0)
+                  "surface_minutes" (get payload "surface_minutes" {})
+                  "contract_field_coverage" (get payload "contract_field_coverage" {})
+                  "row_provenance_summary" (get payload "row_provenance_summary" {})
+                  "overlay_counts" (get payload "overlay_counts" {})
+                  "neutralization_applied" (get payload "neutralization_applied")}
+                 target-check)
+
+          (= name "replayed_feature_cohort")
+          (merge {"json_valid" true
+                  "ok" (= true (get payload "ok"))
+                  "status" (get payload "status")
+                  "reason" (get payload "reason")
+                  "capture_rows" (get payload "capture_rows" 0)
+                  "replayable_rows" (get payload "replayable_rows" 0)
+                  "features" (get payload "features" 0)
+                  "problem_feature_count" (get payload "problem_feature_count" 0)
+                  "max_abs_deviation" (get payload "max_abs_deviation")
+                  "mean_abs_deviation" (get payload "mean_abs_deviation")
+                  "p95_abs_deviation" (get payload "p95_abs_deviation")
+                  "exact_match_fraction" (get payload "exact_match_fraction")
+                  "skipped_blank_sidecars" (get payload "skipped_blank_sidecars" 0)
+                  "skipped_parse_errors" (get payload "skipped_parse_errors" 0)
+                  "overlay_counts" (get payload "overlay_counts" {})
+                  "neutralized_feature_count" (get payload "neutralized_feature_count" 0)}
+                 target-check)
+
+          (= name "grid_feature_input_parity")
+          (merge {"json_valid" true
+                  "ok" (= true (get payload "ok"))
+                  "status" (get payload "status")
+                  "unavailable_reason" (get payload "reason")
+                  "matched_rows" (get payload "matched_rows" 0)
+                  "matched_start" (get payload "matched_start")
+                  "matched_end" (get payload "matched_end")
+                  "shape" (get payload "shape")
+                  "max_abs_deviation" (get payload "max_abs_deviation")
+                  "min_correlation" (get payload "min_correlation")
+                  "contract_density" (get payload "contract_density")
+                  "live_chain_observed_at_delta" (get payload "live_chain_observed_at_delta")
+                  "live_grid_history_tail" (get payload "live_grid_history_tail")
+                  "grid_history_sequence" (get payload "grid_history_sequence")
+                  "historical_time_shift_summaries" (get payload "historical_time_shift_summaries")
+                  "best_historical_time_shift" (get payload "best_historical_time_shift")
+                  "sequence_lag_summaries" (get payload "sequence_lag_summaries")
+                  "best_sequence_lag" (get payload "best_sequence_lag")
+                  "best_sequence_lag_by_mean" (get payload "best_sequence_lag_by_mean")
+                  "best_sequence_lag_by_min" (get payload "best_sequence_lag_by_min")
+                  "alignment_diagnosis" (get payload "alignment_diagnosis")
+                  "rows" (get payload "rows" [])}
+                 (diagnostic-target-check name payload target-stamp))
+
+          (= name "matched_feature_parity")
+          (let [summary (get payload "summary" {})
+                features (get payload "features" [])
+                unavailable? (= "unavailable" (get summary "status"))
+                feature-row-count (count features)
+                status-counts (into {} (.items (get summary "status_counts" {})))
+                row-status-counts (frequencies (map #(get % "status") features))
+                row-problem-count (count (filter #(not (contains? #{"EXACT_MATCH" "MATCH"}
+                                                                  (get % "status")))
+                                                 features))]
+            (merge {"available" (not unavailable?)
+                    "json_valid" true
+                    "status" (if unavailable? "unavailable" "available")
+                    "unavailable_reason" (when unavailable?
+                                           (get summary "unavailable_reason"))
+                    "matched_rows" (get summary "matched_rows" 0)
+                    "feature_count" (get summary "feature_count" 0)
+                    "feature_row_count" feature-row-count
+                    "problem_feature_count" (get summary "problem_feature_count" 0)
+                    "problem_feature_row_count" row-problem-count
+                    "status_counts" status-counts
+                    "row_status_counts" row-status-counts
+                    "max_abs_deviation" (get summary "max_abs_deviation")
+                    "min_correlation" (get summary "min_correlation")
+                    "matched_start" (get summary "matched_start")
+                    "matched_end" (get summary "matched_end")}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          (= name "greek_reconstruction_promotion")
+          (let [summary (get payload "summary" {})]
+            (merge {"json_valid" true
+                    "status" (get summary "status" "available")
+                    "unavailable_reason" (get summary "unavailable_reason")
+                    "capture_ok" (get summary "capture_ok" false)
+                    "coverage_ok" (get summary "coverage_ok" false)
+                    "evaluated_count" (get summary "evaluated_count" 0)
+                    "candidate_count" (get summary "candidate_count" 0)
+                    "candidate_model_gain" (get summary "candidate_model_gain" 0)
+                    "capture_reasons" (get summary "capture_reasons" [])
+                    "coverage_reasons" (get summary "coverage_reasons" [])}
+                   (diagnostic-target-check name summary target-stamp)))
+
+          :else
+          (merge {"json_valid" true} target-check)))
+      (catch python/Exception e
+        {"json_valid" false
+         "error" (str e)}))))
+
+(defn diagnostic-status
+  [manifest target-date]
+  (let [artifacts (get manifest "artifacts" {})]
+    (into {}
+          (map (fn [[name keys]]
+                 (let [present (vec (sort (filter #(get-in artifacts [% "exists"]) keys)))
+                       json-key (first (filter #(.endswith % ".json") keys))
+                       json-entry (get artifacts json-key)
+                       json-summary (when (and json-entry (get json-entry "exists"))
+                                      (diagnostic-json-summary name json-entry target-date))
+                       missing0 (vec (sort (remove (set present) keys)))
+                       unavailable-status? (contains? #{"unavailable" "error"}
+                                                       (get json-summary "status"))
+                       missing (if unavailable-status?
+                                 (vec (remove #(.endswith % ".npz") missing0))
+                                 missing0)]
+                   [name (merge {"available" (not (empty? present))
+                                 "present" present
+                                 "missing" missing}
+                                (or json-summary {}))]))
+               diagnostic-artifacts))))
+
+(defn direct-artifact-entry
+  [path]
+  (if (os.path/exists path)
+    {"path" path
+     "exists" true
+     "bytes" (os.path/getsize path)
+     "sha256" (sha256-file path)}
+    {"path" path
+     "exists" false}))
+
+(defn direct-diagnostic-artifacts
+  [analysis-dir stamp]
+  (into {}
+        (mapcat (fn [[_ keys]]
+                  (map (fn [key]
+                         (let [idx (.rfind key ".")
+                               base (if (neg? idx) key (subs key 0 idx))
+                               ext (if (neg? idx) "" (subs key idx))
+                               path (os.path/join analysis-dir
+                                                  (str base "_" stamp ext))]
+                           [key (direct-artifact-entry path)]))
+                       keys))
+                diagnostic-artifacts)))
+
+(defn direct-artifacts-status
+  [readiness probe verification neutralization runtime-preflight direct-diagnostics]
+  (let [capture (get direct-diagnostics "capture_v2_sidecars" {})]
+    {"readiness" {"available" (boolean readiness)
+                  "verdict" (get readiness "verdict")
+                  "reason_count" (count (get readiness "reasons" []))}
+     "thetadata_probe" {"available" (boolean probe)
+                        "total" (get-in probe ["summary" "total"] 0)
+                        "usable" (get-in probe ["summary" "usable"] 0)
+                        "failed" (get-in probe ["summary" "failed"] 0)
+                        "payload_examples" (get-in probe ["summary" "payload_examples"] 0)}
+     "thetadata_payload_verification" {"available" (boolean verification)
+                                       "status" (get verification "status")
+                                       "total" (get verification "total" 0)
+                                       "checked" (get verification "checked" 0)
+                                       "invalid" (get verification "invalid" 0)}
+     "neutralization" {"available" (boolean neutralization)
+                       "candidate_now" (get-in neutralization ["summary" "candidate_now"] 0)
+                       "review_count" (get-in neutralization ["summary" "review_count"] 0)
+                       "blocked_count" (get-in neutralization ["summary" "blocked_count"] 0)}
+     "capture_v2_runtime_preflight" {"available" (boolean runtime-preflight)
+                                     "ok" (= true (get runtime-preflight "ok"))
+                                     "status" (get runtime-preflight "status")
+                                     "sidecar_every" (get runtime-preflight "sidecar_every")
+                                     "target_capture_status" (get-in runtime-preflight ["target_capture_check" "status"])
+                                     "target_capture_ok" (get-in runtime-preflight ["target_capture_check" "ok"])
+                                     "issue_count" (count (get runtime-preflight "issues" []))
+                                     "warning_count" (count (get runtime-preflight "warnings" []))}
+     "capture_v2_sidecars" {"available" (= true (get capture "available"))
+                            "ok" (get capture "ok")
+                            "status" (get capture "status")
+                            "row_count" (get capture "row_count")
+                            "issue_count" (get capture "issue_count")
+                            "warning_count" (get capture "warning_count")
+                            "option_surface_prefixes" (get capture "option_surface_prefixes")
+                            "sidecar_total_contracts" (get capture "sidecar_total_contracts")}}))
+
+(defn enrich-diagnostic-field
+  [diagnostics direct-diagnostics diagnostic-key field]
+  (let [existing (get-in diagnostics [diagnostic-key field])
+        direct (get-in direct-diagnostics [diagnostic-key field])]
+    (if (and (or (nil? existing)
+                 (and (map? existing) (empty? existing))
+                 (and (python/isinstance existing python/dict)
+                      (= 0 (len existing))))
+             (some? direct))
+    (assoc-in diagnostics [diagnostic-key field] (get-in direct-diagnostics [diagnostic-key field]))
+      diagnostics)))
+
+(defn enrich-diagnostics-from-direct
+  [diagnostics direct-diagnostics]
+  (-> diagnostics
+      (enrich-diagnostic-field direct-diagnostics "historical_feature_cohort" "row_provenance_summary")
+      (enrich-diagnostic-field direct-diagnostics "grid_feature_input_parity" "alignment_diagnosis")))
+
+(defn raw-unlock-status
+  [manifest target-date analysis-dir manifest-path status-path]
+  (let [artifacts (get manifest "artifacts" {})
+        present (vec (sort (filter #(get-in artifacts [% "exists"]) raw-unlock-artifacts)))
+        missing (vec (sort (remove (set present) raw-unlock-artifacts)))
+        audit-entry (get artifacts "raw_feature_unlock_audit.json")
+        candidates-entry (get artifacts "raw_feature_unlock_candidates.json")
+        unmask-entry (get artifacts "neutralization_unmask_dry_run.json")
+        target-stamp (compact-date target-date)]
+    (merge
+     {"available" (boolean (and audit-entry (get audit-entry "exists")))
+      "candidates_available" (boolean (and candidates-entry (get candidates-entry "exists")))
+      "unmask_dry_run_available" (boolean (and unmask-entry (get unmask-entry "exists")))
+      "present" present
+      "missing" missing}
+     (try
+       (if (or (and audit-entry (get audit-entry "exists"))
+               (and unmask-entry (get unmask-entry "exists")))
+         (let [payload (when (and audit-entry (get audit-entry "exists"))
+                         (read-json (get audit-entry "path")))
+               summary (get payload "summary" {})
+               unmask-payload (when (and unmask-entry (get unmask-entry "exists"))
+                                (read-json (get unmask-entry "path")))
+               audit-stamp (or (safe-compact-date (get summary "target_date"))
+                               (safe-compact-date (get unmask-payload "readiness_target_date")))
+               candidate-features (get summary "candidate_features" [])
+               candidate-file-values (when (and candidates-entry (get candidates-entry "exists"))
+                                       (read-json (get candidates-entry "path")))
+               candidate-file-ok? (and (or (nil? candidate-file-values)
+                                           (python/isinstance candidate-file-values python/list))
+                                       (= (set candidate-features)
+                                          (set (or candidate-file-values []))))
+               unmask-results (get unmask-payload "results" [])
+               unmask-removed-total (reduce + 0 (map #(int (or (get % "removed") 0)) unmask-results))
+               unmask-missing-total (reduce + 0 (map #(int (or (get % "missing") 0)) unmask-results))
+               unmask-result-accounts (vec (map #(get % "account") unmask-results))
+               unmask-result-accounts-valid? (and (every? #(and (string? %)
+                                                                 (pos? (count %)))
+                                                           unmask-result-accounts)
+                                                   (= (count unmask-result-accounts)
+                                                      (count (set unmask-result-accounts))))
+               unmask-result-accounts-match-expected? (and unmask-result-accounts-valid?
+                                                           (= expected-unmask-account-set
+                                                              (set unmask-result-accounts)))
+               unmask-candidate-features (get unmask-payload "candidate_features" [])
+               unmask-candidate-provenance (get unmask-payload "candidate_provenance" [])
+               unmask-dry-run-sha256 (get unmask-entry "sha256")
+               unmask-candidate-count (int (or (get unmask-payload "candidate_count") 0))
+               unmask-candidate-features-valid? (and (python/isinstance unmask-candidate-features python/list)
+                                                     (every? #(and (string? %)
+                                                                   (pos? (count %)))
+                                                             unmask-candidate-features))
+               unmask-candidate-count-matches? (and unmask-candidate-features-valid?
+                                                    (= unmask-candidate-count
+                                                       (count unmask-candidate-features)))
+               unmask-candidate-features-unique? (and unmask-candidate-features-valid?
+                                                     (= (count unmask-candidate-features)
+                                                        (count (set unmask-candidate-features))))
+               unmask-result-count (count unmask-results)
+               unmask-results-complete? (and (pos? unmask-result-count)
+                                             unmask-result-accounts-match-expected?
+                                             (every? #(and (= 0 (int (or (get % "missing") 0)))
+                                                           (= unmask-candidate-count
+                                                              (int (or (get % "removed") 0))))
+                                                     unmask-results))
+               verified-apply-available (and (= true (get unmask-payload "verified_by_audit"))
+                                             (= false (get unmask-payload "applied"))
+                                             (= "PASS" (get unmask-payload "readiness_verdict"))
+                                             (= true (get unmask-payload "readiness_target_matches"))
+                                             (pos? unmask-candidate-count)
+                                             unmask-candidate-count-matches?
+                                             unmask-candidate-features-unique?
+                                             unmask-results-complete?)]
+           {"json_valid" true
+            "status" (get summary "status" "available")
+            "available_status" (not= "unavailable" (get summary "status"))
+            "unavailable_reason" (get summary "unavailable_reason")
+            "target_matches_request" (= target-stamp audit-stamp)
+            "target_mismatch_reasons" (if (= target-stamp audit-stamp)
+                                        []
+                                        [(str "raw_unlock target_date is not target date")])
+            "neutralized_total" (get summary "neutralized_total" 0)
+            "supported_neutralized" (get summary "supported_neutralized" 0)
+            "unsupported_neutralized" (get summary "unsupported_neutralized" 0)
+            "unsupported_neutralized_by_family" (get summary "unsupported_neutralized_by_family" {})
+            "candidate_count" (get summary "candidate_count" 0)
+            "candidate_model_gain" (get summary "candidate_model_gain" 0)
+            "candidate_file_matches_audit" candidate-file-ok?
+            "unmask_dry_run_verified_by_audit" (= true (get unmask-payload "verified_by_audit"))
+            "unmask_dry_run_applied" (= true (get unmask-payload "applied"))
+            "unmask_dry_run_readiness_available" (= true (get unmask-payload "readiness_available"))
+            "unmask_dry_run_readiness_verdict" (get unmask-payload "readiness_verdict")
+            "unmask_dry_run_readiness_target_date" (get unmask-payload "readiness_target_date")
+            "unmask_dry_run_readiness_target_matches" (get unmask-payload "readiness_target_matches")
+            "unmask_dry_run_readiness_reason_count" (get unmask-payload "readiness_reason_count" 0)
+            "unmask_dry_run_readiness_error" (get unmask-payload "readiness_error")
+            "unmask_dry_run_candidate_count" unmask-candidate-count
+            "unmask_dry_run_candidate_count_matches_features" unmask-candidate-count-matches?
+            "unmask_dry_run_candidate_features_valid" unmask-candidate-features-valid?
+            "unmask_dry_run_candidate_features_unique" unmask-candidate-features-unique?
+            "unmask_dry_run_candidate_features" unmask-candidate-features
+            "unmask_dry_run_sha256" unmask-dry-run-sha256
+            "unmask_dry_run_extra_audit_count" (count (get unmask-payload "extra_audits" []))
+            "unmask_dry_run_removed_total" unmask-removed-total
+            "unmask_dry_run_missing_total" unmask-missing-total
+            "unmask_dry_run_result_count" unmask-result-count
+            "unmask_dry_run_expected_accounts" expected-unmask-accounts
+            "unmask_dry_run_result_accounts" unmask-result-accounts
+            "unmask_dry_run_result_accounts_valid" unmask-result-accounts-valid?
+            "unmask_dry_run_result_accounts_match_expected" unmask-result-accounts-match-expected?
+            "unmask_dry_run_results_complete" unmask-results-complete?
+            "unmask_dry_run_results" (vec unmask-results)
+            "verified_apply_available" verified-apply-available
+            "verified_apply_command" (when verified-apply-available
+                                       (verified-apply-command target-date analysis-dir manifest-path status-path))
+            "unmask_dry_run_candidate_features_preview" (vec (take 20 unmask-candidate-features))
+            "unmask_dry_run_candidate_provenance_preview" (vec (take 20 unmask-candidate-provenance))
+            "candidate_features_preview" (vec (take 20 candidate-features))})
+         {"json_valid" false
+          "candidate_count" 0
+          "unsupported_neutralized" 0})
+       (catch python/Exception e
+         {"json_valid" false
+          "candidate_count" 0
+          "unsupported_neutralized" 0
+          "error" (str e)})))))
+
+(defn verified-apply-validation-status
+  [path target-date]
+  (let [payload (load-json-if-exists path)
+        available (boolean payload)
+        read-error (get payload "_read_error")
+        target-matches? (and payload (= target-date (get payload "target_date")))
+        candidate-count (get payload "candidate_count" 0)
+        candidate-features (get payload "candidate_features" [])
+        command (get payload "command")
+        command-text (get payload "command_text")
+        command-non-applying? (and (python/isinstance command python/list)
+                                   (not (contains? (set command) "--apply")))]
+    {"available" available
+     "path" path
+     "json_valid" (and available (nil? read-error))
+     "target_matches_request" (boolean target-matches?)
+     "target_mismatch_reasons" (cond
+                                 (not available) []
+                                 read-error [(str "verified apply validation JSON is unreadable")]
+                                 target-matches? []
+                                 :else [(str "verified apply validation target_date is not target date")])
+     "apply" (= true (get payload "apply"))
+     "candidate_count" candidate-count
+     "candidate_features" candidate-features
+     "candidate_features_preview" (vec (take 20 (get payload "candidate_features" [])))
+     "manifest_json" (get payload "manifest_json")
+     "status_json" (get payload "status_json")
+     "manifest_sha256" (get payload "manifest_sha256")
+     "dry_run_sha256" (get payload "dry_run_sha256")
+     "command" command
+     "command_text" command-text
+     "command_available" (and (string? command-text)
+                              (not= "" (.strip command-text)))
+     "command_non_applying" command-non-applying?
+     "error" read-error}))
+
+(defn source-parity-gate-status
+  "Expose the raw-input admission decision separately from feature diagnostics.
+  A tensor comparison is informative; only this gate may certify a corpus."
+  [path]
+  (let [payload (load-json-if-exists path)
+        present? (boolean payload)]
+    {"available" present?
+     "path" path
+     "json_valid" present?
+     "status" (get payload "status")
+     "certifiable" (= true (get payload "certifiable"))
+     "matched_rows" (get payload "matched_rows")
+     "min_rows" (get payload "min_rows")
+     "reasons" (get payload "reasons" [])
+     "provenance_compatibility" (get payload "provenance_compatibility" {})}))
+
+(defn verified-corpus-status
+  [path]
+  (let [payload (load-json-if-exists path)]
+    {"available" (boolean payload)
+     "path" path
+     "json_valid" (boolean payload)
+     "status" (get payload "status")
+     "ok" (= true (get payload "ok"))
+     "reason" (get payload "reason")
+     "rows" (get payload "rows")
+     "features" (get payload "features")}))
+
+(defn status
+  [{:keys [target-date analysis-dir payload-dir manifest out]}]
+  (let [stamp (compact-date target-date)
+        manifest-path-value (manifest-path analysis-dir stamp manifest)
+        status-path-value (or out (os.path/join analysis-dir (str "market_evidence_status_" stamp ".json")))
+        readiness-path-value (readiness-path analysis-dir stamp)
+        probe-path-value (probe-path analysis-dir stamp)
+        verification-path-value (verification-path analysis-dir stamp)
+        neutralization-path-value (neutralization-path analysis-dir stamp)
+        source-parity-path-value (os.path/join analysis-dir (str "captured_source_parity_" stamp ".json"))
+        verified-corpus-path-value (os.path/join analysis-dir (str "verified_feature_corpus_" stamp ".json"))
+        verified-apply-validation-path-value (verified-apply-validation-path analysis-dir stamp)
+        capture-runtime-preflight-path-value (capture-runtime-preflight-path analysis-dir stamp)
+        manifest-payload (load-json-if-exists manifest-path-value)
+        readiness (load-json-if-exists readiness-path-value)
+        probe (load-json-if-exists probe-path-value)
+        verification (load-json-if-exists verification-path-value)
+        neutralization (load-json-if-exists neutralization-path-value)
+        capture-runtime-preflight (load-json-if-exists capture-runtime-preflight-path-value)
+        verified-apply-validation (verified-apply-validation-status
+                                   verified-apply-validation-path-value
+                                   target-date)
+        source-parity-gate (source-parity-gate-status source-parity-path-value)
+        verified-corpus (verified-corpus-status verified-corpus-path-value)
+        direct-diagnostics (diagnostic-status {"artifacts" (direct-diagnostic-artifacts
+                                                            analysis-dir stamp)}
+                                             target-date)
+        diagnostics (enrich-diagnostics-from-direct
+                     (diagnostic-status manifest-payload target-date)
+                     direct-diagnostics)
+        direct-artifacts (direct-artifacts-status readiness probe verification
+                                                  neutralization
+                                                  capture-runtime-preflight
+                                                  direct-diagnostics)
+        historical-diagnostic (get diagnostics "historical_feature_cohort" {})
+        historical-diagnostic-present? (= true (get historical-diagnostic "available"))
+        historical-diagnostic-json-valid? (not= false (get historical-diagnostic "json_valid"))
+        historical-diagnostic-target-ok? (not= false (get historical-diagnostic "target_matches_request"))
+        historical-diagnostic-ok? (= true (get historical-diagnostic "ok"))
+        historical-diagnostic-missing (set (get historical-diagnostic "missing" []))
+        historical-diagnostic-reason (get historical-diagnostic "reason")
+        historical-diagnostic-fail-reasons
+        (vec (filter identity
+                     [(when-not historical-diagnostic-present?
+                        "historical feature cohort diagnostic is missing")
+                      (when (and historical-diagnostic-present?
+                                 (not historical-diagnostic-json-valid?))
+                        "historical feature cohort diagnostic JSON is invalid")
+                      (when (and historical-diagnostic-present?
+                                 (not historical-diagnostic-target-ok?))
+                        "historical feature cohort diagnostic target does not match request")
+                      (when (and historical-diagnostic-present?
+                                 historical-diagnostic-json-valid?
+                                 (not historical-diagnostic-ok?))
+                        (str "historical feature cohort unavailable: "
+                             (or historical-diagnostic-reason
+                                 (get historical-diagnostic "status")
+                                 "unknown reason")))
+                      (when (and historical-diagnostic-present?
+                                 (contains? historical-diagnostic-missing
+                                            "historical_features.npz"))
+                        "historical feature tensor artifact missing")]))
+        matched-diagnostic (get diagnostics "matched_feature_parity" {})
+        matched-diagnostic-unavailable? (= "unavailable" (get matched-diagnostic "status"))
+        matched-diagnostic-present? (= true (get matched-diagnostic "available"))
+        matched-diagnostic-json-valid? (not= false (get matched-diagnostic "json_valid"))
+        matched-diagnostic-target-ok? (not= false (get matched-diagnostic "target_matches_request"))
+        matched-diagnostic-rows (int (or (get matched-diagnostic "matched_rows") 0))
+        matched-diagnostic-feature-count (int (or (get matched-diagnostic "feature_count") 0))
+        matched-diagnostic-feature-row-count (int (or (get matched-diagnostic "feature_row_count") 0))
+        matched-diagnostic-problems (int (or (get matched-diagnostic "problem_feature_count") 0))
+        matched-diagnostic-problem-row-count (int (or (get matched-diagnostic "problem_feature_row_count") 0))
+        matched-diagnostic-status-counts (get matched-diagnostic "status_counts" {})
+        matched-diagnostic-row-status-counts (get matched-diagnostic "row_status_counts" {})
+        matched-diagnostic-max-abs-dev (get matched-diagnostic "max_abs_deviation")
+        matched-diagnostic-min-correlation (get matched-diagnostic "min_correlation")
+        matched-diagnostic-start (get matched-diagnostic "matched_start")
+        matched-diagnostic-end (get matched-diagnostic "matched_end")
+        readiness-matched (get readiness "matched_feature_parity" {})
+        readiness-matched-unavailable? (= "unavailable" (get readiness-matched "status"))
+        readiness-matched-present? (= true (get readiness-matched "available"))
+        readiness-matched-rows (int (or (get readiness-matched "matched_rows") 0))
+        readiness-matched-problems (int (or (get readiness-matched "problem_feature_count") 0))
+        readiness-matched-max-abs-dev (get readiness-matched "max_abs_deviation")
+        readiness-matched-min-correlation (get readiness-matched "min_correlation")
+        readiness-matched-start (get readiness-matched "matched_start")
+        readiness-matched-end (get readiness-matched "matched_end")
+        matched-diagnostic-fail-reasons
+        (vec (filter identity
+                     [(when matched-diagnostic-unavailable?
+                        (str "matched feature parity diagnostic unavailable: "
+                             (get matched-diagnostic "unavailable_reason")))
+                      (when (and (not matched-diagnostic-unavailable?)
+                                 (not matched-diagnostic-present?))
+                        "matched feature parity diagnostic is missing")
+                      (when (and matched-diagnostic-present?
+                                 (not matched-diagnostic-json-valid?))
+                        "matched feature parity diagnostic JSON is invalid")
+                      (when (and matched-diagnostic-present?
+                                 (not matched-diagnostic-target-ok?))
+                        "matched feature parity diagnostic target does not match request")
+                      (when (and matched-diagnostic-present?
+                                 (< matched-diagnostic-rows 60))
+                        "matched feature parity diagnostic rows below minimum 60")
+                      (when (and matched-diagnostic-present?
+                                 (not (pos? matched-diagnostic-feature-count)))
+                        "matched feature parity diagnostic feature_count is not positive")
+                      (when (and matched-diagnostic-present?
+                                 (not= matched-diagnostic-feature-count
+                                       matched-diagnostic-feature-row-count))
+                        "matched feature parity diagnostic feature_count does not match feature rows")
+                      (when (and matched-diagnostic-present?
+                                 (not= matched-diagnostic-problems
+                                       matched-diagnostic-problem-row-count))
+                        "matched feature parity diagnostic problem_feature_count does not match feature rows")
+                      (when (and matched-diagnostic-present?
+                                 (not= matched-diagnostic-status-counts
+                                       matched-diagnostic-row-status-counts))
+                        "matched feature parity diagnostic status_counts does not match feature rows")
+                      (when (and matched-diagnostic-present?
+                                 (pos? matched-diagnostic-problems))
+                        "matched feature parity diagnostic has problem features")
+                      (when (and matched-diagnostic-present?
+                                 (not (finite-number? matched-diagnostic-max-abs-dev)))
+                        "matched feature parity diagnostic max_abs_deviation is missing or non-numeric")
+                      (when (and matched-diagnostic-present?
+                                 (not (finite-number? matched-diagnostic-min-correlation)))
+                        "matched feature parity diagnostic min_correlation is missing or non-numeric")
+                      (when (and matched-diagnostic-present?
+                                 (not (nonblank-string? matched-diagnostic-start)))
+                        "matched feature parity diagnostic matched_start is missing")
+                      (when (and matched-diagnostic-present?
+                                 (not (nonblank-string? matched-diagnostic-end)))
+                        "matched feature parity diagnostic matched_end is missing")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-unavailable?)
+                        (str "readiness matched feature parity diagnostic unavailable: "
+                             (get readiness-matched "unavailable_reason")))
+                      (when (and matched-diagnostic-present?
+                                 (not readiness-matched-unavailable?)
+                                 (not readiness-matched-present?))
+                        "readiness matched feature parity diagnostic is missing")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-present?
+                                 (not= readiness-matched-rows matched-diagnostic-rows))
+                        "readiness matched feature parity rows do not match manifest diagnostic")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-present?
+                                 (not= readiness-matched-problems matched-diagnostic-problems))
+                        "readiness matched feature parity problem count does not match manifest diagnostic")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-present?
+                                 (not= readiness-matched-max-abs-dev matched-diagnostic-max-abs-dev))
+                        "readiness matched feature parity max_abs_deviation does not match manifest diagnostic")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-present?
+                                 (not= readiness-matched-min-correlation matched-diagnostic-min-correlation))
+                        "readiness matched feature parity min_correlation does not match manifest diagnostic")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-present?
+                                 (not= readiness-matched-start matched-diagnostic-start))
+                        "readiness matched feature parity matched_start does not match manifest diagnostic")
+                      (when (and matched-diagnostic-present?
+                                 readiness-matched-present?
+                                 (not= readiness-matched-end matched-diagnostic-end))
+                        "readiness matched feature parity matched_end does not match manifest diagnostic")]))
+        raw-unlock (raw-unlock-status manifest-payload target-date analysis-dir manifest-path-value status-path-value)
+        validation-candidate-count-matches? (= (get verified-apply-validation "candidate_count")
+                                               (get raw-unlock "unmask_dry_run_candidate_count"))
+        validation-candidate-features-match? (= (vec (get verified-apply-validation "candidate_features" []))
+                                                (vec (get raw-unlock "unmask_dry_run_candidate_features" [])))
+        manifest-actual-sha256 (when (os.path/exists manifest-path-value)
+                                 (sha256-file manifest-path-value))
+        validation-manifest-sha-matches? (and (string? (get verified-apply-validation "manifest_sha256"))
+                                              (= (get verified-apply-validation "manifest_sha256")
+                                                 manifest-actual-sha256))
+        validation-dry-run-sha-matches? (and (string? (get verified-apply-validation "dry_run_sha256"))
+                                             (= (get verified-apply-validation "dry_run_sha256")
+                                                (get raw-unlock "unmask_dry_run_sha256")))
+        validation-manifest-path-matches? (= (get verified-apply-validation "manifest_json")
+                                             manifest-path-value)
+        validation-status-path-matches? (= (get verified-apply-validation "status_json")
+                                           status-path-value)
+        verified-apply-validation-final (assoc verified-apply-validation
+                                               "candidate_count_matches_dry_run"
+                                               validation-candidate-count-matches?
+                                               "candidate_features_match_dry_run"
+                                               validation-candidate-features-match?
+                                               "manifest_sha256_matches"
+                                               validation-manifest-sha-matches?
+                                               "dry_run_sha256_matches"
+                                               validation-dry-run-sha-matches?
+                                               "manifest_json_matches"
+                                               validation-manifest-path-matches?
+                                               "status_json_matches"
+                                               validation-status-path-matches?
+                                               "apply_safe"
+                                               (and (= true (get raw-unlock "verified_apply_available"))
+                                                    (= true (get verified-apply-validation "available"))
+                                                    (= true (get verified-apply-validation "json_valid"))
+                                                    (= true (get verified-apply-validation "target_matches_request"))
+                                                    (= false (get verified-apply-validation "apply"))
+                                                    (= true (get verified-apply-validation "command_available"))
+                                                    (= true (get verified-apply-validation "command_non_applying"))
+                                                    validation-candidate-count-matches?
+                                                    validation-candidate-features-match?
+                                                    validation-manifest-sha-matches?
+                                                    validation-dry-run-sha-matches?
+                                                    validation-manifest-path-matches?
+                                                    validation-status-path-matches?))
+        verify (if (os.path/exists manifest-path-value)
+                 (run-manifest-verify manifest-path-value analysis-dir payload-dir target-date)
+                 {"valid?" false
+                  "status" "error"
+                  "returncode" 1
+                  "issues" [{"severity" "bad"
+                             "code" "market-evidence/status-manifest-missing"
+                             "path" manifest-path-value}]})
+        readiness-verdict (get readiness "verdict" "MISSING")
+        readiness-historical (if (seq (get readiness "historical_feature_cohort" {}))
+                               (get readiness "historical_feature_cohort")
+                               historical-diagnostic)
+        readiness-raw-unlock (if (seq (get readiness "raw_feature_unlock" {}))
+                               (get readiness "raw_feature_unlock")
+                               raw-unlock)
+        readiness-v3-unlock (if (seq (get readiness "v3_grid_unlock" {}))
+                              (get readiness "v3_grid_unlock")
+                              (get diagnostics "v3_unlock" {}))
+        manifest-read-error (get manifest-payload "_read_error")
+        manifest-valid (= true (get manifest-payload "valid?"))
+        manifest-target-date (get manifest-payload "target_date")
+        manifest-target-stamp (get manifest-payload "target_stamp")
+        manifest-date-matches? (and (= stamp manifest-target-stamp)
+                                    (= stamp (safe-compact-date manifest-target-date)))
+        verify-valid (and (= true (get verify "valid?"))
+                          (= "ok" (get verify "status"))
+                          (= 0 (get verify "returncode")))
+        ok? (and manifest-valid
+                 manifest-date-matches?
+                 verify-valid
+                 (= "PASS" readiness-verdict)
+                 (empty? historical-diagnostic-fail-reasons)
+                 (empty? matched-diagnostic-fail-reasons))
+        manifest-invalid-reasons (cond
+                                   (nil? manifest-payload)
+                                   ["manifest is missing"]
+
+                                   manifest-read-error
+                                   []
+
+                                   (not manifest-valid)
+                                   ["manifest recorded invalid"]
+
+                                   :else
+                                   [])
+        fail-reasons (vec (concat
+                           (when manifest-read-error
+                             [(str "manifest JSON is unreadable: " manifest-read-error)])
+                           manifest-invalid-reasons
+                           (when-not manifest-date-matches?
+                             [(str "manifest target date/stamp does not match requested target " target-date)])
+                           (when-not verify-valid
+                             ["manifest verification failed"])
+                           (when-not (= "PASS" readiness-verdict)
+                             [(str "readiness verdict is " readiness-verdict)])
+                           historical-diagnostic-fail-reasons
+                           matched-diagnostic-fail-reasons))
+        unmask-apply-ready? (and ok?
+                                 (= true (get raw-unlock "verified_apply_available"))
+                                 (= true (get verified-apply-validation-final "apply_safe")))
+        unmask-apply-reasons (vec (concat
+                                   (when-not ok?
+                                     ["market evidence status is not OK"])
+                                   (when-not (= true (get raw-unlock "verified_apply_available"))
+                                     ["verified apply command is not available from dry-run evidence"])
+                                   (when-not (= true (get verified-apply-validation-final "available"))
+                                     ["verified apply validation artifact is missing"])
+                                   (when (and (= true (get verified-apply-validation-final "available"))
+                                              (not= true (get verified-apply-validation-final "apply_safe")))
+                                     ["verified apply validation is not apply_safe"])))]
+    {"target_date" target-date
+     "target_stamp" stamp
+     "generated_at" (.isoformat (datetime.datetime/now datetime.timezone/utc) ** :timespec "seconds")
+     "ok?" ok?
+     "status" (if ok? "ok" "error")
+     "reasons" fail-reasons
+     "unmask_apply_ready?" unmask-apply-ready?
+     "unmask_apply_reasons" unmask-apply-reasons
+     "paths" {"manifest" manifest-path-value
+              "status" status-path-value
+              "readiness" readiness-path-value
+              "probe" probe-path-value
+              "payload_verification" verification-path-value
+              "neutralization" neutralization-path-value
+              "capture_runtime_preflight" capture-runtime-preflight-path-value
+              "verified_apply_validation" verified-apply-validation-path-value}
+     "manifest" {"available" (boolean manifest-payload)
+                 "valid?" manifest-valid
+                 "target_date" manifest-target-date
+                 "target_stamp" manifest-target-stamp
+                 "target_matches_request?" manifest-date-matches?
+                 "read_error" manifest-read-error
+                 "readiness_verdict" (get manifest-payload "readiness_verdict")
+                 "payload_example_count" (get manifest-payload "payload_example_count" 0)
+                 "payload_artifact_count" (payload-artifact-count manifest-payload)
+                 "artifact_count" (artifact-count manifest-payload)
+                 "diagnostics" diagnostics
+                 "direct_diagnostics" direct-diagnostics
+                 "direct_artifacts" direct-artifacts
+                 "raw_unlock" raw-unlock
+                 "issue_count" (count (get manifest-payload "issues" []))
+                 "issues" (first-n (get manifest-payload "issues" []) 10)}
+     "manifest_verification" {"valid?" verify-valid
+                              "returncode" (get verify "returncode")
+                              "issue_count" (count (get verify "issues" []))
+                              "issues" (first-n (get verify "issues" []) 10)}
+     "readiness" {"available" (boolean readiness)
+                  "verdict" readiness-verdict
+                  "reason_count" (count (get readiness "reasons" []))
+                  "reasons" (first-n (get readiness "reasons" []) 10)
+                  "baseline" (get readiness "baseline" {})
+                  "thetadata_probe" (get readiness "thetadata_probe" {})
+                  "thetadata_payload_verification" (get readiness "thetadata_payload_verification" {})
+                  "matched_feature_parity" (get readiness "matched_feature_parity" {})
+                  "historical_feature_cohort" readiness-historical
+                  "raw_feature_unlock" readiness-raw-unlock
+                  "v3_grid_unlock" readiness-v3-unlock
+                  "neutralization" (get readiness "neutralization" {})}
+     "probe" {"available" (boolean probe)
+              "summary" (get probe "summary" {})}
+     "payload_verification" {"available" (boolean verification)
+                             "status" (get verification "status")
+                             "total" (get verification "total" 0)
+                             "checked" (get verification "checked" 0)
+                             "skipped" (get verification "skipped" 0)
+                             "invalid" (get verification "invalid" 0)}
+     "neutralization" {"available" (boolean neutralization)
+                       "summary" (get neutralization "summary" {})}
+     "source_parity_gate" source-parity-gate
+     "verified_feature_corpus" verified-corpus
+     "verified_apply_validation" verified-apply-validation-final}))
+
+(defn markdown
+  [payload]
+  (evidence-status/markdown payload))
+
+(defn ensure-parent-dir!
+  [path]
+  (let [parent (os.path/dirname path)]
+    (when (pos? (count parent))
+      (os/makedirs parent ** :exist_ok true))))
+
+(try
+  (let [{:keys [target-date analysis-dir payload-dir out md-out] :as opts}
+        (parse-args (vec *command-line-args*))]
+    (when (nil? target-date)
+      (usage)
+      (python/exit 2))
+      (let [result (status opts)
+            encoded (json-out result)]
+      (when out
+        (ensure-parent-dir! out)
+        (spit out (str encoded "\n")))
+      (when md-out
+        (ensure-parent-dir! md-out)
+        (spit md-out (markdown result)))
+      (println encoded)
+      (python/exit (if (get result "ok?") 0 1))))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

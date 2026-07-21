@@ -10,12 +10,25 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "basilisp==0.5.1",
+  "balli @ git+https://github.com/vandyand/balli.git@5757dce09528ad1e90e7d9e493860c8a033b6b21",
+  "databento==0.81.0",
+  "numpy>=1.26",
+  "websockets>=13,<16",
   "pytest>=8.0",
   "python-ulid>=2.7",
+  "tzdata>=2025.2",
 ]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+markers = [
+  "fast: cheap deterministic tests suitable for the normal edit loop",
+  "ops: operational script, deployment, status, or workflow tests",
+  "integration: cross-component tests or tests that exercise CLI/process boundaries",
+  "slow: tests intentionally too expensive for the normal edit loop",
+  "market: tests that require or validate market-hours/runtime data assumptions",
+  "remote: tests that require a remote host or external service",
+]
 pythonpath = [
   "tests",
   ".",
@@ -49,7 +62,9 @@ pythonpath = [
   "components/broker.router/src",
   "components/broker.sim/src",
   "components/market-data.alpaca/src",
+  "components/market-data.databento/src",
   "components/market-data.thetadata/src",
+  "components/market-data.thetadata-schema/src",
   "components/market-data.composite/src",
   "components/market-data.replay/src",
   "components/persistence.fact-store/src",
@@ -58,9 +73,17 @@ pythonpath = [
   "components/control-plane.file-store/src",
   "components/artifact.file-store/src",
   "components/analysis.core/src",
+  "components/analysis.derived-greeks/src",
+  "components/current-pnl.core/src",
+  "components/reporting.core/src",
+  "components/report-metrics.core/src",
+  "components/status.core/src",
+  "components/ops.core/src",
+  "components/feature-parity.core/src",
   "components/replay.fixture/src",
   "components/bridge.steve-v2/src",
   "components/bridge.v2-term/src",
+  "components/bridge.v2-vol/src",
   "bases/engine-live/src",
   "bases/engine-replay/src",
   "bases/control-plane/src",
@@ -73,3 +96,4 @@ testpaths = [
 
 [tool.setuptools]
 include-package-data = true
+py-modules = []

@@ -1,0 +1,1101 @@
+(ns ops.test-report-validation-cli
+  (:import datetime hashlib json os pathlib shutil subprocess sys tempfile zoneinfo)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]
+            [stevetrading.status.core :as status]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def validate-script "scripts/validate_report_day.lpy")
+(def audit-script "scripts/audit_daily_report_validations.lpy")
+(def status-audit-script "scripts/audit_status_publication.lpy")
+(def build-status-script "scripts/build_status.lpy")
+(def previous-trading-day-script "scripts/previous_trading_day.lpy")
+(def report-target-date-script "scripts/report_target_date.lpy")
+(def repair-daily-index-script "scripts/repair_daily_report_index.lpy")
+(def build-daily-index-script "scripts/build_daily_report_index.lpy")
+(def build-overview-index-script "scripts/build_reports_overview_index.lpy")
+(def render-daily-report-script "scripts/render_daily_report.lpy")
+(def render-weekly-report-script "scripts/render_weekly_report.lpy")
+(def render-account-reports-script "scripts/render_account_reports.lpy")
+(def generate-daily-validation-script "scripts/generate_daily_validation.lpy")
+(def run-reports-script (.joinpath root "projects/ops/scripts/run_reports.sh"))
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp-bin (str (resolve-basilisp)))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) (.items x)))
+    (or (vector? x) (seq? x) (python/isinstance x python/list)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps
+  ([x] (json/dumps (jsonable x)))
+  ([x & kwargs] (apply json/dumps (jsonable x) kwargs)))
+
+(defn read-json [p] (json/loads (.read_text p)))
+(defn write-json! [p payload] (.write_text p (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+(defn path [parent child] (.joinpath parent child))
+
+(defn merged-env [env]
+  (let [out (.copy os/environ)]
+    (.update out (jsonable (or env {})))
+    out))
+
+(defn run-basilisp [script & opts]
+  (let [opts-map (into {} (map vec (partition 2 opts)))
+        cwd (get opts-map :cwd root)
+        env (get opts-map :env {})
+        args (get opts-map :args [])
+        script-path (let [candidate (pathlib/Path script)]
+                      (if (.is_absolute candidate) candidate (.joinpath root script)))]
+    (subprocess/run
+     (python/list (concat [basilisp-bin "run" (str script-path) "--"] args))
+     ** :cwd (str cwd)
+        :env (merged-env env)
+        :text true
+        :capture_output true
+        :check false)))
+
+(defn valid-report-payload
+  ([] (valid-report-payload "2026-07-02"))
+  ([date]
+   {"report/date" date
+    "report/rendered?" true
+    "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                 "report/date" date
+                 "trade/closed-count" 1
+                 "order/count" 2
+                 "positions/open-count" 0
+                 "positions/open" []
+                 "pnl/equity-day" "25.00"
+                 "pnl/realized" "25.00"
+                 "pnl/unrealized" "0.00"
+                 "pnl/closed-trades" "25.00"
+                 "broker/equity-observed?" true
+                 "report/explanations" []}]}))
+
+(defn write-validation!
+  ([daily-dir] (write-validation! daily-dir "2026-07-02"))
+  ([daily-dir date]
+   (let [stamp (str/replace date "-" "")
+         validation (path daily-dir (str stamp ".validation.json"))
+         html (path daily-dir (str stamp ".html"))]
+     (write-json! validation (valid-report-payload date))
+     (.write_text html "<html>ok</html>\n")
+     validation)))
+
+(defn sha256-text [text]
+  (.hexdigest (hashlib/sha256 (.encode text "utf-8"))))
+
+(defn artifact-entry [text]
+  {"sha256" (sha256-text text)
+   "bytes" (python/len (.encode text "utf-8"))})
+
+(defn file-artifact [p]
+  (let [data (.read_bytes p)]
+    {"path" (str p)
+     "sha256" (.hexdigest (hashlib/sha256 data))
+     "bytes" (python/len data)}))
+
+(defn edn-string [value] (json/dumps value))
+
+(defn write-daily-artifact-manifest!
+  ([daily-dir] (write-daily-artifact-manifest! daily-dir :date "2026-07-02"))
+  ([daily-dir & opts]
+   (let [opts-map (into {} (map vec (partition 2 opts)))
+         date (get opts-map :date "2026-07-02")
+         validated-at (get opts-map :validated-at "2026-07-02T21:00:00+00:00")
+         manifest-daily-dir (get opts-map :manifest-daily-dir daily-dir)
+         compact (str/replace date "-" "")
+         validation-path (path daily-dir (str compact ".validation.json"))
+         html-path (path daily-dir (str compact ".html"))
+         validation (file-artifact validation-path)
+         html (file-artifact html-path)
+         manifest-path (path daily-dir (str (.-name validation-path) ".manifest.edn"))]
+     (.write_text
+      manifest-path
+      (str/join
+       "\n"
+       ["{:manifest/version 1"
+        " :manifest/kind :reporting/daily-report-artifacts-v1"
+        (str " :report/date " (edn-string date))
+        (str " :report/validated-at " (edn-string validated-at))
+        (str " :daily-dir " (edn-string (str manifest-daily-dir)))
+        (str " :validation/artifact "
+             "{:path " (edn-string (get validation "path"))
+             " :sha256 " (edn-string (get validation "sha256"))
+             " :bytes " (get validation "bytes") "}")
+        " :validation/status :ok"
+        " :validation/valid? true"
+        " :validation/account-count 1"
+        (str " :html/artifact "
+             "{:path " (edn-string (get html "path"))
+             " :sha256 " (edn-string (get html "sha256"))
+             " :bytes " (get html "bytes") "}}}")
+        ""]))
+     manifest-path)))
+
+(defn refresh-status-manifest! [out-dir]
+  (let [manifest-path (path out-dir "status.publish.json")
+        manifest (read-json manifest-path)
+        artifacts (.setdefault manifest "artifacts" (python/dict))]
+    (doseq [name ["status.json" "status.validation.json" "index.html"]]
+      (let [p (path out-dir name)]
+        (when (.exists p)
+          (.__setitem__ artifacts name (jsonable (artifact-entry (.read_text p)))))))
+    (write-json! manifest-path manifest)
+    manifest))
+
+(defn previous-weekday [d]
+  (loop [candidate d]
+    (if (< (.weekday candidate) 5)
+      candidate
+      (recur (- candidate (datetime/timedelta ** :days 1))))))
+
+(defn write-status-publication! [out-dir]
+  (let [ny (zoneinfo/ZoneInfo "America/New_York")
+        now-dt (.replace (.now datetime/datetime ny) ** :microsecond 0)
+        now (.isoformat now-dt)
+        session-date (.date now-dt)
+        report-due (.replace now-dt ** :hour 16 :minute 5 :second 0 :microsecond 0)
+        expected-date (previous-weekday (if (>= now-dt report-due)
+                                          session-date
+                                          (- session-date (datetime/timedelta ** :days 1))))
+        expected-iso (.isoformat expected-date)
+        expected-stamp (str/replace expected-iso "-" "")
+        reports-dir (.-parent out-dir)
+        session-iso (.isoformat session-date)
+        session-stamp (str/replace session-iso "-" "")
+        market-evidence-status (path out-dir (str "market_evidence_status_" session-stamp ".json"))
+        strategy-rows [["CHESTNUT" "strategy/steve-v2/chestnut/v1" "account/alpaca/chestnut-paper" "alpaca-paper"]
+                       ["LYNX" "strategy/steve-v2/lynx/v1" "account/alpaca/lynx-paper" "alpaca-paper"]
+                       ["MOOSE" "strategy/steve-v2/moose/v1" "account/alpaca/moose-paper" "alpaca-paper"]
+                       ["OAK" "strategy/steve-v2/oak/v1" "account/alpaca/oak-paper" "alpaca-paper"]
+                       ["PARROT" "strategy/steve-v2/parrot/v1" "account/alpaca/parrot-paper" "alpaca-paper"]
+                       ["DOLPHIN" "strategy/steve-v2/dolphin/v1" "account/alpaca/dolphin-paper" "alpaca-paper"]
+                       ["Local Sim Fleet" "sim-local-fleet" "sim" "local-sim"]
+                       ["V2 Vol/Term Sim" "sim-vt-session" "sim" "local-sim"]]
+        dependencies ["stevetrading-six.service"
+                      "stevetrading-watchdog.timer"
+                      "stevetrading-reports-build.timer"
+                      "Daily Reports"
+                      "stevetrading-status-dashboard.timer"
+                      "stevetrading-market-evidence-preflight.timer"
+                      "stevetrading-market-evidence-capture-smoke.service"
+                      "stevetrading-market-evidence-capture-smoke.timer"
+                      "Market Evidence Capture Smoke"
+                      "stevetrading-market-evidence-collect.service"
+                      "stevetrading-market-evidence-collect.timer"
+                      "ThetaData Terminal"
+                      "Market Evidence"]]
+    (write-json! market-evidence-status
+                 {"target_date" session-iso
+                  "target_stamp" session-stamp
+                  "ok?" true
+                  "status" "ok"
+                  "reasons" []
+                  "manifest" {"valid?" true
+                              "target_matches_request?" true
+                              "payload_example_count" 8
+                              "diagnostics" {"prediction_delta" {"available" true}
+                                             "parity_gate" {"available" true}}}
+                  "manifest_verification" {"valid?" true "returncode" 0}
+                  "readiness" {"verdict" "PASS"}})
+    (let [strategy-payloads (vec (for [[name strategy-id account-id group] strategy-rows]
+                                   {"name" name
+                                    "status" "idle"
+                                    "strategy_id" strategy-id
+                                    "account_id" account-id
+                                    "group" group
+                                    "detail" "test"
+                                    "last_fact_at" nil
+                                    "age_minutes" nil
+                                    "facts" 0
+                                    "signals" 0
+                                    "intents" 0
+                                    "fills" 0
+                                    "rejects" 0
+                                    "faults" 0}))
+          dependency-payloads (vec (for [name dependencies]
+                                     (merge {"name" name
+                                             "status" (if (= name "Market Evidence") "idle" "ok")
+                                             "detail" "test"
+                                             "expected" "test"
+                                             "updated_at" now}
+                                            (cond
+                                              (= name "Market Evidence")
+                                              {"evidence" {"phase" "preflight-pending"
+                                                           "target_date" session-iso
+                                                           "target_stamp" session-stamp
+                                                           "preflight_due_at" (str session-iso "T09:10:00-04:00")
+                                                           "collector_due_at" (str session-iso "T10:45:00-04:00")
+                                                           "status_path" (str market-evidence-status)
+                                                           "status_updated_at" now}}
+                                              (= name "Daily Reports")
+                                              {"evidence" {"expected_date" expected-iso
+                                                           "expected_stamp" expected-stamp
+                                                           "due_at" (str session-iso "T16:05:00-04:00")
+                                                           "daily_dir" "/tmp/reports/daily"
+                                                           "validation_path" (str "/tmp/reports/daily/" expected-stamp ".validation.json")
+                                                           "html_path" (str "/tmp/reports/daily/" expected-stamp ".html")
+                                                           "validation_exists" true
+                                                           "html_exists" true
+                                                           "report_date" expected-iso
+                                                           "report_date_matches" true
+                                                           "rendered" true
+                                                           "validation_status" "ok"
+                                                           "validation_valid" true
+                                                           "validation_issue_count" 0}}
+                                              :else {}))))
+          status-payload {"generated_at" now
+                          "target_date" session-iso
+                          "session" {"date" session-iso
+                                     "label" "post-market"
+                                     "is_trading_day" true
+                                     "is_market_hours" false
+                                     "session_kind" "regular"
+                                     "is_early_close" false
+                                     "open_at" (str session-iso "T09:30:00-04:00")
+                                     "close_at" (str session-iso "T16:00:00-04:00")
+                                     "market_reason" nil}
+                          "probes_enabled" true
+                          "overall" (status/overall strategy-payloads dependency-payloads)
+                          "initiatives" [{"priority" "P0" "name" "ThetaData Feature Unlock" "status" "active" "detail" "test"}
+                                         {"priority" "P0" "name" "Live Safety" "status" "active" "detail" "test"}
+                                         {"priority" "P0" "name" "Execution Fixes" "status" "active" "detail" "test"}
+                                         {"priority" "P1" "name" "Evidence Pipeline" "status" "active" "detail" "test"}
+                                         {"priority" "P1" "name" "Feature/Behavior Parity" "status" "watch" "detail" "test"}
+                                         {"priority" "P2" "name" "Same-Population Stats" "status" "blocked" "detail" "test"}
+                                         {"priority" "P2" "name" "L4 Options Paper Brokerage" "status" "needed" "detail" "test"}]
+                          "strategy_rows" strategy-payloads
+                          "dependencies" dependency-payloads}
+          validation-payload (status/validate-payload status-payload {:now now-dt})
+          status-payload (assoc status-payload "artifact_validation" validation-payload)
+          status-json (str (json/dumps (status/->jsonable status-payload) ** :indent 2 :sort_keys true) "\n")
+          validation-json (str (json/dumps (status/->jsonable validation-payload) ** :indent 2 :sort_keys true) "\n")
+          html "<html>ok</html>\n"
+          artifacts {"status.json" status-json
+                     "status.validation.json" validation-json
+                     "index.html" html}
+          manifest-json (str (json/dumps (status/->jsonable (status/status-publication-manifest status-payload artifacts))
+                                          ** :indent 2 :sort_keys true)
+                             "\n")]
+      (doseq [target ["daily" "weekly" "accounts"]]
+        (let [target-dir (path reports-dir target)]
+          (.mkdir target-dir ** :parents true :exist_ok true)
+          (.write_text (path target-dir "index.html") "<html>ok</html>\n")))
+      (.write_text (path out-dir "status.json") status-json)
+      (.write_text (path out-dir "status.validation.json") validation-json)
+      (.write_text (path out-dir "index.html") html)
+      (.write_text (path out-dir "status.publish.json") manifest-json))))
+
+(defn temp-path []
+  (pathlib/Path (tempfile/mkdtemp)))
+
+(defn issue-codes [payload]
+  (set (map #(.get % "code") (.get payload "issues"))))
+
+(defn read-json-from-stdout [result]
+  (json/loads (.-stdout result)))
+
+(deftest validate-report-day-cli-contract
+  (let [help (run-basilisp validate-script :args ["--help"])
+        unknown (run-basilisp validate-script :args ["--wat"])]
+    (is (= 0 (.-returncode help)))
+    (is (str/includes? (.-stdout help) "validate_report_day.lpy"))
+    (is (= 2 (.-returncode unknown)))
+    (is (str/includes? (.-stderr unknown) "unknown argument: --wat"))))
+
+(deftest validate-report-day-rejects-invalid-projections
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          non-trading (path tmp "non-trading.json")
+          no-closed (path tmp "no-closed.json")
+          warning (path tmp "warning.json")
+          payload-a (valid-report-payload "2026-07-03")
+          payload-b (-> (valid-report-payload "2026-07-02")
+                        (assoc-in ["accounts" 0 "trade/closed-count"] 0)
+                        (assoc-in ["accounts" 0 "order/count"] 2)
+                        (assoc-in ["accounts" 0 "pnl/equity-day"] "-150.00")
+                        (assoc-in ["accounts" 0 "pnl/realized"] "-150.00")
+                        (assoc-in ["accounts" 0 "pnl/unrealized"] "0.00")
+                        (assoc-in ["accounts" 0 "pnl/closed-trades"] "0.00")
+                        (assoc "pnl/equity-day" "-150.00")
+                        (assoc "pnl/realized" "-150.00")
+                        (assoc "pnl/unrealized" "0.00")
+                        (assoc "pnl/closed-trades" "0.00"))
+          payload-c (valid-report-payload "2026-07-02")]
+      (write-json! non-trading payload-a)
+      (write-json! no-closed payload-b)
+      (write-json! warning (assoc-in payload-c ["accounts" 0 "broker/equity-observed?"] false))
+      (let [non-trading-result (run-basilisp validate-script :args [(str non-trading)])
+            no-closed-result (run-basilisp validate-script :args [(str no-closed)])
+            warning-result (run-basilisp validate-script :args [(str warning)])]
+        (is (= 1 (.-returncode non-trading-result)))
+        (is (str/includes? (.-stdout non-trading-result) ":report/non-trading-day-rendered"))
+        (is (= 1 (.-returncode no-closed-result)))
+        (is (str/includes? (.-stdout no-closed-result) ":pnl/realized-without-closed-trades"))
+        (is (= 1 (.-returncode warning-result)))
+        (is (str/includes? (.-stdout warning-result) ":broker/missing-equity-observation"))))))
+
+(deftest audit-daily-report-validations-cli-contract
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          help (run-basilisp audit-script :args ["--help"])
+          unknown (run-basilisp audit-script :args ["--daily-dir" "/tmp" "--typo"])
+          missing (run-basilisp audit-script :args ["--daily-dir" "--date" "2026-07-02"])
+          mutually-exclusive (run-basilisp audit-script :args ["--daily-dir" (str tmp) "--all" "--date" "2026-07-02"])]
+      (is (= 0 (.-returncode help)))
+      (is (str/includes? (.-stdout help) "audit_daily_report_validations.lpy"))
+      (is (= 2 (.-returncode unknown)))
+      (is (str/includes? (.-stderr unknown) "unknown argument: --typo"))
+      (is (= 2 (.-returncode missing)))
+      (is (str/includes? (.-stderr missing) "missing value for --daily-dir"))
+      (is (= 2 (.-returncode mutually-exclusive)))
+      (is (str/includes? (.-stderr mutually-exclusive) "--all and --date are mutually exclusive")))))
+
+(deftest repair-daily-report-index-links-rendered-validation
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          daily-dir (path tmp "daily")]
+      (.mkdir daily-dir ** :parents true)
+      (write-validation! daily-dir "2026-07-08")
+      (.write_text
+       (path daily-dir "index.html")
+       (str "<html><body>\n"
+            "<h2>Calendar — 1 reports</h2>\n"
+            "<div class=\"calendar-day empty\">\n"
+            "  <div class=\"cd-num\">Jul 8</div>\n"
+            "</div>\n"
+            "</body></html>\n"))
+      (let [result (run-basilisp repair-daily-index-script
+                                 :args ["--daily-dir" (str daily-dir) "--date" "2026-07-08"])
+            index-text (.read_text (path daily-dir "index.html"))]
+        (is (= 0 (.-returncode result)))
+        (is (str/includes? index-text "href=\"20260708.html\""))
+        (is (str/includes? index-text "Calendar — 1 reports"))
+        (is (str/includes? index-text "$25.00"))
+        (is (str/includes? index-text "1 trades &middot; WR n/a"))))))
+
+(deftest build-daily-report-index-uses-local-validation-artifacts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          daily-dir (path tmp "daily")
+          weekly-dir (path tmp "weekly")
+          accounts-dir (path tmp "accounts")]
+      (.mkdir daily-dir ** :parents true)
+      (.mkdir weekly-dir ** :parents true)
+      (.mkdir accounts-dir ** :parents true)
+      (write-validation! daily-dir "2026-07-08")
+      (.write_text
+       (path daily-dir "20260709.html")
+       (str "<html><body><section><h3>Total Daily PnL</h3>"
+            "<div class=\"value negative\">-$12.50</div>"
+            "<h3>Total Trades</h3><div class=\"value neutral\">3</div>"
+            "</section></body></html>\n"))
+      (.write_text (path weekly-dir "2026-W28.html") "<html>week</html>\n")
+      (.write_text (path weekly-dir "2026-W29.html") "<html>week</html>\n")
+      (.write_text (path accounts-dir "chestnut.html") "<html>account</html>\n")
+      (let [result (run-basilisp build-daily-index-script
+                                 :args ["--daily-dir" (str daily-dir)
+                                        "--weekly-dir" (str weekly-dir)
+                                        "--accounts-dir" (str accounts-dir)])
+            index-text (.read_text (path daily-dir "index.html"))
+            weekly-text (.read_text (path weekly-dir "index.html"))
+            accounts-text (.read_text (path accounts-dir "index.html"))]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (str/includes? index-text "href=\"20260708.html\""))
+        (is (str/includes? index-text "href=\"20260709.html\""))
+        (is (str/includes? index-text "Calendar &mdash; 2 reports"))
+        (is (str/includes? index-text "$25.00"))
+        (is (str/includes? index-text "1 trades &middot; validated"))
+        (is (str/includes? index-text "-$12.50"))
+        (is (str/includes? index-text "3 trades &middot; legacy HTML"))
+        (is (str/includes? index-text "/reports/status/index.html\">System"))
+        (is (str/includes? weekly-text "href=\"2026-W28.html\""))
+        (is (str/includes? weekly-text "Weekly Reports"))
+        (is (str/includes? accounts-text "href=\"chestnut.html\""))
+        (is (str/includes? accounts-text "CHESTNUT"))))))
+
+(deftest build-reports-overview-index-uses-local-artifacts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          reports-dir (path tmp "reports")
+          daily-dir (path reports-dir "daily")
+          weekly-dir (path reports-dir "weekly")
+          accounts-dir (path reports-dir "accounts")
+          status-dir (path reports-dir "status")]
+      (doseq [dir [daily-dir weekly-dir accounts-dir status-dir]]
+        (.mkdir dir ** :parents true))
+      (write-validation! daily-dir "2026-07-08")
+      (.write_text
+       (path daily-dir "20260709.html")
+       (str "<html><body><section><h3>Total Daily PnL</h3>"
+            "<div class=\"value negative\">-$12.50</div>"
+            "<h3>Total Trades</h3><div class=\"value neutral\">3</div>"
+            "</section></body></html>\n"))
+      (.write_text (path weekly-dir "2026-W28.html") "<html>week</html>\n")
+      (.write_text (path weekly-dir "2026-W29.html") "<html>week</html>\n")
+      (.write_text (path accounts-dir "parrot.html") "<html>account</html>\n")
+      (write-json! (path status-dir "status.json")
+                   {"status" "ok"
+                    "generated_at" "2026-07-09T16:05:00-04:00"})
+      (let [result (run-basilisp build-overview-index-script
+                                 :args ["--reports-dir" (str reports-dir)])
+            index-text (.read_text (path reports-dir "index.html"))]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (str/includes? index-text "href=\"daily/20260709.html\""))
+        (is (str/includes? index-text "href=\"weekly/2026-W29.html\""))
+        (is (str/includes? index-text "href=\"accounts/index.html\""))
+        (is (str/includes? index-text "href=\"status/index.html\""))
+        (is (str/includes? index-text "Latest Daily"))
+        (is (str/includes? index-text "-$12.50"))
+        (is (str/includes? index-text "$25.00"))
+        (is (str/includes? index-text "3</td><td>html"))
+        (is (str/includes? index-text "1</td><td>validation"))
+        (is (str/includes? index-text "Status: ok"))))))
+
+(deftest render-daily-report-uses-canonical-validation-json
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          daily-dir (path tmp "daily")
+          date "2026-07-02"
+          stamp "20260702"]
+      (.mkdir daily-dir ** :parents true)
+      (write-json!
+       (path daily-dir (str stamp ".validation.json"))
+       {"report/date" date
+        "report/rendered?" true
+        "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                     "account/display" "PARROT"
+                     "report/date" date
+                     "trade/closed-count" 2
+                     "order/count" 4
+                     "positions/open-count" 1
+                     "positions/open" [{"instrument/id" "equity/NASDAQ/SPY"
+                                        "position/side" "long"
+                                        "position/quantity" "1"
+                                        "position/unrealized-pnl" "3.00"}]
+                     "pnl/equity-day" "28.00"
+                     "pnl/realized" "25.00"
+                     "pnl/unrealized" "3.00"
+                     "pnl/closed-trades" "25.00"
+                     "broker/equity-observed?" true
+                     "report/explanations" ["explanation/open-position-carryover"]}]})
+      (let [result (run-basilisp render-daily-report-script
+                                 :args ["--daily-dir" (str daily-dir)
+                                        "--date" date])
+            html (.read_text (path daily-dir (str stamp ".html")))]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (str/includes? html "Rendered by Basilisp from canonical validation JSON"))
+        (is (str/includes? html "Daily Report &mdash; 2026-07-02"))
+        (is (str/includes? html "Total broker equity P&amp;L"))
+        (is (str/includes? html "$28.00"))
+        (is (str/includes? html "$25.00"))
+        (is (str/includes? html "$3.00"))
+        (is (str/includes? html "PARROT"))
+        (is (str/includes? html "equity/NASDAQ/SPY"))
+        (is (str/includes? html "Validation</span><strong>ok / 0 issues"))))))
+
+(deftest generate-daily-validation-from-cached-orders-and-state-fixture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          daily-dir (path tmp "daily")
+          cache-dir (path tmp "cache")
+          state-path (path tmp "state.json")
+          date "2026-07-02"
+          accounts ["chestnut" "lynx" "moose" "oak" "parrot" "dolphin"]]
+      (.mkdir daily-dir ** :parents true)
+      (.mkdir cache-dir ** :parents true)
+      (doseq [slug accounts]
+        (write-json! (path cache-dir (str "orders_" slug "_" date ".json"))
+                     {"version" 1
+                      "orders" (if (= slug "parrot")
+                                 [{"account" "parrot"
+                                   "order_id" "p-open"
+                                   "symbol" "SPY"
+                                   "side" "BUY"
+                                   "filled_at" "2026-07-02T10:00:00-04:00"
+                                   "filled_avg_price" 600.0
+                                   "qty" 1
+                                   "order_type" "market"}
+                                  {"account" "parrot"
+                                   "order_id" "p-close"
+                                   "symbol" "SPY"
+                                   "side" "SELL"
+                                   "filled_at" "2026-07-02T10:05:00-04:00"
+                                   "filled_avg_price" 601.5
+                                   "qty" 1
+                                   "order_type" "market"}]
+                                 [])}))
+      (write-json! state-path
+                   {"chestnut" {"equity_day_pnl" 0.0 "positions" []}
+                    "lynx" {"equity_day_pnl" 0.0 "positions" []}
+                    "moose" {"equity_day_pnl" 0.0 "positions" []}
+                    "oak" {"equity_day_pnl" 0.0 "positions" []}
+                    "parrot" {"equity_day_pnl" 1.5 "positions" []}
+                    "dolphin" {"equity_day_pnl" 0.0 "positions" []}})
+      (let [result (run-basilisp generate-daily-validation-script
+                                 :args ["--daily-dir" (str daily-dir)
+                                        "--date" date
+                                        "--orders-cache-dir" (str cache-dir)
+                                        "--state-fixture" (str state-path)
+                                        "--allow-cache"])]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (.exists (path daily-dir "20260702.validation.json")))
+        (when (.exists (path daily-dir "20260702.validation.json"))
+          (let [payload (read-json (path daily-dir "20260702.validation.json"))
+                parrot (first (filter #(= "account/alpaca/parrot-paper" (.get % "account/id"))
+                                      (.get payload "accounts")))]
+            (is (= date (.get payload "report/date")))
+            (is (= 6 (python/len (.get payload "accounts"))))
+            (is (= 1 (.get parrot "trade/closed-count")))
+            (is (= 2 (.get parrot "order/count")))
+            (is (= 1.5 (.get parrot "pnl/equity-day")))
+            (is (= 1.5 (.get parrot "pnl/realized")))
+            (is (= true (.get parrot "broker/equity-observed?")))))))))
+
+(deftest render-weekly-report-aggregates-daily-validation-json
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          daily-dir (path tmp "daily")
+          weekly-dir (path tmp "weekly")]
+      (.mkdir daily-dir ** :parents true)
+      (.mkdir weekly-dir ** :parents true)
+      (write-json!
+       (path daily-dir "20260706.validation.json")
+       {"report/date" "2026-07-06"
+        "report/rendered?" true
+        "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                     "account/display" "PARROT"
+                     "report/date" "2026-07-06"
+                     "trade/closed-count" 2
+                     "order/count" 4
+                     "positions/open-count" 0
+                     "positions/open" []
+                     "pnl/equity-day" "10.00"
+                     "pnl/realized" "10.00"
+                     "pnl/unrealized" "0.00"
+                     "pnl/closed-trades" "10.00"
+                     "broker/equity-observed?" true
+                     "report/explanations" []}]})
+      (write-json!
+       (path daily-dir "20260707.validation.json")
+       {"report/date" "2026-07-07"
+        "report/rendered?" true
+        "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                     "account/display" "PARROT"
+                     "report/date" "2026-07-07"
+                     "trade/closed-count" 1
+                     "order/count" 2
+                     "positions/open-count" 1
+                     "positions/open" [{"instrument/id" "equity/NASDAQ/SPY"
+                                        "position/side" "long"
+                                        "position/quantity" "1"
+                                        "position/unrealized-pnl" "3.00"}]
+                     "pnl/equity-day" "8.00"
+                     "pnl/realized" "5.00"
+                     "pnl/unrealized" "3.00"
+                     "pnl/closed-trades" "5.00"
+                     "broker/equity-observed?" true
+                     "report/explanations" ["explanation/open-position-carryover"]}]})
+      (let [result (run-basilisp render-weekly-report-script
+                                 :args ["--daily-dir" (str daily-dir)
+                                        "--weekly-dir" (str weekly-dir)
+                                        "--week" "2026-W28"])
+            html-path (path weekly-dir "2026-W28.html")]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (.exists html-path))
+        (let [html (.read_text html-path)]
+        (is (str/includes? html "Rendered by Basilisp from daily validation JSON"))
+        (is (str/includes? html "Weekly Report &mdash; 2026-W28"))
+        (is (str/includes? html "Total broker equity P&amp;L"))
+        (is (str/includes? html "$18.00"))
+        (is (str/includes? html "$15.00"))
+        (is (str/includes? html "$3.00"))
+        (is (str/includes? html "<td>PARROT</td>"))
+        (is (str/includes? html "<td>3</td>"))
+        (is (str/includes? html "<td>6</td>"))
+        (is (str/includes? html "<td>2</td>")))))))
+
+(deftest render-account-reports-aggregate-daily-validation-json
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          daily-dir (path tmp "daily")
+          accounts-dir (path tmp "accounts")]
+      (.mkdir daily-dir ** :parents true)
+      (.mkdir accounts-dir ** :parents true)
+      (write-json!
+       (path daily-dir "20260706.validation.json")
+       {"report/date" "2026-07-06"
+        "report/rendered?" true
+        "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                     "account/display" "PARROT"
+                     "report/date" "2026-07-06"
+                     "trade/closed-count" 2
+                     "order/count" 4
+                     "positions/open-count" 0
+                     "positions/open" []
+                     "pnl/equity-day" "10.00"
+                     "pnl/realized" "10.00"
+                     "pnl/unrealized" "0.00"
+                     "pnl/closed-trades" "10.00"
+                     "broker/equity-observed?" true
+                     "report/explanations" []}]})
+      (write-json!
+       (path daily-dir "20260707.validation.json")
+       {"report/date" "2026-07-07"
+        "report/rendered?" true
+        "accounts" [{"account/id" "account/alpaca/parrot-paper"
+                     "account/display" "PARROT"
+                     "report/date" "2026-07-07"
+                     "trade/closed-count" 1
+                     "order/count" 2
+                     "positions/open-count" 1
+                     "positions/open" [{"instrument/id" "equity/NASDAQ/SPY"
+                                        "position/side" "long"
+                                        "position/quantity" "1"
+                                        "position/unrealized-pnl" "3.00"}]
+                     "pnl/equity-day" "8.00"
+                     "pnl/realized" "5.00"
+                     "pnl/unrealized" "3.00"
+                     "pnl/closed-trades" "5.00"
+                     "broker/equity-observed?" true
+                     "report/explanations" ["explanation/open-position-carryover"]}]})
+      (let [result (run-basilisp render-account-reports-script
+                                 :args ["--daily-dir" (str daily-dir)
+                                        "--accounts-dir" (str accounts-dir)
+                                        "--account" "parrot"])
+            html-path (path accounts-dir "parrot.html")]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (.exists html-path))
+        (let [html (.read_text html-path)]
+          (is (str/includes? html "Rendered by Basilisp from daily validation JSON"))
+          (is (str/includes? html "PARROT Account Report"))
+          (is (str/includes? html "Canonical validation-backed period: 2 days"))
+          (is (str/includes? html "Broker equity P&amp;L"))
+          (is (str/includes? html "$18.00"))
+          (is (str/includes? html "$15.00"))
+          (is (str/includes? html "$3.00"))
+          (is (str/includes? html "href=\"/reports/daily/20260706.html\""))
+          (is (str/includes? html "href=\"/reports/daily/20260707.html\""))
+          (is (str/includes? html "<span>Closed trades</span><strong>3</strong>"))
+          (is (str/includes? html "<span>Orders/fills</span><strong>6</strong>")))))))
+
+(deftest audit-daily-report-validations-fails-bad-bundles
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          empty-dir (path tmp "empty")
+          orphan-dir (path tmp "orphan")
+          malformed-dir (path tmp "malformed")]
+      (.mkdir empty-dir)
+      (.mkdir orphan-dir)
+      (.mkdir malformed-dir)
+      (write-validation! orphan-dir "2026-07-02")
+      (.write_text (path orphan-dir "20260701.html") "<html>unchecked</html>\n")
+      (write-json! (path malformed-dir "20261301.validation.json") (valid-report-payload "2026-07-02"))
+      (let [empty-result (run-basilisp audit-script :args ["--daily-dir" (str empty-dir) "--all"])
+            orphan-result (run-basilisp audit-script :args ["--daily-dir" (str orphan-dir) "--all"])
+            malformed-result (run-basilisp audit-script :args ["--daily-dir" (str malformed-dir) "--all"])
+            empty-payload (read-json-from-stdout empty-result)
+            orphan-payload (read-json-from-stdout orphan-result)
+            malformed-payload (read-json-from-stdout malformed-result)
+            malformed-codes (issue-codes malformed-payload)]
+        (is (= 1 (.-returncode empty-result)))
+        (is (= false (.get empty-payload "valid?")))
+        (is (= 0 (.get empty-payload "checked")))
+        (is (contains? (issue-codes empty-payload) "no-daily-validation-artifacts"))
+        (is (= 1 (.-returncode orphan-result)))
+        (is (= 1 (.get orphan-payload "checked")))
+        (is (contains? (issue-codes orphan-payload) "orphan-daily-html-artifact"))
+        (is (= 1 (.-returncode malformed-result)))
+        (is (contains? malformed-codes "validation-filename-date-unparseable"))
+        (is (contains? malformed-codes "validation-date-filename-mismatch"))))))
+
+(deftest audit-daily-report-validations-warns-and-writes-manifest
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          warn-dir (path tmp "warn")
+          ok-dir (path tmp "ok")]
+      (.mkdir warn-dir)
+      (.mkdir ok-dir)
+      (let [validation (assoc-in (valid-report-payload "2026-07-02")
+                                 ["accounts" 0 "broker/equity-observed?"]
+                                 false)]
+        (write-json! (path warn-dir "20260702.validation.json") validation)
+        (.write_text (path warn-dir "20260702.html") "<html>warning</html>\n"))
+      (write-validation! ok-dir "2026-07-02")
+      (let [warn-result (run-basilisp audit-script :args ["--daily-dir" (str warn-dir) "--date" "2026-07-02"])
+            ok-result (run-basilisp audit-script :args ["--daily-dir" (str ok-dir) "--date" "2026-07-02" "--write-manifests" "--require-manifests"])
+            warn-payload (read-json-from-stdout warn-result)
+            ok-payload (read-json-from-stdout ok-result)]
+        (is (= 0 (.-returncode warn-result)))
+        (is (= true (.get warn-payload "valid?")))
+        (is (= "warn" (.get warn-payload "status")))
+        (is (= true (.get (first (.get warn-payload "results")) "valid?")))
+        (is (= "warn" (.get (first (.get warn-payload "results")) "status")))
+        (is (some #(= "missing-equity-observation" (.get % "code"))
+                  (mapcat #(.get % "issues") (.get warn-payload "results"))))
+        (is (= 0 (.-returncode ok-result)) (.-stderr ok-result))
+        (is (= true (.get ok-payload "valid?")))
+        (is (= 1 (.get ok-payload "checked")))
+        (is (.exists (path ok-dir "20260702.validation.json.manifest.edn")))))))
+
+(deftest audit-daily-report-validations-rejects-manifest-tampering
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          mutators [(python/tuple ["validated-at-unparseable"
+                                   (fn [daily-dir]
+                                     (write-daily-artifact-manifest! daily-dir :validated-at "not-a-timestamp")
+                                     "daily-artifact-manifest-validated-at-unparseable")])
+                    (python/tuple ["validated-at-future"
+                                   (fn [daily-dir]
+                                     (write-daily-artifact-manifest! daily-dir :validated-at "2999-01-01T00:00:00Z")
+                                     "daily-artifact-manifest-validated-at-in-future")])
+                    (python/tuple ["wrong-daily-dir"
+                                   (fn [daily-dir]
+                                     (let [other (path (.-parent daily-dir) "other-daily")]
+                                       (.mkdir other)
+                                       (write-daily-artifact-manifest! daily-dir :manifest-daily-dir other)
+                                       "daily-artifact-manifest-daily-dir-mismatch"))])
+                    (python/tuple ["short-validation-sha"
+                                   (fn [daily-dir]
+                                     (let [manifest (write-daily-artifact-manifest! daily-dir)
+                                           sha (get (file-artifact (path daily-dir "20260702.validation.json")) "sha256")]
+                                       (.write_text manifest (str/replace-first (.read_text manifest) sha "abc"))
+                                       "daily-artifact-manifest-artifact-sha256-invalid"))])
+                    (python/tuple ["uppercase-validation-sha"
+                                   (fn [daily-dir]
+                                     (let [manifest (write-daily-artifact-manifest! daily-dir)
+                                           sha (get (file-artifact (path daily-dir "20260702.validation.json")) "sha256")]
+                                       (.write_text manifest (str/replace-first (.read_text manifest) sha (.upper sha)))
+                                       "daily-artifact-manifest-artifact-sha256-invalid"))])
+                    (python/tuple ["nonhex-html-sha"
+                                   (fn [daily-dir]
+                                     (let [manifest (write-daily-artifact-manifest! daily-dir)
+                                           sha (get (file-artifact (path daily-dir "20260702.html")) "sha256")]
+                                       (.write_text manifest (str/replace-first (.read_text manifest) sha (apply str (repeat 64 "g"))))
+                                       "daily-artifact-manifest-artifact-sha256-invalid"))])
+                    (python/tuple ["nonstring-html-sha"
+                                   (fn [daily-dir]
+                                     (let [manifest (write-daily-artifact-manifest! daily-dir)
+                                           sha (get (file-artifact (path daily-dir "20260702.html")) "sha256")]
+                                       (.write_text manifest (str/replace-first (.read_text manifest) (edn-string sha) "1234"))
+                                       "daily-artifact-manifest-artifact-sha256-invalid"))])]]
+      (doseq [[idx pair] (map-indexed vector mutators)]
+        (let [[name mutate] pair
+              daily-dir (path tmp (str "case-" idx))]
+          (.mkdir daily-dir)
+          (write-validation! daily-dir "2026-07-02")
+          (let [expected-code (mutate daily-dir)
+                result (run-basilisp audit-script :args ["--daily-dir" (str daily-dir) "--date" "2026-07-02" "--require-manifests"])
+                payload (read-json-from-stdout result)]
+            (is (= 1 (.-returncode result)) (str name " " (.-stdout result) " " (.-stderr result)))
+            (is (contains? (issue-codes payload) expected-code))))))))
+
+(deftest audit-status-publication-cli-and-valid-manifest
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          valid-dir (path tmp "valid")
+          help (run-basilisp status-audit-script :args ["--help"])
+          unknown (run-basilisp status-audit-script :args ["--wat"])
+          missing (run-basilisp status-audit-script :args ["--out-dir"])]
+      (.mkdir valid-dir)
+      (write-status-publication! valid-dir)
+      (let [valid (run-basilisp status-audit-script :args ["--out-dir" (str valid-dir)])
+            payload (read-json-from-stdout valid)]
+        (is (= 0 (.-returncode help)))
+        (is (str/includes? (.-stdout help) "audit_status_publication.lpy"))
+        (is (= 2 (.-returncode unknown)))
+        (is (str/includes? (.-stderr unknown) "unknown argument: --wat"))
+        (is (= 2 (.-returncode missing)))
+        (is (str/includes? (.-stderr missing) "missing value for --out-dir"))
+        (is (= 0 (.-returncode valid)) (str (.-stdout valid) (.-stderr valid)))
+        (is (= true (.get payload "valid?")) (str payload))))))
+
+(deftest audit-status-publication-rejects-deterministic-tampering
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          mutators [(python/tuple ["remove-required-entry"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.pop (.get manifest "artifacts") "index.html")
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-missing-artifact-entry"))])
+                    (python/tuple ["unsafe-artifact-name"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ (.get manifest "artifacts") "../outside.json" (jsonable (artifact-entry "outside\n")))
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-unsafe-artifact-name"))])
+                    (python/tuple ["extra-safe-artifact-name"
+                                   (fn [out-dir]
+                                     (let [extra "legacy-status.json"
+                                           manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.write_text (path out-dir extra) "{}\n")
+                                       (.__setitem__ (.get manifest "artifacts") extra (jsonable (artifact-entry "{}\n")))
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-extra-artifact-entry"))])
+                    (python/tuple ["symlink-escape"
+                                   (fn [out-dir]
+                                     (let [escaped (path (.-parent out-dir) "escaped-status.json")
+                                           status (path out-dir "status.json")]
+                                       (.write_text escaped (.read_text status))
+                                       (.unlink status)
+                                       (.symlink_to status escaped)
+                                       (refresh-status-manifest! out-dir)
+                                       "published-artifact-path-escape"))])
+                    (python/tuple ["wrong-kind"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ manifest "manifest_kind" "wrong/status-manifest")
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-kind-invalid"))])
+                    (python/tuple ["wrong-version"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ manifest "manifest_version" 999)
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-version-invalid"))])
+                    (python/tuple ["extra-manifest-key"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ manifest "unexpected" true)
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-extra-keys"))])
+                    (python/tuple ["remove-manifest-key"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.pop manifest "generated_at")
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-missing-keys"))])
+                    (python/tuple ["bad-artifact-shape"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ (.get manifest "artifacts") "status.json" "not an artifact entry")
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-artifact-invalid-shape"))])
+                    (python/tuple ["bad-sha"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ (.get (.get manifest "artifacts") "status.json") "sha256" "abc")
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-artifact-sha256-invalid"))])
+                    (python/tuple ["status-stale"
+                                   (fn [out-dir]
+                                     (let [ny (zoneinfo/ZoneInfo "America/New_York")
+                                           stale (.replace (- (.now datetime/datetime ny) (datetime/timedelta ** :minutes 45)) ** :microsecond 0)
+                                           status-payload (read-json (path out-dir "status.json"))]
+                                       (.__setitem__ status-payload "generated_at" (.isoformat stale))
+                                       (write-json! (path out-dir "status.json") status-payload)
+                                       (let [manifest (refresh-status-manifest! out-dir)]
+                                         (.__setitem__ manifest "generated_at" (.isoformat stale))
+                                         (write-json! (path out-dir "status.publish.json") manifest))
+                                       "published-status-validation-failed"))])
+                    (python/tuple ["fake-validation"
+                                   (fn [out-dir]
+                                     (write-json! (path out-dir "status.validation.json")
+                                                  {"valid?" true
+                                                   "issues" [{"severity" "bad" "code" "status/fake-clean" "detail" "tampered"}]})
+                                     (refresh-status-manifest! out-dir)
+                                     "published-validation-issues-mismatch")])
+                    (python/tuple ["missing-embedded-validation"
+                                   (fn [out-dir]
+                                     (let [status-payload (read-json (path out-dir "status.json"))]
+                                       (.pop status-payload "artifact_validation")
+                                       (write-json! (path out-dir "status.json") status-payload)
+                                       (refresh-status-manifest! out-dir)
+                                       "published-embedded-validation-unreadable"))])
+                    (python/tuple ["duplicate-strategy"
+                                   (fn [out-dir]
+                                     (let [status-payload (read-json (path out-dir "status.json"))
+                                           rows (.get status-payload "strategy_rows")]
+                                       (.__setitem__ status-payload "strategy_rows" (python/list (concat [(.__getitem__ rows 0)] (butlast rows))))
+                                       (write-json! (path out-dir "status.json") status-payload)
+                                       (refresh-status-manifest! out-dir)
+                                       "published-status-validation-failed"))])
+                    (python/tuple ["manifest-generated-at-mismatch"
+                                   (fn [out-dir]
+                                     (let [manifest (read-json (path out-dir "status.publish.json"))]
+                                       (.__setitem__ manifest "generated_at" "2026-07-05T00:00:00-04:00")
+                                       (write-json! (path out-dir "status.publish.json") manifest)
+                                       "publish-manifest-generated-at-mismatch"))])
+                    (python/tuple ["remove-nav-target"
+                                   (fn [out-dir]
+                                     (.unlink (path (path (.-parent out-dir) "daily") "index.html"))
+                                     "nav-target-missing")])
+                    (python/tuple ["remove-required-initiative"
+                                   (fn [out-dir]
+                                     (let [status-payload (read-json (path out-dir "status.json"))
+                                           initiatives (.get status-payload "initiatives")]
+                                       (.__setitem__ status-payload "initiatives"
+                                                     (python/list (filter #(not= "L4 Options Paper Brokerage" (.get % "name")) initiatives)))
+                                       (write-json! (path out-dir "status.json") status-payload)
+                                       (refresh-status-manifest! out-dir)
+                                       "published-status-validation-failed"))])]]
+      (doseq [[idx pair] (map-indexed vector mutators)]
+        (let [[name mutate] pair
+              out-dir (path tmp (str "case-" idx))]
+          (.mkdir out-dir)
+          (write-status-publication! out-dir)
+          (let [expected-suffix (mutate out-dir)
+                result (run-basilisp status-audit-script :args ["--out-dir" (str out-dir)])
+                payload (read-json-from-stdout result)
+                codes (issue-codes payload)]
+            (is (= 1 (.-returncode result)) (str name " " (.-stdout result) " " (.-stderr result)))
+            (is (some #(.endswith % expected-suffix) codes) (str name " " codes))))))))
+
+(deftest report-validation-clis-run-from-non-repo-cwd
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          scratch (path tmp "scratch")
+          daily-dir (path tmp "daily")
+          status-dir (path tmp "status")]
+      (.mkdir scratch)
+      (.mkdir daily-dir)
+      (.mkdir status-dir)
+      (write-validation! daily-dir "2026-07-02")
+      (write-status-publication! status-dir)
+      (let [validation (run-basilisp validate-script
+                                      :args [(str (path daily-dir "20260702.validation.json"))]
+                                      :cwd scratch
+                                      :env {"STEVE_REPO_ROOT" (str root)})
+            daily-audit (run-basilisp audit-script
+                                      :args ["--daily-dir" (str daily-dir)
+                                             "--date" "2026-07-02"
+                                             "--write-manifests"
+                                             "--require-manifests"]
+                                      :cwd scratch
+                                      :env {"STEVE_REPO_ROOT" (str root)})
+            status-audit (run-basilisp status-audit-script
+                                       :args ["--out-dir" (str status-dir)]
+                                       :cwd scratch
+                                       :env {"STEVE_REPO_ROOT" (str root)})]
+        (is (= 0 (.-returncode validation)) (.-stderr validation))
+        (is (= 0 (.-returncode daily-audit)) (.-stderr daily-audit))
+        (is (= 0 (.-returncode status-audit)) (str (.-stdout status-audit) (.-stderr status-audit)))
+        (is (= true (.get (read-json-from-stdout daily-audit) "valid?")))
+        (is (= true (.get (read-json-from-stdout status-audit) "valid?"))
+            (str (read-json-from-stdout status-audit)))))))
+
+(deftest run-reports-script-guards-current-report-flow
+  (let [script (.read_text run-reports-script)]
+    (doseq [snippet ["REPORTS_TARGET_DATE"
+                     "REPORTS_DATE"
+                     "scripts/report_target_date.lpy"
+                     "could not determine completed report target date"
+                     "generate_daily_validation"
+                     "scripts/generate_daily_validation.lpy"
+                     "Report artifact build attempt"
+                     "Reports target date - $TODAY"
+                     "Reports mode - $MODE"
+                     "--date \"$TODAY\""
+                     "if [[ \"$MODE\" != \"backfill\" && ! -f \"$daily_dir/${TODAY//-/}.validation.json\" ]]"
+                     "scripts/previous_trading_day.lpy"
+                     "could not determine previous trading day"
+                     "latest_validation="
+                     "-name '*.validation.json'"
+                     "| tail -n 1"
+                     "if [[ \"$latest_date\" != \"$expected_latest\" ]]"
+                     "latest report validation artifact is stale"
+                     "Auditing latest existing daily validation artifact"
+                     "--date \"$latest_date\""
+                     "WARN: latest report validation audit found issues"
+                     "no prior daily validation artifact found"
+                     "BASILISP=\"${BASILISP_BIN:-$BASILISP_ROOT/.venv/bin/basilisp}\""
+                     "BASILISP=\"/opt/stevetrading/shared/Data-Preprocessor/.venv/bin/basilisp\""
+                     "export BASILISP_BIN=\"$BASILISP\""
+                     "if [[ -x \"$BASILISP\""
+                     "-f \"$BASILISP_ROOT/scripts/audit_daily_report_validations.lpy\""
+                     "runner not executable: $BASILISP"
+                     "exit 2"
+                     "rm \"$plural\""
+                     "cp -a \"$singular\" \"$plural\""
+                     "normalize_report_nav"
+                     "render_daily_report"
+                     "scripts/render_daily_report.lpy"
+                     "render_weekly_report"
+                     "scripts/render_weekly_report.lpy"
+                     "render_classic_reports"
+                     "render_account_reports"
+                     "scripts/render_account_reports.lpy"
+                     "RESULT: FAILED classic report render"
+                     "build_daily_report_index"
+                     "scripts/build_daily_report_index.lpy"
+                     "--weekly-dir \"$weekly_dir\""
+                     "--accounts-dir \"$accounts_dir\""
+                     "build_reports_overview_index"
+                     "scripts/build_reports_overview_index.lpy"
+                     "--reports-dir \"$reports_dir\""
+                     "verify_local_daily_report_index"
+                     "local daily index does not link"
+                     "RESULT: FAILED local daily report index verification"
+                     "/reports/account/index\\.html#/reports/accounts/index.html"
+                     "<a href=\"/reports/status/index.html\">System</a>"
+                     "build_mode=\"skip-deploy\""
+                     "DEPLOY_ATTEMPTS=\"${REPORTS_DEPLOY_ATTEMPTS:-3}\""
+                     "VERIFY_ATTEMPTS=\"${REPORTS_VERIFY_ATTEMPTS:-9}\""
+                     "publish_reports_site"
+                     "Publication attempt $attempt/$DEPLOY_ATTEMPTS"
+                     "report publication after $DEPLOY_ATTEMPTS attempts"
+                     "Public report verification diagnostic:"
+                     "verify_public_classic_overview"
+                     "Public classic overview verified"
+                     "public overview is not the classic report UI"
+                     "RESULT: FAILED report publication exit=$rc"]]
+      (is (str/includes? script snippet) snippet))
+    (is (< (.index script "ensure_accounts_nav_target") (.index script "publish_reports_site")))
+    (is (< (.index script "normalize_report_nav") (.index script "publish_reports_site")))
+    (let [build-ok-block (subs script (.index script "if [[ \"$build_ok\" == \"1\" ]]"))]
+      (is (< (.index build-ok-block "render_classic_reports") (.index build-ok-block "verify_local_daily_report_index")))
+      (is (not (str/includes? build-ok-block "render_daily_report &&"))))
+    (is (< (.index script "verify_local_daily_report_index") (.index script "publish_reports_site")))
+    (is (not (str/includes? script "PATH=\"$REF_ROOT/.venv/bin:$PATH\"")))
+    (is (not (str/includes? script "REPORTS_RENDERER")))
+    (is (str/includes? script "render_classic_reports"))
+    (is (str/includes? script "$REF_ROOT/.venv/bin/python3"))
+    (is (not (str/includes? script "REPORTS_SKIP_PYTHON")))
+    (is (not (str/includes? script "bash deploy_reports.sh")))))
+
+(deftest trading-day-and-report-target-helpers
+  (let [previous (run-basilisp previous-trading-day-script :args ["2026-07-05"])
+        before-close (run-basilisp report-target-date-script :args ["--now" "2026-07-09T04:03:00-04:00"])
+        after-close (run-basilisp report-target-date-script :args ["--now" "2026-07-08T16:05:00-04:00"])
+        holiday-weekend (run-basilisp report-target-date-script :args ["--now" "2026-07-05T12:00:00-04:00"])]
+    (is (= 0 (.-returncode previous)))
+    (is (= "2026-07-02" (.strip (.-stdout previous))))
+    (is (= 0 (.-returncode before-close)))
+    (is (= "2026-07-08" (.strip (.-stdout before-close))))
+    (is (= 0 (.-returncode after-close)))
+    (is (= "2026-07-08" (.strip (.-stdout after-close))))
+    (is (= 0 (.-returncode holiday-weekend)))
+    (is (= "2026-07-02" (.strip (.-stdout holiday-weekend))))))
+
+(deftest build-status-cli-contract
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          help (run-basilisp build-status-script :args ["--help"])
+          unknown (run-basilisp build-status-script :args ["--oops"])
+          missing (run-basilisp build-status-script :args ["--out-dir" "--no-probes"])
+          invalid-date (run-basilisp build-status-script :args ["--date" "2026-02-31" "--out-dir" (str tmp) "--no-probes"])
+          no-probes (run-basilisp build-status-script :args ["--date" "2026-07-03" "--out-dir" (str tmp) "--no-probes"])]
+      (is (= 0 (.-returncode help)))
+      (is (str/includes? (.-stdout help) "build_status.lpy"))
+      (is (= 2 (.-returncode unknown)))
+      (is (str/includes? (.-stderr unknown) "unknown argument: --oops"))
+      (is (= 2 (.-returncode missing)))
+      (is (str/includes? (.-stderr missing) "missing value for --out-dir"))
+      (is (= 2 (.-returncode invalid-date)))
+      (is (str/includes? (.-stderr invalid-date) "invalid date for --date: 2026-02-31"))
+      (is (= 1 (.-returncode no-probes)))
+      (is (str/includes? (.-stderr no-probes) "dependency probes were disabled"))
+      (is (not (.exists (path tmp "status.publish.json")))))))

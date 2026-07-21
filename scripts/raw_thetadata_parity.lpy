@@ -1,0 +1,333 @@
+;; Persist raw ThetaData snapshot/at-time pairs and emit a fast parity verdict.
+;; This is a diagnostic gate, not event-stream certification.
+(import argparse datetime hashlib json math os os.path re sys urllib.parse urllib.request zoneinfo)
+(require '[clojure.set :as set])
+
+(def default-base-url "http://127.0.0.1:25503")
+(def default-landing-root "/mnt/d/stevetrading/thetadata-parity-v1")
+(def ^:private eastern (zoneinfo/ZoneInfo "America/New_York"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn now-et [] (datetime.datetime/now eastern))
+(defn compact-date [value] (.replace (str value) "-" ""))
+(defn safe-name [value] (.strip (re/sub "[^A-Za-z0-9_.=-]+" "_" (str value)) "_"))
+(defn py-list? [value] (python/isinstance value python/list))
+(defn py-dict? [value] (python/isinstance value python/dict))
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    (py-dict? value) (python/dict (map (fn [key] (python/tuple [(str key) (->jsonable (.get value key))])) (.keys value)))
+    (py-list? value) (python/list (map ->jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (->jsonable payload) ** :sort_keys true :separators (python/tuple ["," ":"])) "\n"))
+
+(defn sha256-text [text]
+  (.hexdigest (hashlib/sha256 (.encode text "utf-8"))))
+
+(defn atomic-write! [path text]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (let [tmp (str path ".tmp-" (os/getpid) "-" (.-microsecond (datetime.datetime/now datetime.timezone/utc)))]
+    (spit tmp text)
+    (os/replace tmp path)))
+
+(defn unique-path [dir stem]
+  (loop [n 0]
+    (let [suffix (if (zero? n) "" (str "-" n))
+          path (os.path/join dir (str stem suffix ".json"))]
+      (if (os.path/exists path) (recur (inc n)) path))))
+
+(defn request-url [base-url path params]
+  (let [pairs (python/list (map (fn [[k v]] (python/tuple [(str k) (str v)]))
+                                (sort-by first params)))]
+    (str (.rstrip base-url "/") path "?" (urllib.parse/urlencode pairs))))
+
+(defn http-json [url timeout-s]
+  (let [started (datetime.datetime/now datetime.timezone/utc)
+        request (urllib.request/Request url ** :headers {"Accept" "application/json"})]
+    (try
+      (with-open [response (urllib.request/urlopen request ** :timeout timeout-s)]
+        (let [body (.decode (.read response) "utf-8" "strict")]
+          {"ok" true "status" (.-status response) "url" url "body" body
+           "payload" (json/loads body)
+           "elapsed_ms" (int (* 1000.0 (.total_seconds (- (datetime.datetime/now datetime.timezone/utc) started))))}))
+      (catch python/Exception e
+        {"ok" false "url" url "error" (str e)
+         "elapsed_ms" (int (* 1000.0 (.total_seconds (- (datetime.datetime/now datetime.timezone/utc) started))))}))))
+
+(defn header-columns [payload]
+  (let [header (when (py-dict? payload) (.get payload "header"))
+        columns (when (py-dict? header)
+                  (or (.get header "format") (.get header "columns") (.get header "fields")))]
+    (when (py-list? columns) (vec (map str columns)))))
+
+(defn table-rows [payload]
+  (cond
+    (py-list? payload) (vec (filter py-dict? payload))
+    (and (py-dict? payload) (py-list? (.get payload "response")) (seq (header-columns payload)))
+    (let [columns (header-columns payload)]
+      (vec (keep (fn [row]
+                   (when (py-list? row)
+                     (into {} (map-indexed (fn [i col] [col (when (< i (count row)) (nth row i))]) columns))))
+                 (.get payload "response"))))
+    (py-dict? payload)
+    (let [columns (vec (filter #(py-list? (.get payload %)) (.keys payload)))
+          n (if (seq columns) (apply max (map #(count (.get payload %)) columns)) 0)]
+      (if (pos? n)
+        (vec (for [i (range n)]
+               (into {} (map (fn [column]
+                               [column (when (< i (count (.get payload column)))
+                                         (nth (.get payload column) i))])
+                             columns))))
+        [payload]))
+    :else []))
+
+(defn finite-number [value]
+  (try
+    (let [number (float value)] (when (math/isfinite number) number))
+    (catch python/Exception _ nil)))
+
+(defn parse-et-timestamp [value]
+  (let [parsed (datetime.datetime/fromisoformat (str value))]
+    (if (some? (.-tzinfo parsed))
+      (.astimezone parsed eastern)
+      (.replace parsed ** :tzinfo eastern))))
+
+(defn payload-watermark [payload fallback]
+  (let [timestamps (keep (fn [row]
+                           (when-let [value (get row "timestamp")]
+                             (try (parse-et-timestamp value)
+                                  (catch python/Exception _ nil))))
+                         (table-rows payload))]
+    (or (when (seq timestamps) (apply max timestamps)) fallback)))
+
+(defn class-spec [class]
+  (case class
+    "option-nbbo-quote"
+    {"family" "option-nbbo-quote"
+     "snapshot-path" "/v3/option/snapshot/quote"
+     "at-time-path" "/v3/option/at_time/quote"
+     "fields" ["bid" "ask" "bid_size" "ask_size" "bid_exchange" "ask_exchange" "bid_condition" "ask_condition"]
+     "required" ["bid" "ask"]}
+    "index-price"
+    {"family" "index-price"
+     "snapshot-path" "/v3/index/snapshot/price"
+     "at-time-path" "/v3/index/at_time/price"
+     "fields" ["price"] "required" ["price"]}
+    "option-open-interest"
+    {"family" "option-open-interest"
+     "snapshot-path" "/v3/option/snapshot/open_interest"
+     "history-path" "/v3/option/history/open_interest"
+     "fields" ["open_interest"] "required" ["open_interest"]}
+    (throw (python/ValueError (str "unsupported --class: " class)))))
+
+(defn choose-option-expiration [base-url symbol target-date timeout-s]
+  (let [url (request-url base-url "/v3/option/list/expirations" {"symbol" symbol "format" "json"})
+        response (http-json url timeout-s)]
+    (if-not (get response "ok")
+      [nil response]
+      (let [expirations (sort (keep (fn [row]
+                                      (let [value (get row "expiration")]
+                                        (when value
+                                          (try
+                                            (let [parsed (datetime.date/fromisoformat (str value))]
+                                              (when (not (neg? (compare parsed target-date)))
+                                                (.isoformat parsed)))
+                                            (catch python/Exception _ nil)))))
+                                    (table-rows (get response "payload"))))]
+        (if (seq expirations)
+          [(first expirations) response]
+          [nil (assoc response "ok" false "error" "no expiration on or after target date")])))))
+
+(defn option-key [row]
+  (let [expiration (str (or (get row "expiration") ""))
+        right (.upper (str (or (get row "right") "")))
+        strike (finite-number (get row "strike"))]
+    (when (and (pos? (count expiration))
+               (contains? #{"C" "P" "CALL" "PUT"} right)
+               (some? strike))
+      (str expiration "|" right "|" strike))))
+
+(defn row-key [class row]
+  (case class
+    "option-nbbo-quote" (option-key row)
+    "option-open-interest" (option-key row)
+    "index-price" (str (or (get row "symbol") "INDEX"))))
+
+(defn rows-by-key [class payload]
+  (reduce (fn [out row]
+            (if-let [key (row-key class row)] (assoc out key row) out))
+          {} (table-rows payload)))
+
+(defn field-result [left right field tolerance]
+  (let [l (finite-number (get left field))
+        r (finite-number (get right field))]
+    (cond
+      (and (nil? l) (nil? r)) {"state" "absent-both"}
+      (or (nil? l) (nil? r)) {"state" "missing-one-side"}
+      :else (let [deviation (abs (- l r))]
+              {"state" (if (<= deviation tolerance) "equal" "different")
+               "live" l "historical" r "abs_deviation" deviation}))))
+
+(defn compare-payloads [class live historical tolerance]
+  (let [spec (class-spec class)
+        live-by-key (rows-by-key class live)
+        history-by-key (rows-by-key class historical)
+        live-keys (set (keys live-by-key))
+        history-keys (set (keys history-by-key))
+        shared (sort (set/intersection live-keys history-keys))
+        fields (get spec "fields")
+        required (get spec "required")
+        rows (vec (for [key shared]
+                    (let [result (into {} (map (fn [field]
+                                                 [field (field-result (get live-by-key key)
+                                                                      (get history-by-key key)
+                                                                      field tolerance)])
+                                               fields))]
+                      {"key" key "fields" result
+                       "required_ok" (every? #(= "equal" (get (get result %) "state")) required)})))
+        different (reduce + 0 (map (fn [row]
+                                     (count (filter #(= "different" (get (get (get row "fields") %) "state")) fields))) rows))
+        missing-required (reduce + 0 (map (fn [row]
+                                            (count (filter #(not= "equal" (get (get (get row "fields") %) "state")) required))) rows))
+        pass? (and (seq shared) (= live-keys history-keys) (zero? different) (zero? missing-required))]
+    {"status" (if pass? "PASS" "FAIL") "class" class "tolerance" tolerance
+     "live_rows" (count live-by-key) "historical_rows" (count history-by-key)
+     "shared_rows" (count shared)
+     "live_only_rows" (count (set/difference live-keys history-keys))
+     "historical_only_rows" (count (set/difference history-keys live-keys))
+     "different_fields" different "missing_required_fields" missing-required
+     "sample" (vec (take 20 rows))}))
+
+(defn persist! [landing-root side session-date family symbol captured-at request payload]
+  (let [dir (os.path/join landing-root side session-date family (safe-name symbol))
+        receipt-dir (os.path/join landing-root "receipts" session-date family (safe-name symbol))
+        payload-path (unique-path dir (safe-name captured-at))
+        receipt-path (unique-path receipt-dir (safe-name captured-at))
+        text (json-text payload)
+        rows (table-rows payload)
+        fields (vec (sort (set (mapcat keys rows))))
+        receipt {"schema_version" 1 "captured_at" captured-at "session_date" session-date
+                 "side" side "family" family "symbol" symbol "request" request
+                 "payload_path" payload-path "payload_sha256" (sha256-text text)
+                 "row_count" (count rows) "schema_fields" fields
+                 "schema_fingerprint" (sha256-text (json-text fields))}]
+    (atomic-write! payload-path text)
+    (atomic-write! receipt-path (str (json/dumps (->jsonable receipt) ** :indent 2 :sort_keys true) "\n"))
+    receipt))
+
+(defn snapshot-params [class symbol expiration]
+  (case class
+    "option-nbbo-quote" {"symbol" symbol "expiration" (compact-date expiration) "format" "json"}
+    "option-open-interest" {"symbol" symbol "expiration" (compact-date expiration) "right" "both" "format" "json"}
+    "index-price" {"symbol" symbol "format" "json"}))
+
+(defn history-params [class symbol expiration watermark]
+  (if (= class "option-open-interest")
+    {"symbol" symbol "expiration" (compact-date expiration)
+     "date" (.strftime watermark "%Y%m%d") "right" "both" "format" "json"}
+    (merge {"symbol" symbol "start_date" (.strftime watermark "%Y%m%d")
+            "end_date" (.strftime watermark "%Y%m%d")
+            ;; Use the captured timestamp, not a rounded minute, so a moving
+            ;; market cannot manufacture a false raw-payload mismatch.
+            "time_of_day" (subs (.strftime watermark "%H:%M:%S.%f") 0 12) "format" "json"}
+           (if (= class "option-nbbo-quote")
+             {"expiration" (compact-date expiration) "right" "both"}
+             {}))))
+
+(defn history-path [spec]
+  (or (get spec "at-time-path") (get spec "history-path")))
+
+(defn parse-date [value]
+  (try (datetime.date/fromisoformat value)
+       (catch python/Exception _ (throw (python/ValueError "--target-date must be YYYY-MM-DD")))))
+(defn parse-time [value]
+  (try (datetime.time/fromisoformat value)
+       (catch python/Exception _ (throw (python/ValueError "--time-of-day must be HH:MM:SS[.mmm]")))))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--class" ** :dest "class_name" :required true
+                   :choices (python/list ["option-nbbo-quote" "option-open-interest" "index-price"]))
+    (.add_argument parser "--symbol" ** :required true)
+    (.add_argument parser "--expiration")
+    (.add_argument parser "--base-url" ** :default default-base-url)
+    (.add_argument parser "--landing-root" ** :default default-landing-root)
+    (.add_argument parser "--timeout-s" ** :type float :default 15.0)
+    (.add_argument parser "--tolerance" ** :type float :default 0.0)
+    (.add_argument parser "--target-date")
+    (.add_argument parser "--time-of-day")
+    (.add_argument parser "--historical-only" ** :action "store_true")
+    (.parse_args parser (python/list argv))))
+
+(defn validate-args! [args]
+  (when (<= (.-timeout_s args) 0.0) (throw (python/ValueError "--timeout-s must be positive")))
+  (when (neg? (.-tolerance args)) (throw (python/ValueError "--tolerance must be non-negative")))
+  (when (and (.-historical_only args) (not (and (.-target_date args) (.-time_of_day args))))
+    (throw (python/ValueError "--historical-only requires --target-date and --time-of-day"))))
+
+(defn run-main [argv]
+  (try
+    (let [args (parse-args argv)
+          _ (validate-args! args)
+          class (.-class_name args)
+          spec (class-spec class)
+          symbol (.upper (.-symbol args))
+          fallback-date (if (.-historical_only args)
+                          (parse-date (.-target_date args))
+                          (.date (now-et)))
+          [expiration expiration-response]
+          (if (contains? #{"option-nbbo-quote" "option-open-interest"} class)
+            (if (.-expiration args)
+              [(.-expiration args) {"ok" true "source" "argument"}]
+              (choose-option-expiration (.-base_url args) symbol fallback-date (.-timeout_s args)))
+            [nil {"ok" true "source" "not-applicable"}])
+          snapshot-url (request-url (.-base_url args) (get spec "snapshot-path")
+                                    (snapshot-params class symbol expiration))
+          snapshot (when (and (not (.-historical_only args)) (get expiration-response "ok"))
+                     (http-json snapshot-url (.-timeout_s args)))
+          watermark (if (.-historical_only args)
+                      (datetime.datetime/combine (parse-date (.-target_date args)) (parse-time (.-time_of_day args)) ** :tzinfo eastern)
+                      (if (get snapshot "ok") (payload-watermark (get snapshot "payload") (now-et)) (now-et)))
+          date (.strftime watermark "%Y-%m-%d")
+          history-url (request-url (.-base_url args) (history-path spec)
+                                   (history-params class symbol expiration watermark))
+          history (if (get expiration-response "ok")
+                    (http-json history-url (.-timeout_s args))
+                    {"ok" false "error" (get expiration-response "error")})
+          history-receipt (when (get history "ok")
+                             (persist! (.-landing_root args) "historical" date (get spec "family") symbol (now-utc)
+                                       {"endpoint" (history-path spec) "url" history-url "watermark_et" (.isoformat watermark)}
+                                       (get history "payload")))
+          live-receipt (when (and snapshot (get snapshot "ok"))
+                         (persist! (.-landing_root args) "live" date (get spec "family") symbol (now-utc)
+                                   {"endpoint" (get spec "snapshot-path") "url" snapshot-url "watermark_et" (.isoformat watermark)}
+                                   (get snapshot "payload")))
+          comparison (cond
+                       (not (get expiration-response "ok")) {"status" "INCONCLUSIVE" "reason" "expiration-discovery-failed" "error" (get expiration-response "error")}
+                       (and snapshot (not (get snapshot "ok"))) {"status" "INCONCLUSIVE" "reason" "live-snapshot-failed" "error" (get snapshot "error")}
+                       (not (get history "ok")) {"status" "INCONCLUSIVE" "reason" "historical-at-time-failed" "error" (get history "error")}
+                       (.-historical_only args) {"status" "INCONCLUSIVE" "reason" "historical-only"}
+                       :else (compare-payloads class (get snapshot "payload") (get history "payload") (.-tolerance args)))
+          payload (assoc comparison "watermark_et" (.isoformat watermark) "expiration" expiration
+                         "live_receipt" live-receipt "historical_receipt" history-receipt)
+          comparison-path (unique-path (os.path/join (.-landing_root args) "comparisons" date (get spec "family") symbol)
+                                       (safe-name (now-utc)))]
+      (atomic-write! comparison-path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+      (println (json/dumps (->jsonable (assoc payload "comparison_path" comparison-path)) ** :sort_keys true))
+      0)
+    (catch python/Exception e
+      (binding [*out* *err*] (println (str "raw ThetaData parity error: " e)))
+      2)))
+
+(try
+  (python/exit (run-main (vec *command-line-args*)))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str "raw ThetaData parity fatal error: " e)))
+    (python/exit 2)))

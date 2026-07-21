@@ -34,6 +34,7 @@ REF="${STEVE_REF_ROOT:-$DEFAULT_REF}"
 LIFECYCLE="${STEVE_THETADATA_LIFECYCLE:-$REF/thetadata_lifecycle.sh}"
 BASILISP="${BASILISP_BIN:-$REF/.venv/bin/basilisp}"
 cd "$REPO"
+export STEVE_REPO_ROOT="$REPO"
 
 # Keep the launcher environment aligned with the workspace. A stale
 # .nrepl-pythonpath can make market-open startup fail after adding a component.
@@ -41,21 +42,53 @@ ls -d components/*/src bases/*/src | paste -sd: - > .nrepl-pythonpath
 PYPATH="$(cat .nrepl-pythonpath)"
 
 log() { echo "$(date -u '+%FT%TZ') [orchestrator] $*"; }
+et_now() {
+  if [ -n "${STEVE_SIX_NOW_ET:-}" ]; then
+    TZ=America/New_York date -d "$STEVE_SIX_NOW_ET" "$@"
+  else
+    TZ=America/New_York date "$@"
+  fi
+}
+
+ET_TODAY="$(et_now +%F)"
+ET_HHMM="$(et_now +%H%M)"
 
 # weekend guard (cron 1-5 already filters; belt for manual runs)
-case "$(date +%u)" in 6|7) log "weekend — skipping"; exit 0 ;; esac
+case "$(et_now +%u)" in 6|7) log "weekend — skipping"; exit 0 ;; esac
+
+# Recovery guard for a persistent timer after host reboots. A reboot after the
+# 09:20 ET timer should recover the live capture, but an after-hours boot must
+# not grab the shared ThetaData terminal or launch a dead session.
+if [ "${STEVE_SIX_SKIP_SESSION_WINDOW:-0}" != "1" ]; then
+  if [ "$ET_HHMM" -lt 900 ] || [ "$ET_HHMM" -gt 1555 ]; then
+    log "outside recoverable market session window ($ET_TODAY $ET_HHMM ET) — skipping"
+    exit 0
+  fi
+fi
 
 # NYSE full-day holiday guard. The market is closed these dates, so don't
 # grab the shared ThetaData terminal or launch bots into a dead session.
 # (Remaining 2026 NYSE closures; half-days Nov 27 / Dec 24 stay open.)
 NYSE_HOLIDAYS="2026-06-19 2026-07-03 2026-09-07 2026-11-26 2026-12-25"
 case " $NYSE_HOLIDAYS " in
-  *" $(date +%F) "*) log "NYSE holiday ($(date +%F)) — skipping"; exit 0 ;;
+  *" $ET_TODAY "*) log "NYSE holiday ($ET_TODAY) — skipping"; exit 0 ;;
 esac
 
 log "running live import preflight"
 if ! PYTHONPATH="$PYPATH" "$BASILISP" run "$REPO/scripts/preflight_live_imports.lpy"; then
   log "live import preflight failed — aborting before terminal start"
+  exit 1
+fi
+
+CAPTURE_DIR="${CAPTURE_DIR:-$REPO/live_runtime/feature-capture}"
+ANALYSIS_DIR="${ANALYSIS_DIR:-$REPO/live_runtime/analysis}"
+mkdir -p "$CAPTURE_DIR" "$ANALYSIS_DIR"
+log "preparing capture-v2 session file"
+if ! PYTHONPATH="$PYPATH" "$BASILISP" run "$REPO/scripts/prepare_capture_v2_session.lpy" -- \
+    --capture-dir "$CAPTURE_DIR" \
+    --target-date "$ET_TODAY" \
+    --out-json "$ANALYSIS_DIR/prepare_capture_v2_session_${ET_TODAY//-/}.json"; then
+  log "capture-v2 session preparation failed — aborting before terminal start"
   exit 1
 fi
 

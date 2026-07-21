@@ -1,0 +1,122 @@
+;; Compare captured Alpaca live bar-buffer tails with Alpaca historical bars.
+(import argparse json numpy os os.path urllib.parse urllib.request)
+
+(def symbols ["SPY" "HYG" "TLT" "VXX"])
+(def fields ["open" "high" "low" "close" "volume" "vwap" "trade_count"])
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    (python/isinstance value python/dict) (python/dict
+                                           (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ value k))]))
+                                                (.keys value)))
+    (python/isinstance value python/list) (python/list (map ->jsonable value))
+    :else value))
+
+(defn env-value [path key]
+  (let [text (slurp path)
+        prefix (str key "=")
+        matches (filter #(.startswith % prefix) (.splitlines text))]
+    (when (seq matches)
+      (.strip (subs (first matches) (count prefix))))))
+
+(defn finite [value]
+  (try (float value) (catch python/Exception _ nil)))
+
+(defn utc-time [value]
+  (let [raw (.strip (str value))
+        text (if (.startswith raw "#inst \"") (subs raw 7 (dec (count raw))) raw)]
+    (if (.endswith text "+00:00") (str (subs text 0 (- (count text) 6)) "Z") text)))
+
+(defn latest-bar [raw symbol]
+  (try
+    (let [bars (.get (json/loads (str raw)) symbol)]
+      (when (and bars (pos? (len bars))) (.__getitem__ bars -1)))
+    (catch python/Exception _ nil)))
+
+(defn fetch-bars [key secret symbol start end]
+  (let [query (urllib.parse/urlencode {"timeframe" "1Min" "feed" "iex"
+                                        "start" start "end" end "sort" "asc" "limit" "10000"})
+        req (urllib.request/Request (str "https://data.alpaca.markets/v2/stocks/" symbol "/bars?" query))]
+    (.add_header req "APCA-API-KEY-ID" key)
+    (.add_header req "APCA-API-SECRET-KEY" secret)
+    (let [response (urllib.request/urlopen req ** :timeout 30)
+          bars (.get (json/loads (.decode (.read response) "utf-8")) "bars" [])]
+      (into {} (for [bar bars] [(.get bar "t") bar])))))
+
+(defn summarize [records]
+  (let [devs (vec (map #(.get % "abs_deviation") records))]
+    {"count" (count devs)
+     "max_abs_deviation" (when (seq devs) (apply max devs))
+     "mean_abs_deviation" (when (seq devs) (/ (reduce + 0.0 devs) (count devs)))
+     "samples" (vec (take 5 records))}))
+
+(defn fixture-bars [path symbol]
+  (let [payload (json/loads (slurp path))
+        bars (.get payload symbol [])]
+    (into {} (for [bar bars] [(.get bar "t") bar]))))
+
+(defn parse-args [argv]
+  (let [p (argparse/ArgumentParser)]
+    (.add_argument p "--capture" ** :required true)
+    (.add_argument p "--ref-env" ** :required true)
+    (.add_argument p "--out-json" ** :required true)
+    (.add_argument p "--max-rows" ** :type int :default 30)
+    (.add_argument p "--bars-fixture-json" **
+                   :help "Test-only JSON map of symbol to Alpaca-shaped bars; bypasses the network.")
+    (.parse_args p (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        cap (numpy/load (.-capture args) ** :allow_pickle true)
+        raws (vec (.__getitem__ cap "bar_buffers_json"))
+        usable (vec (filter #(and % (pos? (count (str %)))) raws))
+        selected (vec (take-last (.-max_rows args) usable))
+        key (env-value (.-ref_env args) "ALPACA_CHESTNUT_API_KEY")
+        secret (env-value (.-ref_env args) "ALPACA_CHESTNUT_API_SECRET")
+        records (atom [])
+        missing (atom [])]
+    (doseq [symbol symbols]
+      (let [live (vec (keep #(latest-bar % symbol) selected))
+            times (sort (map #(utc-time (.get % "time")) live))]
+        (when (seq times)
+          (let [hist (if (.-bars_fixture_json args)
+                       (fixture-bars (.-bars_fixture_json args) symbol)
+                       (fetch-bars key secret symbol (first times)
+                                   (str (subs (last times) 0 10) "T23:59:59Z")))]
+            (doseq [bar live
+                    :let [time (utc-time (.get bar "time"))
+                          other (.get hist time)]]
+              (if-not other
+                (swap! missing conj {"symbol" symbol "time" time})
+                (doseq [field fields
+                        :let [live-value (finite (.get bar field))
+                              historical-value (finite (.get other (case field
+                                                                 "open" "o" "high" "h" "low" "l" "close" "c"
+                                                                 "volume" "v" "vwap" "vw" "trade_count" "n")))]
+                        :when (and live-value historical-value)]
+                  (swap! records conj {"symbol" symbol "field" field "time" time
+                                       "live_value" live-value "historical_value" historical-value
+                                       "abs_deviation" (abs (- live-value historical-value))}))))))))
+    (let [max-dev (if (seq @records) (apply max (map #(.get % "abs_deviation") @records)) nil)
+          by-symbol (into {}
+                          (for [symbol symbols]
+                            [symbol (into {}
+                                          (for [field fields]
+                                            [field (summarize (filter #(and (= symbol (.get % "symbol"))
+                                                                            (= field (.get % "field"))) @records))]))]))
+          payload (python/dict {"status" (if (and (seq @records) (empty? @missing) (zero? max-dev)) "pass" "fail")
+                                "capture" (os.path/abspath (.-capture args))
+                                "provider" "alpaca/iex"
+                                "sidecar_rows_examined" (count selected)
+                                "fields_compared" (count @records)
+                                "missing_historical_bars" (count @missing)
+                                "missing_historical_samples" (vec (take 10 @missing))
+                                "max_abs_deviation" max-dev
+                                "by_symbol" by-symbol})]
+      (spit (.-out_json args) (str (json/dumps (->jsonable payload) ** :indent 2) "\n"))
+      (println (json/dumps (->jsonable payload)))
+      (if (= "pass" (.get payload "status")) 0 1))))
+
+(python/exit (run-main *command-line-args*))

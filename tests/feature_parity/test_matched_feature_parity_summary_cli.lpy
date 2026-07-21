@@ -1,0 +1,172 @@
+(ns feature-parity.test-matched-feature-parity-summary-cli
+  (:import csv json os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def basilisp-bin
+  (str (or (os.environ/get "BASILISP_BIN")
+           (os.path/join (str root) ".venv/bin/basilisp"))))
+(def script (.joinpath root "scripts" "summarize_matched_feature_parity.lpy"))
+
+(defn run-script
+  [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn write-csv
+  [path rows]
+  (with-open [fh (open path "w" ** :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames ["feature" "status" "correlation" "max_abs_deviation" "live_zero_frac" "historical_zero_frac" "live_leading_zero_count" "live_leading_zero_until"])]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer row)))))
+
+(defn write-usage-csv
+  [path rows]
+  (with-open [fh (open path "w" ** :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames ["account" "head" "feature_index" "feature"
+                                                    "feature_kind" "family" "status" "neutralized"
+                                                    "active_problem" "split_count" "total_gain"
+                                                    "avg_gain" "total_cover" "min_threshold"
+                                                    "max_threshold"])]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer row)))))
+
+(deftest summarize-matched-feature-parity-rejects-missing-input
+  (let [missing (run-script "--matched-csv")
+        unknown (run-script "--matched-cvs" "x")
+        bad-top (run-script "--matched-csv" "x" "--top-n" "0")
+        help (run-script "--help")]
+    (is (= 2 (.-returncode missing)))
+    (is (str/includes? (.-stderr missing) "missing value for --matched-csv"))
+    (is (= 2 (.-returncode unknown)))
+    (is (str/includes? (.-stderr unknown) "unknown argument: --matched-cvs"))
+    (is (= 2 (.-returncode bad-top)))
+    (is (str/includes? (.-stderr bad-top) "--top-n must be a positive integer"))
+    (is (= 0 (.-returncode help)))
+    (is (str/includes? (.-stdout help) "--matched-csv PATH"))
+    (is (str/includes? (.-stdout help) "--usage-csv PATH"))))
+
+(deftest summarize-matched-feature-parity-writes-actionable-summary
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          matched (.joinpath tmp "matched_feature_parity_20260708.csv")
+          usage (.joinpath tmp "usage.csv")
+          grid-input (.joinpath tmp "grid_feature_input_parity_20260708.json")
+          out-json (.joinpath tmp "summary.json")
+          out-md (.joinpath tmp "summary.md")]
+      (write-csv matched
+                 [{"feature" "tda_vega_betti_auc" "status" "CONSTANT_OR_DEGENERATE" "correlation" "" "max_abs_deviation" "0" "live_zero_frac" "1" "historical_zero_frac" "1" "live_leading_zero_count" "120" "live_leading_zero_until" "2026-07-08T15:59:00Z"}
+                  {"feature" "scat_delta_cross_scale_corr" "status" "DIVERGED" "correlation" "0.1" "max_abs_deviation" "9.5" "live_zero_frac" "0" "historical_zero_frac" "0" "live_leading_zero_count" "0" "live_leading_zero_until" ""}
+                  {"feature" "HYG_price_close" "status" "DIVERGED" "correlation" "0.98" "max_abs_deviation" "0.025" "live_zero_frac" "" "historical_zero_frac" "" "live_leading_zero_count" "16" "live_leading_zero_until" "2026-07-08T13:46:00Z"}
+                  {"feature" "SPY_price_close" "status" "EXACT_MATCH" "correlation" "1" "max_abs_deviation" "0" "live_zero_frac" "0" "historical_zero_frac" "0" "live_leading_zero_count" "0" "live_leading_zero_until" ""}])
+      (write-usage-csv usage
+                       [{"account" "chestnut" "head" "long" "feature_index" "1"
+                         "feature" "tda_vega_betti_auc" "feature_kind" "tabular"
+                         "family" "v3-grid" "status" "SANE" "neutralized" "False"
+                         "active_problem" "False" "split_count" "2" "total_gain" "10"
+                         "avg_gain" "5" "total_cover" "1" "min_threshold" "0"
+                         "max_threshold" "1"}
+                        {"account" "lynx" "head" "short" "feature_index" "2"
+                         "feature" "scat_delta_cross_scale_corr" "feature_kind" "tabular"
+                         "family" "v3-grid" "status" "SANE" "neutralized" "False"
+                         "active_problem" "False" "split_count" "1" "total_gain" "7"
+                         "avg_gain" "7" "total_cover" "1" "min_threshold" "0"
+                         "max_threshold" "1"}
+                        {"account" "moose" "head" "gen" "feature_index" "3"
+                         "feature" "HYG_price_close" "feature_kind" "tabular"
+                         "family" "equity-base" "status" "SANE" "neutralized" "False"
+                         "active_problem" "False" "split_count" "20" "total_gain" "100"
+                         "avg_gain" "5" "total_cover" "1" "min_threshold" "0"
+                         "max_threshold" "1"}])
+      (.write_text grid-input
+                   "{\"status\":\"ok\",\"ok\":true,\"matched_rows\":35,\"mean_correlation\":0.91,\"min_correlation\":0.54,\"max_abs_deviation\":1.25,\"best_sequence_lag\":{\"lag_minutes\":-1,\"mean_correlation\":0.93,\"min_correlation\":0.88},\"best_sequence_lag_by_mean\":{\"lag_minutes\":-1,\"mean_correlation\":0.93,\"min_correlation\":0.88},\"best_sequence_lag_by_min\":{\"lag_minutes\":-1,\"mean_correlation\":0.93,\"min_correlation\":0.88},\"alignment_diagnosis\":{\"category\":\"rolling-window-sequence-lag\",\"reason\":\"Within-sequence lag improves correlation materially more than shifting timestamps; inspect rolling grid-history order/warmup/bucketing.\"}}\n")
+      (let [result (run-script "--matched-csv" (str matched)
+                               "--usage-csv" (str usage)
+                               "--grid-input-parity-json" (str grid-input)
+                               "--out-json" (str out-json)
+                               "--md-out" (str out-md)
+                               "--top-n" "3")
+            payload (json/loads (.read_text out-json))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "2026-07-08" (.get payload "target_date")))
+        (is (= "20260708" (.get payload "target_stamp")))
+        (is (str/includes? (.get payload "generated_at") "T"))
+        (is (= 4 (.get payload "feature_count")))
+        (is (= 3 (.get payload "problem_count")))
+        (is (= 1 (.get payload "exact_match_count")))
+        (is (= 2 (.get (.get payload "by_status") "DIVERGED")))
+        (is (= 1 (.get (.get payload "by_prefix") "tda")))
+        (is (= 1 (.get (.get payload "by_prefix") "scat")))
+        (is (= 1 (.get (.get payload "by_diagnostic") "constant-or-degenerate")))
+        (is (= 1 (.get (.get payload "by_diagnostic") "v3-structural-transform-divergence")))
+        (is (= 1 (.get (.get payload "by_diagnostic") "bar-source-drift")))
+        (is (= "scat_delta_cross_scale_corr"
+               (.get (first (.get payload "top_problem_rows")) "feature")))
+        (is (= "v3-structural-transform-divergence"
+               (.get (first (.get payload "top_problem_rows")) "diagnostic_key")))
+        (is (= "2026-07-08T13:46:00Z"
+               (.get (.__getitem__ (.get payload "top_problem_rows") 1) "live_leading_zero_until")))
+        (is (= "HYG_price_close"
+               (.get (first (.get payload "top_weighted_problem_rows")) "feature")))
+        (is (= "bar-source-drift"
+               (.get (first (.get payload "top_weighted_problem_rows")) "diagnostic_key")))
+        (is (= 100.0
+               (.get (first (.get payload "top_weighted_problem_rows")) "model_total_gain")))
+        (is (= "DIVERGED:HYG"
+               (.get (first (.get payload "top_weighted_status_prefixes")) "key")))
+        (is (= "bar-source-drift"
+               (.get (first (.get payload "top_weighted_diagnostics")) "key")))
+        (is (= "DIVERGED:bar-source-drift"
+               (.get (first (.get payload "top_weighted_status_diagnostics")) "key")))
+        (is (= 35
+               (.get (.get payload "grid_input_parity") "matched_rows")))
+        (is (= 0.54
+               (.get (.get payload "grid_input_parity") "min_correlation")))
+        (is (= -1
+               (.get (.get payload "grid_input_parity") "best_sequence_lag_minutes")))
+        (is (= 0.93
+               (.get (.get payload "grid_input_parity") "best_sequence_lag_mean_correlation")))
+        (is (= 0.88
+               (.get (.get payload "grid_input_parity") "best_sequence_lag_min_correlation")))
+        (is (= "source-grid-input-drift"
+               (.get (.get payload "interpretation") "primary_blocker")))
+        (is (= true
+               (.get (.get payload "interpretation") "source_grid_input_drift?")))
+        (is (= true
+               (.get (.get payload "interpretation") "source_grid_lag_suspected?")))
+        (is (= "rolling-window-sequence-lag"
+               (.get (.get payload "interpretation") "source_grid_alignment_category")))
+        (is (str/includes? (.get (.get payload "interpretation") "recommended_next_action")
+                           "rolling grid-history"))
+        (is (str/includes? (.read_text out-md) "Matched Feature Parity Summary"))
+        (is (str/includes? (.read_text out-md) "Grid Input Parity"))
+        (is (str/includes? (.read_text out-md) "Primary blocker"))
+        (is (str/includes? (.read_text out-md) "rolling grid-history"))
+        (is (str/includes? (.read_text out-md) "Target date"))
+        (is (str/includes? (.read_text out-md) "Top Diagnostics"))
+        (is (str/includes? (.read_text out-md) "Top Weighted Diagnostics"))
+        (is (str/includes? (.read_text out-md) "Live Leading Zero Until"))
+        (is (str/includes? (.read_text out-md) "Top Weighted Problem Rows"))
+        (is (str/includes? (.-stdout result) "wrote"))))))
+
+(deftest summarize-matched-feature-parity-honors-explicit-target-date
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          matched (.joinpath tmp "matched.csv")
+          out-json (.joinpath tmp "summary.json")]
+      (write-csv matched
+                 [{"feature" "SPY_price_close" "status" "EXACT_MATCH" "correlation" "1" "max_abs_deviation" "0" "live_zero_frac" "0" "historical_zero_frac" "0" "live_leading_zero_count" "0" "live_leading_zero_until" ""}])
+      (let [result (run-script "--matched-csv" (str matched)
+                               "--target-date" "2026-07-09"
+                               "--out-json" (str out-json))
+            payload (json/loads (.read_text out-json))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "2026-07-09" (.get payload "target_date")))
+        (is (= "20260709" (.get payload "target_stamp")))))))

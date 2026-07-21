@@ -1,0 +1,346 @@
+;; Offline prediction sensitivity for suspicious Steve V2 live features.
+(import csv datetime glob json math numpy os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[stevetrading.bridge.steve-v2.inference :as inf]
+         '[stevetrading.feature-parity.core :as fp])
+
+(def default-ref
+  (or (os.environ/get "STEVE_REF_ROOT")
+      (let [vps-ref "/opt/stevetrading/shared/Data-Preprocessor"]
+        (if (os.path/isdir vps-ref)
+          vps-ref
+          (os.path/join (os.path/expanduser "~")
+                        "contracting/upwork/steven-tran/SteveTrading/ref/Data-Preprocessor")))))
+
+(def default-capture-dir (os.path/join repo-root fp/default-capture-dir))
+(def default-out-dir (os.path/join repo-root fp/default-analysis-dir))
+(def accounts ["chestnut" "lynx" "moose"])
+(def heads ["long" "gen" "short"])
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/live_feature_prediction_delta.lpy -- "
+                "[--capture-dir DIR] [--out-dir DIR] [--dates YYYYMMDD ...] "
+                "[--candidate-mode per-capture|aggregate] [--baseline-csv PATH] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn valid-capture-date [value]
+  (let [s (str value)]
+    (when-not (and (= 8 (count s)) (.isdigit s))
+      (throw (python/ValueError "expected YYYYMMDD calendar date")))
+    (try
+      (datetime.datetime/strptime s "%Y%m%d")
+      (catch python/Exception _
+        (throw (python/ValueError "expected YYYYMMDD calendar date"))))
+    s))
+
+(defn date-values [remaining arg]
+  (let [values (vec (take-while #(not (.startswith (str %) "--")) (rest remaining)))]
+    (when (empty? values)
+      (throw (python/ValueError (str "missing value for " arg))))
+    (mapv valid-capture-date values)))
+
+(defn after-date-values [remaining]
+  (seq (drop-while #(not (.startswith (str %) "--")) (rest remaining))))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:capture-dir default-capture-dir
+              :out-dir default-out-dir
+              :candidate-mode "per-capture"
+              :dates []}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--capture-dir")
+          (recur (nnext remaining) (assoc out :capture-dir (option-value remaining arg)))
+
+          (= arg "--out-dir")
+          (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+
+          (= arg "--dates")
+          (recur (after-date-values remaining) (assoc out :dates (date-values remaining arg)))
+
+          (= arg "--candidate-mode")
+          (let [mode (option-value remaining arg)]
+            (when-not (contains? #{"per-capture" "aggregate"} mode)
+              (throw (python/ValueError "argument --candidate-mode: invalid choice")))
+            (recur (nnext remaining) (assoc out :candidate-mode mode)))
+
+          (= arg "--baseline-csv")
+          (recur (nnext remaining) (assoc out :baseline-csv (option-value remaining arg)))
+
+          (= arg "--write-unavailable")
+          (recur (next remaining) (assoc out :write-unavailable true))
+
+          (= arg "--unavailable-reason")
+          (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage) (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn output-stamp [date-filter generated-at]
+  (if (= 1 (count date-filter))
+    (first date-filter)
+    (.replace (subs generated-at 0 10) "-" "")))
+
+(defn make-inference [bundle]
+  (inf/make-multihead-inference default-ref bundle))
+
+(defn load-json [path]
+  (fp/read-json path))
+
+(defn bundle-path [account]
+  (os.path/join default-ref "pipeline_data" (str "live_model_" account "_multihead_corrected")))
+
+(defn seed-std [bundle head]
+  (let [d (numpy/load (os.path/join bundle (str "calibration_seed_" head ".npz")))
+        n (float (aget d "pred_count"))
+        mu (/ (float (aget d "pred_sum")) n)
+        var (- (/ (float (aget d "pred_sum_sq")) n) (* mu mu))]
+    (math/sqrt (max var 0.0))))
+
+(defn load-neutralization [bundle inf]
+  (let [path (os.path/join bundle "neutralize_features.json")]
+    (if-not (os.path/exists path)
+      [(numpy/array (python/list []) ** :dtype (.-int64 numpy))
+       (numpy/array (python/list []) ** :dtype (.-float32 numpy))]
+      (let [names (vec (load-json (os.path/join bundle "feature_names.json")))
+            name->idx (into {} (map-indexed (fn [i n] [n i]) names))
+            idxs (vec (keep #(get name->idx %) (load-json path)))
+            idx (numpy/array (python/list idxs) ** :dtype (.-int64 numpy))]
+        [idx (.astype (aget (:feature-mean inf) idx) (.-float32 numpy))]))))
+
+(defn bool-cell? [value]
+  (contains? #{"true" "1" "yes" "y"} (.lower (.strip (str value)))))
+
+(defn aggregate-candidates [baseline-csv]
+  (let [out (atom [])]
+    (with-open [fh (open (str baseline-csv) ** :newline "")]
+      (let [reader (csv/DictReader fh)]
+        (doseq [row (iterator-seq reader)]
+          (when (bool-cell? (get row "active_problem"))
+            (swap! out conj (get row "feature"))))))
+    @out))
+
+(defn latest-baseline-csv []
+  (let [candidates (sort (glob/glob (os.path/join default-out-dir "live_feature_parity_baseline_*.csv")))]
+    (when (empty? candidates)
+      (throw (python/RuntimeError (str "no aggregate baseline CSV found in " default-out-dir))))
+    (last candidates)))
+
+(defn candidate-features [capture-features bundle mode aggregate-baseline-csv]
+  (let [names (vec (load-json (os.path/join bundle "feature_names.json")))]
+    (if (= mode "aggregate")
+      (aggregate-candidates (or aggregate-baseline-csv (latest-baseline-csv)))
+      (let [stats (numpy/load (os.path/join bundle "feature_stats.npz"))
+            neutralized-path (os.path/join bundle "neutralize_features.json")
+            neutralized (if (os.path/exists neutralized-path)
+                          (set (load-json neutralized-path))
+                          #{})
+            rows (fp/build-baseline-rows (.astype capture-features (.-float64 numpy))
+                                         names
+                                         (.astype (aget stats "mean") (.-float64 numpy))
+                                         (.astype (aget stats "std") (.-float64 numpy))
+                                         neutralized)]
+        (vec (sort (map #(get % "feature")
+                        (filter #(get % "active_problem") rows))))))))
+
+(defn grid-seq [grids end-idx lookback]
+  (let [start (max 0 (- (+ end-idx 1) lookback))]
+    (.astype (aget grids (python/slice start (+ end-idx 1))) (.-float32 numpy))))
+
+(defn summarize-delta [p0 p1 bundle]
+  (let [delta (- p1 p0)
+        row (atom {})]
+    (doseq [[h head] (map-indexed vector heads)]
+      (let [abs-delta (numpy/abs (aget delta (python/slice nil nil) h))
+            std (max (seed-std bundle head) 1.0e-9)
+            abs-z (/ abs-delta std)]
+        (swap! row assoc
+               (str head "_mean_abs_delta") (float (numpy/mean abs-delta))
+               (str head "_p95_abs_delta") (float (numpy/quantile abs-delta 0.95))
+               (str head "_max_abs_delta") (float (numpy/max abs-delta))
+               (str head "_mean_abs_seed_z") (float (numpy/mean abs-z))
+               (str head "_p95_abs_seed_z") (float (numpy/quantile abs-z 0.95))
+               (str head "_max_abs_seed_z") (float (numpy/max abs-z)))))
+    (swap! row assoc
+           "max_abs_seed_z_any_head" (apply max (map #(get @row (str % "_max_abs_seed_z")) heads))
+           "p95_abs_seed_z_any_head" (apply max (map #(get @row (str % "_p95_abs_seed_z")) heads)))
+    @row))
+
+(defn run-capture [path mode aggregate-baseline-csv]
+  (let [cap (numpy/load path ** :allow_pickle true)
+        date (last (.rsplit (first (.rsplit (os.path/basename path) "." 1)) "_" 1))
+        grids (.astype (aget cap "grids") (.-float32 numpy))
+        candidate-names (candidate-features (aget cap "chestnut")
+                                            (bundle-path "chestnut")
+                                            mode
+                                            aggregate-baseline-csv)
+        rows (atom [])]
+    (doseq [account accounts]
+      (let [bundle (bundle-path account)
+            inf (make-inference bundle)
+            names (vec (load-json (os.path/join bundle "feature_names.json")))
+            name->idx (into {} (map-indexed (fn [i n] [n i]) names))
+            [neutral-idx neutral-mean] (load-neutralization bundle inf)
+            candidate-idxs (vec (keep #(get name->idx %) candidate-names))
+            candidate-idx (numpy/array (python/list candidate-idxs) ** :dtype (.-int64 numpy))
+            candidate-mean (.astype (aget (:feature-mean inf) candidate-idx) (.-float32 numpy))
+            base-preds (atom [])
+            alt-preds (atom [])
+            features (.astype (aget cap account) (.-float32 numpy))
+            row-count (int (first (.-shape features)))]
+        (doseq [i (range row-count)]
+          (let [seq (grid-seq grids i (int (:lookback inf)))
+                f0 (.copy (aget features i))]
+            (when (> (.-size neutral-idx) 0)
+              (aset f0 neutral-idx neutral-mean))
+            (let [f1 (.copy f0)]
+              (when (> (.-size candidate-idx) 0)
+                (aset f1 candidate-idx candidate-mean))
+              (swap! base-preds conj (inf/predict inf f0 seq))
+              (swap! alt-preds conj (inf/predict inf f1 seq)))))
+        (let [p0 (numpy/array (python/list @base-preds) ** :dtype (.-float64 numpy))
+              p1 (numpy/array (python/list @alt-preds) ** :dtype (.-float64 numpy))
+              row (merge {"date" date
+                          "account" account
+                          "rows" row-count
+                          "candidate_mode" mode
+                          "candidate_feature_count" (count candidate-names)}
+                         (summarize-delta p0 p1 bundle))]
+          (swap! rows conj row))))
+    [@rows candidate-names]))
+
+(defn write-csv [path rows]
+  (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+  (with-open [fh (open (str path) ** :mode "w" :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list fp/prediction-delta-csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer row)))))
+
+(defn prediction-markdown [generated-at rows candidate-by-date]
+  (let [table (atom [["Date" "Account" "Rows" "Candidates" "P95 |Delta| seed-z" "Max |Delta| seed-z"]])]
+    (doseq [r rows]
+      (swap! table conj [(get r "date")
+                         (get r "account")
+                         (str (get r "rows"))
+                         (str (get r "candidate_feature_count"))
+                         (python/format (get r "p95_abs_seed_z_any_head") ".4f")
+                         (python/format (get r "max_abs_seed_z_any_head") ".4f")]))
+    (str "# Live Feature Prediction Delta\n\n"
+         "Generated: `" generated-at "`\n\n"
+         "This read-only audit runs corrected live inference over captured live feature\n"
+         "files with normal runtime neutralization, then repeats with currently\n"
+         "suspicious active features additionally pinned to train means.\n\n"
+         "## Summary\n\n"
+         (fp/md-table @table) "\n\n"
+         "## Candidate Features\n\n"
+         (.join "\n"
+                (map (fn [[date names]]
+                       (let [preview (.join ", " (take 30 names))
+                             suffix (if (> (count names) 30)
+                                      (str ", ... (+" (- (count names) 30) " more)")
+                                      "")]
+                         (str "- `" date "`: `" (count names) "` candidates: " preview suffix)))
+                     (sort candidate-by-date))) "\n\n"
+         "## Interpretation\n\n"
+         "- `seed-z` scales prediction deltas by each head's calibration seed standard deviation.\n"
+         "- Near-zero deltas mean the remaining feature mismatch is not materially moving current predictions.\n"
+         "- Large deltas mean we should classify and remediate those features before trusting live/backtest same-population comparisons.\n")))
+
+(defn unavailable-markdown [generated-at reason stamp]
+  (str "# Live Feature Prediction Delta\n\n"
+       "Generated: `" generated-at "`\n\n"
+       "Status: `unavailable`\n\n"
+       "- Target date: `" stamp "`\n"
+       "- Reason: `" reason "`\n\n"
+       "No prediction sensitivity rows were produced. This is a fail-closed diagnostic artifact and does not make any feature safe to unmask.\n"))
+
+(defn matching-captures [capture-dir dates]
+  (let [wanted (set dates)]
+    (vec (filter (fn [path]
+                   (let [date (last (.rsplit (first (.rsplit (os.path/basename path) "." 1)) "_" 1))]
+                     (or (empty? wanted) (contains? wanted date))))
+                 (sort (glob/glob (os.path/join (str capture-dir) "live_features_*.npz")))))))
+
+(defn run-main [opts]
+  (let [date-filter (set (:dates opts))
+        generated-at (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+        stamp (output-stamp date-filter generated-at)]
+    (if (:write-unavailable opts)
+      (let [reason (or (:unavailable-reason opts) "prediction delta unavailable")
+            suffix (.replace (:candidate-mode opts) "-" "_")
+            out-base (os.path/join (:out-dir opts) (str "live_feature_prediction_delta_" suffix "_" stamp))
+            csv-path (str out-base ".csv")
+            json-path (str out-base ".json")
+            md-path (str out-base ".md")
+            payload {"generated_at" generated-at
+                     "status" "unavailable"
+                     "available" false
+                     "unavailable_reason" reason
+                     "candidate_mode" (:candidate-mode opts)
+                     "candidate_by_date" {stamp []}
+                     "rows" []}]
+        (os/makedirs (:out-dir opts) ** :exist_ok true)
+        (fp/clear-artifacts! [csv-path json-path md-path])
+        (write-csv csv-path [])
+        (spit json-path (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+        (spit md-path (unavailable-markdown generated-at reason stamp))
+        (binding [*out* *err*]
+          (println reason)
+          (println (str "wrote unavailable prediction delta artifact " json-path)))
+        1)
+      (let [paths (matching-captures (:capture-dir opts) (:dates opts))]
+        (when (empty? paths)
+          (throw (python/RuntimeError "no matching capture files")))
+        (let [all-rows (atom [])
+          candidate-by-date (atom {})]
+      (doseq [path paths]
+        (let [[rows candidates] (run-capture path (:candidate-mode opts) (:baseline-csv opts))
+              date (last (.rsplit (first (.rsplit (os.path/basename path) "." 1)) "_" 1))]
+          (swap! all-rows into rows)
+          (swap! candidate-by-date assoc date candidates)))
+      (let [suffix (.replace (:candidate-mode opts) "-" "_")
+            out-base (os.path/join (:out-dir opts) (str "live_feature_prediction_delta_" suffix "_" stamp))
+            csv-path (str out-base ".csv")
+            json-path (str out-base ".json")
+            md-path (str out-base ".md")
+            payload {"generated_at" generated-at
+                     "candidate_mode" (:candidate-mode opts)
+                     "candidate_by_date" @candidate-by-date
+                     "rows" @all-rows}]
+        (os/makedirs (:out-dir opts) ** :exist_ok true)
+        (fp/clear-artifacts! [csv-path json-path md-path])
+        (write-csv csv-path @all-rows)
+        (spit json-path (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+        (spit md-path (prediction-markdown generated-at @all-rows @candidate-by-date))
+        (println (json/dumps (fp/->jsonable payload) ** :indent 2 :sort_keys true))
+        (println (str "wrote " md-path))
+        (println (str "wrote " csv-path))
+        (println (str "wrote " json-path))
+        0))))))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

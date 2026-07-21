@@ -1,0 +1,150 @@
+(ns stevetrading.analysis.thetadata-profile
+  "Streaming physical profile for immutable ThetaData NDJSON event payloads.
+
+  This deliberately measures the provider response before choosing a panel,
+  bar size, or feature set.  It reads one line at a time and retains only
+  counters plus the most recent quote state for each option contract."
+  (:import datetime hashlib json operator pathlib time))
+
+(def canonical-manifest-root (pathlib/Path "D:\\SteveTradingData\\manifests\\v1"))
+
+(defn now-utc []
+  (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%S.%fZ"))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    :else value))
+
+(defn json-text [payload]
+  (str (json/dumps (jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+
+(defn- under? [path root]
+  (try (.relative_to path root) true
+       (catch python/ValueError _ false)))
+
+(defn- bump! [counts key]
+  ;; The file can contain tens of millions of events.  These counters are
+  ;; deliberately mutable Python dictionaries so a streaming measurement does
+  ;; not allocate a new persistent map for every event.
+  (let [value (inc (.get counts key 0))]
+    (operator/setitem counts key value)
+    counts))
+
+(defn- contract-key [event]
+  (str (.get event "symbol") "|" (.get event "expiration") "|"
+       (.get event "strike") "|" (.get event "right")))
+
+(defn- quote-state [event]
+  ;; Fields that define the quote state available to a live strategy.  Sequence
+  ;; and timestamp are intentionally excluded: they identify an update, but do
+  ;; not themselves change the displayed quote.
+  [(.get event "bid") (.get event "ask")
+   (.get event "bid_size") (.get event "ask_size")
+   (.get event "bid_exchange") (.get event "ask_exchange")
+   (.get event "bid_condition") (.get event "ask_condition")])
+
+(defn- top-counts [counts limit label]
+  (vec (map (fn [[key value]] {label key "events" value})
+            (take limit (sort-by (fn [[_ value]] (- value))
+                                 (iterator-seq (.items counts)))))))
+
+(defn- file-profile [raw-path top-contracts]
+  (let [path (pathlib/Path raw-path)
+        event-class (if (.endswith (.-name path) ".quote.ndjson") "quote" "trade")
+        started (time/monotonic)]
+    (with-open [stream (python/open path "rb")]
+      (loop [events 0 source-bytes 0 invalid-lines 0 first-ts nil last-ts nil
+             per-minute (python/dict) per-expiration (python/dict)
+             per-right (python/dict) per-contract (python/dict)
+             quote-states (python/dict) exact-changes 0 price-changes 0
+             line (.readline stream)]
+        (if (zero? (count line))
+          (let [elapsed (- (time/monotonic) started)
+                retained-exact (if (= event-class "quote") exact-changes events)
+                retained-price (if (= event-class "quote") price-changes events)]
+            {"file" (.-name path)
+             "event_class" event-class
+             "source_bytes" source-bytes
+             "events" events
+             "invalid_ndjson_lines" invalid-lines
+             "first_timestamp" first-ts
+             "last_timestamp" last-ts
+             "events_per_second_read" (when (pos? elapsed) (/ events elapsed))
+             "bytes_per_event" (when (pos? events) (/ (float source-bytes) events))
+             "active_contracts" (count per-contract)
+             "per_minute" (top-counts per-minute 20 "minute")
+             "top_expirations" (top-counts per-expiration 20 "expiration")
+             "top_rights" (top-counts per-right 4 "right")
+             "top_contracts" (top-counts per-contract top-contracts "contract")
+             "causal_retention"
+             {"raw_event_stream" {"events" events "source_byte_equivalent" source-bytes}
+              "quote_state_change" {"events" retained-exact
+                                    "source_byte_equivalent" (if (pos? events) (* source-bytes (/ retained-exact events)) 0)
+                                    "meaning" "Keeps a quote only when bid, ask, size, exchange, or condition changes."}
+              "quote_price_change" {"events" retained-price
+                                    "source_byte_equivalent" (if (pos? events) (* source-bytes (/ retained-price events)) 0)
+                                    "meaning" "Keeps a quote only when bid or ask changes; this is intentionally lossier."}}})
+          (let [line-bytes (count line)
+                text (.strip (.decode line "utf-8"))]
+            (if (zero? (count text))
+              (recur events (+ source-bytes line-bytes) invalid-lines first-ts last-ts
+                     per-minute per-expiration per-right per-contract quote-states
+                     exact-changes price-changes (.readline stream))
+              (let [event (json/loads text)
+                    timestamp (.get event "timestamp")
+                minute (when timestamp (subs timestamp 0 16))
+                expiry (.get event "expiration")
+                right (.get event "right")
+                key (contract-key event)
+                next-events (inc events)
+                next-source-bytes (+ source-bytes line-bytes)
+                _ (bump! per-contract key)
+                _ (when minute (bump! per-minute minute))
+                _ (when expiry (bump! per-expiration expiry))
+                _ (when right (bump! per-right right))
+                is-quote (= event-class "quote")
+                state (when is-quote (quote-state event))
+                prior (when is-quote (get quote-states key))
+                changed? (and is-quote (not= state prior))
+                    price-changed? (and is-quote (not= (subvec (vec state) 0 2)
+                                                     (when prior (subvec (vec prior) 0 2))))]
+                (recur next-events next-source-bytes invalid-lines
+                       (or first-ts timestamp) (or timestamp last-ts)
+                       per-minute per-expiration per-right per-contract
+                       (do (when is-quote (operator/setitem quote-states key state)) quote-states)
+                       (+ exact-changes (if changed? 1 0))
+                       (+ price-changes (if price-changed? 1 0))
+                       (.readline stream))))))))))
+
+(defn profile-directory
+  [raw-dir top-contracts]
+  (let [root (.resolve (pathlib/Path raw-dir))
+        files (sort (iterator-seq (.glob root "*.ndjson")))]
+    (when-not (.is_dir root)
+      (throw (python/ValueError (str "raw directory does not exist: " root))))
+    (when (empty? files)
+      (throw (python/ValueError (str "no .ndjson files in: " root))))
+    (let [profiles (vec (map #(file-profile % top-contracts) files))
+          bytes (reduce + (map #(.get % "source_bytes") profiles))
+          events (reduce + (map #(.get % "events") profiles))]
+      {"created_at_utc" (now-utc)
+       "kind" "thetadata-event-profile-v1"
+       "purpose" "Physical and causal-retention measurement only; this receipt does not claim alpha or approve a permanent filter."
+       "raw" {"directory" (str root) "files" (count profiles) "bytes" bytes "events" events
+              "bytes_per_event" (when (pos? events) (/ (float bytes) events))}
+       "method" {"reader" "line-by-line UTF-8 NDJSON; no payload is loaded as a whole"
+                 "quote_state_change" "compare each contract only with its immediately preceding observed quote"
+                 "source_byte_equivalent" "retained-event fraction multiplied by original bytes; not a serialized-format estimate"}
+       "files" profiles})))
+
+(defn write-profile!
+  [raw-dir out-path top-contracts]
+  (let [out (.resolve (pathlib/Path out-path))]
+    (when-not (under? out (.resolve canonical-manifest-root))
+      (throw (python/ValueError (str "--out must be below " (.resolve canonical-manifest-root)))))
+    (.mkdir (.-parent out) ** :parents true :exist_ok true)
+    (let [profile (profile-directory raw-dir top-contracts)]
+      (spit (str out) (json-text profile))
+      profile)))

@@ -1,0 +1,327 @@
+(ns ops.test-operational-entrypoints
+  (:import os pathlib shutil subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def safe-cli-scripts
+  ["scripts/audit_control_plane_artifacts.lpy"
+   "scripts/audit_status_publication.lpy"
+   "scripts/audit_daily_report_validations.lpy"
+   "scripts/build_status.lpy"
+   "scripts/is_trading_day.lpy"
+   "scripts/live_feature_model_usage_audit.lpy"
+   "scripts/live_feature_parity_baseline.lpy"
+   "scripts/live_feature_parity_gate.lpy"
+   "scripts/market_evidence_manifest.lpy"
+   "scripts/market_evidence_readiness.lpy"
+   "scripts/market_evidence_status.lpy"
+   "scripts/assert_market_evidence_status.lpy"
+   "scripts/neutralization_audit.lpy"
+   "scripts/previous_trading_day.lpy"
+   "scripts/report_target_date.lpy"
+   "scripts/validate_report_day.lpy"
+   "scripts/verify_thetadata_payload_examples.lpy"
+   "scripts/align_behavior.lpy"
+   "scripts/analyze_alpaca_fill_alignment.lpy"
+   "scripts/calibrate_sim_fills.lpy"
+   "scripts/export_episodes.lpy"
+   "scripts/export_live_tape.lpy"
+   "scripts/export_replay_fixture_from_facts.lpy"
+   "scripts/export_replay_tape.lpy"
+   "scripts/launch_steve_v2_replay.lpy"
+   "scripts/run_same_pop_stats.lpy"
+   "scripts/validate_same_pop_readiness.lpy"
+	   "scripts/verify_same_pop_manifest.lpy"
+	   "scripts/neutralization_candidate_gap_report.lpy"
+	   "scripts/collect_option_surface_sidecar.lpy"
+	   "scripts/option_surface_sidecar_check.lpy"])
+
+(defn resolve-basilisp []
+  (cond
+    (os.environ/get "BASILISP_BIN") (pathlib/Path (os.environ/get "BASILISP_BIN"))
+    (.exists (.joinpath root ".venv/bin/basilisp")) (.joinpath root ".venv/bin/basilisp")
+    (.exists (.with_name (pathlib/Path sys/executable) "basilisp")) (.with_name (pathlib/Path sys/executable) "basilisp")
+    (shutil/which "basilisp") (pathlib/Path (shutil/which "basilisp"))
+    :else (.joinpath root ".venv/bin/basilisp")))
+
+(def basilisp (str (resolve-basilisp)))
+
+(defn path [parent child]
+  (.joinpath parent child))
+
+(defn read-file [rel]
+  (.read_text (.joinpath root rel)))
+
+(defn runtime-wrapper-files []
+  (let [roots [(.joinpath root "scripts")
+               (.joinpath root "projects/ops/scripts")]
+        suffixes #{".sh" ".service" ".timer"}]
+    (vec
+     (sort
+      (for [search-root roots
+            path (iterator-seq (.rglob search-root "*"))
+            :when (and (.is_file path)
+                       (contains? suffixes (.-suffix path)))]
+        (.as_posix (.relative_to path root)))))))
+
+(defn python-script-reference? [text]
+  (or (not (nil? (re-find #"(?m)(?:^|\s)(?:python|python3)\s+[^;\n]*\.py\b" text)))
+      (not (nil? (re-find #"(?m)(?:^|\s)(?:bash|env|timeout|exec|nohup)\s+[^;\n]*\.py\b" text)))
+      (not (nil? (re-find #"(?m)Exec(?:Start|StartPre|Reload|Stop)=[^\n]*\.py\b" text)))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn merged-env [m]
+  (let [env (.copy os/environ)]
+    (.update env (jsonable (or m {})))
+    env))
+
+(defn run-cmd
+  ([args] (run-cmd args {} root nil))
+  ([args env cwd timeout]
+   (subprocess/run
+    (python/list args)
+    ** :cwd (str cwd)
+       :env (merged-env env)
+       :text true
+       :capture_output true
+       :check false
+       :timeout (or timeout 60))))
+
+(defn run-basilisp [script args cwd env timeout]
+  (run-cmd (concat [basilisp "run" (str (.joinpath root script)) "--"] args)
+           env cwd timeout))
+
+(deftest reports-web-service-uses-deployed-basilisp-bin-env
+  (let [service (read-file "projects/ops/scripts/systemd/stevetrading-reports-web.service")]
+    (is (str/includes? service "EnvironmentFile=-/etc/stevetrading/env"))
+    (is (str/includes? service "${BASILISP_BIN:?BASILISP_BIN not set}"))
+    (is (not (str/includes? service "/opt/stevetrading/current/.venv/bin/basilisp")))))
+
+(deftest status-dashboard-wrapper-autoloads-deployed-env-without-overriding-explicit-env
+  (let [script (read-file "projects/ops/scripts/run_status_dashboard.sh")]
+    (doseq [snippet ["/etc/stevetrading/env"
+                     "-z \"${BASILISP_BIN:-}\""
+                     "-z \"${STEVE_REF_ROOT:-}\""
+                     "-z \"${ANALYSIS_DIR:-}\""
+                     "resolve_runner \"${BASILISP_BIN:-}\""]]
+      (is (str/includes? script snippet) snippet))))
+
+(deftest reports-static-server-has-no-python-wrappers
+  (is (not (.exists (.joinpath root "projects/ops/scripts/reports_static_server.py"))))
+  (is (not (.exists (.joinpath root "scripts/ops/reports_static_server.py")))))
+
+(deftest reports-static-server-public-status-requires-explicit-flag
+  (let [server (read-file "scripts/reports_static_server.lpy")]
+    (is (str/includes? server "os/getenv \"REPORTS_PUBLIC_STATUS\" \"\""))
+    (is (str/includes? server "contains? public-paths"))
+    (is (str/includes? server "REPORTS_PASSWORD_SHA256 is required unless REPORTS_ALLOW_NO_AUTH=1"))))
+
+(deftest manual-session-runners-export-canonical-repo-root-and-basilisp-override
+  (doseq [rel ["scripts/open_session.sh"
+               "scripts/steve_six_session.sh"
+               "scripts/steve_watchdog.sh"
+               "scripts/local_sim_session.sh"
+               "scripts/local_sim_watchdog.sh"
+               "scripts/lint.sh"
+               "scripts/test.sh"
+               "scripts/nrepl.sh"]]
+    (is (str/includes? (read-file rel) "export STEVE_REPO_ROOT=\"$REPO\"") rel))
+  (let [open-session (read-file "scripts/open_session.sh")
+        steve-six (read-file "scripts/steve_six_session.sh")
+        lint (read-file "scripts/lint.sh")
+        test-runner (read-file "scripts/test.sh")
+        nrepl (read-file "scripts/nrepl.sh")]
+    (is (str/includes? open-session "REPO=\"${STEVE_REPO_ROOT:-$(cd \"$(dirname \"$0\")/..\" && pwd)}\""))
+    (is (str/includes? open-session "BASILISP=\"${BASILISP_BIN:-$REF/.venv/bin/basilisp}\""))
+    (is (str/includes? open-session "PYTHONPATH=\"$PYPATH\" \"$BASILISP\" run \"$REPO/scripts/launch_open_venturevd.lpy\""))
+    (is (not (str/includes? open-session "\"$REPO/.venv/bin/basilisp\"")))
+    (is (str/includes? steve-six "BASILISP=\"${BASILISP_BIN:-$REF/.venv/bin/basilisp}\""))
+    (is (str/includes? lint "BASILISP=\"${BASILISP_BIN:-$REPO/.venv/bin/basilisp}\""))
+    (is (str/includes? lint "\"$BASILISP\" run scripts/compile_check.lpy"))
+    (is (str/includes? lint "\"$BASILISP\" run scripts/check_deps.lpy"))
+    (is (str/includes? test-runner "BASILISP=\"${BASILISP_BIN:-$REPO/.venv/bin/basilisp}\""))
+    (is (str/includes? test-runner "exec \"$BASILISP\" test \"$@\""))
+    (is (str/includes? nrepl "BASILISP=\"${BASILISP_BIN:-$REPO/.venv/bin/basilisp}\""))
+    (is (str/includes? nrepl "nohup \"$BASILISP\" nrepl-server --port \"${PORT}\""))))
+
+(deftest test-runner-has-fast-inner-loop-mode
+  (let [text (read-file "scripts/test.sh")
+        docs (read-file "tests/README.md")
+        inner-block (subs text (.index text "inner)") (.index text "    ;;\n  changed)"))]
+    (is (str/includes? text "scripts/test.sh inner"))
+    (is (str/includes? docs "scripts/test.sh inner"))
+    (is (str/includes? text "tests/test_toolchain.lpy"))
+    (is (str/includes? text "tests/feature_parity/test_evidence_status.lpy"))
+    (is (not (str/includes? inner-block "tests/ops")))
+    (is (not (str/includes? inner-block "tests/e2e")))))
+
+(deftest test-runner-rejects-python-test-targets
+  (let [text (read-file "scripts/test.sh")
+        result (run-cmd [(str (.joinpath root "scripts/test.sh")) "map" "tests/ops/legacy_python_test.py"])]
+    (is (str/includes? text "reject_python_test_target"))
+    (is (str/includes? text "Python test targets are not supported"))
+    (is (str/includes? text "tests/*.py|tests/**/*.py"))
+    (is (= 2 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+    (is (str/includes? (.-stderr result) "Python test targets are not supported"))))
+
+(deftest market-evidence-wrapper-uses-basilisp-status-assertions
+  (let [text (read-file "scripts/collect_market_evidence.sh")]
+    (is (str/includes? text "scripts/assert_market_evidence_status.lpy"))
+    (is (not (str/includes? text "python3 - \"$STATUS_JSON\"")))))
+
+(deftest local-sim-wrappers-use-strict-basilisp-thetadata-health
+  (doseq [rel ["scripts/local_sim_session.sh"
+               "scripts/local_sim_watchdog.sh"]]
+    (let [text (read-file rel)
+          theta-block (subs text (.index text "theta_healthy()")
+                            (.index text "}\n\n" (.index text "theta_healthy()")))]
+      (is (str/includes? theta-block "scripts/wait_thetadata_health.lpy") rel)
+	      (is (str/includes? theta-block "--timeout-seconds") rel)
+	      (is (not (str/includes? theta-block "curl -sS")) rel)
+	      (is (not (str/includes? theta-block "*expiration*")) rel))))
+
+(deftest local-sim-session-and-watchdog-locks-do-not-perma-block-recovery
+  (let [session (read-file "scripts/local_sim_session.sh")
+        watchdog (read-file "scripts/local_sim_watchdog.sh")]
+    (is (str/includes? session "live_runtime/local_sim_session.lock"))
+    (is (str/includes? session "flock -n 8"))
+    (is (str/includes? watchdog "live_runtime/local_sim_watchdog.lock"))
+    (is (str/includes? watchdog "flock -n 9"))
+    (doseq [snippet ["local_sim_session.sh\" 9>&-"
+                     "\"$REF_BASILISP\" run \"$REPO/scripts/launch_vol_term_sim.lpy\" \\\n    9>&-"]]
+      (is (str/includes? watchdog snippet) snippet))))
+
+(deftest market-evidence-wrapper-uses-basilisp-workflow-scripts
+  (let [text (read-file "scripts/collect_market_evidence.sh")]
+    (doseq [script ["scripts/thetadata_capability_probe.lpy"
+                    "scripts/live_feature_prediction_delta.lpy"
+                    "scripts/live_feature_parity_baseline.lpy"
+                    "scripts/market_evidence_status.lpy"]]
+      (is (str/includes? text script) script))
+    (doseq [stale ["scripts/thetadata_capability_probe.py"
+                   "scripts/live_feature_prediction_delta.py"
+                   "scripts/live_feature_parity_baseline.py"
+                   ".venv/bin/python"]]
+      (is (not (str/includes? text stale)) stale))))
+
+(deftest removed-python-compatibility-wrappers-stay-removed
+  (doseq [wrapper ["scripts/analyze_alpaca_fill_alignment.py"
+                   "scripts/check_deps.py"
+                   "scripts/compile_check.py"
+                   "projects/ops/scripts/hetzner_vps.py"
+                   "projects/ops/scripts/reports_static_server.py"
+                   "scripts/audit_control_plane_artifacts.py"
+                   "scripts/live_feature_model_usage_audit.py"
+                   "scripts/live_feature_parity_gate.py"
+                   "scripts/live_feature_parity_baseline.py"
+                   "scripts/neutralization_audit.py"
+                   "scripts/current_pnl.py"
+                   "scripts/sim_broker_status.py"
+                   "scripts/deploy_corrected_bundles.py"
+                   "scripts/live_feature_parity_deep_dive.py"
+                   "scripts/parity_phase_b.py"
+                   "scripts/parity_pred_compare.py"
+                   "scripts/parity_rebucket.py"
+                   "scripts/parity_replay.py"
+                   "scripts/ops/hetzner_vps.py"
+                   "scripts/ops/reports_static_server.py"
+                   "tests/ops/test_hetzner_vps.py"
+                   "tests/ops/test_live_systemd_units.py"]]
+    (is (not (.exists (.joinpath root wrapper))) wrapper)))
+
+(deftest production-python-script-inventory-is-empty
+  (let [search-roots [(.joinpath root "scripts") (.joinpath root "projects/ops/scripts") (.joinpath root "tests")]
+        discovered (atom [])]
+    (doseq [search-root search-roots]
+      (doseq [path (iterator-seq (.rglob search-root "*.py"))]
+        (when-not (some #{"__pycache__"} (.-parts path))
+          (swap! discovered conj (.as_posix (.relative_to path root))))))
+    (is (= [] @discovered))))
+
+(deftest runtime-wrappers-do-not-call-python-scripts
+  (let [offenders (vec
+                   (for [rel (runtime-wrapper-files)
+                         :let [text (read-file rel)]
+                         :when (python-script-reference? text)]
+                     rel))]
+    (is (= [] offenders))))
+
+(deftest market-evidence-wrapper-overrides-stale-parent-repo-root
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          current (path tmp "current")
+          logs (path tmp "logs")
+          fake-collect (path tmp "fake-collect-market-evidence")
+          calls (path tmp "calls.txt")]
+      (.mkdir current)
+      (.write_text fake-collect
+                   (str "#!/usr/bin/env bash\n"
+                        "set -euo pipefail\n"
+                        "printf 'args=%s\\n' \"$*\" >> " calls "\n"
+                        "printf 'STEVE_REPO_ROOT=%s\\n' \"$STEVE_REPO_ROOT\" >> " calls "\n"
+                        "printf 'PWD=%s\\n' \"$PWD\" >> " calls "\n"))
+      (.chmod fake-collect 493)
+      (let [result (run-cmd [(str (.joinpath root "projects/ops/scripts/run_market_evidence.sh"))]
+                            {"STEVE_REPO_ROOT" (str (path tmp "poisoned-parent-root"))
+                             "STEVETRADING_BASILISP_ROOT" (str current)
+                             "MARKET_EVIDENCE_MODE" "dry-run"
+                             "MARKET_EVIDENCE_SKIP_NON_TRADING_DAYS" "0"
+                             "MARKET_EVIDENCE_COLLECT_SCRIPT" (str fake-collect)
+                             "MARKET_EVIDENCE_LOG_DIR" (str logs)}
+                            tmp 60)
+            call-text (.read_text calls)]
+        (is (= 0 (.-returncode result)) (str (.-stdout result) (.-stderr result)))
+        (is (str/includes? call-text (str "STEVE_REPO_ROOT=" current)))
+        (is (str/includes? call-text (str "PWD=" current)))
+        (is (not (str/includes? call-text "poisoned-parent-root")))))))
+
+(deftest current-pnl-no-rows-exits-nonzero
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          result (run-basilisp "scripts/current_pnl.lpy" ["venturevd"]
+                               tmp {"HOME" (str tmp) "STEVE_REPO_ROOT" (str root)} 60)]
+      (is (= 1 (.-returncode result)))
+      (is (str/includes? (.-stdout result) "No account rows found")))))
+
+(deftest steve-v2-replay-rejects-malformed-cli-flags-before-loading-bridge
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          cases [[["--max-facts" "1.5"] "invalid --max-facts: 1.5"]
+                 [["--max-facts" "0"] "invalid --max-facts: 0"]
+                 [["--mult2-scale" "nan"] "invalid --mult2-scale: nan"]
+                 [["--mult2-scale" "-1"] "invalid --mult2-scale: -1"]
+                 [["--bundle-variant" "legacy"] "invalid bundle-variant: legacy"]
+                 [["--fixtuer" (str (path tmp "missing.edn"))] "unknown argument: --fixtuer"]
+                 [["--max-facts"] "missing value for --max-facts"]
+                 [["--max-facts" "--bundle-variant"] "missing value for --max-facts"]]]
+      (doseq [[extra expected] cases]
+        (let [result (run-basilisp "scripts/launch_steve_v2_replay.lpy"
+                                   (concat ["--fixture" (str (path tmp "missing.edn"))
+                                            "--out" (str (path tmp "out"))]
+                                           extra)
+                                   root {"STEVE_REPO_ROOT" (str root)} 30)]
+          (is (= 2 (.-returncode result)) (str extra))
+          (is (str/includes? (.-stdout result) expected) expected)
+          (is (not (str/includes? (.-stdout result) "loading Steve V2 bridge"))))))))
+
+(deftest sim-broker-status-missing-journals-exits-nonzero
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          result (run-basilisp "scripts/sim_broker_status.lpy" [] tmp {} 60)]
+      (is (= 1 (.-returncode result)))
+      (is (str/includes? (.-stdout result) "No durable sim broker journals found")))))
+
+(deftest safe-cli-scripts-help-and-unknown-args-do-not-traceback
+  (doseq [script safe-cli-scripts]
+    (let [help-result (run-cmd [basilisp "run" script "--" "--help"] {} root 60)
+          unknown-result (run-cmd [basilisp "run" script "--" "--definitely-unknown"] {} root 60)]
+      (is (= 0 (.-returncode help-result)) script)
+      (is (not (str/includes? (.-stderr help-result) "Traceback")) script)
+      (is (contains? #{1 2} (.-returncode unknown-result)) script)
+      (is (not (str/includes? (.-stderr unknown-result) "Traceback")) script))))

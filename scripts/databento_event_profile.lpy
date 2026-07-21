@@ -1,0 +1,28 @@
+;; Basilisp CLI for receipt-backed Databento DBN event profiling.
+(import argparse glob os os.path sys)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.analysis.databento-profile :as profile])
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--dbn" ** :required true)
+    (.add_argument parser "--out" ** :required true)
+    (.add_argument parser "--top-instruments" ** :type int :default 20)
+    (.parse_args parser (python/list argv))))
+
+(try
+  (let [args (parse-args (vec *command-line-args*))]
+    (when (<= (.-top_instruments args) 0)
+      (throw (python/ValueError "--top-instruments must be positive")))
+    (println (profile/json-text
+              (profile/write-profile! (.-dbn args) (.-out args) (.-top_instruments args))))
+    (python/exit 0))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

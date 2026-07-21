@@ -1,0 +1,2482 @@
+(ns feature-parity.test-core
+  (:import csv json math numpy os os.path tempfile)
+  (:require [basilisp.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [stevetrading.feature-parity.core :as gate]))
+
+(def baseline-header
+  "feature,status,neutralized,active_problem\n")
+
+(defn- temp-dir
+  []
+  (tempfile/mkdtemp ** :prefix "feature-parity-test-"))
+
+(defn- write-file
+  [path text]
+  (spit path text)
+  path)
+
+(defn- seed-stale-artifacts
+  [dir base]
+  (os/makedirs dir ** :exist_ok true)
+  (doseq [ext [".json" ".csv" ".md"]]
+    (spit (os.path/join dir (str base ext))
+          "stale artifact\n")))
+
+(defn- stale-artifacts-gone?
+  [dir base]
+  (every? (fn [ext]
+            (false? (os.path/exists (os.path/join dir (str base ext)))))
+          [".json" ".csv" ".md"]))
+
+(defn- make-baseline-fixture
+  []
+  (let [dir (temp-dir)
+        bundle (os.path/join dir "bundle")
+        captures (os.path/join dir "captures")
+        out (os.path/join dir "out")]
+    (os/makedirs bundle ** :exist_ok true)
+    (os/makedirs captures ** :exist_ok true)
+    (spit (os.path/join bundle "feature_names.json")
+          (json/dumps (gate/->jsonable ["price_close"
+                                         "vix_proxy"
+                                         "dict_entropy"
+                                         "SPX_close"
+                                         "opt_delta"
+                                         "flat_active"
+                                         "zero_bug"
+                                         "neutralized_bad"])))
+    (numpy/savez (os.path/join bundle "feature_stats.npz")
+                 ** :mean (numpy/array [10.0 0.0 0.0 100.0 0.5 3.0 1.0 2.0])
+                    :std (numpy/array [1.0 1.0 1.0 10.0 0.2 1.0 2.0 1.0]))
+    (spit (os.path/join bundle "neutralize_features.json")
+          (json/dumps (gate/->jsonable ["neutralized_bad"])))
+    (numpy/savez (os.path/join captures "live_features_20260701.npz")
+                 ** :times (numpy/array ["2026-07-01T09:31:00Z"
+                                          "2026-07-01T09:32:00Z"
+                                          "2026-07-01T09:33:00Z"])
+                    :spy (numpy/array [600.0 600.1 600.2])
+                    :grids (numpy/zeros #py (3 6 21 8))
+                    :chestnut
+                    (numpy/array [[9.0 -1.0 -1.0 90.0 0.3 3.0 0.0 20.0]
+                                  [10.0 0.0 0.0 100.0 0.5 3.0 0.0 21.0]
+                                  [11.0 1.0 1.0 110.0 0.7 3.0 0.0 22.0]])
+                    :lynx
+                    (numpy/array [[9.0 -1.0 -1.0 90.0 0.3 3.0 0.0 20.0]
+                                  [10.0 0.0 0.0 100.0 0.5 3.0 0.0 21.0]
+                                  [11.0 1.0 1.0 110.0 0.7 3.0 0.0 22.0]])
+                    :moose
+                    (numpy/array [[9.0 -1.0 -1.0 90.0 0.3 3.0 0.0 20.0]
+                                  [10.0 0.0 0.0 100.0 0.5 3.0 0.0 21.0]
+                                  [11.0 1.0 1.0 110.0 0.7 3.0 0.0 22.0]])
+                    :bar_buffers_json (numpy/array [(json/dumps (gate/->jsonable {"SPY" [{"close" 600.0}]}))
+                                                     (json/dumps (gate/->jsonable {"SPY" [{"close" 600.1}]}))
+                                                     (json/dumps (gate/->jsonable {"SPY" [{"close" 600.2}]}))]
+                                                    ** :dtype (.-object_ numpy))
+                    :option_chain_json (numpy/array [(json/dumps (gate/->jsonable {"contracts" []}))
+                                                     (json/dumps (gate/->jsonable {"contracts" []}))
+                                                     (json/dumps (gate/->jsonable {"contracts" []}))]
+                                                    ** :dtype (.-object_ numpy))
+                    :option_surfaces_json (numpy/array [(json/dumps (gate/->jsonable {}))
+                                                        (json/dumps (gate/->jsonable {}))
+                                                        (json/dumps (gate/->jsonable {}))]
+                                                       ** :dtype (.-object_ numpy)))
+    {:root dir :bundle bundle :captures captures :out out}))
+
+(deftest pass-verdict-when-active-features-are-sane-and-delta-is-small
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"
+                                  "f2,ZERO_FILLED_LIVE,true,false\n"))
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :prediction-delta-csv delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "PASS" (get payload "verdict")))
+    (is (= 1 (get payload "active_sane")))
+    (is (= 0 (get payload "active_zero_filled")))
+    (is (= [] (get payload "reasons")))))
+
+(deftest write-gate-uses-target-date-for-output-artifact-name
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260705.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"))
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260705.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        result (gate/write-gate! {:baseline-csv baseline
+                                  :prediction-delta-csv delta
+                                  :out-dir dir
+                                  :target-date "2026-07-05"
+                                  :generated-at "2026-07-06T12:00:00Z"})]
+    (is (= (os.path/join dir "live_feature_parity_gate_20260705.json")
+           (:json-path result)))
+    (is (= "PASS" (get (:payload result) "verdict")))))
+
+(deftest gate-target-date-discovery-does-not-use-stale-prediction-delta
+  (let [dir (temp-dir)
+        _ (write-file (os.path/join dir "live_feature_parity_baseline_20260709.csv")
+                      (str baseline-header
+                           "f1,SANE,false,false\n"))
+        _ (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260706.csv")
+                      (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                           "lynx,0.05,0.09\n"))
+        payload (gate/summarize-gate {:out-dir dir
+                                      :target-date "2026-07-09"
+                                      :generated-at "2026-07-09T20:00:00Z"})
+        prediction-delta (get payload "prediction_delta")]
+    (is (= false (get prediction-delta "available")))
+    (is (= "WATCH" (get payload "verdict")))
+    (is (some #(= "prediction delta report missing" %)
+              (get payload "reasons")))))
+
+(deftest fail-verdict-for-active-zero-filled-or-large-delta
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,ZERO_FILLED_LIVE,false,true\n"))
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.52,0.80\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :prediction-delta-csv delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (= 1 (get payload "active_zero_filled")))
+    (is (some #(= "active zero-filled features present" %)
+              (get payload "reasons")))
+    (is (some #(= "prediction delta p95 >= 0.50 calibration-sigma" %)
+              (get payload "reasons")))))
+
+(deftest watch-verdict-for-degenerate-or-missing-delta
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,DEGENERATE_LIVE,false,true\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "WATCH" (get payload "verdict")))
+    (is (= 1 (get payload "active_degenerate")))
+    (is (some #(= "prediction delta report missing" %)
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fails-empty-or-malformed-baseline-csv
+  (let [dir (temp-dir)
+        empty-baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                                   baseline-header)
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        empty-payload (gate/summarize-gate {:baseline-csv empty-baseline
+                                            :prediction-delta-csv delta
+                                            :out-dir dir
+                                            :generated-at "2026-07-03T12:00:00Z"})
+        malformed-baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260704.csv")
+                                       (str baseline-header
+                                            "f1,GARBAGE,false,false\n"
+                                            "f2,ZERO_FILLED_LIVE,false,false\n"))
+        malformed-payload (gate/summarize-gate {:baseline-csv malformed-baseline
+                                                :prediction-delta-csv delta
+                                                :out-dir dir
+                                                :generated-at "2026-07-04T12:00:00Z"})]
+    (is (= "FAIL" (get empty-payload "verdict")))
+    (is (some #(= "feature parity baseline CSV has no feature rows" %)
+              (get empty-payload "reasons")))
+    (is (= "FAIL" (get malformed-payload "verdict")))
+    (is (some #(not= -1 (.find % "unknown status GARBAGE"))
+              (get malformed-payload "reasons")))
+    (is (some #(not= -1 (.find % "active_problem=false contradicts"))
+              (get malformed-payload "reasons")))))
+
+(deftest feature-parity-gate-fails-duplicate-or-malformed-boolean-baseline-rows
+  (let [dir (temp-dir)
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        duplicate-baseline (write-file
+                            (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                            (str baseline-header
+                                 "f1,SANE,false,false\n"
+                                 "f1,SANE,false,false\n"))
+        bad-bool-baseline (write-file
+                           (os.path/join dir "live_feature_parity_baseline_20260704.csv")
+                           (str baseline-header
+                                "f1,SANE,maybe,false\n"
+                                "f2,SANE,false,nope\n"))
+        duplicate-payload (gate/summarize-gate {:baseline-csv duplicate-baseline
+                                                :prediction-delta-csv delta
+                                                :out-dir dir
+                                                :generated-at "2026-07-03T12:00:00Z"})
+        bad-bool-payload (gate/summarize-gate {:baseline-csv bad-bool-baseline
+                                               :prediction-delta-csv delta
+                                               :out-dir dir
+                                               :generated-at "2026-07-04T12:00:00Z"})]
+    (is (= "FAIL" (get duplicate-payload "verdict")))
+    (is (some #(not= -1 (.find % "duplicate feature row f1"))
+              (get duplicate-payload "reasons")))
+    (is (= "FAIL" (get bad-bool-payload "verdict")))
+    (is (some #(not= -1 (.find % "neutralized must be true/false"))
+              (get bad-bool-payload "reasons")))
+    (is (some #(not= -1 (.find % "active_problem must be true/false"))
+              (get bad-bool-payload "reasons")))))
+
+(deftest feature-parity-gate-fails-blank-feature-or-impossible-baseline-metrics
+  (let [dir (temp-dir)
+        detailed-header (str "feature,family,status,neutralized,active_problem,"
+                             "live_mean,live_std,z_mean,z_std,zero_frac,"
+                             "nonfinite_frac,train_mean,train_std\n")
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        bad-baseline (write-file
+                      (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                      (str detailed-header
+                           ",equity-base,SANE,false,false,1.0,1.0,0.0,1.0,0.0,0.0,1.0,1.0\n"
+                           "bad_nan,equity-base,SANE,false,false,nan,1.0,0.0,1.0,0.0,0.0,1.0,1.0\n"
+                           "bad_std,equity-base,SANE,false,false,1.0,-0.1,0.0,1.0,0.0,0.0,1.0,1.0\n"
+                           "bad_frac,equity-base,SANE,false,false,1.0,1.0,0.0,1.0,1.2,0.0,1.0,1.0\n"
+                           "bad_train_std,equity-base,SANE,false,false,1.0,1.0,0.0,1.0,0.0,0.0,1.0,-2.0\n"))
+        payload (gate/summarize-gate {:baseline-csv bad-baseline
+                                      :prediction-delta-csv delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(not= -1 (.find % "feature must be nonblank"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "live_mean must be finite numeric"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "live_std must be nonnegative"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "zero_frac must be between 0 and 1"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "train_std must be nonnegative"))
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fails-baseline-missing-required-header-columns
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str "feature,status,neutralized\n"
+                                  "f1,SANE,false\n"))
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :prediction-delta-csv delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(not= -1 (.find % "missing required columns"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "active_problem"))
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fails-baseline-with-unexpected-header-columns
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str "feature,status,neutralized,active_problem,unexpected_column\n"
+                                  "f1,SANE,false,false,spoof\n"))
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :prediction-delta-csv delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(not= -1 (.find % "feature parity baseline CSV has unexpected columns"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "unexpected_column"))
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fuzz-rejects-corrupted-baseline-csvs
+  (let [dir (temp-dir)
+        delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.05,0.09\n"))
+        corruptions [(str baseline-header
+                          "f1,SANE,false,false\n"
+                          "f1,SANE,false,false\n")
+                     (str baseline-header
+                          "f1,SANE,TRUEISH,false\n")
+                     (str baseline-header
+                          "f1,SANE,false,FALSEISH\n")
+                     (str "feature,status,active_problem\n"
+                          "f1,SANE,false\n")
+                     (str baseline-header
+                          "f1,GARBAGE,false,false\n")]]
+    (doseq [[idx csv-text] (map-indexed vector corruptions)]
+      (let [baseline (write-file (os.path/join dir (str "live_feature_parity_baseline_20260703_"
+                                                        idx ".csv"))
+                                 csv-text)
+            payload (gate/summarize-gate {:baseline-csv baseline
+                                          :prediction-delta-csv delta
+                                          :out-dir dir
+                                          :generated-at "2026-07-03T12:00:00Z"})]
+        (is (= "FAIL" (get payload "verdict")) (str "corruption idx " idx))
+        (is (seq (get payload "reasons")) (str "corruption idx " idx))))))
+
+(deftest feature-parity-gate-fails-nonfinite-or-missing-prediction-delta-metrics
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"))
+        nan-delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                              (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                                   "lynx,nan,0.09\n"))
+        blank-delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260704.csv")
+                                (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                                     "lynx,0.05,\n"))
+        nan-payload (gate/summarize-gate {:baseline-csv baseline
+                                          :prediction-delta-csv nan-delta
+                                          :out-dir dir
+                                          :generated-at "2026-07-03T12:00:00Z"})
+        blank-payload (gate/summarize-gate {:baseline-csv baseline
+                                            :prediction-delta-csv blank-delta
+                                            :out-dir dir
+                                            :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get nan-payload "verdict")))
+    (is (some #(not= -1 (.find % "missing/nonfinite/negative p95"))
+              (get nan-payload "reasons")))
+    (is (= "FAIL" (get blank-payload "verdict")))
+    (is (some #(not= -1 (.find % "missing/nonfinite/negative max"))
+              (get blank-payload "reasons")))))
+
+(deftest feature-parity-gate-fails-prediction-delta-missing-required-columns
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"))
+        missing-max (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                                (str "strategy,p95_abs_seed_z_any_head\n"
+                                     "lynx,0.05\n"))
+        empty-missing (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260704.csv")
+                                  "strategy\n")
+        missing-max-payload (gate/summarize-gate {:baseline-csv baseline
+                                                  :prediction-delta-csv missing-max
+                                                  :out-dir dir
+                                                  :generated-at "2026-07-03T12:00:00Z"})
+        empty-missing-payload (gate/summarize-gate {:baseline-csv baseline
+                                                    :prediction-delta-csv empty-missing
+                                                    :out-dir dir
+                                                    :generated-at "2026-07-04T12:00:00Z"})]
+    (is (= "FAIL" (get missing-max-payload "verdict")))
+    (is (some #(not= -1 (.find % "prediction delta CSV missing required columns"))
+              (get missing-max-payload "reasons")))
+    (is (some #(not= -1 (.find % "max_abs_seed_z_any_head"))
+              (get missing-max-payload "reasons")))
+    (is (= "FAIL" (get empty-missing-payload "verdict")))
+    (is (some #(not= -1 (.find % "prediction delta CSV missing required columns"))
+              (get empty-missing-payload "reasons")))
+    (is (some #(= "prediction delta CSV has no rows" %)
+              (get empty-missing-payload "reasons")))))
+
+(deftest feature-parity-gate-fails-prediction-delta-with-unexpected-header-columns
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"))
+        delta (write-file
+               (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+               (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head,extra_metric\n"
+                    "lynx,0.05,0.09,999\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :prediction-delta-csv delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(not= -1 (.find % "prediction delta CSV has unexpected columns"))
+              (get payload "reasons")))
+    (is (some #(not= -1 (.find % "extra_metric"))
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fails-impossible-prediction-delta-quantiles
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"))
+        impossible-delta (write-file
+                          (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                          (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                               "lynx,0.25,0.20\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline
+                                      :prediction-delta-csv impossible-delta
+                                      :out-dir dir
+                                      :generated-at "2026-07-03T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(not= -1 (.find % "p95_abs_seed_z_any_head greater than max_abs_seed_z_any_head"))
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fuzz-rejects-corrupted-prediction-delta-csvs
+  (let [dir (temp-dir)
+        baseline (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                             (str baseline-header
+                                  "f1,SANE,false,false\n"))
+        corruptions [(str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                          "lynx,0.25,0.20\n")
+                     (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                          "lynx,-0.01,0.20\n")
+                     (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                          "lynx,0.10,nan\n")
+                     (str "strategy,p95_abs_seed_z_any_head\n"
+                          "lynx,0.10\n")
+                     "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"]]
+    (doseq [[idx csv-text] (map-indexed vector corruptions)]
+      (let [delta (write-file (os.path/join dir (str "live_feature_prediction_delta_aggregate_20260703_"
+                                                     idx ".csv"))
+                              csv-text)
+            payload (gate/summarize-gate {:baseline-csv baseline
+                                          :prediction-delta-csv delta
+                                          :out-dir dir
+                                          :generated-at "2026-07-03T12:00:00Z"})]
+        (is (= "FAIL" (get payload "verdict")) (str "corruption idx " idx))
+        (is (seq (get payload "reasons")) (str "corruption idx " idx))))))
+
+(deftest feature-parity-gate-fails-mismatched-or-wrong-target-artifact-dates
+  (let [dir (temp-dir)
+        baseline-04 (write-file (os.path/join dir "live_feature_parity_baseline_20260704.csv")
+                                (str baseline-header
+                                     "f1,SANE,false,false\n"))
+        delta-05 (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260705.csv")
+                             (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                                  "lynx,0.05,0.09\n"))
+        payload (gate/summarize-gate {:baseline-csv baseline-04
+                                      :prediction-delta-csv delta-05
+                                      :target-date "2026-07-05"
+                                      :out-dir dir
+                                      :generated-at "2026-07-05T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "feature parity baseline CSV is not for target date 2026-07-05" %)
+              (get payload "reasons")))
+    (is (some #(= "feature parity baseline and prediction delta CSV dates do not match" %)
+              (get payload "reasons")))))
+
+(deftest feature-parity-gate-fails-unparseable-target-artifact-dates
+  (let [dir (temp-dir)
+        bad-baseline (write-file (os.path/join dir "live_feature_parity_baseline_20261301.csv")
+                                 (str baseline-header
+                                      "f1,SANE,false,false\n"))
+        bad-delta (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260230.csv")
+                              (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                                   "lynx,0.05,0.09\n"))
+        payload (gate/summarize-gate {:baseline-csv bad-baseline
+                                      :prediction-delta-csv bad-delta
+                                      :target-date "2026-07-05"
+                                      :out-dir dir
+                                      :generated-at "2026-07-05T12:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "feature parity baseline CSV filename does not contain a parseable YYYYMMDD date" %)
+              (get payload "reasons")))
+    (is (some #(= "prediction delta CSV filename does not contain a parseable YYYYMMDD date" %)
+              (get payload "reasons")))))
+
+(deftest write-gate-produces-json-and-markdown
+  (let [dir (temp-dir)
+        _ (write-file (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                      (str baseline-header
+                           "f1,SANE,false,false\n"))
+        _ (write-file (os.path/join dir "live_feature_prediction_delta_aggregate_20260703.csv")
+                      (str "strategy,p95_abs_seed_z_any_head,max_abs_seed_z_any_head\n"
+                           "lynx,0.05,0.09\n"))
+        {:keys [payload json-path markdown-path]} (gate/write-gate! {:out-dir dir
+                                                                     :generated-at "2026-07-03T12:00:00Z"})
+        json-payload (json/loads (slurp json-path))]
+    (is (= "PASS" (get payload "verdict")))
+    (is (= "PASS" (get json-payload "verdict")))
+    (is (true? (os.path/exists markdown-path)))
+    (is (.startswith (slurp markdown-path) "# Live Feature Parity Gate"))))
+
+(deftest baseline-classifies-feature-families
+  (is (= "equity-base" (gate/feature-family "price_close")))
+  (is (= "v2-grid" (gate/feature-family "vix_proxy")))
+  (is (= "v3-grid" (gate/feature-family "dict_entropy")))
+  (is (= "index-proxy" (gate/feature-family "SPX_close")))
+  (is (= "options-base" (gate/feature-family "opt_delta"))))
+
+(deftest baseline-classifies-distribution-edge-cases
+  (is (= "SANE"
+         (gate/classify-feature (numpy/array [-1.0 0.0 1.0])
+                                (numpy/array [-1.0 0.0 1.0])
+                                1.0)))
+  (is (= "ZERO_FILLED_LIVE"
+         (gate/classify-feature (numpy/array [0.0 0.0 0.0])
+                                (numpy/array [-0.5 -0.5 -0.5])
+                                2.0)))
+  (is (= "BOTH_ZERO"
+         (gate/classify-feature (numpy/array [0.0 0.0 0.0])
+                                (numpy/array [0.0 0.0 0.0])
+                                0.0)))
+  (is (= "DEGENERATE_LIVE"
+         (gate/classify-feature (numpy/array [3.0 3.0 3.0])
+                                (numpy/array [0.0 0.0 0.0])
+                                1.0)))
+  (is (= "WILD_OFFSET"
+         (gate/classify-feature (numpy/array [10.0 11.0 12.0])
+                                (numpy/array [10.0 11.0 12.0])
+                                1.0)))
+  (is (= "NONFINITE"
+         (gate/classify-feature (numpy/array [numpy/nan numpy/inf])
+                                (numpy/array [numpy/nan numpy/inf])
+                                1.0))))
+
+(deftest baseline-write-produces-expected-summary-and-files
+  (let [{:keys [bundle captures out]} (make-baseline-fixture)
+        {:keys [summary rows csv-path json-path markdown-path]}
+        (gate/write-baseline! {:bundle bundle
+                               :capture-dir captures
+                               :out-dir out
+                               :generated-at "2026-07-03T12:00:00Z"})
+        by-feature (into {} (map (fn [r] [(get r "feature") r]) rows))
+        json-payload (json/loads (slurp json-path))]
+    (is (= 8 (get summary "features")))
+    (is (= 3 (get summary "rows")))
+    (is (= 1 (get summary "capture_file_count")))
+    (is (= 1 (get summary "neutralized_count")))
+    (is (= "SANE" (get-in by-feature ["price_close" "status"])))
+    (is (= "ZERO_FILLED_LIVE" (get-in by-feature ["zero_bug" "status"])))
+    (is (= "DEGENERATE_LIVE" (get-in by-feature ["flat_active" "status"])))
+    (is (= true (get-in by-feature ["zero_bug" "active_problem"])))
+    (is (= false (get-in by-feature ["neutralized_bad" "active_problem"])))
+    (is (= "2026-07-03T12:00:00Z" (get-in json-payload ["summary" "generated_at"])))
+    (is (= 0 (python/len (get-in json-payload ["summary" "captures" "raw_replay_missing_by_file"]))))
+    (is (= true (get-in json-payload ["summary" "per_capture" 0 "raw_replay_ready"])))
+    (is (= [] (vec (get-in json-payload ["summary" "per_capture" 0 "raw_replay_missing"]))))
+    (is (true? (os.path/exists csv-path)))
+    (is (true? (os.path/exists markdown-path)))
+    (is (.startswith (slurp markdown-path) "# Live Feature Parity Baseline"))))
+
+(deftest baseline-write-rejects-duplicate-bundle-json-keys
+  (let [{:keys [bundle captures out]} (make-baseline-fixture)]
+    (seed-stale-artifacts out "live_feature_parity_baseline_20260703")
+    (spit (os.path/join bundle "feature_names.json")
+          "{\"features\": [\"price_close\"], \"features\": [\"forged\"]}\n")
+    (let [thrown (try
+                   (gate/write-baseline! {:bundle bundle
+                                          :capture-dir captures
+                                          :out-dir out
+                                          :generated-at "2026-07-03T12:00:00Z"})
+                   nil
+                   (catch python/Exception e e))]
+      (is (not (nil? thrown)))
+      (is (not= -1 (.find (str thrown) "duplicate JSON key: features")))
+      (is (stale-artifacts-gone? out "live_feature_parity_baseline_20260703"))))
+  (let [{:keys [bundle captures out]} (make-baseline-fixture)]
+    (spit (os.path/join bundle "neutralize_features.json")
+          "{\"features\": [], \"features\": [\"zero_bug\"]}\n")
+    (let [thrown (try
+                   (gate/write-baseline! {:bundle bundle
+                                          :capture-dir captures
+                                          :out-dir out
+                                          :generated-at "2026-07-03T12:00:00Z"})
+                   nil
+                   (catch python/Exception e e))]
+      (is (not (nil? thrown)))
+      (is (not= -1 (.find (str thrown) "duplicate JSON key: features"))))))
+
+(deftest load-captures-skips-malformed-files-and-keeps-valid-evidence
+  (let [dir (temp-dir)
+        captures (os.path/join dir "captures")
+        arr (numpy/array [[1.0 2.0] [3.0 4.0]])]
+    (os/makedirs captures ** :exist_ok true)
+    (numpy/savez (os.path/join captures "live_features_20260701.npz")
+                 ** :times (numpy/array ["t1" "t2"])
+                    :spy (numpy/array [600.0 601.0])
+                    :grids (numpy/zeros #py (2 6 21 8))
+                    :chestnut arr
+                    :lynx arr
+                    :moose arr)
+    (numpy/savez (os.path/join captures "live_features_20260702.npz")
+                 ** :times (numpy/array ["t1"])
+                    :chestnut arr)
+    (let [[X meta caps] (gate/load-captures captures nil)]
+      (is (= [2 2] (vec (.-shape X))))
+      (is (= 1 (count caps)))
+      (is (= 2 (get-in meta ["rows_by_file" "live_features_20260701.npz"])))
+      (is (>= (.find (get-in meta ["skipped_files" "live_features_20260702.npz"])
+                     "missing required")
+              0)))))
+
+(deftest load-captures-fails-with-diagnostics-when-all-files-are-bad
+  (let [dir (temp-dir)
+        captures (os.path/join dir "captures")
+        arr (numpy/array [[1.0 2.0] [3.0 4.0]])]
+    (os/makedirs captures ** :exist_ok true)
+    (numpy/savez (os.path/join captures "live_features_20260701.npz")
+                 ** :times (numpy/array ["t1"])
+                    :spy (numpy/array [600.0])
+                    :grids (numpy/zeros #py (1 6 21 8))
+                    :chestnut arr
+                    :lynx arr
+                    :moose arr)
+    (try
+      (gate/load-captures captures nil)
+      (is false "expected malformed capture directory to fail")
+      (catch python/Exception e
+        (is (>= (.find (str e) "no captures found") 0))))))
+
+(deftest baseline-stress-many-sane-features-with-injected-problems
+  (let [n 80
+        names (vec (map #(str "feat_" %) (range n)))
+        base (numpy/array (vec (for [i (range 100)]
+                                 (vec (for [j (range n)]
+                                        (+ (* 0.01 i) (* 0.001 j)))))))
+        mean (numpy/array (vec (repeat n 0.5)))
+        std (numpy/array (vec (repeat n 0.3)))]
+    ;; Inject deterministic failure modes into two columns.
+    (doseq [i (range 100)]
+      (aset base i 5 0.0)
+      (aset base i 9 3.0))
+    (let [rows (gate/build-baseline-rows base names mean std #{"feat_9"})
+          summary (gate/summarize-baseline-rows rows)
+          by-feature (into {} (map (fn [r] [(get r "feature") r]) rows))]
+      (is (= n (count rows)))
+      (is (= "ZERO_FILLED_LIVE" (get-in by-feature ["feat_5" "status"])))
+      (is (= true (get-in by-feature ["feat_5" "active_problem"])))
+      (is (= "DEGENERATE_LIVE" (get-in by-feature ["feat_9" "status"])))
+      (is (= false (get-in by-feature ["feat_9" "active_problem"])))
+      (is (= 1 (get summary "active_zero_filled")))
+      (is (<= 1 (get summary "active_problem"))))))
+
+(def audit-header
+  "feature,family,status,neutralized,active_problem,live_mean,live_std,z_mean,z_std,zero_frac,nonfinite_frac\n")
+
+(def usage-header
+  "feature,total_gain,split_count,total_cover,account,head\n")
+
+(deftest neutralization-audit-ranks-neutralized-features-and-date-overlap
+  (let [dir (temp-dir)
+        captures (os.path/join dir "captures")
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str audit-header
+                       "opt_delta,options-base,SANE,true,false,0.5,0.2,0.1,1.1,0.0,0.0\n"
+                       "shifted,equity-base,OFFSET,true,false,10.0,1.0,4.0,0.5,0.0,0.0\n"
+                       "active_bad,equity-base,ZERO_FILLED_LIVE,false,true,0.0,0.0,-1.0,0.0,1.0,0.0\n"))
+        usage (write-file
+               (os.path/join dir "live_feature_model_usage_20260703.csv")
+               (str usage-header
+                    "opt_delta,6.0,2,10,chestnut,seed_z\n"
+                    "shifted,4.0,1,5,lynx,win_prob\n"
+                    "active_bad,90.0,20,100,lynx,seed_z\n"))
+        option-cache (write-file
+                      (os.path/join dir "option_bars_cache.jsonl")
+                      (str (json/dumps (gate/->jsonable {"symbol" "SPY250101C00600000"
+                                                          "ts" "2026-07-01T10:00:00Z"}))
+                           "\n"))
+        _ (os/makedirs captures ** :exist_ok true)
+        _ (write-file (os.path/join captures "live_features_20260701.npz") "placeholder")
+        {:keys [summary rows]} (gate/summarize-neutralization-audit
+                                {:baseline-csv baseline
+                                 :usage-csv usage
+                                 :option-cache option-cache
+                                 :capture-dir captures
+                                 :generated-at "2026-07-03T12:00:00Z"})
+        by-feature (into {} (map (fn [r] [(get r "feature") r]) rows))]
+    (is (= 3 (get summary "total_features")))
+    (is (= 2 (get summary "neutralized_features")))
+    (is (= 1 (get summary "candidate_now")))
+    (is (= 1 (get summary "review_count")))
+    (is (= 0 (get summary "blocked_count")))
+    (is (= ["2026-07-01"] (get-in summary ["option_cache" "capture_date_overlap"])))
+    (is (= "candidate-now" (get-in by-feature ["opt_delta" "recoverability"])))
+    (is (= "review-shift" (get-in by-feature ["shifted" "recoverability"])))
+    (is (nil? (get by-feature "active_bad")))
+    (is (< 0.09 (get summary "neutralized_model_gain_pct") 0.11))
+    (is (not= -1 (.find (get-in by-feature ["opt_delta" "source_note"])
+                        "overlaps 1 saved feature-capture dates")))))
+
+(deftest neutralization-audit-classifies-blocked-and-low-priority-features
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str audit-header
+                       "zero_opt,options-base,ZERO_FILLED_LIVE,true,false,0.0,0.0,-1.0,0.0,1.0,0.0\n"
+                       "flat_builder,v3-grid,DEGENERATE_LIVE,true,false,3.0,0.0,0.0,0.0,0.0,0.0\n"
+                       "unused_sane,equity-base,SANE,true,false,1.0,1.0,0.0,1.0,0.0,0.0\n"))
+        usage (write-file
+               (os.path/join dir "live_feature_model_usage_20260703.csv")
+               (str usage-header
+                    "zero_opt,1.0,1,1,chestnut,seed_z\n"
+                    "flat_builder,2.0,1,1,chestnut,seed_z\n"))]
+    (let [{:keys [summary rows]} (gate/summarize-neutralization-audit
+                                  {:baseline-csv baseline
+                                   :usage-csv usage
+                                   :generated-at "2026-07-03T12:00:00Z"})
+          by-feature (into {} (map (fn [r] [(get r "feature") r]) rows))]
+      (is (= 2 (get summary "blocked_count")))
+      (is (= "blocked-live-source" (get-in by-feature ["zero_opt" "recoverability"])))
+      (is (= "blocked-live-builder" (get-in by-feature ["flat_builder" "recoverability"])))
+      (is (= "low-priority-candidate" (get-in by-feature ["unused_sane" "recoverability"])))
+      (is (= 0 (get-in by-feature ["unused_sane" "model_split_count"])))
+      (is (= 0 (get-in by-feature ["unused_sane" "head_count"]))))))
+
+(deftest neutralization-audit-writes-artifacts-and-requires-inputs
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str audit-header
+                       "f1,equity-base,SANE,true,false,1.0,1.0,0.0,1.0,0.0,0.0\n"))
+        usage (write-file
+               (os.path/join dir "live_feature_model_usage_20260703.csv")
+               (str usage-header
+                    "f1,1.0,1,1,chestnut,seed_z\n"))
+        {:keys [summary rows csv-path json-path markdown-path]}
+        (gate/write-neutralization-audit! {:baseline-csv baseline
+                                           :usage-csv usage
+                                           :out-dir dir
+                                           :generated-at "2026-07-03T12:00:00Z"})
+        json-payload (json/loads (slurp json-path))]
+    (is (= 1 (count rows)))
+    (is (= 1 (get summary "candidate_now")))
+    (is (= 1 (get-in json-payload ["summary" "candidate_now"])))
+    (is (true? (os.path/exists csv-path)))
+    (is (true? (os.path/exists markdown-path)))
+    (is (.startswith (slurp markdown-path) "# Neutralization Audit"))
+    (is (thrown? python/Exception
+                 (gate/summarize-neutralization-audit
+                  {:baseline-csv baseline
+                   :generated-at "2026-07-03T12:00:00Z"})))))
+
+(deftest neutralization-audit-rejects-malformed-input-csvs
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str audit-header
+                       "f1,equity-base,SANE,true,false,1.0,1.0,0.0,1.0,0.0,0.0\n"))
+        bad-baseline (write-file
+                      (os.path/join dir "live_feature_parity_baseline_bad_20260703.csv")
+                      (str audit-header
+                           "f1,equity-base,SANE,true,false,nan,1.0,0.0,1.0,0.0,0.0\n"))
+        bad-usage (write-file
+                   (os.path/join dir "live_feature_model_usage_20260703.csv")
+                   (str usage-header
+                        "f1,not-a-number,1,1,chestnut,seed_z\n"
+                        ",1.0,1,1,chestnut,seed_z\n"
+                        "f2,1.0,-1,1,chestnut,seed_z\n"))
+        missing-usage-column (write-file
+                              (os.path/join dir "live_feature_model_usage_missing_20260703.csv")
+                              (str "feature,total_gain,split_count,account,head\n"
+                                   "f1,1.0,1,chestnut,seed_z\n"))
+        usage-throw (try
+                      (gate/summarize-neutralization-audit
+                       {:baseline-csv baseline
+                        :usage-csv bad-usage
+                        :generated-at "2026-07-03T12:00:00Z"})
+                      nil
+                      (catch python/Exception e e))
+        missing-throw (try
+                        (gate/summarize-neutralization-audit
+                         {:baseline-csv baseline
+                          :usage-csv missing-usage-column
+                          :generated-at "2026-07-03T12:00:00Z"})
+                        nil
+                        (catch python/Exception e e))
+        baseline-throw (try
+                         (gate/summarize-neutralization-audit
+                          {:baseline-csv bad-baseline
+                           :usage-csv bad-usage
+                           :generated-at "2026-07-03T12:00:00Z"})
+                         nil
+                         (catch python/Exception e e))]
+    (is (= :neutralization/malformed-input (:error/code (ex-data usage-throw))))
+    (is (some #(not= -1 (.find % "total_gain must be finite numeric"))
+              (:issues (ex-data usage-throw))))
+    (is (some #(not= -1 (.find % "feature must be nonblank"))
+              (:issues (ex-data usage-throw))))
+    (is (some #(not= -1 (.find % "split_count must be nonnegative"))
+              (:issues (ex-data usage-throw))))
+    (is (some #(not= -1 (.find % "missing required columns"))
+              (:issues (ex-data missing-throw))))
+    (is (some #(not= -1 (.find % "live_mean must be finite numeric"))
+              (:issues (ex-data baseline-throw))))))
+
+(deftest neutralization-audit-write-clears-stale-artifacts-on-validation-failure
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str audit-header
+                       "f1,equity-base,SANE,true,false,1.0,1.0,0.0,1.0,0.0,0.0\n"))
+        bad-usage (write-file
+                   (os.path/join dir "live_feature_model_usage_20260703.csv")
+                   (str usage-header
+                        "f1,not-a-number,1,1,chestnut,seed_z\n"))
+        base "neutralization_audit_20260703"]
+    (seed-stale-artifacts dir base)
+    (let [thrown (try
+                   (gate/write-neutralization-audit! {:baseline-csv baseline
+                                                      :usage-csv bad-usage
+                                                      :out-dir dir
+                                                      :target-date "2026-07-03"
+                                                      :generated-at "2026-07-03T12:00:00Z"})
+                   nil
+                   (catch python/Exception e e))]
+      (is (not (nil? thrown)))
+      (is (= :neutralization/malformed-input (:error/code (ex-data thrown))))
+      (is (stale-artifacts-gone? dir base)))))
+
+(def model-usage-baseline-header
+  "feature,family,status,neutralized,active_problem\n")
+
+(defn- xgb-model
+  [split-indices loss-changes sum-hessian split-conditions]
+  {"learner"
+   {"gradient_booster"
+    {"model"
+     {"trees"
+      [{"left_children" [1 -1 -1]
+        "right_children" [2 -1 -1]
+        "split_indices" split-indices
+        "loss_changes" loss-changes
+        "sum_hessian" sum-hessian
+        "split_conditions" split-conditions}]}}}})
+
+(defn- xgb-forest
+  [trees]
+  {"learner" {"gradient_booster" {"model" {"trees" trees}}}})
+
+(defn- xgb-balanced-tree
+  [feature-a feature-b feature-c gain-base threshold-base]
+  {"left_children" [1 3 5 -1 -1 -1 -1]
+   "right_children" [2 4 6 -1 -1 -1 -1]
+   "split_indices" [feature-a feature-b feature-c 0 0 0 0]
+   "loss_changes" [gain-base (+ gain-base 0.5) (+ gain-base 1.0) 0.0 0.0 0.0 0.0]
+   "sum_hessian" [(* 10.0 gain-base) (* 11.0 gain-base) (* 12.0 gain-base) 0.0 0.0 0.0 0.0]
+   "split_conditions" [threshold-base (+ threshold-base 0.1) (+ threshold-base 0.2) 0.0 0.0 0.0 0.0]})
+
+(defn- write-xgb-bundle
+  [dir]
+  (let [bundle (os.path/join dir "live_model_chestnut_multihead_corrected")]
+    (os/makedirs bundle ** :exist_ok true)
+    (spit (os.path/join bundle "feature_names.json")
+          (json/dumps (gate/->jsonable ["good" "bad" "neutral"])))
+    (spit (os.path/join bundle "config.json")
+          (json/dumps (gate/->jsonable {"n_tabular_features" 3})))
+    (spit (os.path/join bundle "xgb_long.json")
+          (json/dumps (gate/->jsonable (xgb-model [1 0 0]
+                                                  [5.0 0.0 0.0]
+                                                  [10.0 0.0 0.0]
+                                                  [0.25 0.0 0.0]))))
+    (spit (os.path/join bundle "xgb_gen.json")
+          (json/dumps (gate/->jsonable (xgb-model [3 0 0]
+                                                  [7.0 0.0 0.0]
+                                                  [12.0 0.0 0.0]
+                                                  [1.25 0.0 0.0]))))
+    (spit (os.path/join bundle "xgb_short.json")
+          (json/dumps (gate/->jsonable (xgb-model [0 0 0]
+                                                  [2.0 0.0 0.0]
+                                                  [4.0 0.0 0.0]
+                                                  [-0.5 0.0 0.0]))))
+    bundle))
+
+(defn- write-stress-xgb-bundle
+  [dir]
+  (let [bundle (os.path/join dir "live_model_moose_multihead_corrected")
+        names (vec (map #(str "feat_" %) (range 8)))]
+    (os/makedirs bundle ** :exist_ok true)
+    (spit (os.path/join bundle "feature_names.json")
+          (json/dumps (gate/->jsonable names)))
+    (spit (os.path/join bundle "config.json")
+          (json/dumps (gate/->jsonable {"n_tabular_features" 8})))
+    (doseq [[head offset] [["long" 0] ["gen" 20] ["short" 40]]]
+      (let [trees (vec
+                   (for [i (range 30)]
+                     (xgb-balanced-tree
+                      (mod (+ i offset) 8)
+                      (mod (+ i offset 3) 8)
+                      (+ 8 (mod i 4))
+                      (+ 1.0 (* 0.25 i) (* 0.01 offset))
+                      (- (* 0.02 i) 0.3))))]
+        (spit (os.path/join bundle (get gate/xgb-head-files head))
+              (json/dumps (gate/->jsonable (xgb-forest trees))))))
+    bundle))
+
+(defn- approx=
+  [a b]
+  (< (math/fabs (- (float a) (float b))) 1e-6))
+
+(deftest model-usage-audit-attributes-tabular-active-problem-and-embedding-splits
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str model-usage-baseline-header
+                       "good,equity-base,SANE,false,false\n"
+                       "bad,equity-base,ZERO_FILLED_LIVE,false,true\n"
+                       "neutral,equity-base,DEGENERATE_LIVE,true,false\n"))
+        bundle (write-xgb-bundle dir)
+        {:keys [summaries rows]} (gate/model-usage-audit
+                                  {:baseline-csv baseline
+                                   :bundles [bundle]})
+        by-head (into {} (map (fn [s] [(get s "head") s]) summaries))
+        by-feature (into {} (map (fn [r] [[(get r "head") (get r "feature")] r]) rows))]
+    (is (= "chestnut" (gate/account-from-bundle bundle)))
+    (is (= 3 (count summaries)))
+    (is (= 1 (get-in by-head ["long" "active_problem_splits"])))
+    (is (= 5.0 (get-in by-head ["long" "active_problem_gain"])))
+    (is (= 1.0 (get-in by-head ["long" "active_problem_gain_pct"])))
+    (is (= 1 (get-in by-head ["gen" "embedding_splits"])))
+    (is (= 0 (get-in by-head ["gen" "active_problem_splits"])))
+    (is (= "embedding_00" (get-in by-feature [["gen" "embedding_00"] "feature"])))
+    (is (= "embedding" (get-in by-feature [["gen" "embedding_00"] "feature_kind"])))
+    (is (= "SANE" (get-in by-feature [["short" "good"] "status"])))
+    (is (= -0.5 (get-in by-feature [["short" "good"] "min_threshold"])))))
+
+(deftest model-usage-audit-writes-artifacts-and-rejects-feature-count-mismatch
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str model-usage-baseline-header
+                       "good,equity-base,SANE,false,false\n"
+                       "bad,equity-base,ZERO_FILLED_LIVE,false,true\n"
+                       "neutral,equity-base,DEGENERATE_LIVE,true,false\n"))
+        bundle (write-xgb-bundle dir)
+        {:keys [summaries rows csv-path json-path markdown-path]}
+        (gate/write-model-usage-audit! {:baseline-csv baseline
+                                        :bundles [bundle]
+                                        :out-dir dir
+                                        :generated-at "2026-07-03T12:00:00Z"})
+        json-payload (json/loads (slurp json-path))]
+    (is (= 3 (count summaries)))
+    (is (= 3 (count rows)))
+    (is (= 3 (count (get json-payload "summaries"))))
+    (is (true? (os.path/exists csv-path)))
+    (is (true? (os.path/exists markdown-path)))
+    (is (.startswith (slurp markdown-path) "# Live Feature Model Usage Audit"))
+    (spit (os.path/join bundle "config.json")
+          (json/dumps (gate/->jsonable {"n_tabular_features" 2})))
+    (is (thrown? python/Exception
+                 (gate/model-usage-audit {:baseline-csv baseline
+                                          :bundles [bundle]})))))
+
+(deftest model-usage-audit-write-clears-stale-artifacts-on-validation-failure
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str model-usage-baseline-header
+                       "good,equity-base,SANE,false,false\n"
+                       "bad,equity-base,ZERO_FILLED_LIVE,false,true\n"
+                       "neutral,equity-base,DEGENERATE_LIVE,true,false\n"))
+        bundle (write-xgb-bundle dir)
+        base "live_feature_model_usage_20260703"]
+    (spit (os.path/join bundle "config.json")
+          (json/dumps (gate/->jsonable {"n_tabular_features" 2})))
+    (seed-stale-artifacts dir base)
+    (let [thrown (try
+                   (gate/write-model-usage-audit! {:baseline-csv baseline
+                                                   :bundles [bundle]
+                                                   :out-dir dir
+                                                   :target-date "2026-07-03"
+                                                   :generated-at "2026-07-03T12:00:00Z"})
+                   nil
+                   (catch python/Exception e e))]
+      (is (not (nil? thrown)))
+      (is (= :error/model-feature-count-mismatch (:error/code (ex-data thrown))))
+      (is (not= -1 (.find (str thrown) "n_tabular=2 feature_names=3")))
+      (is (stale-artifacts-gone? dir base)))))
+
+(deftest split-nodes-rejects-malformed-xgb-tree-shapes
+  (let [tree (xgb-balanced-tree 0 1 2 1.0 0.0)]
+    (is (thrown? python/Exception
+                 (gate/split-nodes (dissoc tree "sum_hessian"))))
+    (is (thrown? python/Exception
+                 (gate/split-nodes (assoc tree "loss_changes" [1.0 2.0]))))))
+
+(deftest split-nodes-rejects-malformed-xgb-split-values
+  (let [tree (xgb-balanced-tree 0 1 2 1.0 0.0)
+        corruptions [(assoc tree "split_indices" [1.5 0 0 0 0 0 0])
+                     (assoc tree "split_indices" [numpy/inf 0 0 0 0 0 0])
+                     (assoc tree "loss_changes" [numpy/nan 0.0 0.0 0.0 0.0 0.0 0.0])
+                     (assoc tree "loss_changes" [-0.1 0.0 0.0 0.0 0.0 0.0 0.0])
+                     (assoc tree "sum_hessian" [numpy/inf 0.0 0.0 0.0 0.0 0.0 0.0])
+                     (assoc tree "sum_hessian" [-1.0 0.0 0.0 0.0 0.0 0.0 0.0])
+                     (assoc tree "split_conditions" [numpy/nan 0.0 0.0 0.0 0.0 0.0 0.0])]]
+    (doseq [[idx corrupted] (map-indexed vector corruptions)]
+      (let [thrown (try
+                     (gate/split-nodes corrupted)
+                     nil
+                     (catch python/Exception e e))]
+        (is (= :error/xgb-split-value (:error/code (ex-data thrown)))
+            (str "corruption idx " idx))))))
+
+(deftest xgb-trees-rejects-missing-tree-payload
+  (let [dir (temp-dir)
+        path (write-file (os.path/join dir "xgb_bad.json")
+                         (json/dumps (gate/->jsonable {"learner" {}})))]
+    (is (thrown? python/Exception
+                 (gate/xgb-trees path)))))
+
+(deftest xgb-trees-rejects-duplicate-model-json-keys
+  (let [dir (temp-dir)
+        path (write-file (os.path/join dir "xgb_duplicate.json")
+                         "{\"learner\": {\"gradient_booster\": {\"model\": {\"trees\": []}}}, \"learner\": {}}\n")
+        thrown (try
+                 (gate/xgb-trees path)
+                 nil
+                 (catch python/Exception e e))]
+    (is (not (nil? thrown)))
+    (is (not= -1 (.find (str thrown) "duplicate JSON key: learner")))))
+
+(deftest model-usage-audit-rejects-unknown-head
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str model-usage-baseline-header
+                       "good,equity-base,SANE,false,false\n"
+                       "bad,equity-base,ZERO_FILLED_LIVE,false,true\n"
+                       "neutral,equity-base,DEGENERATE_LIVE,true,false\n"))
+        bundle (write-xgb-bundle dir)]
+    (is (thrown? python/Exception
+                 (gate/audit-model-head "chestnut"
+                                        bundle
+                                        "unknown"
+                                        (gate/load-baseline-map baseline))))))
+
+(deftest model-usage-audit-rejects-negative-feature-index-before-attribution
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str model-usage-baseline-header
+                       "good,equity-base,SANE,false,false\n"
+                       "bad,equity-base,ZERO_FILLED_LIVE,false,true\n"
+                       "neutral,equity-base,DEGENERATE_LIVE,true,false\n"))
+        bundle (write-xgb-bundle dir)]
+    (spit (os.path/join bundle "xgb_long.json")
+          (json/dumps (gate/->jsonable (xgb-model [-1 0 0]
+                                                  [5.0 0.0 0.0]
+                                                  [10.0 0.0 0.0]
+                                                  [0.25 0.0 0.0]))))
+    (is (thrown? python/Exception
+                 (gate/model-usage-audit {:baseline-csv baseline
+                                          :bundles [bundle]})))))
+
+(deftest model-usage-audit-stress-preserves-summary-invariants
+  (let [dir (temp-dir)
+        baseline (write-file
+                  (os.path/join dir "live_feature_parity_baseline_20260703.csv")
+                  (str model-usage-baseline-header
+                       "feat_0,equity-base,SANE,false,false\n"
+                       "feat_1,equity-base,ZERO_FILLED_LIVE,false,true\n"
+                       "feat_2,equity-base,SANE,false,false\n"
+                       "feat_3,equity-base,DEGENERATE_LIVE,false,true\n"
+                       "feat_4,equity-base,SANE,false,false\n"
+                       "feat_5,equity-base,SANE,false,false\n"
+                       "feat_6,equity-base,SANE,false,false\n"
+                       "feat_7,equity-base,SANE,false,false\n"))
+        bundle (write-stress-xgb-bundle dir)
+        {:keys [summaries rows]} (gate/model-usage-audit
+                                  {:baseline-csv baseline
+                                   :bundles [bundle]})]
+    (is (= 3 (count summaries)))
+    (doseq [summary summaries]
+      (let [head (get summary "head")
+            head-rows (filter #(= head (get % "head")) rows)
+            split-total (reduce + (map #(get % "split_count") head-rows))
+            gain-total (reduce + (map #(get % "total_gain") head-rows))
+            cover-total (reduce + (map #(get % "total_cover") head-rows))
+            tabular-total (reduce + (map #(if (= "tabular" (get % "feature_kind"))
+                                            (get % "split_count")
+                                            0)
+                                         head-rows))
+            embedding-total (reduce + (map #(if (= "embedding" (get % "feature_kind"))
+                                              (get % "split_count")
+                                              0)
+                                           head-rows))]
+        (is (= 90 (get summary "splits")))
+        (is (= split-total (get summary "splits")))
+        (is (= tabular-total (get summary "tabular_splits")))
+        (is (= embedding-total (get summary "embedding_splits")))
+        (is (approx= gain-total (get summary "total_gain")))
+        (is (approx= cover-total (get summary "total_cover")))
+        (is (> (get summary "active_problem_splits") 0))
+        (is (> (get summary "active_problem_gain") 0.0))))))
+
+(defn- write-json
+  [path data]
+  (spit path (json/dumps (gate/->jsonable data) ** :indent 2 :sort_keys true))
+  path)
+
+(defn- stamp->iso
+  [stamp]
+  (str (subs stamp 0 4) "-" (subs stamp 4 6) "-" (subs stamp 6 8)))
+
+(defn- readiness-artifacts
+  [dir stamp overrides]
+  (let [iso-date (stamp->iso stamp)
+        capture-file (str "live_features_" stamp ".npz")
+        generated-at (str iso-date "T14:00:00Z")
+        payload-generated-at (str iso-date "T14:01:00Z")
+        baseline (write-json
+                  (os.path/join dir (str "live_feature_parity_baseline_" stamp ".json"))
+                  {"summary" (merge {"generated_at" generated-at
+                                     "rows" 120
+                                     "capture_file_count" 1
+                                     "active_problem_count" 0
+                                     "captures" {"files" [capture-file]
+                                                 "rows_by_file" {capture-file 120}
+                                                 "skipped_files" {}
+                                                 "required_raw_replay_arrays" ["bar_buffers_json"
+                                                                               "option_chain_json"
+                                                                               "option_surfaces_json"]
+                                                 "raw_replay_missing_by_file" {}}
+                                     "per_capture" [{"date" stamp
+                                                     "path" capture-file
+                                                     "rows" 120
+                                                     "raw_replay_ready" true
+                                                     "raw_replay_missing" []}]}
+                                    (get overrides "baseline" {}))})
+        probe (write-json
+               (os.path/join dir (str "thetadata_capability_probe_" stamp ".json"))
+               (merge {"generated_at" generated-at
+                       "summary" {"total" 4
+                                  "ok" 4
+                                  "usable" 2
+                                  "failed" 0
+                                  "payload_examples" 2
+                                  "error_classes" {}}
+                       "results" [{"name" "option.expirations"
+                                   "ok" true
+                                   "usable" true
+                                   "summary" {"required_ok" true
+                                              "row_width_valid" true}
+                                   "payload_example" (os.path/join dir "payloads" stamp "expirations.json")}
+                                  {"name" "option.snapshot.quote"
+                                   "ok" true
+                                   "usable" true
+                                   "summary" {"required_ok" true
+                                              "row_width_valid" true}
+                                   "payload_example" (os.path/join dir "payloads" stamp "quote.json")}
+                                  {"name" "option.snapshot.greeks"
+                                   "ok" true
+                                   "usable" false}
+                                  {"name" "stock.snapshot.quote"
+                                   "ok" true
+                                   "usable" false}]}
+                      (get overrides "probe" {})))
+        payload-verification (write-json
+                              (os.path/join dir (str "thetadata_payload_verification_" stamp ".json"))
+                              (merge {"generated_at" payload-generated-at
+                                      "valid?" true
+                                      "status" "ok"
+                                      "total" 2
+                                      "checked" 2
+                                      "skipped" 0
+                                      "invalid" 0
+                                      "example_generated_date_counts" {stamp 2}
+                                      "example_path_date_counts" {stamp 2}
+                                      "results" [{"probe" "option.expirations"
+                                                  "path" (os.path/join dir "payloads" stamp "expirations.json")
+                                                  "status" "ok"
+                                                  "valid?" true}
+                                                 {"probe" "option.snapshot.quote"
+                                                  "path" (os.path/join dir "payloads" stamp "quote.json")
+                                                  "status" "ok"
+                                                  "valid?" true}]}
+                                     (get overrides "payload-verification" {})))
+        neutralization (write-json
+                        (os.path/join dir (str "neutralization_audit_" stamp ".json"))
+                        {"summary" (merge {"generated_at" generated-at
+                                           "candidate_now" 0
+                                           "review_count" 0
+                                           "blocked_count" 0
+                                           "neutralized_features" 826
+                                           "baseline_csv" (os.path/join dir (str "live_feature_parity_baseline_" stamp ".csv"))
+                                           "usage_csv" (os.path/join dir (str "live_feature_model_usage_" stamp ".csv"))}
+                                          (get overrides "neutralization" {}))})
+        matched-parity (write-json
+                        (os.path/join dir (str "matched_feature_parity_" stamp ".json"))
+                        {"summary" (merge {"target_date" iso-date
+                                           "generated_at" generated-at
+                                           "matched_rows" 120
+                                           "matched_start" (str iso-date "T13:30:00Z")
+                                           "matched_end" (str iso-date "T19:59:00Z")
+                                           "feature_count" 2
+                                           "neutralized_count" 0
+                                           "problem_feature_count" 0
+                                           "active_problem_count" 0
+                                           "neutralized_problem_count" 0
+                                           "status_counts" {"MATCH" 2}
+                                           "max_abs_deviation" 0.0
+                                           "min_correlation" 1.0}
+                                          (get overrides "matched-parity" {}))
+                         "features" (get overrides "matched-parity-features"
+                                         [{"feature" "SPY_close"
+                                           "status" "MATCH"
+                                           "neutralized" false
+                                           "active_problem" false}
+                                          {"feature" "vix_proxy"
+                                           "status" "MATCH"
+                                           "neutralized" false
+                                           "active_problem" false}])})]
+    {"baseline" baseline
+     "probe" probe
+     "payload-verification" payload-verification
+     "neutralization" neutralization
+     "matched-parity" matched-parity}))
+
+(deftest evidence-readiness-passes-for-fresh-sufficient-clean-artifacts
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260705" {})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "PASS" (get payload "verdict")))
+    (is (= [] (get payload "reasons")))))
+
+(deftest evidence-readiness-rejects-invalid-min-capture-row-overrides
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260705" {})]
+    (doseq [bad-min [0 -1 1.5 true "many"]]
+      (let [payload (gate/evidence-readiness
+                     {:analysis-dir dir
+                      :target-date "2026-07-05"
+                      :baseline-json (get artifacts "baseline")
+                      :probe-json (get artifacts "probe")
+                      :payload-verification-json (get artifacts "payload-verification")
+                      :neutralization-json (get artifacts "neutralization")
+                      :min-capture-rows bad-min
+                      :generated-at "2026-07-05T15:00:00Z"})]
+        (is (= "FAIL" (get payload "verdict"))
+            (str "bad min should fail: " (pr-str bad-min)))
+        (is (some #(= "min-capture-rows must be positive integer" %)
+                  (get payload "fail_reasons"))
+            (str "bad min should be reported: " (pr-str bad-min)))))))
+
+(deftest evidence-readiness-fails-for-stale-low-row-or-malformed-capture-evidence
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260704"
+                   {"baseline" {"rows" 10
+                                "captures" {"files" ["bad.npz"]
+                                            "rows_by_file" {"bad.npz" 10}
+                                            "skipped_files" {"bad.npz" "corrupt"}}
+                                "per_capture" [{"date" "missing"
+                                                "path" "bad.npz"
+                                                "rows" 10}]}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :min-capture-rows 60
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "baseline artifact is not for target date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "capture rows below minimum 60" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline skipped malformed capture files" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-for-stale-feature-capture-files
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"baseline" {"captures" {"files" ["live_features_20260704.npz"]
+                                            "rows_by_file" {"live_features_20260704.npz" 120}
+                                            "skipped_files" {}}
+                                "per_capture" [{"date" "20260704"
+                                                "path" "live_features_20260704.npz"
+                                                "rows" 120}]}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :min-capture-rows 60
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "target-date capture rows below minimum 60" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline includes non-target-date capture rows" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-watches-when-baseline-has-active-training-distribution-warnings
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"baseline" {"active_problem_count" 3}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "WATCH" (get payload "verdict")))
+    (is (some #(= "baseline has active training-distribution warnings" %)
+              (get payload "watch_reasons")))
+    (is (not (some #(= "baseline has active live feature parity problems" %)
+                   (get payload "fail_reasons"))))))
+
+(deftest evidence-readiness-fails-when-baseline-summary-contradicts-feature-rows
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260705" {})
+        baseline-path (get artifacts "baseline")
+        baseline-json (json/loads (slurp baseline-path))]
+    (spit baseline-path
+          (json/dumps
+           (gate/->jsonable
+            {"summary" (get baseline-json "summary")
+             "features" [{"feature" "bad_live"
+                          "status" "ZERO_FILLED_LIVE"
+                          "neutralized" false
+                          "active_problem" true}]})
+           ** :indent 2 :sort_keys true))
+    (let [payload (gate/evidence-readiness
+                   {:analysis-dir dir
+                    :target-date "2026-07-05"
+                    :baseline-json baseline-path
+                    :probe-json (get artifacts "probe")
+                    :payload-verification-json (get artifacts "payload-verification")
+                    :neutralization-json (get artifacts "neutralization")
+                    :generated-at "2026-07-05T15:00:00Z"})]
+      (is (= "FAIL" (get payload "verdict")))
+      (is (some #(= "baseline features contain active live feature parity problems" %)
+                (get payload "fail_reasons")))
+      (is (some #(= "baseline active_problem_count does not match feature rows" %)
+                (get payload "fail_reasons"))))))
+
+(deftest evidence-readiness-fails-for-contradictory-baseline-capture-metadata
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"baseline" {"rows" 120
+                                "capture_file_count" 1
+                                "captures" {"files" ["live_features_20260704.npz"]
+                                            "rows_by_file" {"live_features_20260705.npz" 119}
+                                            "skipped_files" {}}
+                                "per_capture" [{"date" "20260705"
+                                                "path" "live_features_20260704.npz"
+                                                "rows" 119}]}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "baseline rows do not equal per_capture row total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline rows do not equal captures.rows_by_file total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline per_capture date does not match capture path date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline capture files include non-target-date files" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-target-dated-files-contain-stale-payloads
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"baseline" {"generated_at" "2026-07-04T14:00:00Z"}
+                    "probe" {"generated_at" "2026-07-04T14:00:00Z"}
+                    "payload-verification" {"generated_at" "2026-07-04T14:01:00Z"}
+                    "neutralization" {"generated_at" "2026-07-04T14:00:00Z"}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "baseline target_date/generated_at is not for target date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData capability probe target_date/generated_at is not for target date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification target_date/generated_at is not for target date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "neutralization audit target_date/generated_at is not for target date" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-neutralization-source-csvs-are-stale
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"neutralization" {"baseline_csv" (os.path/join dir "live_feature_parity_baseline_20260704.csv")
+                                      "usage_csv" (os.path/join dir "live_feature_model_usage_20260704.csv")}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "neutralization audit baseline CSV is not for target date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "neutralization audit model usage CSV is not for target date" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-on-malformed-generated-at-prefixes
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"probe" {"generated_at" "2026-07-05-not-real"}
+                    "payload-verification" {"generated_at" "2026-07-05T99:99:99Z"}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData capability probe target_date/generated_at is not for target date" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification target_date/generated_at is not for target date" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-target-date-discovery-does-not-use-stale-probe
+  (let [dir (temp-dir)
+        _stale-artifacts (readiness-artifacts dir "20260706" {})
+        artifacts (readiness-artifacts dir "20260709" {})
+        _ (os/remove (get artifacts "probe"))
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-09"
+                  :baseline-json (get artifacts "baseline")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :capture-check-json (get artifacts "capture_check")
+                  :generated-at "2026-07-09T15:00:00Z"})]
+    (is (= false (get-in payload ["thetadata_probe" "available"])))
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData capability probe missing" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-surfaces-unavailable-matched-parity-artifact
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260709" {})
+        result (gate/write-matched-feature-parity-unavailable!
+                {:out-dir dir
+                 :target-date "2026-07-09"
+                 :generated-at "2026-07-09T20:00:00Z"
+                 :reason "historical feature source NPZ missing"
+                 :min-rows 60})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-09"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :capture-check-json (get artifacts "capture_check")
+                  :matched-parity-json (:json-path result)
+                  :generated-at "2026-07-09T20:00:00Z"})]
+    (is (= false (get-in payload ["matched_feature_parity" "available"])))
+    (is (= "unavailable" (get-in payload ["matched_feature_parity" "status"])))
+    (is (= "historical feature source NPZ missing"
+           (get-in payload ["matched_feature_parity" "unavailable_reason"])))
+    (is (some #(= "matched live-vs-historical feature parity unavailable: historical feature source NPZ missing" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-thetadata-is-unusable
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"probe" {"summary" {"total" 3
+                                        "ok" 0
+                                        "usable" 0
+                                        "failed" 3
+                                        "error_classes" {"terminal-unreachable" 3}}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData terminal unreachable for all usable surfaces" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-verification-is-missing-or-invalid
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260705" {})
+        _ (os/remove (get artifacts "payload-verification"))
+        missing (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})
+        invalid-artifacts (readiness-artifacts
+                           dir "20260706"
+                           {"payload-verification" {"status" "error"
+                                                    "valid?" false
+                                                    "invalid" 1
+                                                    "checked" 2}})
+        invalid (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-06"
+                  :baseline-json (get invalid-artifacts "baseline")
+                  :probe-json (get invalid-artifacts "probe")
+                  :payload-verification-json (get invalid-artifacts "payload-verification")
+                  :neutralization-json (get invalid-artifacts "neutralization")
+                  :generated-at "2026-07-06T15:00:00Z"})]
+    (is (= "FAIL" (get missing "verdict")))
+    (is (some #(= "ThetaData payload verification missing" %)
+              (get missing "fail_reasons")))
+    (is (= "FAIL" (get invalid "verdict")))
+    (is (some #(= "ThetaData payload verification found invalid examples" %)
+              (get invalid "fail_reasons")))
+    (is (some #(= "ThetaData payload verification valid flag is not true" %)
+              (get invalid "fail_reasons")))
+    (is (some #(= "ThetaData payload verification status is not ok" %)
+              (get invalid "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-verification-valid-flag-is-forged-false
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"payload-verification" {"valid?" false
+                                            "status" "ok"
+                                            "total" 2
+                                            "checked" 2
+                                            "skipped" 0
+                                            "invalid" 0
+                                            "example_generated_date_counts" {"20260705" 2}
+                                            "example_path_date_counts" {"20260705" 2}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData payload verification valid flag is not true" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-for-malformed-payload-verification-result-rows
+  (let [dir (temp-dir)
+        cases [[{"results" "not-a-list"}
+                "ThetaData payload verification results must be list"]
+               [{"results" [{"probe" "option.expirations"
+                             "status" "ok"}
+                            {"probe" "option.snapshot.quote"
+                             "status" "ok"
+                             "valid?" true}]}
+                "ThetaData payload verification result row 0 valid? must be boolean"]
+               [{"results" [{"probe" "option.expirations"
+                             "status" "green"
+                             "valid?" true}
+                            {"probe" "option.snapshot.quote"
+                             "status" "ok"
+                             "valid?" true}]}
+                "ThetaData payload verification result row 0 status is invalid"]
+               [{"results" [{"status" "ok"
+                             "valid?" true}
+                            {"probe" "option.snapshot.quote"
+                             "status" "ok"
+                             "valid?" true}]}
+                "ThetaData payload verification result row 0 missing probe identity"]
+               [{"results" ["not-an-object"
+                            {"probe" "option.snapshot.quote"
+                             "status" "ok"
+                             "valid?" true}]}
+                "ThetaData payload verification result row 0 must be object"]]]
+    (doseq [[override expected] cases]
+      (let [artifacts (readiness-artifacts
+                       dir "20260705"
+                       {"payload-verification" override})
+            payload (gate/evidence-readiness
+                     {:analysis-dir dir
+                      :target-date "2026-07-05"
+                      :baseline-json (get artifacts "baseline")
+                      :probe-json (get artifacts "probe")
+                      :payload-verification-json (get artifacts "payload-verification")
+                      :neutralization-json (get artifacts "neutralization")
+                      :generated-at "2026-07-05T15:00:00Z"})]
+        (is (= "FAIL" (get payload "verdict")))
+        (is (some #(= expected %) (get payload "fail_reasons")))))))
+
+(deftest evidence-readiness-fails-for-malformed-probe-result-rows
+  (let [dir (temp-dir)
+        cases [[{"results" "not-a-list"}
+                "ThetaData probe results must be list"]
+               [{"results" [{"ok" true
+                             "usable" true
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 missing probe identity"]
+               [{"results" [{"name" "option.expirations"
+                             "usable" true
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 ok must be boolean"]
+               [{"results" [{"name" "option.expirations"
+                             "ok" true
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 usable must be boolean"]
+               [{"results" [{"name" "option.expirations"
+                             "ok" false
+                             "usable" false
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 saved payload example despite ok=false"]
+               [{"results" [{"name" "option.expirations"
+                             "ok" true
+                             "usable" true
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "summary" {"required_ok" true
+                                        "row_width_valid" true}
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 usable summary must be object"]
+               [{"results" [{"name" "option.expirations"
+                             "ok" true
+                             "usable" true
+                             "summary" {"required_ok" false
+                                        "row_width_valid" true}
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "summary" {"required_ok" true
+                                        "row_width_valid" true}
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 usable summary required_ok must be true"]
+               [{"results" [{"name" "option.expirations"
+                             "ok" true
+                             "usable" true
+                             "summary" {"required_ok" true
+                                        "row_width_valid" false}
+                             "payload_example" "expirations.json"}
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "summary" {"required_ok" true
+                                        "row_width_valid" true}
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 usable summary row_width_valid must not be false"]
+               [{"results" ["not-an-object"
+                            {"name" "option.snapshot.quote"
+                             "ok" true
+                             "usable" true
+                             "summary" {"required_ok" true
+                                        "row_width_valid" true}
+                             "payload_example" "quote.json"}
+                            {"name" "option.snapshot.greeks"
+                             "ok" true
+                             "usable" false}
+                            {"name" "stock.snapshot.quote"
+                             "ok" true
+                             "usable" false}]}
+                "ThetaData probe result row 0 must be object"]]]
+    (doseq [[override expected] cases]
+      (let [artifacts (readiness-artifacts
+                       dir "20260705"
+                       {"probe" override})
+            payload (gate/evidence-readiness
+                     {:analysis-dir dir
+                      :target-date "2026-07-05"
+                      :baseline-json (get artifacts "baseline")
+                      :probe-json (get artifacts "probe")
+                      :payload-verification-json (get artifacts "payload-verification")
+                      :neutralization-json (get artifacts "neutralization")
+                      :generated-at "2026-07-05T15:00:00Z"})]
+        (is (= "FAIL" (get payload "verdict")))
+        (is (some #(= expected %) (get payload "fail_reasons")))))))
+
+(deftest deterministic-fuzz-readiness-watches-any-positive-baseline-active-problem-count
+  (let [dir (temp-dir)]
+    (doseq [n (range 1 15)]
+      (let [stamp (str "202607" (python/format (+ 10 n) "02d"))
+            artifacts (readiness-artifacts
+                       dir stamp
+                       {"baseline" {"active_problem_count" n}})
+            target-date (str (subs stamp 0 4) "-" (subs stamp 4 6) "-" (subs stamp 6 8))
+            payload (gate/evidence-readiness
+                     {:analysis-dir dir
+                      :target-date target-date
+                      :baseline-json (get artifacts "baseline")
+                      :probe-json (get artifacts "probe")
+                      :payload-verification-json (get artifacts "payload-verification")
+                      :neutralization-json (get artifacts "neutralization")
+                      :generated-at (str target-date "T15:00:00Z")})]
+        (is (= "WATCH" (get payload "verdict")))
+        (is (= n (get-in payload ["baseline" "active_problem_count"])))
+        (is (some #(= "baseline has active training-distribution warnings" %)
+                  (get payload "watch_reasons")))))))
+
+(deftest evidence-readiness-fails-for-stale-or-empty-payload-verification
+  (let [dir (temp-dir)
+        stale-artifacts (readiness-artifacts dir "20260704" {})
+        stale (gate/evidence-readiness
+               {:analysis-dir dir
+                :target-date "2026-07-05"
+                :baseline-json (get stale-artifacts "baseline")
+                :probe-json (get stale-artifacts "probe")
+                :payload-verification-json (get stale-artifacts "payload-verification")
+                :neutralization-json (get stale-artifacts "neutralization")
+                :generated-at "2026-07-05T15:00:00Z"})
+        empty-artifacts (readiness-artifacts
+                         dir "20260705"
+                         {"probe" {"summary" {"total" 4
+                                              "ok" 4
+                                              "usable" 2
+                                              "failed" 0
+                                              "payload_examples" 0
+                                              "error_classes" {}}}
+                          "payload-verification" {"total" 0
+                                                  "checked" 0
+                                                  "invalid" 0}})
+        empty (gate/evidence-readiness
+               {:analysis-dir dir
+                :target-date "2026-07-05"
+                :baseline-json (get empty-artifacts "baseline")
+                :probe-json (get empty-artifacts "probe")
+                :payload-verification-json (get empty-artifacts "payload-verification")
+                :neutralization-json (get empty-artifacts "neutralization")
+                :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get stale "verdict")))
+    (is (some #(= "ThetaData payload verification is not for target date" %)
+              (get stale "fail_reasons")))
+    (is (= "FAIL" (get empty "verdict")))
+    (is (some #(= "ThetaData probe saved no payload examples" %)
+              (get empty "fail_reasons")))
+    (is (some #(= "ThetaData payload verification checked no supported examples" %)
+              (get empty "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-verification-does-not-match-probe-examples
+  (let [dir (temp-dir)
+        count-mismatch-artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"probe" {"summary" {"total" 4
+                              "ok" 4
+                              "usable" 2
+                              "failed" 0
+                              "payload_examples" 3
+                              "error_classes" {}}}
+          "payload-verification" {"total" 2
+                                  "checked" 2
+                                  "example_generated_date_counts" {"20260705" 2}
+                                  "example_path_date_counts" {"20260705" 2}}})
+        count-mismatch (gate/evidence-readiness
+                        {:analysis-dir dir
+                         :target-date "2026-07-05"
+                         :baseline-json (get count-mismatch-artifacts "baseline")
+                         :probe-json (get count-mismatch-artifacts "probe")
+                         :payload-verification-json (get count-mismatch-artifacts "payload-verification")
+                         :neutralization-json (get count-mismatch-artifacts "neutralization")
+                         :generated-at "2026-07-05T15:00:00Z"})
+        stale-example-artifacts
+        (readiness-artifacts
+         dir "20260706"
+         {"payload-verification" {"example_generated_date_counts" {"20260705" 2}
+                                  "example_target_date_counts" {"20260705" 2}
+                                  "example_path_date_counts" {"20260706" 2}}})
+        stale-example (gate/evidence-readiness
+                       {:analysis-dir dir
+                        :target-date "2026-07-06"
+                        :baseline-json (get stale-example-artifacts "baseline")
+                        :probe-json (get stale-example-artifacts "probe")
+                        :payload-verification-json (get stale-example-artifacts "payload-verification")
+                        :neutralization-json (get stale-example-artifacts "neutralization")
+                        :generated-at "2026-07-06T15:00:00Z"})
+        stale-path-artifacts
+        (readiness-artifacts
+         dir "20260707"
+         {"payload-verification" {"example_generated_date_counts" {"20260707" 2}
+                                  "example_path_date_counts" {"20260706" 2}}})
+        stale-path (gate/evidence-readiness
+                    {:analysis-dir dir
+                     :target-date "2026-07-07"
+                     :baseline-json (get stale-path-artifacts "baseline")
+                     :probe-json (get stale-path-artifacts "probe")
+                     :payload-verification-json (get stale-path-artifacts "payload-verification")
+                     :neutralization-json (get stale-path-artifacts "neutralization")
+                     :generated-at "2026-07-07T15:00:00Z"})
+        skipped-artifacts
+        (readiness-artifacts
+         dir "20260708"
+         {"payload-verification" {"total" 2
+                                  "checked" 1
+                                  "skipped" 1
+                                  "example_generated_date_counts" {"20260708" 2}
+                                  "example_path_date_counts" {"20260708" 2}}})
+        skipped (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-08"
+                  :baseline-json (get skipped-artifacts "baseline")
+                  :probe-json (get skipped-artifacts "probe")
+                  :payload-verification-json (get skipped-artifacts "payload-verification")
+                  :neutralization-json (get skipped-artifacts "neutralization")
+                  :generated-at "2026-07-08T15:00:00Z"})]
+    (is (= "FAIL" (get count-mismatch "verdict")))
+    (is (some #(= "ThetaData payload verification count does not match probe saved examples" %)
+              (get count-mismatch "fail_reasons")))
+    (is (= "FAIL" (get stale-example "verdict")))
+    (is (some #(= "ThetaData payload verification target date counts include non-target dates" %)
+              (get stale-example "fail_reasons")))
+    (is (= "FAIL" (get stale-path "verdict")))
+    (is (some #(= "ThetaData payload verification includes examples outside target-date directory" %)
+              (get stale-path "fail_reasons")))
+    (is (= "FAIL" (get skipped "verdict")))
+    (is (some #(= "ThetaData payload verification skipped unsupported examples" %)
+              (get skipped "fail_reasons")))
+    (is (some #(= "ThetaData payload verification checked count does not match probe saved examples" %)
+              (get skipped "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-verification-date-counts-hide-stale-extras
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"payload-verification" {"total" 2
+                                  "checked" 2
+                                  "example_generated_date_counts" {"20260705" 2
+                                                                   "20260704" 99}
+                                  "example_target_date_counts" {"20260705" 2
+                                                                "20260704" 99}
+                                  "example_path_date_counts" {"20260705" 2
+                                                              "20260704" 99}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData payload verification target date counts do not sum to total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification target date counts include non-target dates" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification path date counts do not sum to total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification path date counts include non-target dates" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-for-contradictory-probe-summary-counts
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"probe" {"summary" {"total" 0
+                              "ok" 3
+                              "usable" 2
+                              "failed" 1
+                              "payload_examples" 2
+                              "error_classes" {}}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData probe total must be positive" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe ok count exceeds total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe failed count exceeds total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe ok plus failed counts exceed total" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-for-malformed-or-negative-artifact-counters
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"baseline" {"rows" -1
+                      "active_problem_count" "not-an-int"
+                      "captures" {"files" ["live_features_20260705.npz"]
+                                  "rows_by_file" {"live_features_20260705.npz" -2}
+                                  "skipped_files" {}}
+                      "per_capture" [{"date" "20260705"
+                                      "path" "live_features_20260705.npz"
+                                      "rows" "bad"}]}
+          "probe" {"summary" {"total" "4.5"
+                              "ok" 4
+                              "usable" 2
+                              "failed" 0
+                              "payload_examples" 2
+                              "error_classes" {"timeout" -1}}}
+          "payload-verification" {"checked" "bad"
+                                  "example_generated_date_counts" {"20260705" "two"}
+                                  "example_target_date_counts" {"20260705" "bad"}
+                                  "example_path_date_counts" {"20260705" -1}}
+          "neutralization" {"blocked_count" -7}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "baseline rows must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline active_problem_count must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline per_capture row 0 rows must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline captures.rows_by_file live_features_20260705.npz must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe summary total must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe error_classes timeout must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification checked must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification example_generated_date_counts 20260705 must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification example_target_date_counts 20260705 must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification example_path_date_counts 20260705 must be nonnegative integer" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "neutralization audit blocked_count must be nonnegative integer" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-for-malformed-nested-count-shapes
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"baseline" {"captures" {"files" []
+                                  "rows_by_file" ["not" "an" "object"]
+                                  "skipped_files" {}}
+                      "per_capture" "not-a-list"}
+          "probe" {"summary" {"error_classes" ["not" "an" "object"]}}
+          "payload-verification" {"example_generated_date_counts" "not-an-object"
+                                  "example_target_date_counts" ["not" "an" "object"]
+                                  "example_path_date_counts" "not-an-object"}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "baseline per_capture must be list" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "baseline captures.rows_by_file must be object" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe error_classes must be object" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification example_generated_date_counts must be object" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification example_target_date_counts must be object" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification example_path_date_counts must be object" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-probe-summary-contradicts-result-rows
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"probe" {"summary" {"total" 4
+                              "ok" 4
+                              "usable" 3
+                              "failed" 0
+                              "payload_examples" 2
+                              "error_classes" {}}
+                   "results" [{"name" "option.expirations"
+                               "ok" true
+                               "usable" true
+                               "payload_example" "expirations.json"}
+                              {"name" "option.snapshot.quote"
+                               "ok" true
+                               "usable" true
+                               "payload_example" "quote.json"}
+                              {"name" "option.snapshot.greeks"
+                               "ok" false
+                               "usable" false}]}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData probe summary total does not match result rows" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe summary ok count does not match result rows" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe summary usable count does not match result rows" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData probe summary failed count does not match result rows" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-verification-summary-contradicts-result-rows
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"payload-verification" {"total" 2
+                                  "checked" 2
+                                  "skipped" 0
+                                  "invalid" 0
+                                  "results" [{"probe" "option.expirations"
+                                              "status" "ok"
+                                              "valid?" true}
+                                             {"probe" "option.snapshot.quote"
+                                              "status" "error"
+                                              "valid?" false}
+                                             {"probe" "stock.snapshot.quote"
+                                              "status" "skipped"
+                                              "valid?" true}]}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData payload verification total does not match result rows" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification skipped count does not match result rows" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification invalid count does not match result rows" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-verification-duplicates-probe-coverage
+  (let [dir (temp-dir)
+        duplicate-path (os.path/join dir "payloads" "20260705" "expirations.json")
+        missing-path (os.path/join dir "payloads" "20260705" "quote.json")
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"payload-verification" {"total" 2
+                                  "checked" 2
+                                  "skipped" 0
+                                  "invalid" 0
+                                  "example_generated_date_counts" {"20260705" 2}
+                                  "example_path_date_counts" {"20260705" 2}
+                                  "results" [{"probe" "option.expirations"
+                                              "path" duplicate-path
+                                              "status" "ok"
+                                              "valid?" true}
+                                             {"probe" "option.expirations"
+                                              "path" duplicate-path
+                                              "status" "ok"
+                                              "valid?" true}]}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(not= -1 (.find % "ThetaData payload verification duplicate checked probe identities:"))
+              (get payload "fail_reasons")))
+    (is (some #(not= -1 (.find % duplicate-path))
+              (get payload "fail_reasons")))
+    (is (some #(not= -1 (.find % "ThetaData payload verification missing checked probe identities:"))
+              (get payload "fail_reasons")))
+    (is (some #(not= -1 (.find % missing-path))
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-target-date-counts-drift
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"payload-verification" {"total" 2
+                                  "checked" 2
+                                  "example_generated_date_counts" {"20260705" 2}
+                                  "example_target_date_counts" {"20260704" 1
+                                                                "missing" 1}
+                                  "example_path_date_counts" {"20260705" 2}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData payload verification target date counts include non-target dates" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-payload-target-date-counts-hide-extra-rows
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"payload-verification" {"total" 2
+                                  "checked" 2
+                                  "example_generated_date_counts" {"20260705" 2}
+                                  "example_target_date_counts" {"20260705" 2
+                                                                "20260704" 99}
+                                  "example_path_date_counts" {"20260705" 2}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "ThetaData payload verification target date counts do not sum to total" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "ThetaData payload verification target date counts include non-target dates" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-fails-when-neutralization-summary-contradicts-feature-rows
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260705" {})
+        neutralization-path (get artifacts "neutralization")
+        neutralization (json/loads (slurp neutralization-path))]
+    (spit neutralization-path
+          (json/dumps
+           (gate/->jsonable
+            {"summary" (assoc (into {} (.items (get neutralization "summary")))
+                               "neutralized_features" 0
+                               "candidate_now" 0
+                               "review_count" 0
+                               "blocked_count" 0)
+             "features" [{"feature" "candidate"
+                          "recoverability" "candidate-now"}
+                         {"feature" "review"
+                          "recoverability" "review-shift"}
+                         {"feature" "blocked"
+                          "recoverability" "blocked-live-source"}]})
+           ** :indent 2 :sort_keys true))
+    (let [payload (gate/evidence-readiness
+                   {:analysis-dir dir
+                    :target-date "2026-07-05"
+                    :baseline-json (get artifacts "baseline")
+                    :probe-json (get artifacts "probe")
+                    :payload-verification-json (get artifacts "payload-verification")
+                    :neutralization-json neutralization-path
+                    :generated-at "2026-07-05T15:00:00Z"})]
+      (is (= "FAIL" (get payload "verdict")))
+      (is (some #(= "neutralization audit neutralized_features does not match feature rows" %)
+                (get payload "fail_reasons")))
+      (is (some #(= "neutralization audit candidate_now does not match feature rows" %)
+                (get payload "fail_reasons")))
+      (is (some #(= "neutralization audit review_count does not match feature rows" %)
+                (get payload "fail_reasons")))
+      (is (some #(= "neutralization audit blocked_count does not match feature rows" %)
+                (get payload "fail_reasons"))))))
+
+(deftest evidence-readiness-fails-when-neutralization-provenance-is-detached
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"neutralization" {"baseline_csv" ""
+                                      "usage_csv" ""}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "FAIL" (get payload "verdict")))
+    (is (some #(= "neutralization audit missing baseline CSV provenance" %)
+              (get payload "fail_reasons")))
+    (is (some #(= "neutralization audit missing model usage CSV provenance" %)
+              (get payload "fail_reasons")))))
+
+(deftest evidence-readiness-accepts-compact-payload-verification-target-date-at-utc-boundary
+  (let [dir (temp-dir)
+        artifacts
+        (readiness-artifacts
+         dir "20260705"
+         {"payload-verification" {"target_date" "20260705"
+                                  "generated_at" "2026-07-06T01:00:00Z"
+                                  "example_generated_date_counts" {"20260705" 2}
+                                  "example_path_date_counts" {"20260705" 2}}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T21:00:00Z"})]
+    (is (= "PASS" (get payload "verdict")))
+    (is (not (some #(= "ThetaData payload verification target_date/generated_at is not for target date" %)
+                   (get payload "fail_reasons"))))))
+
+(deftest evidence-readiness-watches-for-partial-or-still-blocked-evidence
+  (let [dir (temp-dir)
+        expirations-path (os.path/join dir "payloads" "20260705" "expirations.json")
+        quote-path (os.path/join dir "payloads" "20260705" "quote.json")
+        artifacts (readiness-artifacts
+                   dir "20260705"
+                   {"probe" {"summary" {"total" 4
+                                        "ok" 3
+                                        "usable" 2
+                                        "failed" 1
+                                        "payload_examples" 2
+                                        "error_classes" {"unsupported-endpoint" 1}}
+                              "results" [{"name" "option.expirations"
+                                          "ok" true
+                                          "usable" true
+                                          "summary" {"required_ok" true
+                                                     "row_width_valid" true}
+                                          "payload_example" expirations-path}
+                                         {"name" "option.snapshot.quote"
+                                          "ok" true
+                                          "usable" true
+                                          "summary" {"required_ok" true
+                                                     "row_width_valid" true}
+                                          "payload_example" quote-path}
+                                         {"name" "option.snapshot.greeks"
+                                          "ok" true
+                                          "usable" false}
+                                         {"name" "bulk.option.greeks"
+                                          "ok" false
+                                          "usable" false}]}
+                    "neutralization" {"review_count" 2
+                                      "blocked_count" 7}})
+        payload (gate/evidence-readiness
+                 {:analysis-dir dir
+                  :target-date "2026-07-05"
+                  :baseline-json (get artifacts "baseline")
+                  :probe-json (get artifacts "probe")
+                  :payload-verification-json (get artifacts "payload-verification")
+                  :neutralization-json (get artifacts "neutralization")
+                  :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "WATCH" (get payload "verdict")))
+    (is (some #(= "ThetaData probe partially failed" %)
+              (get payload "watch_reasons")))
+    (is (some #(= "neutralization audit still has blocked features" %)
+              (get payload "watch_reasons")))))
+
+(deftest evidence-readiness-writes-json-and-markdown
+  (let [dir (temp-dir)
+        artifacts (readiness-artifacts dir "20260705" {})
+        {:keys [payload json-path markdown-path]}
+        (gate/write-evidence-readiness!
+         {:analysis-dir dir
+          :out-dir dir
+          :target-date "2026-07-05"
+          :baseline-json (get artifacts "baseline")
+          :probe-json (get artifacts "probe")
+          :payload-verification-json (get artifacts "payload-verification")
+          :neutralization-json (get artifacts "neutralization")
+          :generated-at "2026-07-05T15:00:00Z"})]
+    (is (= "PASS" (get payload "verdict")))
+    (is (= "PASS" (get (json/loads (slurp json-path)) "verdict")))
+    (is (true? (os.path/exists markdown-path)))
+    (is (.startswith (slurp markdown-path) "# Market Evidence Readiness"))))
+
+(deftest matched-time-indexes-normalizes-live-capture-instants
+  (let [matched (gate/matched-time-indexes
+                 ["#inst \"2026-07-05T13:30:00+00:00\""
+                  "#inst \"2026-07-05T13:31:00+00:00\""
+                  "#inst \"2026-07-05T13:32:00+00:00\""]
+                 ["2026-07-05T13:31:00Z"
+                  "2026-07-05T13:30:00Z"])]
+    (is (= [0 1] (get matched "live_indexes")))
+    (is (= [1 0] (get matched "historical_indexes")))
+    (is (= ["2026-07-05T13:30:00Z"
+            "2026-07-05T13:31:00Z"]
+           (get matched "times")))))
+
+(deftest matched-feature-parity-report-writes-steve-requested-metrics
+  (let [dir (temp-dir)
+        live (os.path/join dir "live_features_20260705.npz")
+        historical (os.path/join dir "historical_features_20260705.npz")
+        features (os.path/join dir "feature_names.json")
+        neutralized (os.path/join dir "neutralize_features.json")
+        out (os.path/join dir "out")]
+    (spit features (json/dumps (gate/->jsonable ["SPY_close" "vix_proxy"])))
+    (spit neutralized (json/dumps (gate/->jsonable ["vix_proxy"])))
+    (numpy/savez live
+                 ** :times (numpy/array ["#inst \"2026-07-05T13:30:00+00:00\""
+                                          "#inst \"2026-07-05T13:31:00+00:00\""
+                                          "#inst \"2026-07-05T13:32:00+00:00\""])
+                    :chestnut (numpy/array [[1.0 0.0]
+                                            [2.0 0.0]
+                                            [3.0 0.0]]))
+    (numpy/savez historical
+                 ** :times (numpy/array ["2026-07-05T13:30:00Z"
+                                          "2026-07-05T13:31:00Z"
+                                          "2026-07-05T13:32:00Z"])
+                    :X (numpy/array [[1.0 0.0]
+                                     [2.5 0.0]
+                                     [3.0 1.0]]))
+    (let [{:keys [summary rows csv-path json-path markdown-path]}
+          (gate/write-matched-feature-parity!
+           {:live-capture live
+            :historical-npz historical
+            :feature-names features
+            :out-dir out
+            :target-date "2026-07-05"
+            :generated-at "2026-07-05T20:00:00Z"})
+          by-feature (into {} (map (fn [r] [(get r "feature") r]) rows))
+          spy (get by-feature "SPY_close")
+          vix (get by-feature "vix_proxy")
+          payload (json/loads (slurp json-path))]
+      (is (= 3 (get summary "matched_rows")))
+      (is (= "2026-07-05T13:30:00Z" (get summary "matched_start")))
+      (is (= "2026-07-05T13:32:00Z" (get summary "matched_end")))
+      (is (= 2 (get summary "feature_count")))
+      (is (= 1 (get (get summary "status_counts") "CONSTANT_OR_DEGENERATE")))
+      (is (= 1 (get (get summary "status_counts") "DIVERGED")))
+      (is (= 2 (get summary "problem_feature_count")))
+      (is (= 1 (get summary "active_problem_count")))
+      (is (= 1 (get summary "neutralized_count")))
+      (is (= 1 (get summary "neutralized_problem_count")))
+      (is (= 2 (count rows)))
+      (is (= 2.0 (get spy "live_mean")))
+      (is (= 0.5 (get spy "max_abs_deviation")))
+      (is (= "DIVERGED" (get spy "status")))
+      (is (= false (get spy "neutralized")))
+      (is (= true (get spy "active_problem")))
+      (is (= 0 (get spy "live_leading_zero_count")))
+      (is (nil? (get spy "live_leading_zero_until")))
+      (is (= 1.0 (get vix "live_zero_frac")))
+      (is (= (/ 2.0 3.0) (get vix "historical_zero_frac")))
+      (is (= 3 (get vix "live_leading_zero_count")))
+      (is (= "2026-07-05T13:32:00Z" (get vix "live_leading_zero_until")))
+      (is (= 2 (get vix "historical_leading_zero_count")))
+      (is (= "2026-07-05T13:31:00Z" (get vix "historical_leading_zero_until")))
+      (is (= "CONSTANT_OR_DEGENERATE" (get vix "status")))
+      (is (= true (get vix "neutralized")))
+      (is (= false (get vix "active_problem")))
+      (is (= 3 (get-in payload ["summary" "matched_rows"])))
+      (is (= 2 (get-in payload ["summary" "feature_count"])))
+      (is (= 1 (get-in payload ["summary" "status_counts" "CONSTANT_OR_DEGENERATE"])))
+      (is (= 1 (get-in payload ["summary" "status_counts" "DIVERGED"])))
+      (is (= 1 (get-in payload ["summary" "active_problem_count"])))
+      (is (= 1 (get-in payload ["summary" "neutralized_problem_count"])))
+      (is (true? (os.path/exists csv-path)))
+      (is (= 3 (count (str/split-lines (slurp csv-path)))))
+      (is (str/includes? (slurp csv-path) "SPY_close"))
+      (is (str/includes? (slurp csv-path) "vix_proxy"))
+      (is (true? (os.path/exists markdown-path)))
+      (is (.startswith (slurp markdown-path)
+                       "# Matched Live vs Historical Feature Parity")))))
+
+(deftest matched-feature-parity-report-rejects-insufficient-overlap
+  (let [dir (temp-dir)
+        live (os.path/join dir "live_features_20260705.npz")
+        historical (os.path/join dir "historical_features_20260705.npz")
+        features (os.path/join dir "feature_names.json")
+        out (os.path/join dir "out")]
+    (spit features (json/dumps (gate/->jsonable ["SPY_close"])))
+    (numpy/savez live
+                 ** :times (numpy/array ["#inst \"2026-07-05T13:30:00+00:00\""
+                                          "#inst \"2026-07-05T13:31:00+00:00\""])
+                    :chestnut (numpy/array [[1.0] [2.0]]))
+    (numpy/savez historical
+                 ** :times (numpy/array ["2026-07-05T13:30:00Z"
+                                          "2026-07-05T13:31:00Z"])
+                    :X (numpy/array [[1.0] [2.0]]))
+    (os/makedirs out ** :exist_ok true)
+    (doseq [ext [".json" ".csv" ".md"]]
+      (spit (os.path/join out (str "matched_feature_parity_20260705" ext))
+            "stale matched parity artifact\n"))
+    (let [thrown (try
+                   (gate/write-matched-feature-parity!
+                    {:live-capture live
+                     :historical-npz historical
+                     :feature-names features
+                     :out-dir out
+                     :target-date "2026-07-05"
+                     :min-rows 60})
+                   nil
+                   (catch python/Exception e e))]
+      (is (not (nil? thrown)))
+      (is (not= -1 (.find (str thrown)
+                          "insufficient overlapping timestamps between live and historical tensors")))
+      (is (false? (os.path/exists (os.path/join out "matched_feature_parity_20260705.json"))))
+      (is (false? (os.path/exists (os.path/join out "matched_feature_parity_20260705.csv"))))
+      (is (false? (os.path/exists (os.path/join out "matched_feature_parity_20260705.md")))))))

@@ -1,0 +1,198 @@
+;; Audit control-plane manifest artifacts and fail closed.
+(import glob json os os.path sys)
+
+(def repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd)))
+(doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                     (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+  (.insert (.-path sys) 0 path))
+
+(require '[basilisp.edn :as edn]
+         '[stevetrading.control-plane.protocol :as cpp])
+
+(defn usage
+  []
+  (println
+   (str "usage: basilisp run scripts/audit_control_plane_artifacts.lpy -- "
+        "[--path FILE_OR_GLOB ...] [--root DIR] [--summary-only] "
+        "[--warnings-as-errors]")))
+
+(defn option-value
+  [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value)
+              (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args
+  [args]
+  (loop [remaining (seq args)
+         out {:paths []
+              :root (os.path/join repo-root "live_runtime")
+              :summary-only? false
+              :warnings-as-errors? false}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--path")
+          (recur (nnext remaining)
+                 (update out :paths conj (option-value remaining arg)))
+
+          (= arg "--root")
+          (recur (nnext remaining)
+                 (assoc out :root (option-value remaining arg)))
+
+          (= arg "--summary-only")
+          (recur (next remaining) (assoc out :summary-only? true))
+
+          (= arg "--warnings-as-errors")
+          (recur (next remaining) (assoc out :warnings-as-errors? true))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn- expand-pattern
+  [pattern]
+  (let [matches (sort (glob/glob pattern ** :recursive true))]
+    (if (empty? matches) [pattern] matches)))
+
+(defn- file?
+  [path]
+  (os.path/isfile path))
+
+(defn- path-inside-root?
+  [root path]
+  (let [root-real (os.path/realpath root)
+        path-real (os.path/realpath path)]
+    (or (= path-real root-real)
+        (.startswith path-real (str root-real os/sep)))))
+
+(defn discover-paths
+  [{:keys [paths root]}]
+  (let [patterns (if (seq paths)
+                   paths
+                   [(os.path/join root "cp*" "revisions" "*.edn")])
+        rows (mapv (fn [pattern]
+                     (let [files (->> (expand-pattern pattern)
+                                      (filter file?)
+                                      distinct
+                                      sort
+                                      vec)]
+                       {:pattern pattern
+                        :files files
+                        :missing? (empty? files)}))
+                   patterns)]
+    {:paths (->> rows (mapcat :files) distinct sort vec)
+     :missing-patterns (->> rows
+                            (filter :missing?)
+                            (mapv :pattern))}))
+
+(defn- jsonable-error
+  [e]
+  {:code (str (:error/code e))
+   :path (mapv str (:error/path e))
+   :message (:error/message e)})
+
+(defn audit-file
+  [path]
+  (try
+    (let [manifest (edn/read-string (slurp path))
+          validation (cpp/validate-manifest manifest)]
+      {:path path
+       :valid? (:valid? validation)
+       :errors (mapv jsonable-error (:errors validation))
+       :warnings (mapv jsonable-error (:warnings validation))})
+    (catch python/Exception e
+      {:path path
+       :valid? false
+       :errors [{:code "control-plane-artifact/unreadable"
+                 :path []
+                 :message (str e)}]
+       :warnings []})))
+
+(defn annotate-root-containment
+  [root result]
+  (if (path-inside-root? root (:path result))
+    result
+    (-> result
+        (assoc :valid? false)
+        (update :errors conj
+                {:code "control-plane-artifact/root-escape"
+                 :path []
+                 :message (str "discovered manifest resolves outside runtime root: "
+                               (:path result))}))))
+
+(defn audit-control-plane-artifacts
+  [opts]
+  (let [{:keys [paths missing-patterns]} (discover-paths opts)
+        explicit-paths? (seq (:paths opts))
+        files (cond->> (mapv audit-file paths)
+                (not explicit-paths?)
+                (mapv #(annotate-root-containment (:root opts) %)))
+        invalid (filterv #(not (:valid? %)) files)
+        warning-files (filterv #(seq (:warnings %)) files)
+        warning-count (reduce + 0 (map #(count (:warnings %)) warning-files))
+        warning-codes (->> warning-files
+                           (mapcat :warnings)
+                           (map :code)
+                           distinct
+                           sort
+                           vec)
+        warnings-block? (and (:warnings-as-errors? opts)
+                             (pos? warning-count))
+        report-files (if (:summary-only? opts)
+                       invalid
+                       files)]
+    {:valid? (and (seq paths)
+                  (empty? missing-patterns)
+                  (empty? invalid)
+                  (not warnings-block?))
+     :path-count (count paths)
+     :missing-count (count missing-patterns)
+     :missing-patterns missing-patterns
+     :invalid-count (count invalid)
+     :warning-count warning-count
+     :warning-file-count (count warning-files)
+     :warning-codes warning-codes
+     :warnings-as-errors? (:warnings-as-errors? opts)
+     :summary-only? (:summary-only? opts)
+     :files report-files}))
+
+(defn ->jsonable
+  [x]
+  (cond
+    (map? x)
+    (python/dict
+     (map (fn [[k v]]
+            (let [ks (str k)]
+              (python/tuple [(if (.startswith ks ":") (subs ks 1) ks)
+                             (->jsonable v)])))
+          x))
+
+    (or (vector? x) (seq? x) (set? x))
+    (python/list (map ->jsonable x))
+
+    (keyword? x)
+    (let [s (str x)]
+      (if (.startswith s ":") (subs s 1) s))
+
+    :else x))
+
+(try
+  (let [opts (parse-args (vec *command-line-args*))
+        result (audit-control-plane-artifacts opts)]
+    (println (json/dumps (->jsonable result) ** :indent 2 :sort_keys true))
+    (python/exit (if (:valid? result) 0 1)))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

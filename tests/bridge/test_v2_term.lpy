@@ -4,8 +4,19 @@
   z<-enter -> SHORT_CALENDAR, |z|<exit while held -> flat). The
   prediction_fn wrap itself is interop (smoke-tested live, not unit-
   tested — no torch/network in the suite)."
+  (:import datetime)
   (:require [basilisp.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [stevetrading.bridge.v2-term :as v2t]))
+
+(deftest core-bridge-keeps-legacy-loading-out-of-band
+  (let [core-source (slurp "components/bridge.v2-term/src/stevetrading/bridge/v2_term.lpy")
+        legacy-source (slurp "components/bridge.v2-term/src/stevetrading/bridge/v2_term/legacy.lpy")]
+    (is (not (str/includes? core-source "stevetrading_v2")))
+    (is (not (str/includes? core-source "importlib/import-module")))
+    (is (str/includes? core-source "requires :prediction-factory"))
+    (is (str/includes? legacy-source "stevetrading_v2.strategies._term_predictor_builder"))
+    (is (str/includes? legacy-source "core/make-v2-term-bridge"))))
 
 (deftest hysteresis-machine
   (testing "flat + small z stays flat"
@@ -24,3 +35,49 @@
   (testing "nil z (predictor cold / fetch error) holds the prior kind"
     (is (= :long (v2t/hysteresis-step :long nil 2.5 0.5)))
     (is (= :flat (v2t/hysteresis-step :flat nil 2.5 0.5)))))
+
+(deftest injected-predictor-factory-memoizes-per-minute-and-holds-on-nan
+  (let [now (atom ((.-datetime datetime) 2026 7 9 14 0 0
+                   ** :tzinfo (.-utc datetime/timezone)))
+        calls (atom 0)
+        values (atom [3.0 0.0])
+        bridge (v2t/make-v2-term-bridge
+                {:strategies {:test-term {:enter-sigma 2.5 :exit-sigma 0.5}}
+                 :now-fn (fn [] @now)
+                 :prediction-factory
+                 (fn [_bot _params]
+                   {:pred-fn (fn [_instant]
+                               (swap! calls inc)
+                               (let [v (first @values)]
+                                 (swap! values subvec 1)
+                                 v))})})
+        signals (:signals-fn bridge)]
+    (is (= {:test-term :long} (signals)))
+    (is (= {:test-term :long} (signals)))
+    (is (= 1 @calls))
+    (reset! now ((.-datetime datetime) 2026 7 9 14 1 0
+                 ** :tzinfo (.-utc datetime/timezone)))
+    (is (= {:test-term :flat} (signals)))
+    (is (= 2 @calls))))
+
+(deftest injected-predictor-factory-records-errors-and-holds-kind
+  (let [now (atom ((.-datetime datetime) 2026 7 9 14 0 0
+                   ** :tzinfo (.-utc datetime/timezone)))
+        calls (atom 0)
+        bridge (v2t/make-v2-term-bridge
+                {:strategies {:test-term {:enter-sigma 2.5 :exit-sigma 0.5}}
+                 :now-fn (fn [] @now)
+                 :prediction-factory
+                 (fn [_bot _params]
+                   {:pred-fn (fn [_instant]
+                               (swap! calls inc)
+                               (if (= 1 @calls)
+                                 3.0
+                                 (throw (python/RuntimeError "boom"))))})})
+        signals (:signals-fn bridge)]
+    (is (= {:test-term :long} (signals)))
+    (reset! now ((.-datetime datetime) 2026 7 9 14 1 0
+                 ** :tzinfo (.-utc datetime/timezone)))
+    (is (= {:test-term :long} (signals)))
+    (is (= 2 @calls))
+    (is (not= -1 (.find (get-in @(:state bridge) [:last-error]) "test-term: boom")))))

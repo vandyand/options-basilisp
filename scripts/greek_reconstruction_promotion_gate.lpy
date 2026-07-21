@@ -1,0 +1,335 @@
+;; Fail-closed promotion gate for guarded Greek reconstruction formulas.
+(import csv datetime json os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.core :as fp])
+
+(def source "greek_reconstruction_candidate_formula")
+
+(defn usage []
+  (println (str "usage: basilisp run scripts/greek_reconstruction_promotion_gate.lpy -- "
+                "--target-date YYYY-MM-DD --raw-audit-json PATH --capture-check-json PATH "
+                "[--extra-raw-audit-json PATH ...] "
+                "--out-dir DIR [--label LABEL] [threshold flags] "
+                "[--write-unavailable --unavailable-reason TEXT]")))
+
+(defn option-value [remaining flag]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith value "--"))
+      (throw (python/ValueError (str "missing value for " flag))))
+    value))
+
+(defn parse-float [value flag]
+  (try
+    (float value)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid float for " flag ": " value))))))
+
+(defn parse-int [value flag]
+  (try
+    (int value)
+    (catch python/Exception _
+      (throw (python/ValueError (str "invalid integer for " flag ": " value))))))
+
+(defn parse-args [args]
+  (loop [remaining args
+         out {:target-date nil
+              :raw-audit-json nil
+              :extra-raw-audit-json []
+              :capture-check-json nil
+              :out-dir nil
+              :label nil
+              :max-abs-z-mean 1.5
+              :min-z-std 0.2
+              :max-z-std 2.5
+              :max-zero-frac 0.95
+              :min-split-count 1
+              :min-evaluated-count 60
+              :write-unavailable false
+              :unavailable-reason nil}]
+    (if (empty? remaining)
+      (do
+        (doseq [required (if (:write-unavailable out)
+                           [:target-date :out-dir]
+                           [:target-date :raw-audit-json :capture-check-json :out-dir])]
+          (when-not (get out required)
+            (throw (python/ValueError (str "missing required --" (.replace (name required) "_" "-"))))))
+        out)
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--target-date") (recur (nnext remaining) (assoc out :target-date (option-value remaining arg)))
+          (= arg "--raw-audit-json") (recur (nnext remaining) (assoc out :raw-audit-json (option-value remaining arg)))
+          (= arg "--extra-raw-audit-json") (recur (nnext remaining) (update out :extra-raw-audit-json conj (option-value remaining arg)))
+          (= arg "--capture-check-json") (recur (nnext remaining) (assoc out :capture-check-json (option-value remaining arg)))
+          (= arg "--out-dir") (recur (nnext remaining) (assoc out :out-dir (option-value remaining arg)))
+          (= arg "--label") (recur (nnext remaining) (assoc out :label (option-value remaining arg)))
+          (= arg "--max-abs-z-mean") (recur (nnext remaining) (assoc out :max-abs-z-mean (parse-float (option-value remaining arg) arg)))
+          (= arg "--min-z-std") (recur (nnext remaining) (assoc out :min-z-std (parse-float (option-value remaining arg) arg)))
+          (= arg "--max-z-std") (recur (nnext remaining) (assoc out :max-z-std (parse-float (option-value remaining arg) arg)))
+          (= arg "--max-zero-frac") (recur (nnext remaining) (assoc out :max-zero-frac (parse-float (option-value remaining arg) arg)))
+          (= arg "--min-split-count") (recur (nnext remaining) (assoc out :min-split-count (parse-int (option-value remaining arg) arg)))
+          (= arg "--min-evaluated-count") (recur (nnext remaining) (assoc out :min-evaluated-count (parse-int (option-value remaining arg) arg)))
+          (= arg "--write-unavailable") (recur (next remaining) (assoc out :write-unavailable true))
+          (= arg "--unavailable-reason") (recur (nnext remaining) (assoc out :unavailable-reason (option-value remaining arg)))
+          (or (= arg "-h") (= arg "--help")) (do (usage) (python/exit 0))
+          :else (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn load-json [path]
+  (when-not (os.path/exists path)
+    (throw (python/RuntimeError (str "required JSON artifact is missing: " path))))
+  (let [payload (fp/read-json path)]
+    (when-not (map? payload)
+      (throw (python/RuntimeError (str "JSON artifact must be an object: " path))))
+    payload))
+
+(defn nonnegative-int [value label reasons]
+  (if (or (true? value) (false? value) (not (int? value)) (neg? value))
+    (do
+      (swap! reasons conj (str label " must be a nonnegative integer"))
+      0)
+    value))
+
+(defn capture-ok [payload target-date]
+  (let [reasons (atom [])]
+    (when (not= (get payload "target_date") target-date)
+      (swap! reasons conj "capture check target_date mismatch"))
+    (when (not (true? (get payload "ok")))
+      (swap! reasons conj "capture check ok is not true"))
+    (when (not= (get payload "capture_version") 2)
+      (swap! reasons conj "capture check capture_version is not 2"))
+    (when (seq (get payload "issues"))
+      (swap! reasons conj "capture check has issues"))
+    (let [useful (or (get payload "sidecar_useful_rows") {})]
+      (doseq [key ["bar_buffers_json" "option_chain_json" "option_surfaces_json"]]
+        (when (<= (nonnegative-int (get useful key) (str "capture check sidecar_useful_rows." key) reasons) 0)
+          (swap! reasons conj (str "capture check has no useful rows for " key)))))
+    (let [contracts (or (get payload "sidecar_total_contracts") {})]
+      (doseq [key ["option_chain_json" "option_surfaces_json"]]
+        (when (<= (nonnegative-int (get contracts key) (str "capture check sidecar_total_contracts." key) reasons) 0)
+          (swap! reasons conj (str "capture check has no contracts for " key)))))
+    [(not (seq @reasons)) @reasons]))
+
+(defn coverage-ok [raw-summary evaluated-count min-evaluated-count]
+  (let [reasons (atom [])
+        expected (get raw-summary "guarded_greek_reconstruction_count")]
+    (when (some? expected)
+      (let [parsed (nonnegative-int expected "raw guarded_greek_reconstruction_count" reasons)]
+        (when (not= parsed evaluated-count)
+          (swap! reasons conj (str "raw guarded_greek_reconstruction_count " expected
+                                   " does not match evaluated rows " evaluated-count)))))
+    (when (< evaluated-count min-evaluated-count)
+      (swap! reasons conj (str "evaluated rows " evaluated-count " below minimum " min-evaluated-count)))
+    [(not (seq @reasons)) @reasons]))
+
+(defn unique-by-feature
+  [rows]
+  (loop [remaining (seq rows)
+         seen #{}
+         out []]
+    (if-not remaining
+      out
+      (let [row (first remaining)
+            feature (get row "feature")]
+        (if (contains? seen feature)
+          (recur (next remaining) seen out)
+          (recur (next remaining) (conj seen feature) (conj out row)))))))
+
+(defn raw-guarded-rows
+  [raw]
+  (vec (filter #(= source (get % "source_note")) (or (get raw "features") []))))
+
+(defn validate-raw-target!
+  [raw path target-date]
+  (let [raw-summary (or (get raw "summary") {})]
+    (when (not= (get raw-summary "target_date") target-date)
+      (throw (python/RuntimeError (str "raw audit target_date " (repr (get raw-summary "target_date"))
+                                      " does not match " (repr target-date)
+                                      ": " path))))
+    raw-summary))
+
+(defn row-decision [row opts capture-ok? coverage-ok?]
+  (let [reasons (atom [])]
+    (when-not capture-ok?
+      (swap! reasons conj "capture check is not clean"))
+    (when-not coverage-ok?
+      (swap! reasons conj "guarded Greek coverage is incomplete"))
+    (when (not= (get row "source_note") source)
+      (swap! reasons conj "not a guarded Greek reconstruction row"))
+    (when (not= (get row "recomputed_status") "SANE")
+      (swap! reasons conj "recomputed_status is not SANE"))
+    (when (> (abs (float (or (get row "z_mean") 0.0))) (:max-abs-z-mean opts))
+      (swap! reasons conj "abs z_mean exceeds threshold"))
+    (let [z-std (float (or (get row "z_std") 0.0))]
+      (when (< z-std (:min-z-std opts))
+        (swap! reasons conj "z_std below threshold"))
+      (when (> z-std (:max-z-std opts))
+        (swap! reasons conj "z_std above threshold")))
+    (when (> (float (or (get row "zero_frac") 0.0)) (:max-zero-frac opts))
+      (swap! reasons conj "zero_frac above threshold"))
+    (when (< (int (or (get row "model_split_count") 0)) (:min-split-count opts))
+      (swap! reasons conj "model split count below threshold"))
+    [(not (seq @reasons)) @reasons]))
+
+(defn write-csv [path rows]
+  (let [fields ["feature" "candidate" "reasons" "recomputed_status" "model_gain"
+                "model_split_count" "z_mean" "z_std" "zero_frac"]]
+    (os/makedirs (os.path/dirname path) ** :exist_ok true)
+    (with-open [fh (python/open path "w" ** :newline "")]
+      (let [writer (csv/DictWriter fh fields)]
+        (.writeheader writer)
+        (doseq [row rows]
+          (.writerow writer (into {} (map (fn [field] [field (get row field "")]) fields))))))))
+
+(defn md-table [headers rows]
+  (str "| " (.join " | " headers) " |\n"
+       "| " (.join " | " (repeat (count headers) "---")) " |\n"
+       (.join "" (for [row rows]
+                   (str "| " (.join " | " (map str row)) " |\n")))))
+
+(defn write-unavailable [opts]
+  (let [label (or (:label opts) (.replace (:target-date opts) "-" ""))
+        reason (or (:unavailable-reason opts) "Greek reconstruction promotion gate unavailable")
+        out-base (os.path/join (:out-dir opts) (str "greek_reconstruction_promotion_gate_" label))
+        json-path (str out-base ".json")
+        csv-path (str out-base ".csv")
+        md-path (str out-base ".md")
+        summary {"generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                 "target_date" (:target-date opts)
+                 "status" "unavailable"
+                 "available" false
+                 "unavailable_reason" reason
+                 "raw_audit_json" (str (:raw-audit-json opts))
+                 "capture_check_json" (str (:capture-check-json opts))
+                 "capture_ok" false
+                 "capture_reasons" [reason]
+                 "coverage_ok" false
+                 "coverage_reasons" [reason]
+                 "raw_guarded_greek_reconstruction_count" nil
+                 "min_evaluated_count" (:min-evaluated-count opts)
+                 "evaluated_count" 0
+                 "candidate_count" 0
+                 "candidate_features" []
+                 "candidate_model_gain" 0.0
+                 "thresholds" {"max_abs_z_mean" (:max-abs-z-mean opts)
+                               "min_z_std" (:min-z-std opts)
+                               "max_z_std" (:max-z-std opts)
+                               "max_zero_frac" (:max-zero-frac opts)
+                               "min_split_count" (:min-split-count opts)}}]
+    (os/makedirs (:out-dir opts) ** :exist_ok true)
+    (fp/clear-artifacts! [json-path csv-path md-path])
+    (spit json-path (str (json/dumps (fp/->jsonable {"summary" summary "features" []})
+                                     ** :indent 2 :sort_keys true) "\n"))
+    (write-csv csv-path [])
+    (spit md-path (str "# Greek Reconstruction Promotion Gate\n\n"
+                       "- Status: `unavailable`\n"
+                       "- Reason: `" reason "`\n"))
+    (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+    (println (str "wrote unavailable Greek promotion artifact " json-path))
+    1))
+
+(defn run-main [opts]
+  (if (:write-unavailable opts)
+    (write-unavailable opts)
+    (let [label (or (:label opts) (.replace (:target-date opts) "-" ""))
+        raw-path (:raw-audit-json opts)
+        capture-path (:capture-check-json opts)
+        raw (load-json raw-path)
+        extra-raw-paths (:extra-raw-audit-json opts)
+        extra-raws (vec (map load-json extra-raw-paths))
+        capture (load-json capture-path)
+        raw-summary (validate-raw-target! raw raw-path (:target-date opts))
+        extra-summaries (vec (map (fn [path payload]
+                                    (validate-raw-target! payload path (:target-date opts)))
+                                  extra-raw-paths
+                                  extra-raws))]
+    (let [[capture-ok? capture-reasons] (capture-ok capture (:target-date opts))
+          guarded-rows (unique-by-feature (sort-by #(- (float (or (get % "model_gain") 0.0)))
+                                                   (mapcat raw-guarded-rows (cons raw extra-raws))))
+          expected-guarded-count (if (seq extra-raw-paths)
+                                   (count guarded-rows)
+                                   (get raw-summary "guarded_greek_reconstruction_count"))
+          combined-raw-summary (if (seq extra-raw-paths)
+                                 (assoc raw-summary "guarded_greek_reconstruction_count" expected-guarded-count)
+                                 raw-summary)
+          [coverage-ok? coverage-reasons] (coverage-ok combined-raw-summary (count guarded-rows) (:min-evaluated-count opts))
+          rows (vec
+                 (sort-by #(- (float (or (get % "model_gain") 0.0)))
+                          (for [row guarded-rows
+                                :let [[candidate? reasons] (row-decision row opts capture-ok? coverage-ok?)]]
+                            (assoc row
+                                   "candidate" candidate?
+                                   "reasons" (.join "; " reasons)))))
+          candidate-features (vec (for [row rows :when (get row "candidate")] (get row "feature")))
+          candidate-gain (float (reduce + (map #(float (or (get % "model_gain") 0.0))
+                                                (filter #(get % "candidate") rows))))
+          summary {"generated_at" (.strftime (datetime.datetime/now datetime.timezone/utc) "%Y-%m-%dT%H:%M:%SZ")
+                   "target_date" (:target-date opts)
+                   "raw_audit_json" (str raw-path)
+                   "extra_raw_audit_json" (vec (map str extra-raw-paths))
+                   "capture_check_json" (str capture-path)
+                   "capture_ok" capture-ok?
+                   "capture_reasons" capture-reasons
+                   "coverage_ok" coverage-ok?
+                   "coverage_reasons" coverage-reasons
+                   "raw_guarded_greek_reconstruction_count" expected-guarded-count
+                   "extra_raw_guarded_greek_reconstruction_count" (vec (map #(get % "guarded_greek_reconstruction_count") extra-summaries))
+                   "min_evaluated_count" (:min-evaluated-count opts)
+                   "evaluated_count" (count rows)
+                   "candidate_count" (count candidate-features)
+                   "candidate_features" candidate-features
+                   "candidate_model_gain" candidate-gain
+                   "thresholds" {"max_abs_z_mean" (:max-abs-z-mean opts)
+                                 "min_z_std" (:min-z-std opts)
+                                 "max_z_std" (:max-z-std opts)
+                                 "max_zero_frac" (:max-zero-frac opts)
+                                 "min_split_count" (:min-split-count opts)}}
+          out-base (os.path/join (:out-dir opts) (str "greek_reconstruction_promotion_gate_" label))
+          json-path (str out-base ".json")
+          csv-path (str out-base ".csv")
+          md-path (str out-base ".md")]
+      (os/makedirs (:out-dir opts) ** :exist_ok true)
+      (fp/clear-artifacts! [json-path csv-path md-path])
+      (spit json-path (str (json/dumps (fp/->jsonable {"summary" summary "features" rows})
+                                       ** :indent 2 :sort_keys true) "\n"))
+      (write-csv csv-path rows)
+      (spit md-path
+            (str "# Greek Reconstruction Promotion Gate\n\n"
+                 "This gate is the only path from guarded Greek reconstruction formulas to unmask candidates.\n\n"
+                 "- Target date: `" (:target-date opts) "`\n"
+                 "- Capture OK: `" (get summary "capture_ok") "`\n"
+                 "- Coverage OK: `" (get summary "coverage_ok") "`\n"
+                 "- Evaluated: `" (get summary "evaluated_count") "`\n"
+                 "- Candidates: `" (get summary "candidate_count") "`\n"
+                 "- Candidate model gain: `" (format "%.4f" candidate-gain) "`\n\n"
+                 "## Capture Reasons\n\n"
+                 (if (seq capture-reasons) (.join "\n" (map #(str "- " %) capture-reasons)) "- none")
+                 "\n\n## Coverage Reasons\n\n"
+                 (if (seq coverage-reasons) (.join "\n" (map #(str "- " %) coverage-reasons)) "- none")
+                 "\n\n## Top Rows\n\n"
+                 (md-table ["Feature" "Candidate" "Status" "z_mean" "z_std" "Reasons"]
+                           (for [row (take 30 rows)]
+                             [(str "`" (get row "feature") "`")
+                              (get row "candidate")
+                              (get row "recomputed_status" "")
+                              (format "%.4f" (float (or (get row "z_mean") 0.0)))
+                              (format "%.4f" (float (or (get row "z_std") 0.0)))
+                              (get row "reasons" "")]))))
+      (println (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true))
+      (println (str "wrote " json-path))
+      0))))
+
+(try
+  (python/exit (run-main (parse-args (vec *command-line-args*))))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (if (.startswith (str e) "duplicate JSON key:")
+      (python/exit 1)
+      (python/exit 2)))
+  (catch python/RuntimeError e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

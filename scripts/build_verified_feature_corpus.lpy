@@ -1,0 +1,116 @@
+;; Assemble a retraining corpus only from source-parity-certified historical
+;; cohorts. Historical tensors must use the native shared feature path.
+(import argparse hashlib json numpy os os.path sys)
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (python/isinstance x python/dict) (python/dict
+                                      (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ x k))]))
+                                           (.keys x)))
+    (python/isinstance x python/list) (python/list (map ->jsonable x))
+    :else x))
+
+(defn write-json! [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn read-json [path]
+  (json/loads (slurp path)))
+
+(defn sha256 [path]
+  (with-open [f (python/open path ** :mode "rb")]
+    (let [digest (hashlib/sha256)]
+      (loop [chunk (.read f 1048576)]
+        (when (pos? (len chunk))
+          (.update digest chunk)
+          (recur (.read f 1048576))))
+      (.hexdigest digest))))
+
+(defn parse-provenance [data]
+  (when (contains? (set (vec (.-files data))) "provenance_json")
+    (let [rows (vec (.__getitem__ data "provenance_json"))
+          raw (first (filter #(pos? (count (.strip (str %)))) rows))]
+      (when raw (json/loads (str raw))))))
+
+(defn native-provenance? [provenance]
+  (and provenance
+       (= "steve-v2-canonical-input/v2" (.get provenance "feature_contract"))
+       (= "completed" (.get (.get provenance "stock") "bar_status"))
+       (= "native" (.get (.get provenance "capture") "feature_implementation"))))
+
+(defn required-arrays? [data]
+  (let [files (set (vec (.-files data)))]
+    (every? #(contains? files %) ["times" "X" "grids" "grid_histories"
+                                  "bar_buffers_json" "option_chain_json" "provenance_json"])))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--source-audit" ** :action "append" :required true)
+    (.add_argument parser "--historical-inputs" ** :action "append" :required true)
+    (.add_argument parser "--out-npz" ** :required true)
+    (.add_argument parser "--out-json" ** :required true)
+    (.parse_args parser (python/list argv))))
+
+(defn reject [out-json message details]
+  (write-json! out-json {"ok" false "status" "rejected" "reason" message "details" details})
+  (println (json/dumps {"ok" false "status" "rejected" "reason" message} ** :sort_keys true))
+  1)
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        audits (vec (.-source_audit args))
+        cohorts (vec (.-historical_inputs args))]
+    (cond
+      (not= (count audits) (count cohorts))
+      (reject (.-out_json args) "source audit and historical input counts must match" {})
+
+      :else
+      (let [audit-payloads (vec (map read-json audits))
+            uncertified (vec (keep-indexed (fn [i audit]
+                                             (when-not (= true (.get audit "certifiable")) i))
+                                           audit-payloads))]
+        (if (seq uncertified)
+          (reject (.-out_json args) "source audit is not certifiable" {"indices" uncertified})
+          (let [datasets (vec (map #(numpy/load % ** :allow_pickle true) cohorts))
+                invalid (vec (keep-indexed
+                              (fn [i data]
+                                (when (or (not (required-arrays? data))
+                                          (not (native-provenance? (parse-provenance data)))) i))
+                              datasets))]
+            (if (seq invalid)
+              (reject (.-out_json args) "historical cohort violates canonical native contract" {"indices" invalid})
+              (let [widths (set (map #(.__getitem__ (.-shape (.__getitem__ % "X")) 1) datasets))]
+                (if (not= 1 (count widths))
+                  (reject (.-out_json args) "historical feature widths differ" {"widths" (vec widths)})
+                  (let [keys ["times" "X" "grids" "grid_histories" "bar_buffers_json" "option_chain_json" "provenance_json"]
+                        merged (into {} (for [key keys]
+                                          [key (.concatenate numpy
+                                                             (python/list (map #(.__getitem__ % key) datasets)))]))
+                        rows (.__getitem__ (.-shape (get merged "X")) 0)
+                        manifest {"ok" true
+                                  "status" "ready"
+                                  "feature_contract" "steve-v2-canonical-input/v2"
+                                  "feature_implementation" "native"
+                                  "rows" (int rows)
+                                  "features" (int (first widths))
+                                  "source_audits" (vec (for [path audits] {"path" (os.path/abspath path)
+                                                                              "sha256" (sha256 path)}))
+                                  "historical_inputs" (vec (for [path cohorts] {"path" (os.path/abspath path)
+                                                                                  "sha256" (sha256 path)}))
+                                  "out_npz" (os.path/abspath (.-out_npz args))}]
+                    (os/makedirs (os.path/dirname (.-out_npz args)) ** :exist_ok true)
+                    (numpy/savez_compressed (.-out_npz args)
+                                            ** :times (get merged "times")
+                                               :X (get merged "X")
+                                               :grids (get merged "grids")
+                                               :grid_histories (get merged "grid_histories")
+                                               :bar_buffers_json (get merged "bar_buffers_json")
+                                               :option_chain_json (get merged "option_chain_json")
+                                               :provenance_json (get merged "provenance_json"))
+                    (write-json! (.-out_json args) manifest)
+                    (println (json/dumps (->jsonable manifest) ** :sort_keys true))
+                    0))))))))))
+
+(python/exit (run-main *command-line-args*))

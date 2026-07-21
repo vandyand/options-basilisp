@@ -1,0 +1,160 @@
+;; Verify a completed neutralization unmask apply result artifact.
+(import argparse hashlib json os os.path sys)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[clojure.set :as set]
+         '[stevetrading.feature-parity.core :as fp])
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--apply-json" ** :required true :help "neutralization_unmask_apply_YYYYMMDD.json")
+    (.add_argument parser "--out-json" ** :default nil :help "optional verification JSON output path")
+    (.add_argument parser "--allow-missing" ** :action "store_true" :help "allow candidate features missing from backups")
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn attr [obj name]
+  (python/getattr obj name))
+
+(defn load-json-value [path]
+  (fp/read-json path))
+
+(defn sha256-file [path]
+  (let [h (hashlib/sha256)]
+    (with-open [fh (python/open path "rb")]
+      (loop [chunk (.read fh (* 1024 1024))]
+        (when chunk
+          (when (> (len chunk) 0)
+            (.update h chunk)
+            (recur (.read fh (* 1024 1024)))))))
+    (.hexdigest h)))
+
+(defn py-list? [value]
+  (python/isinstance value python/list))
+
+(defn require-string-list [value label]
+  (when-not (and (py-list? value)
+                 (every? #(and (python/isinstance % python/str) (not= % ""))
+                         (python/list value)))
+    (throw (python/SystemExit (str label " must be a non-empty string list"))))
+  (let [items (vec (python/list value))]
+    (when (not= (count (set items)) (count items))
+      (throw (python/SystemExit (str label " contains duplicate values"))))
+    items))
+
+(defn verify-row [row candidates allow-missing?]
+  (let [account (get row "account")
+        path (str (get row "path" ""))
+        backup (str (get row "backup" ""))
+        issues (atom [])]
+    (when-not account
+      (swap! issues conj "missing account"))
+    (when-not (os.path/exists path)
+      (swap! issues conj (str "current file missing: " path)))
+    (when-not (os.path/exists backup)
+      (swap! issues conj (str "backup file missing: " backup)))
+    (if (seq @issues)
+      {"account" account "path" path "backup" backup "ok" false "issues" @issues}
+      (let [current (load-json-value path)
+            before (load-json-value backup)
+            current-list? (and (py-list? current) (every? #(python/isinstance % python/str) (python/list current)))
+            before-list? (and (py-list? before) (every? #(python/isinstance % python/str) (python/list before)))]
+        (when-not current-list?
+          (swap! issues conj "current neutralization file is not a string list"))
+        (when-not before-list?
+          (swap! issues conj "backup neutralization file is not a string list"))
+        (let [current-items (if current-list? (vec (python/list current)) [])
+              before-items (if before-list? (vec (python/list before)) [])
+              current-set (set current-items)
+              before-set (set before-items)
+              removed (vec (sort (set/difference before-set current-set)))
+              missing (vec (sort (set/difference candidates before-set)))]
+          (when (not= (int (get row "before" -1)) (count before-items))
+            (swap! issues conj "before count does not match backup file"))
+          (when (not= (int (get row "after" -1)) (count current-items))
+            (swap! issues conj "after count does not match current file"))
+          (when (not= (int (get row "removed" -1)) (count removed))
+            (swap! issues conj "removed count does not match backup/current diff"))
+          (when (not= (int (get row "missing" -1)) (count missing))
+            (swap! issues conj "missing count does not match candidates absent from backup"))
+          (when (not= (vec (sort (get row "removed_features" []))) removed)
+            (swap! issues conj "removed_features does not match backup/current diff"))
+          (when (not= (vec (sort (get row "missing_features" []))) missing)
+            (swap! issues conj "missing_features does not match candidates absent from backup"))
+          (when (and (seq missing) (not allow-missing?))
+            (swap! issues conj (str (count missing) " candidate(s) were missing from backup")))
+          (let [current-sha (sha256-file path)
+                backup-sha (sha256-file backup)]
+            (when (not= (get row "after_sha256") current-sha)
+              (swap! issues conj "after_sha256 does not match current file"))
+            (when (not= (get row "planned_after_sha256") current-sha)
+              (swap! issues conj "planned_after_sha256 does not match current file"))
+            (when (not= (get row "backup_sha256") backup-sha)
+              (swap! issues conj "backup_sha256 does not match backup file"))
+            (when (not= (get row "before_sha256") backup-sha)
+              (swap! issues conj "before_sha256 does not match backup file"))
+            (let [leaked (vec (sort (set/intersection candidates current-set)))]
+              (when (seq leaked)
+                (swap! issues conj (str (count leaked) " candidate(s) still present after apply"))))
+            {"account" account
+             "path" path
+             "backup" backup
+             "ok" (not (seq @issues))
+             "issues" @issues
+             "removed" (count removed)
+             "missing" (count missing)
+             "after_sha256" current-sha
+             "backup_sha256" backup-sha}))))))
+
+(defn run-main [args]
+  (let [apply-path (attr args "apply_json")
+        payload (load-json-value apply-path)]
+    (when-not (map? payload)
+      (throw (python/SystemExit "apply JSON must be an object")))
+    (when-not (true? (get payload "applied"))
+      (throw (python/SystemExit "apply JSON is not from an applied run")))
+    (let [candidate-features (require-string-list (get payload "candidate_features") "candidate_features")
+          candidates (set candidate-features)
+          candidate-count (get payload "candidate_count")]
+      (when (or (true? candidate-count) (false? candidate-count) (not (int? candidate-count)) (not= candidate-count (count candidates)))
+        (throw (python/SystemExit "candidate_count does not match candidate_features")))
+      (let [results (get payload "results")]
+        (when-not (and (py-list? results) (> (len results) 0))
+          (throw (python/SystemExit "apply JSON missing results")))
+        (let [result-rows (vec (python/list results))]
+          (when-not (every? map? result-rows)
+            (throw (python/SystemExit "apply results must be objects")))
+          (let [row-checks (vec (for [row result-rows]
+                                  (verify-row row candidates (true? (attr args "allow_missing")))))
+                ok? (every? #(true? (get % "ok")) row-checks)
+                summary {"ok" ok?
+                         "apply_json" apply-path
+                         "candidate_count" (count candidates)
+                         "result_count" (count row-checks)
+                         "removed_total" (reduce + (map #(int (or (get % "removed") 0)) row-checks))
+                         "missing_total" (reduce + (map #(int (or (get % "missing") 0)) row-checks))
+                         "issues" (vec (mapcat #(get % "issues") row-checks))
+                         "results" row-checks}
+                text (json/dumps (fp/->jsonable summary) ** :indent 2 :sort_keys true)]
+            (when-let [out-json (attr args "out_json")]
+              (os/makedirs (os.path/dirname out-json) ** :exist_ok true)
+              (spit out-json (str text "\n")))
+            (println text)
+            (if ok? 0 1)))))))
+
+(try
+  (python/exit (run-main (parse-args)))
+  (catch python/SystemExit e
+    (let [code (or (python/getattr e "code" 1) 1)]
+      (when (not= code 0)
+        (binding [*out* *err*] (println (str e))))
+      (python/exit code)))
+  (catch python/ValueError e
+    (binding [*out* *err*] (println (str e)))
+    (if (.startswith (str e) "duplicate JSON key:")
+      (python/exit 1)
+      (python/exit 2)))
+  (catch python/Exception e
+    (binding [*out* *err*] (println (str e)))
+    (python/exit 1)))

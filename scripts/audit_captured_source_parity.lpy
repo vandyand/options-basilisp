@@ -1,0 +1,312 @@
+;; Raw source parity gate for a captured live session and a same-time
+;; historical-input artifact. This intentionally runs before feature formulas:
+;; a feature match cannot compensate for unmatched provider inputs.
+(import argparse json math numpy os os.path sys)
+
+(def stock-symbols ["SPY" "HYG" "TLT" "VXX"])
+(def bar-fields ["open" "high" "low" "close" "volume" "vwap" "trade_count"])
+(def quote-fields ["bid" "ask"])
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (python/isinstance x python/dict) (python/dict
+                                      (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ x k))]))
+                                           (.keys x)))
+    (python/isinstance x python/list) (python/list (map ->jsonable x))
+    :else x))
+
+(defn write-json! [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn parse-json [raw]
+  (try
+    (let [text (.strip (str (or raw "")))]
+      (when (and (pos? (count text)) (not= text "{}") (not= text "[]"))
+        (json/loads text)))
+    (catch python/Exception _ nil)))
+
+(defn finite [value]
+  (try
+    (let [out (float value)]
+      (when (math/isfinite out) out))
+    (catch python/Exception _ nil)))
+
+(defn time-key [value]
+  (let [text (.strip (str (or value "")))]
+    (cond
+      (.endswith text "+00:00") (str (subs text 0 (- (count text) 6)) "Z")
+      (.endswith text "Z") text
+      :else text)))
+
+(defn npz-files [data] (set (vec (.-files data))))
+
+(defn arr-at [data key idx]
+  (when (contains? (npz-files data) key)
+    (.__getitem__ (.__getitem__ data key) idx)))
+
+(defn time-index [data]
+  (if-not (contains? (npz-files data) "times")
+    {}
+    (into {} (keep-indexed (fn [i value]
+                             (let [key (time-key value)]
+                               (when (pos? (count key)) [key i])))
+                           (vec (.__getitem__ data "times"))))))
+
+(defn latest-bar [raw symbol]
+  (let [payload (parse-json raw)
+        bars (when payload (.get payload symbol))]
+    (when (and (python/isinstance bars python/list) (pos? (len bars)))
+      (.__getitem__ bars -1))))
+
+(defn numeric-summary [records field]
+  (let [values (vec (keep #(finite (.get % field)) records))]
+    {"count" (count values)
+     "max" (when (seq values) (apply max values))
+     "mean" (when (seq values) (/ (reduce + 0.0 values) (count values)))}))
+
+(defn bar-parity [live hist matched live-index hist-index tolerance]
+  (let [records (atom [])
+        tail-time-mismatches (atom [])
+        missing (atom [])]
+    (doseq [time matched
+            symbol stock-symbols]
+      (let [left (latest-bar (arr-at live "bar_buffers_json" (get live-index time)) symbol)
+            right (latest-bar (arr-at hist "bar_buffers_json" (get hist-index time)) symbol)]
+        (cond
+          (or (nil? left) (nil? right))
+          (swap! missing conj {"time" time "symbol" symbol})
+
+          (not= (time-key (.get left "time")) (time-key (.get right "time")))
+          (swap! tail-time-mismatches conj {"time" time "symbol" symbol
+                                             "live" (str (.get left "time"))
+                                             "historical" (str (.get right "time"))})
+
+          :else
+          (doseq [field bar-fields
+                  :let [l (finite (.get left field))
+                        r (finite (.get right field))]
+                  :when (and (some? l) (some? r))]
+            (swap! records conj {"time" time "symbol" symbol "field" field
+                                 "abs_deviation" (abs (- l r))})))))
+    (let [by-symbol (into {}
+                          (for [symbol stock-symbols]
+                            [symbol
+                             (into {}
+                                   (for [field bar-fields
+                                         :let [xs (filter #(and (= symbol (.get % "symbol"))
+                                                                  (= field (.get % "field"))) @records)]]
+                                     [field (numeric-summary xs "abs_deviation")]))]))
+          max-dev (or (get (numeric-summary @records "abs_deviation") "max") 0.0)]
+      {"available" (and (contains? (npz-files live) "bar_buffers_json")
+                          (contains? (npz-files hist) "bar_buffers_json"))
+       "matched_rows" (count matched)
+       "fields_compared" (count @records)
+       "missing_buffers" (count @missing)
+       "missing_samples" (vec (take 10 @missing))
+       "tail_time_mismatches" (count @tail-time-mismatches)
+       "tail_time_samples" (vec (take 10 @tail-time-mismatches))
+       "max_abs_deviation" max-dev
+       "by_symbol" by-symbol
+       "pass" (and (seq @records) (empty? @missing) (empty? @tail-time-mismatches)
+                    (<= max-dev tolerance))})))
+
+(defn contract-key [contract]
+  (let [strike (finite (.get contract "strike"))
+        right (.upper (str (or (.get contract "right") "")))
+        expiration (str (or (.get contract "expiration") ""))]
+    (when (and strike (contains? #{"CALL" "PUT" "C" "P"} right) (pos? (count expiration)))
+      (str strike "|" right "|" expiration))))
+
+(defn contracts-at [data index time]
+  (let [payload (parse-json (arr-at data "option_chain_json" (get index time)))
+        contracts (when payload (.get payload "contracts"))]
+    (if (python/isinstance contracts python/list) (vec contracts) [])))
+
+(defn contract-index [contracts]
+  (let [out (python/dict)]
+    (doseq [contract contracts]
+      (when-let [key (contract-key contract)]
+        (.__setitem__ out key contract)))
+    out))
+
+(defn chain-parity [live hist matched live-index hist-index tolerance]
+  (let [live-total (atom 0)
+        hist-total (atom 0)
+        shared-total (atom 0)
+        quote-count (atom {"bid" 0 "ask" 0})
+        quote-sum (atom {"bid" 0.0 "ask" 0.0})
+        quote-max (atom {"bid" 0.0 "ask" 0.0})
+        missing-sides (atom 0)]
+    (doseq [time matched]
+      (let [left (contract-index (contracts-at live live-index time))
+            right (contract-index (contracts-at hist hist-index time))]
+        (swap! live-total + (len left))
+        (swap! hist-total + (len right))
+        (when (or (empty? left) (empty? right)) (swap! missing-sides inc))
+        (doseq [key (.keys left)]
+          (when-let [right-contract (.get right key)]
+            (swap! shared-total inc)
+            (doseq [field quote-fields
+                    :let [l (finite (.get (.get left key) field))
+                          r (finite (.get right-contract field))]
+                    :when (and (some? l) (some? r))]
+              (let [dev (abs (- l r))]
+                (swap! quote-count update field inc)
+                (swap! quote-sum update field + dev)
+                (swap! quote-max update field max dev)))))))
+    (let [max-dev (apply max (vals @quote-max))
+          live-coverage (if (pos? @live-total) (/ @shared-total @live-total) 0.0)
+          historical-coverage (if (pos? @hist-total) (/ @shared-total @hist-total) 0.0)
+          by-field (into {}
+                         (for [field quote-fields
+                               :let [n (get @quote-count field 0)]]
+                           [field {"count" n
+                                   "max" (get @quote-max field 0.0)
+                                   "mean" (when (pos? n) (/ (get @quote-sum field 0.0) n))}]))]
+      {"available" (and (contains? (npz-files live) "option_chain_json")
+                          (contains? (npz-files hist) "option_chain_json"))
+       "matched_rows" (count matched)
+       "live_contracts" @live-total
+       "historical_contracts" @hist-total
+       "shared_contracts" @shared-total
+       "live_contract_coverage" live-coverage
+       "historical_contract_coverage" historical-coverage
+       "rows_with_missing_side" @missing-sides
+       "quotes_compared" (reduce + 0 (vals @quote-count))
+       "max_abs_deviation" max-dev
+       "by_field" by-field
+       "pass" (and (pos? @live-total) (pos? @hist-total) (zero? @missing-sides)
+                    (>= live-coverage 0.995) (>= historical-coverage 0.995)
+                    (<= max-dev tolerance))})))
+
+(defn provenance [data]
+  (if-not (contains? (npz-files data) "provenance_json")
+    {:available false :reason "artifact lacks provenance_json"}
+    (let [rows (keep parse-json (vec (.__getitem__ data "provenance_json")))
+          distinct (set (map #(json/dumps % ** :sort_keys true) rows))
+          sample (first rows)
+          stock (.get sample "stock")
+          options (.get sample "options")
+          capture (.get sample "capture")]
+      {:available (boolean sample)
+       :consistent (= 1 (count distinct))
+       :rows (count rows)
+       :schema_version (.get sample "schema_version")
+       :stock_provider (when stock (.get stock "provider"))
+       :stock_provider_family (when stock (.get stock "provider_family"))
+       :stock_endpoint (when stock (.get stock "endpoint"))
+       :stock_venue (when stock (.get stock "venue"))
+       :stock_timeframe (when stock (.get stock "timeframe"))
+       :stock_bar_status (when stock (.get stock "bar_status"))
+       :stock_bar_timestamp (when stock (.get stock "bar_timestamp"))
+       :stock_symbols (when stock (.get stock "symbols"))
+       :option_provider (when options (.get options "provider"))
+       :option_provider_family (when options (.get options "provider_family"))
+       :option_endpoint (when options (.get options "endpoint"))
+       :option_snapshot_kind (when options (.get options "snapshot_kind"))
+       :option_selection (when options (.get options "selection"))
+       :option_strike_range (when options (.get options "strike_range"))
+       :option_symbols (when options (.get options "symbols"))
+       :option_reconstruction (when options (.get options "reconstruction"))
+       :feature_implementation (when capture (.get capture "feature_implementation"))
+       :greeks_policy (when capture (.get capture "greeks_policy"))
+       :feature_contract (.get sample "feature_contract")})))
+
+(defn provenance-pass? [p]
+  (and (:available p) (:consistent p)
+       (= 2 (:schema_version p))
+       (= "steve-v2-canonical-input/v2" (:feature_contract p))
+       (= "completed" (:stock_bar_status p))
+       (= "open-time" (:stock_bar_timestamp p))
+       (pos? (count (str (:stock_provider p))))
+       (pos? (count (str (:stock_provider_family p))))
+       (pos? (count (str (:stock_endpoint p))))
+       (pos? (count (str (:stock_venue p))))
+       (pos? (count (str (:option_provider p))))
+       (pos? (count (str (:option_provider_family p))))
+       (pos? (count (str (:option_endpoint p))))
+       (pos? (count (str (:option_selection p))))
+       (pos? (count (str (:option_strike_range p))))
+       (pos? (count (str (:greeks_policy p))))))
+
+(defn same-value? [left right key]
+  (= (get left key) (get right key)))
+
+(defn provenance-compatibility [live historical]
+  (let [stock-keys [:feature_contract :stock_provider_family :stock_endpoint
+                    :stock_venue :stock_timeframe :stock_bar_status
+                    :stock_bar_timestamp :stock_symbols]
+        shared-option-keys [:option_provider_family :option_selection :option_strike_range
+                            :option_symbols :greeks_policy]
+        stock-mismatches (vec (keep (fn [k] (when-not (same-value? live historical k) (name k))) stock-keys))
+        option-mismatches (vec (keep (fn [k] (when-not (same-value? live historical k) (name k))) shared-option-keys))
+        options-method-ok? (and (= "/v3/option/snapshot/quote" (:option_endpoint live))
+                                (= "last-nbbo" (:option_snapshot_kind live))
+                                (= "/v3/option/at_time/quote" (:option_endpoint historical))
+                                (= "last-nbbo-at-requested-time" (:option_snapshot_kind historical))
+                                (= "at-time-quote" (:option_reconstruction historical)))]
+    {"pass" (and (empty? stock-mismatches) (empty? option-mismatches) options-method-ok?)
+     "stock_mismatches" stock-mismatches
+     "option_mismatches" option-mismatches
+     "live_option_endpoint" (:option_endpoint live)
+     "historical_option_endpoint" (:option_endpoint historical)
+     "historical_option_reconstruction" (:option_reconstruction historical)
+     "reason" (when-not (and (empty? stock-mismatches) (empty? option-mismatches) options-method-ok?)
+                "source contracts differ or historical options are not reconstructed with ThetaData at_time quote")}))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--live-capture" ** :required true)
+    (.add_argument parser "--historical-inputs" ** :required true)
+    (.add_argument parser "--out-json" ** :required true)
+    (.add_argument parser "--min-rows" ** :type int :default 30)
+    (.add_argument parser "--max-rows" ** :type int :default 0
+                   :help "Optional cap on the latest matched rows; 0 audits all overlaps")
+    (.add_argument parser "--bar-tolerance" ** :type float :default 0.0)
+    (.add_argument parser "--quote-tolerance" ** :type float :default 0.0)
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        live (numpy/load (.-live_capture args) ** :allow_pickle true)
+        hist (numpy/load (.-historical_inputs args) ** :allow_pickle true)
+        live-index (time-index live)
+        hist-index (time-index hist)
+        matched0 (vec (sort (filter #(contains? hist-index %) (keys live-index))))
+        matched (if (pos? (.-max_rows args))
+                  (vec (take-last (.-max_rows args) matched0))
+                  matched0)
+        live-provenance (provenance live)
+        historical-provenance (provenance hist)
+        provenance-compatibility (provenance-compatibility live-provenance historical-provenance)
+        bars (bar-parity live hist matched live-index hist-index (.-bar_tolerance args))
+        chains (chain-parity live hist matched live-index hist-index (.-quote_tolerance args))
+        rows-ok? (>= (count matched) (.-min_rows args))
+        provenance-ok? (and (provenance-pass? live-provenance)
+                            (provenance-pass? historical-provenance)
+                            (get provenance-compatibility "pass"))
+        raw-ok? (and (get bars "pass") (get chains "pass"))
+        payload {"status" (if (and rows-ok? provenance-ok? raw-ok?) "pass" "fail")
+                 "certifiable" (and rows-ok? provenance-ok? raw-ok?)
+                 "live_capture" (os.path/abspath (.-live_capture args))
+                 "historical_inputs" (os.path/abspath (.-historical_inputs args))
+                 "matched_rows" (count matched)
+                 "matched_rows_available" (count matched0)
+                 "min_rows" (.-min_rows args)
+                 "provenance" {"live" live-provenance "historical" historical-provenance}
+                 "provenance_compatibility" provenance-compatibility
+                 "bars" bars
+                 "option_chains" chains
+                 "reasons" (vec (concat
+                                  (when-not rows-ok? [(str "matched rows below minimum " (.-min_rows args))])
+                                  (when-not provenance-ok? ["source provenance is missing, invalid, or incompatible"])
+                                  (when-not (get bars "pass") ["stock bar inputs do not meet parity tolerance"])
+                                  (when-not (get chains "pass") ["option chain inputs do not meet exact-universe/quote parity"]))) }]
+    (write-json! (.-out_json args) payload)
+    (println (json/dumps (->jsonable payload) ** :sort_keys true))
+    (if (get payload "certifiable") 0 1)))
+
+(python/exit (run-main *command-line-args*))

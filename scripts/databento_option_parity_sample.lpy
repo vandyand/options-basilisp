@@ -1,0 +1,77 @@
+;; Select a deterministic, activity-stratified exact-contract sample from a live DBN capture.
+(import argparse datetime json pathlib re databento)
+
+(defn ->jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map ->jsonable value))
+    :else value))
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--live-dbn" ** :required true)
+    (.add_argument parser "--sample-size" ** :type int :default 24)
+    (.add_argument parser "--roots" ** :default "ES,NQ,SR3")
+    (.add_argument parser "--trades-only" ** :action "store_true")
+    (.add_argument parser "--out" ** :required true)
+    (.parse_args parser (python/list argv))))
+
+(defn choose-evenly [pairs sample-size]
+  (let [n (count pairs)
+        k (min n sample-size)]
+    (vec (for [i (range k)]
+           (nth pairs (int (round (/ (* i (dec n)) (max 1 (dec k))))))))))
+
+(defn plain-option-symbol? [root symbol]
+  ;; Parent subscriptions also emit user-defined/synthetic mappings.  The
+  ;; ordinary futures-option raw symbology is e.g. `ESU6 P7150` or
+  ;; `NQU6 C32250`. Decimal strikes are permitted for rate options.
+  (boolean (re/fullmatch (str (re/escape root) "[A-Z][0-9] [CP][0-9]+(?:\\.[0-9]+)?")
+                         (str symbol))))
+
+(let [args (parse-args (vec *command-line-args*))
+      source (.resolve (pathlib/Path (.-live_dbn args)))
+      _ (when (<= (.-sample_size args) 0) (throw (python/ValueError "--sample-size must be positive")))
+      roots (vec (filter seq (map #(.strip %) (.split (.-roots args) ","))))
+      _ (when (zero? (count roots)) (throw (python/ValueError "--roots must name at least one root")))
+      trade (.to_df (databento/read_dbn (str source)) ** :schema "trades")
+      mbp (when (not (.-trades_only args))
+            (.to_df (databento/read_dbn (str source)) ** :schema "mbp-1"))
+      ;; The SDK's default `map_symbols=true` uses the live DBN mapping messages,
+      ;; so these are exact raw symbols accepted by historical stype_in=raw_symbol.
+      trade-counts (.value_counts (.get trade "symbol"))
+      counts (if (.-trades_only args)
+               trade-counts
+               (.add (.value_counts (.get mbp "symbol")) trade-counts ** :fill_value 0))
+      root-summaries
+      (into {}
+        (for [root roots]
+          (let [sorted-pairs (vec (sort-by (fn [[symbol count]] [(int count) (str symbol)])
+                                           (filter (fn [[symbol _]] (plain-option-symbol? root symbol))
+                                                   (iterator-seq (.items counts)))))
+                root-trades (vec (filter (fn [[symbol _]] (plain-option-symbol? root symbol))
+                                         (sort-by first (iterator-seq (.items trade-counts)))))
+                sample (choose-evenly sorted-pairs (.-sample_size args))]
+            [root
+               {"population_plain_option_symbols" (count sorted-pairs)
+                "trade_events" (reduce + 0 (map (comp int second) root-trades))
+                "trade_symbols" (vec (map (fn [[symbol count]]
+                                             {"symbol" (str symbol) "live_trade_events" (int count)})
+                                           root-trades))
+                "selected" (vec (map (fn [[symbol count]]
+                                        {"symbol" (str symbol) "live_events" (int count)})
+                                      sample))}])))
+      payload {"kind" "databento-option-parity-sample-v2"
+               "created_at_utc" (.isoformat (datetime.datetime/now datetime.timezone/utc))
+               "live_dbn" (str source)
+               "population_active_symbols" (int (python/len counts))
+               "population_mbp1_events" (if (.-trades_only args) 0 (int (python/len mbp)))
+               "population_trade_events" (int (python/len trade))
+               "trade_active_symbols" (vec (map (fn [[symbol count]] {"symbol" (str symbol) "live_trade_events" (int count)})
+                                                (sort-by first (iterator-seq (.items trade-counts)))))
+               "sampling" "activity-stratified evenly across sorted total-event counts; exact raw symbols; no random seed"
+               "roots" root-summaries}
+      target (.resolve (pathlib/Path (.-out args)))]
+  (.mkdir (.-parent target) ** :parents true :exist_ok true)
+  (spit (str target) (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n"))
+  (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true)))

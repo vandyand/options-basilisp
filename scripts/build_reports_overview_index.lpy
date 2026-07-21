@@ -1,0 +1,285 @@
+;; Build /reports/index.html from already-rendered report artifacts.
+;; This avoids broker refetches in the landing page/index generation path.
+(import datetime glob json os os.path re sys)
+
+(defn usage []
+  (println
+   "usage: basilisp run scripts/build_reports_overview_index.lpy -- --reports-dir DIR [--title TITLE]"))
+
+(defn option-value [remaining arg]
+  (let [value (second remaining)]
+    (when (or (nil? value) (.startswith (str value) "--"))
+      (throw (python/ValueError (str "missing value for " arg))))
+    value))
+
+(defn parse-args [args]
+  (loop [remaining (seq args)
+         out {:title "Tran Trading Reports"}]
+    (if-not remaining
+      out
+      (let [arg (first remaining)]
+        (cond
+          (= arg "--reports-dir")
+          (recur (nnext remaining) (assoc out :reports-dir (option-value remaining arg)))
+
+          (= arg "--title")
+          (recur (nnext remaining) (assoc out :title (option-value remaining arg)))
+
+          (or (= arg "-h") (= arg "--help"))
+          (do (usage)
+              (python/exit 0))
+
+          :else
+          (throw (python/ValueError (str "unknown argument: " arg))))))))
+
+(defn escape-html [s]
+  (-> (str s)
+      (.replace "&" "&amp;")
+      (.replace "<" "&lt;")
+      (.replace ">" "&gt;")
+      (.replace "\"" "&quot;")))
+
+(defn read-json [path]
+  (json/loads (slurp path)))
+
+(defn parse-compact-date [stamp]
+  (datetime/date (python/int (subs stamp 0 4))
+                 (python/int (subs stamp 4 6))
+                 (python/int (subs stamp 6 8))))
+
+(defn parse-money [s]
+  (let [raw (.strip (str s))
+        neg? (.startswith raw "-")
+        cleaned (-> raw
+                    (.replace "$" "")
+                    (.replace "," "")
+                    (.replace "-" "")
+                    (.strip))
+        n (python/float cleaned)]
+    (if neg? (- n) n)))
+
+(defn money [value]
+  (when (some? value)
+    (let [n (python/float value)
+          body (.format "${:,.2f}" (abs n))]
+      (if (neg? n) (str "-" body) body))))
+
+(defn pnl-class [value]
+  (let [n (python/float (or value 0.0))]
+    (cond
+      (pos? n) "positive"
+      (neg? n) "negative"
+      :else "neutral")))
+
+(defn validation-summary [daily-dir stamp d filename]
+  (let [path (os.path/join daily-dir (str stamp ".validation.json"))]
+    (when (os.path/exists path)
+      (let [payload (read-json path)
+            accounts (.get payload "accounts" [])]
+        (when (and (true? (.get payload "report/rendered?" false))
+                   (= (.get payload "report/date") (.isoformat d)))
+          {:date d
+           :stamp stamp
+           :filename filename
+           :source "validation"
+           :pnl (reduce + 0.0
+                        (map #(python/float (or (.get % "pnl/equity-day" 0.0) 0.0)) accounts))
+           :trades (reduce + 0
+                           (map #(python/int (or (.get % "trade/closed-count" 0) 0)) accounts))
+           :accounts (python/len accounts)})))))
+
+(defn html-summary [html-path d stamp filename]
+  (let [html (slurp html-path)
+        pnl-match (re/search #"(?s)<h3>Total Daily PnL</h3>\s*<div class=\"value [^\"]+\">([^<]+)</div>" html)
+        trades-match (re/search #"(?s)<h3>Total Trades</h3>\s*<div class=\"value [^\"]+\">([^<]+)</div>" html)]
+    {:date d
+     :stamp stamp
+     :filename filename
+     :source (if (and pnl-match trades-match) "html" "artifact")
+     :pnl (when pnl-match (parse-money (.group pnl-match 1)))
+     :trades (when trades-match (python/int (.replace (.strip (.group trades-match 1)) "," "")))
+     :accounts 0}))
+
+(defn daily-entry [daily-dir html-path]
+  (let [name (os.path/basename html-path)
+        match (re/fullmatch #"(\d{8})\.html" name)]
+    (when match
+      (let [stamp (.group match 1)
+            d (parse-compact-date stamp)]
+        (or (validation-summary daily-dir stamp d name)
+            (html-summary html-path d stamp name))))))
+
+(defn daily-entries [reports-dir]
+  (let [daily-dir (os.path/join reports-dir "daily")]
+    (if (os.path/isdir daily-dir)
+      (vec (reverse (sort-by :date
+                             (keep #(daily-entry daily-dir %)
+                                   (glob/glob (os.path/join daily-dir "*.html"))))))
+      [])))
+
+(defn weekly-entries [reports-dir]
+  (let [weekly-dir (os.path/join reports-dir "weekly")]
+    (if (os.path/isdir weekly-dir)
+      (vec (reverse
+            (sort-by :label
+                     (keep (fn [p]
+                             (let [name (os.path/basename p)
+                                   match (re/fullmatch #"(\d{4})-W(\d{2})\.html" name)]
+                               (when match
+                                 {:filename name
+                                  :label (str (.group match 1) "-W" (.group match 2))})))
+                           (glob/glob (os.path/join weekly-dir "*.html"))))))
+      [])))
+
+(def account-display
+  {"chestnut" "CHESTNUT"
+   "lynx" "LYNX"
+   "moose" "MOOSE"
+   "oak" "OAK"
+   "parrot" "PARROT"
+   "dolphin" "DOLPHIN"})
+
+(defn account-entries [reports-dir]
+  (let [accounts-dir (os.path/join reports-dir "accounts")]
+    (if (os.path/isdir accounts-dir)
+      (vec
+       (sort-by :display
+                (keep (fn [p]
+                        (let [name (os.path/basename p)
+                              match (re/fullmatch #"([A-Za-z0-9_-]+)\.html" name)]
+                          (when (and match (not= "index.html" name))
+                            (let [slug (.lower (.group match 1))]
+                              {:filename name
+                               :slug slug
+                               :display (get account-display slug (.upper slug))}))))
+                      (glob/glob (os.path/join accounts-dir "*.html")))))
+      [])))
+
+(defn status-summary [reports-dir]
+  (let [status-path (os.path/join reports-dir "status" "status.json")]
+    (when (os.path/exists status-path)
+      (let [payload (read-json status-path)]
+        {:state (.get payload "status" (.get payload "overall_status" "available"))
+         :updated (.get payload "generated_at" (.get payload "as_of" ""))}))))
+
+(def index-css
+  "body{margin:0;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif}.site-header{border-bottom:1px solid #30363d;background:#161b22}.site-header-inner{max-width:1180px;margin:0 auto;padding:18px 24px;display:flex;justify-content:space-between;gap:20px;align-items:center}.brand a{color:#e6edf3;text-decoration:none}.brand h1{margin:0;font-size:24px}.updated{margin-top:4px;color:#8b949e;font-size:12px}.site-nav{display:flex;gap:10px;flex-wrap:wrap}.site-nav a{color:#c9d1d9;text-decoration:none;border:1px solid #30363d;border-radius:999px;padding:7px 10px}.site-nav a:hover{border-color:#58a6ff;color:#fff}.container{max-width:1180px;margin:0 auto;padding:28px 24px}.hero{display:grid;grid-template-columns:1.4fr .9fr;gap:18px;margin-bottom:18px}.section{background:#161b22;border:1px solid #30363d;border-radius:16px;padding:20px}.section h2{margin:0 0 14px}.metric{font-size:36px;font-weight:900}.positive{color:#3fb950}.negative{color:#f85149}.neutral{color:#8b949e}.meta{color:#8b949e;font-size:13px;margin-top:6px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.card{display:block;color:#e6edf3;text-decoration:none;border:1px solid #30363d;background:#0d1117;border-radius:14px;padding:14px}.card:hover{border-color:#58a6ff}.card-title{font-weight:900}.card-sub{color:#8b949e;font-size:13px;margin-top:6px}.table{width:100%;border-collapse:collapse}.table td,.table th{border-bottom:1px solid #30363d;padding:10px;text-align:left}.table th{color:#8b949e;font-size:12px;text-transform:uppercase}@media(max-width:760px){.site-header-inner,.hero{display:block}.site-nav{margin-top:14px}.section{margin-bottom:14px}}")
+
+(defn daily-card [entry]
+  (if entry
+    (str "<a class=\"card\" href=\"daily/" (escape-html (:filename entry)) "\">"
+         "<div class=\"card-title\">" (.isoformat (:date entry)) "</div>"
+         "<div class=\"card-sub\">Latest daily report</div>"
+         (if (some? (:pnl entry))
+           (str "<div class=\"metric " (pnl-class (:pnl entry)) "\">" (money (:pnl entry)) "</div>"
+                "<div class=\"meta\">" (:trades entry) " closed trades &middot; " (escape-html (:source entry)) "</div>")
+           "<div class=\"metric neutral\">metrics n/a</div><div class=\"meta\">artifact available</div>")
+         "</a>")
+    "<a class=\"card\" href=\"daily/index.html\"><div class=\"card-title\">Daily</div><div class=\"card-sub\">No daily reports found</div></a>"))
+
+(defn weekly-card [entry]
+  (if entry
+    (str "<a class=\"card\" href=\"weekly/" (escape-html (:filename entry)) "\">"
+         "<div class=\"card-title\">" (escape-html (:label entry)) "</div>"
+         "<div class=\"card-sub\">Latest weekly report</div></a>")
+    "<a class=\"card\" href=\"weekly/index.html\"><div class=\"card-title\">Weekly</div><div class=\"card-sub\">No weekly reports found</div></a>"))
+
+(defn status-card [status]
+  (str "<a class=\"card\" href=\"status/index.html\">"
+       "<div class=\"card-title\">System</div>"
+       "<div class=\"card-sub\">"
+       (if status
+         (str "Status: " (escape-html (:state status))
+              (when (seq (:updated status))
+                (str " &middot; " (escape-html (:updated status)))))
+         "Status artifact unavailable")
+       "</div></a>"))
+
+(defn accounts-card [accounts]
+  (str "<a class=\"card\" href=\"accounts/index.html\">"
+       "<div class=\"card-title\">Accounts</div>"
+       "<div class=\"card-sub\">" (count accounts) " account report" (if (= 1 (count accounts)) "" "s") "</div></a>"))
+
+(defn recent-daily-table [entries]
+  (str "<table class=\"table\"><thead><tr><th>Date</th><th>P&amp;L</th><th>Trades</th><th>Source</th></tr></thead><tbody>"
+       (apply str
+              (for [e (take 10 entries)]
+                (str "<tr><td><a href=\"daily/" (escape-html (:filename e)) "\">" (.isoformat (:date e)) "</a></td>"
+                     "<td class=\"" (pnl-class (:pnl e)) "\">" (or (money (:pnl e)) "n/a") "</td>"
+                     "<td>" (or (:trades e) "n/a") "</td>"
+                     "<td>" (escape-html (:source e)) "</td></tr>")))
+       "</tbody></table>"))
+
+(defn render-index [title daily weekly accounts status]
+  (let [updated (.strftime (datetime.datetime/now) "%Y-%m-%d %H:%M:%S")
+        latest-daily (first daily)
+        latest-weekly (first weekly)]
+    (str "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+         "  <meta charset=\"utf-8\">\n"
+         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+         "  <link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">\n"
+         "  <title>" (escape-html title) "</title>\n"
+         "  <style>" index-css "</style>\n"
+         "</head>\n<body>\n"
+         "  <header class=\"site-header\"><div class=\"site-header-inner\"><div class=\"brand\">"
+         "<a href=\"/reports/index.html\"><h1>" (escape-html title) "</h1></a>"
+         "<div class=\"updated\">Updated: " (escape-html updated) "</div></div>"
+         "<nav class=\"site-nav\"><a href=\"/reports/index.html\">Overview</a>"
+         "<a href=\"/reports/daily/index.html\">Daily</a>"
+         "<a href=\"/reports/weekly/index.html\">Weekly</a>"
+         "<a href=\"/reports/accounts/index.html\">Accounts</a>"
+         "<a href=\"/reports/status/index.html\">System</a>"
+         "<a href=\"/index.html\" class=\"back\">All Reports</a></nav></div></header>\n"
+         "  <main class=\"container\">\n"
+         "    <div class=\"hero\"><section class=\"section\"><h2>Latest Daily</h2>"
+         (daily-card latest-daily)
+         "</section><section class=\"section\"><h2>Quick Links</h2><div class=\"grid\">"
+         (weekly-card latest-weekly)
+         (accounts-card accounts)
+         (status-card status)
+         "</div></section></div>\n"
+         "    <section class=\"section\"><h2>Recent Daily Reports</h2>"
+         (if (seq daily)
+           (recent-daily-table daily)
+           "<div class=\"meta\">No daily report artifacts found.</div>")
+         "</section>\n"
+         "  </main>\n</body>\n</html>\n")))
+
+(defn build! [{:keys [reports-dir title]}]
+  (when-not reports-dir
+    (throw (python/ValueError "--reports-dir is required")))
+  (when-not (os.path/isdir reports-dir)
+    (throw (python/FileNotFoundError reports-dir)))
+  (let [daily (daily-entries reports-dir)
+        weekly (weekly-entries reports-dir)
+        accounts (account-entries reports-dir)
+        status (status-summary reports-dir)
+        index-path (os.path/join reports-dir "index.html")]
+    (spit index-path (render-index title daily weekly accounts status))
+    {:index-path index-path
+     :daily (count daily)
+     :weekly (count weekly)
+     :accounts (count accounts)
+     :status? (some? status)}))
+
+(try
+  (let [result (build! (parse-args (vec *command-line-args*)))]
+    (println (json/dumps (python/dict {"index_path" (:index-path result)
+                                       "daily" (:daily result)
+                                       "weekly" (:weekly result)
+                                       "accounts" (:accounts result)
+                                       "status" (:status? result)})
+                         ** :indent 2 :sort_keys true))
+    (python/exit 0))
+  (catch python/ValueError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/FileNotFoundError e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2))
+  (catch python/Exception e
+    (binding [*out* *err*]
+      (println (str e)))
+    (python/exit 2)))

@@ -1,0 +1,1382 @@
+;; Build recent-date historical Steve V2 feature tensors from ThetaData.
+;;
+;; This reconstructs same-date historical cohorts from ThetaData historical
+;; OHLC/quote endpoints, then replays the native Basilisp feature formulas and
+;; option overlays used by the live bridge.
+(import argparse builtins collections concurrent.futures datetime hashlib importlib json math numpy os os.path re sys
+        urllib.error urllib.parse urllib.request zoneinfo)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVETRADING_BASILISP_ROOT")
+                                    (os.environ/get "STEVE_REPO_ROOT")
+                                    (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/feature-parity.core/src"))
+
+(require '[stevetrading.feature-parity.raw-unlock :as raw-unlock])
+
+(def et (zoneinfo/ZoneInfo "America/New_York"))
+(def utc (zoneinfo/ZoneInfo "UTC"))
+(def stock-symbols ["SPY" "HYG" "TLT" "VXX"])
+(def index-symbols ["SPX" "VIX" "TNX"])
+(def surface-symbols ["SPX" "SPXW" "VIX" "VIXW"])
+(def historical-option-symbols {"SPX" "SPXW" "VIX" "VIXW"})
+(def default-request-timeout 60.0)
+(def default-chain-horizon-days 1)
+(def default-surface-horizon-days 45)
+(def default-spy-strike-range "100")
+
+(defn ->jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (or (vector? x) (seq? x) (set? x)) (python/list (map ->jsonable x))
+    (python/isinstance x python/dict) (python/dict
+                                      (map (fn [k] (python/tuple [(str k) (->jsonable (.__getitem__ x k))]))
+                                           (.keys x)))
+    (python/isinstance x python/list) (python/list (map ->jsonable x))
+    (or (python/isinstance x datetime/datetime)
+        (python/isinstance x datetime/date)) (.isoformat x)
+    :else x))
+
+(defn write-json! [path payload]
+  (os/makedirs (os.path/dirname path) ** :exist_ok true)
+  (spit path (str (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true) "\n")))
+
+(defn add-ref-to-path! [ref-root]
+  (let [ref (os.path/abspath (str ref-root))]
+    (when-not (contains? (set (.-path sys)) ref)
+      (.insert (.-path sys) 0 ref))))
+
+(declare finite-float parse-et-timestamp normalize-right parse-expiration
+         option-rows-to-chain-by-minute)
+
+(defn load-legacy-feature-engine [bundle]
+  ;; This is the feature implementation currently serving the Steve V2 paper
+  ;; strategies. Historical parity must use it until the native migration has
+  ;; independently matched it and been promoted.
+  (let [module (importlib/import_module "scripts_5yr.live.feature_engine")]
+    ((.-FeatureEngine module)
+     (os.path/join bundle "feature_stats.npz")
+     (os.path/join bundle "feature_names.json"))))
+
+(defn load-legacy-grid-adapter []
+  ;; Match bridge.steve-v2/on-chain!: BS Greeks followed by the reference
+  ;; GreeksGridBuilder. Keeping this interop here avoids a second, subtly
+  ;; different historical grid implementation.
+  (let [options (importlib/import_module "scripts_5yr.live.options_fetcher")
+        grids (importlib/import_module "scripts_5yr.live.greeks_grid")]
+    {"grid_builder" ((.-GreeksGridBuilder grids))
+     "implied_vol" (.-implied_vol options)
+     "bs_greeks" (.-bs_greeks options)
+     "time_to_expiry" (.-time_to_expiry options)}))
+
+(defn legacy-grid-from-chain [adapter chain]
+  (let [underlying (finite-float (or (get chain "underlying") (get chain "spy")) 0.0)
+        now (parse-et-timestamp (or (get chain "observed_at") (get chain "observed-at")))
+        converted (python/list)]
+    (when (pos? underlying)
+      (doseq [contract (or (get chain "contracts") [])]
+        (try
+          (let [strike (finite-float (get contract "strike") 0.0)
+                bid (finite-float (get contract "bid") 0.0)
+                ask (finite-float (get contract "ask") 0.0)
+                mid (if (and (pos? bid) (pos? ask)) (/ (+ bid ask) 2.0) 0.0)
+                option-type (if (= (normalize-right (get contract "right")) "PUT") "put" "call")
+                expiration (datetime.date/fromisoformat (parse-expiration (get contract "expiration")))]
+            ;; This is the production bridge's 12% strike filter and implied-
+            ;; volatility fallback. Do not broaden it for historical data.
+            (when (and (pos? strike)
+                       (pos? mid)
+                       (< (/ (abs (- strike underlying)) underlying) 0.12))
+              (let [t ((get adapter "time_to_expiry") expiration now)]
+                (when (pos? t)
+                  (let [iv ((get adapter "implied_vol") mid underlying strike t 0.043 option-type)]
+                    (when (pos? iv)
+                      (let [greeks ((get adapter "bs_greeks") underlying strike t 0.043 iv option-type)]
+                        (.append converted
+                                 (python/dict {"strike" strike
+                                               "expiration" expiration
+                                               "option_type" option-type
+                                               "iv" iv
+                                               "delta" (.get greeks "delta")
+                                               "vega" (.get greeks "vega")
+                                               "theta" (.get greeks "theta")
+                                               "rho" (.get greeks "rho")})))))))))
+          (catch python/Exception _ nil))))
+    (.build_grid (get adapter "grid_builder") converted underlying now)))
+
+(defn normalize-table [payload]
+  (cond
+    (python/isinstance payload python/list)
+    (vec (for [row payload :when (python/isinstance row python/dict)] (into {} (.items row))))
+
+    (not (python/isinstance payload python/dict))
+    []
+
+    :else
+    (loop [keys ["response" "data" "rows"]]
+      (if (seq keys)
+        (let [value (.get payload (first keys))]
+          (if (python/isinstance value python/list)
+            (if (and (> (len value) 0)
+                     (every? #(python/isinstance % python/dict) value))
+              (vec (for [row value] (into {} (.items row))))
+              (let [cols {"value" value}
+                    n (apply min (map len (vals cols)))]
+                (vec (for [i (range n)]
+                       (into {} (for [[k values] cols] [k (.__getitem__ values i)]))))))
+            (recur (rest keys))))
+        (let [columns (into {} (for [[k v] (.items payload)
+                                     :when (python/isinstance v python/list)]
+                                 [(str k) v]))]
+          (if (empty? columns)
+            []
+            (let [n (apply min (map len (vals columns)))]
+              (vec (for [i (range n)]
+                     (into {} (for [[k values] columns] [k (.__getitem__ values i)])))))))))))
+
+(defn parse-et-timestamp
+  ([value] (parse-et-timestamp value nil))
+  ([value target-date]
+   (let [parsed (cond
+                  (python/isinstance value datetime/datetime) value
+                  (and (number? value) target-date)
+                  (let [seconds (if (> (float value) 100000.0) (/ (float value) 1000.0) (float value))
+                        base (datetime.datetime/combine target-date (datetime/time 0 0) et)]
+                    (+ base (datetime/timedelta ** :seconds seconds)))
+                  :else
+                  (let [text0 (.strip (str value))
+                        text1 (if (and (.startswith text0 "#inst \"") (.endswith text0 "\""))
+                                (subs text0 7 (dec (count text0)))
+                                text0)
+                        text (if (.endswith text1 "Z") (str (subs text1 0 (dec (count text1))) "+00:00") text1)]
+                    (if (and target-date (= (count text) 8) (.isdigit text))
+                      (datetime.datetime/combine target-date
+                                                 (datetime/time (int (subs text 0 2))
+                                                                (int (subs text 2 4))
+                                                                (int (subs text 4 6))))
+                      (datetime.datetime/fromisoformat text))))]
+     (.astimezone (if (nil? (.-tzinfo parsed)) (.replace parsed ** :tzinfo et) parsed) et))))
+
+(defn minute-key [ts]
+  (.strftime (.replace (.astimezone ts utc) ** :second 0 :microsecond 0) "%Y-%m-%dT%H:%M:%SZ"))
+
+(defn shifted-observed-at [key offset-seconds]
+  (if (zero? (int offset-seconds))
+    key
+    (let [dt (datetime.datetime/fromisoformat (.replace (str key) "Z" "+00:00"))
+          shifted (+ dt (datetime/timedelta ** :seconds (int offset-seconds)))]
+      (.strftime (.astimezone shifted utc) "%Y-%m-%dT%H:%M:%SZ"))))
+
+(defn shifted-minute-key [key offset-minutes]
+  (if (zero? (int offset-minutes))
+    key
+    (let [dt (datetime.datetime/fromisoformat (.replace (str key) "Z" "+00:00"))
+          shifted (+ dt (datetime/timedelta ** :minutes (int offset-minutes)))]
+      (.strftime (.astimezone shifted utc) "%Y-%m-%dT%H:%M:%SZ"))))
+
+(defn cohort-option-start-time [start-time end-time cohort-window-minutes grid-history-len]
+  ;; Keep enough option observations to warm the grid sequence, but do not
+  ;; deserialize a whole broad-chain session when the parity gate only needs a
+  ;; recent matched cohort. Stock bars still use --stock-start-time for TA.
+  (if-not (pos? (int cohort-window-minutes))
+    start-time
+    (let [start (datetime.datetime/strptime start-time "%H:%M:%S")
+          end (datetime.datetime/strptime end-time "%H:%M:%S")
+          needed (+ (int cohort-window-minutes) (int grid-history-len))
+          candidate (- end (datetime/timedelta ** :minutes needed))]
+      (.strftime (if (< candidate start) start candidate) "%H:%M:%S"))))
+
+(defn finite-float
+  ([value] (finite-float value 0.0))
+  ([value default]
+   (try
+     (let [out (float value)]
+       (if (math/isfinite out) out default))
+     (catch python/Exception _ default))))
+
+(defn parse-stock-ohlc-rows [rows symbol target-date]
+  (loop [remaining rows
+         previous-close 0.0
+         bars {}]
+    (if-not (seq remaining)
+      bars
+      (let [row (first remaining)
+            ts-value (or (get row "timestamp") (get row "time") (get row "datetime") (get row "date"))]
+        (if (nil? ts-value)
+          (recur (rest remaining) previous-close bars)
+          (let [ts (parse-et-timestamp ts-value target-date)
+                raw-close (finite-float (get row "close"))
+                raw-vwap (finite-float (get row "vwap"))
+                raw-open (finite-float (get row "open"))
+                raw-high (finite-float (get row "high"))
+                raw-low (finite-float (get row "low"))
+                raw-volume (finite-float (get row "volume"))
+                raw-count (finite-float (or (get row "count") (get row "trade_count")))
+                incomplete? (and (<= raw-close 0.0)
+                                 (<= raw-open 0.0)
+                                 (<= raw-high 0.0)
+                                 (<= raw-low 0.0)
+                                 (<= raw-volume 0.0)
+                                 (<= raw-count 0.0))
+                close (cond (> raw-close 0.0) raw-close
+                            (> raw-vwap 0.0) raw-vwap
+                            :else previous-close)]
+            (if (or incomplete? (<= close 0.0))
+              (recur (rest remaining) previous-close bars)
+              (let [open0 (finite-float raw-open close)
+                    high0 (finite-float raw-high close)
+                    low0 (finite-float raw-low close)
+                    open-px (if (> open0 0.0) open0 close)
+                    high-px (if (> high0 0.0) high0 (max open-px close))
+                    low-px (if (> low0 0.0) low0 (min open-px close))
+                    vwap (if (> raw-vwap 0.0) raw-vwap close)
+                    bar {"time" ts
+                         "open" open-px
+                         "high" high-px
+                         "low" low-px
+                         "close" close
+                         "volume" raw-volume
+                         "vwap" vwap
+                         "trade_count" (int raw-count)
+                         "bid" (finite-float (get row "bid") close)
+                         "ask" (finite-float (get row "ask") close)}]
+                (recur (rest remaining) close (assoc bars (minute-key ts) bar))))))))))
+
+(defn scale-bar [bar multiplier]
+  (reduce (fn [out k] (assoc out k (* (finite-float (get out k)) multiplier)))
+          (into {} bar)
+          ["open" "high" "low" "close" "vwap" "bid" "ask"]))
+
+(defn deque-copy [d max-bars]
+  (collections/deque (python/list d) ** :maxlen max-bars))
+
+(defn build-bar-buffers-by-minute [stock-bars max-bars]
+  (let [symbols (concat stock-symbols index-symbols)
+        buffers (into {} (for [sym symbols] [sym (collections/deque ** :maxlen max-bars)]))
+        minute-set (set (mapcat #(keys (get stock-bars % {})) symbols))]
+    (loop [minutes (sort minute-set)
+           by-minute {}]
+      (if-not (seq minutes)
+        by-minute
+        (let [key (first minutes)]
+          (doseq [sym symbols]
+            (when-let [bar (get-in stock-bars [sym key])]
+              (.append (get buffers sym) bar)))
+          (when (and (not (get-in stock-bars ["SPX" key]))
+                     (get-in stock-bars ["SPY" key]))
+            (.append (get buffers "SPX") (scale-bar (get-in stock-bars ["SPY" key]) 10.0)))
+          (when (and (not (get-in stock-bars ["VIX" key]))
+                     (get-in stock-bars ["VXX" key]))
+            (.append (get buffers "VIX") (into {} (get-in stock-bars ["VXX" key]))))
+          (when (and (not (get-in stock-bars ["TNX" key]))
+                     (get-in stock-bars ["TLT" key]))
+            (.append (get buffers "TNX") (into {} (get-in stock-bars ["TLT" key]))))
+          (recur (rest minutes)
+                 (assoc by-minute key (into {} (for [[sym d] buffers] [sym (deque-copy d max-bars)])))))))))
+
+(defn normalize-right [value]
+  (let [text (.upper (str (or value "")))]
+    (cond
+      (contains? #{"C" "CALL" ":OPTION-RIGHT/CALL"} text) "CALL"
+      (contains? #{"P" "PUT" ":OPTION-RIGHT/PUT"} text) "PUT"
+      :else text)))
+
+(defn parse-expiration [value]
+  (let [text (.strip (str value))]
+    (if (and (= (count text) 8) (.isdigit text))
+      (str (subs text 0 4) "-" (subs text 4 6) "-" (subs text 6 8))
+      (.isoformat (datetime.date/fromisoformat (subs text 0 10))))))
+
+(defn underlying-price [underlying-by-minute key]
+  (let [value (get underlying-by-minute key 0.0)]
+    (cond
+      (map? value) (finite-float (or (get value "close") (get value "vwap") (get value "bid") (get value "ask")) 0.0)
+      (python/isinstance value python/dict) (finite-float (or (.get value "close")
+                                                              (.get value "vwap")
+                                                              (.get value "bid")
+                                                              (.get value "ask"))
+                                                          0.0)
+      :else (finite-float value 0.0))))
+
+(defn limit-chain-contracts [chain max-contracts]
+  (if (or (nil? chain) (not (pos? (int max-contracts))))
+    chain
+    (let [underlying (finite-float (or (get chain "underlying") (get chain "spy")) 0.0)
+          contracts (vec (or (get chain "contracts") []))]
+      (if (or (<= underlying 0.0) (<= (count contracts) (int max-contracts)))
+        chain
+        (assoc chain "contracts"
+               (vec (take (int max-contracts)
+                          (sort-by (fn [contract]
+                                     (abs (- (finite-float (get contract "strike") underlying)
+                                             underlying)))
+                                   contracts))))))))
+
+(defn option-rows-to-chain-by-minute [rows symbol target-date underlying-by-minute observed-offset-seconds quote-minute-offset grid-contracts-only?]
+  (let [grouped (collections/defaultdict python/list)]
+    (doseq [row rows]
+      (let [ts-value (or (get row "timestamp") (get row "time") (get row "datetime"))]
+        (when ts-value
+          (let [ts (parse-et-timestamp ts-value target-date)
+                quote-key (minute-key ts)
+                key (shifted-minute-key quote-key (- (int quote-minute-offset)))
+                strike (finite-float (get row "strike") ##NaN)
+                underlying (underlying-price underlying-by-minute key)
+                in-grid-range? (and (pos? underlying)
+                                    (< (/ (abs (- strike underlying)) underlying) 0.12))]
+            (when (and (math/isfinite strike)
+                       (or (not grid-contracts-only?) in-grid-range?))
+              (let [contract (cond-> {"symbol" symbol
+                                      "strike" strike
+                                      "right" (normalize-right (get row "right"))
+                                      "bid" (finite-float (or (get row "bid") (get row "quote/bid")) 0.0)
+                                      "ask" (finite-float (or (get row "ask") (get row "quote/ask")) 0.0)
+                                      "bid_size" (int (finite-float (or (get row "bid_size")
+                                                                        (get row "bid-size")
+                                                                        (get row "quote/bid-size")) 0.0))
+                                      "ask_size" (int (finite-float (or (get row "ask_size")
+                                                                        (get row "ask-size")
+                                                                        (get row "quote/ask-size")) 0.0))
+                                      "expiration" (parse-expiration (get row "expiration"))}
+                               (contains? row "open") (assoc "open" (finite-float (get row "open") 0.0))
+                               (contains? row "high") (assoc "high" (finite-float (get row "high") 0.0))
+                               (contains? row "low") (assoc "low" (finite-float (get row "low") 0.0))
+                               (contains? row "close") (assoc "close" (finite-float (get row "close") 0.0))
+                               (contains? row "volume") (assoc "volume" (finite-float (get row "volume") 0.0))
+                               (contains? row "count") (assoc "count" (int (finite-float (get row "count") 0.0)))
+                               (contains? row "open_interest") (assoc "open_interest" (finite-float (get row "open_interest") 0.0))
+                               (and (contains? row "oi") (not (contains? row "open_interest")))
+                               (assoc "open_interest" (finite-float (get row "oi") 0.0)))]
+	                  (.append (.__getitem__ grouped key) contract)))))))
+    (into {} (for [key (.keys grouped)]
+               (let [contracts (vec (.__getitem__ grouped key))
+                     underlying (underlying-price underlying-by-minute key)]
+                 [key {"observed_at" (shifted-observed-at key observed-offset-seconds)
+                       "quote_minute_offset" (int quote-minute-offset)
+                       "underlying" underlying
+                       "spy" underlying
+                       "contracts" contracts}])))))
+
+	(defn contract-field-coverage [chains-by-minute]
+	  (let [fields ["bid" "ask" "bid_size" "ask_size" "open" "high" "low" "close" "volume" "count" "open_interest"]
+	        totals (python/dict (for [f fields] (python/tuple [f 0])))
+	        contracts (atom 0)
+	        contracts-per-minute (python/list)
+	        minutes-with-contracts (atom 0)
+	        expiration-counts (python/dict)]
+	    (doseq [[_ payload] chains-by-minute]
+	      (let [rows (when (map? payload) (get payload "contracts"))]
+	        (when (and (vector? rows) (seq rows))
+	          (swap! minutes-with-contracts inc)
+	          (.append contracts-per-minute (count rows))
+	          (doseq [contract rows :when (map? contract)]
+	            (swap! contracts inc)
+	            (when-let [expiration (get contract "expiration")]
+	              (let [key (str expiration)]
+	                (.__setitem__ expiration-counts key (inc (int (.get expiration-counts key 0))))))
+	            (doseq [field fields]
+	              (when (and (contains? contract field) (some? (get contract field)))
+	                (.__setitem__ totals field (inc (int (.get totals field 0))))))))))
+    (let [counts (sort (vec contracts-per-minute))
+          n (count counts)
+          median (when (pos? n)
+                   (if (odd? n)
+                     (nth counts (quot n 2))
+                     (/ (+ (nth counts (dec (quot n 2))) (nth counts (quot n 2))) 2.0)))]
+      {"minutes" (count chains-by-minute)
+       "minutes_with_contracts" @minutes-with-contracts
+	       "contracts" @contracts
+	       "contracts_per_minute" {"min" (if (seq counts) (first counts) 0)
+	                               "median" (or median 0)
+	                               "max" (if (seq counts) (last counts) 0)}
+	       "expiration_counts" (into {} (.items expiration-counts))
+	       "field_counts" (into {} (.items totals))
+       "field_coverage" (into {} (for [field fields]
+                                   [field (if (pos? @contracts) (/ (.get totals field 0) @contracts) 0.0)]))})))
+
+(defn historical-contract-coverage [spy-chain-by-minute surfaces]
+  (merge {"SPY" (contract-field-coverage spy-chain-by-minute)}
+         (into {} (for [[symbol by-minute] surfaces]
+                    [symbol (contract-field-coverage by-minute)]))))
+
+(defn sample-sorted
+  ([values] (sample-sorted values 5))
+  ([values n]
+   (vec (take n (sort values)))))
+
+(defn tail-sorted
+  ([values] (tail-sorted values 5))
+  ([values n]
+   (vec (take-last n (sort values)))))
+
+(defn stock-minute-diagnostics [stock-bars]
+  (into {} (for [[symbol bars] stock-bars]
+             (let [ks (keys bars)]
+               [symbol {"count" (count ks)
+                        "first" (sample-sorted ks)
+                        "last" (tail-sorted ks)}]))))
+
+(defn chain-minute-diagnostics [chain-by-minute]
+  (let [ks (keys chain-by-minute)]
+    {"count" (count ks)
+     "first" (sample-sorted ks)
+     "last" (tail-sorted ks)}))
+
+(defn load-npz-optional [path]
+  (when (os.path/exists path)
+    (let [data (numpy/load path)]
+      (into {} (for [name (.-files data)] [name (.__getitem__ data name)])))))
+
+(defn read-json [path]
+  (json/loads (slurp path)))
+
+(defn load-neutralization [bundle name-to-idx]
+  (let [path (os.path/join bundle "neutralize_features.json")]
+    (if-not (os.path/exists path)
+      [(numpy/asarray [] ** :dtype numpy/int64) (numpy/asarray [] ** :dtype numpy/float32)]
+      (let [names (read-json path)
+            stats (numpy/load (os.path/join bundle "feature_stats.npz"))
+            means (numpy/asarray (.__getitem__ stats "mean") ** :dtype numpy/float32)
+            indexes (vec (for [name names :when (contains? name-to-idx name)] (get name-to-idx name)))
+            idx (numpy/asarray indexes ** :dtype numpy/int64)]
+        [idx (.__getitem__ means idx)]))))
+
+(defn overlay! [vector name-to-idx values]
+  (let [count (atom 0)]
+    (doseq [[name value] (if (python/isinstance values python/dict) (.items values) values)]
+      (when-let [idx (get name-to-idx name)]
+        (let [num (finite-float value ##NaN)]
+          (when (math/isfinite num)
+            (.__setitem__ vector idx num)
+            (swap! count inc)))))
+    @count))
+
+(defn sha256-text [text]
+  (let [h (hashlib/sha256)]
+    (.update h (.encode (str text) "utf-8"))
+    (.hexdigest h)))
+
+(defn cache-file-for-url [cache-dir request-url]
+  (os.path/join cache-dir (str (sha256-text request-url) ".json")))
+
+(defn transport-with-timeout
+  ([timeout] (transport-with-timeout timeout nil nil))
+  ([timeout cache-dir cache-stats]
+  (fn [request-url]
+    (let [cache-path (when cache-dir (cache-file-for-url cache-dir request-url))]
+      (if (and cache-path (os.path/exists cache-path))
+        (do
+          (when cache-stats (swap! cache-stats update "hits" (fnil inc 0)))
+          (.get (json/loads (slurp cache-path)) "payload"))
+        (let [req (urllib.request/Request request-url ** :headers {"Accept" "application/json"})]
+          (when cache-stats (swap! cache-stats update "misses" (fnil inc 0)))
+          (with-open [resp (urllib.request/urlopen req ** :timeout timeout)]
+            (let [payload (json/loads (.decode (.read resp) "utf-8"))]
+              (when cache-path
+                (os/makedirs cache-dir ** :exist_ok true)
+                (spit cache-path
+                      (str (json/dumps (->jsonable {"url" request-url
+                                                    "payload" payload})
+                                       ** :indent 2 :sort_keys true)
+                           "\n"))
+                (when cache-stats (swap! cache-stats update "writes" (fnil inc 0))))
+              payload))))))))
+
+(defn request-url [base-url path params]
+  (let [clean (sort-by first (for [[k v] params :when (some? v)] [(str k) v]))
+        query (urllib.parse/urlencode (python/list (map (fn [[k v]] (python/tuple [k v])) clean)))]
+    (str (.rstrip base-url "/") path "?" query)))
+
+(defn fetch-rows [transport request-url]
+  (try
+    (normalize-table (transport request-url))
+    (catch urllib.error/HTTPError e
+      (if (= (.-code e) 472)
+        (throw e)
+        (throw (python/ValueError
+                (str "ThetaData request failed status=" (.-code e)
+                     " url=" request-url)))))
+    (catch python/Exception e
+      (throw (python/ValueError
+              (str "ThetaData request failed error=" (type e)
+                   " detail=" e
+                   " url=" request-url))))))
+
+(defn classify-failure [reason]
+  (let [text (.lower (str reason))]
+    (cond
+      (or (>= (.find text "connection refused") 0)
+          (>= (.find text "connection reset") 0)
+          (>= (.find text "reset by peer") 0)
+          (>= (.find text "unreachable") 0)
+          (>= (.find text "errno 111") 0)
+          (>= (.find text "errno 104") 0))
+      "terminal-unreachable"
+
+	      (or (>= (.find text "timed out") 0)
+	          (>= (.find text "timeout") 0))
+	      "timeout"
+
+	      (or (>= (.find text "status=500") 0)
+	          (>= (.find text "http error 500") 0)
+	          (>= (.find text "internal server error") 0))
+	      "error"
+
+	      (or (>= (.find text "403") 0)
+	          (>= (.find text "forbidden") 0)
+	          (>= (.find text "permission") 0)
+          (>= (.find text "agreement") 0))
+      "entitlement-or-agreement"
+
+      (or (>= (.find text "404") 0)
+          (>= (.find text "410") 0)
+          (>= (.find text "not found") 0))
+      "unsupported-endpoint"
+
+      :else "error")))
+
+(defn no-data-error? [exc]
+  (and (python/isinstance exc urllib.error/HTTPError) (= (.-code exc) 472)))
+
+(defn historical-option-symbol [surface-prefix]
+  (get historical-option-symbols surface-prefix surface-prefix))
+
+(defn fetch-stock-bars [transport base-url symbol target start-time end-time venue]
+  (let [compact (.strftime target "%Y%m%d")
+        rows (fetch-rows transport
+                         (request-url base-url "/v3/stock/history/ohlc"
+                                      {"symbol" symbol
+                                       "start_date" compact
+                                       "end_date" compact
+                                       "date" compact
+                                       "interval" "1m"
+                                       "start_time" start-time
+                                       "end_time" end-time
+                                       "venue" venue
+                                       "format" "json"}))]
+    (parse-stock-ohlc-rows rows symbol target)))
+
+(defn fetch-index-bars [transport base-url symbol target start-time end-time]
+  (let [compact (.strftime target "%Y%m%d")
+        rows (fetch-rows transport
+                         (request-url base-url "/v3/index/history/ohlc"
+                                      {"symbol" symbol
+                                       "start_date" compact
+                                       "end_date" compact
+                                       "date" compact
+                                       "interval" "1m"
+                                       "start_time" start-time
+                                       "end_time" end-time
+                                       "format" "json"}))]
+    (parse-stock-ohlc-rows rows symbol target)))
+
+(defn fetch-expirations [transport base-url symbol]
+  (let [rows (fetch-rows transport (request-url base-url "/v3/option/list/expirations"
+                                               {"symbol" symbol "format" "json"}))]
+    (vec (sort (set (keep (fn [row]
+                            (try
+                              (when-let [value (get row "expiration")]
+                                (datetime.date/fromisoformat (parse-expiration value)))
+                              (catch python/Exception _ nil)))
+                          rows))))))
+
+(defn select-expirations [expirations target horizon-days]
+  (let [end (+ target (datetime/timedelta ** :days horizon-days))]
+    (vec (filter #(and (not (neg? (compare % target))) (not (pos? (compare % end)))) expirations))))
+
+(defn option-history-params [symbol expiration target start-time end-time strike-range]
+  (let [params {"symbol" symbol
+                "expiration" (.strftime expiration "%Y%m%d")
+                "date" (.strftime target "%Y%m%d")
+                "interval" "1m"
+                "start_time" start-time
+                "end_time" end-time
+                "right" "both"
+                "format" "json"}]
+    (if strike-range
+      (assoc params "strike_range" strike-range)
+      (assoc params "strike" "*"))))
+
+(defn validate-strike-range
+  [value arg-name]
+  (when (some? value)
+    (let [text (.strip (str value))]
+      (when-not (re/fullmatch "[1-9][0-9]*" text)
+        (throw (python/ValueError
+                (str arg-name " must be a positive integer strike count, not a decimal percentage: "
+                     text)))))))
+
+(defn split-symbols
+  [value default-symbols]
+  (if (nil? value)
+    default-symbols
+    (vec (filter #(pos? (count %))
+                 (map #(.upper (.strip %))
+                      (.split (str value) ","))))))
+
+(defn progress!
+  [& parts]
+  (binding [*out* *err*]
+    (println (apply str parts))))
+
+(defn fetch-option-quote-rows [transport base-url symbol expiration target start-time end-time strike-range]
+  (fetch-rows transport (request-url base-url "/v3/option/history/quote"
+                                     (option-history-params symbol expiration target start-time end-time strike-range))))
+
+(defn fetch-option-quote-payload [transport base-url symbol expiration target start-time end-time strike-range]
+  ;; Preserve ThetaData's columnar response for the bounded grid-only path.
+  ;; Expanding it to persistent maps is the dominant historical-cohort cost.
+  (transport (request-url base-url "/v3/option/history/quote"
+                          (option-history-params symbol expiration target start-time end-time strike-range))))
+
+(defn at-time-quote-params [symbol expiration target et-time strike-range]
+  (let [params {"symbol" symbol
+                "expiration" (.strftime expiration "%Y%m%d")
+                ;; Terminal v3 requires an explicit date interval and ET
+                ;; `time_of_day` (not the documented date/time aliases).
+                "start_date" (.strftime target "%Y%m%d")
+                "end_date" (.strftime target "%Y%m%d")
+                "time_of_day" (str et-time ".000")
+                "right" "both"
+                "format" "json"}]
+    (if strike-range
+      (assoc params "strike_range" strike-range)
+      (assoc params "strike" "*"))))
+
+(defn et-time-for-minute-key [key]
+  (.strftime (.astimezone (parse-et-timestamp key) et) "%H:%M:%S"))
+
+(defn fetch-option-at-time-rows
+  "Fetch the last OPRA NBBO at one requested ET minute and stamp every row
+  with that requested time. The endpoint is the only historical mechanism
+  eligible to reproduce a live snapshot/quote contract universe."
+  [transport base-url symbol expiration target minute-key strike-range]
+  (let [rows (fetch-rows transport
+                         (request-url base-url "/v3/option/at_time/quote"
+                                      (at-time-quote-params symbol expiration target
+                                                           (et-time-for-minute-key minute-key)
+                                                           strike-range)))
+        et-stamp (str (.strftime target "%Y-%m-%d") "T" (et-time-for-minute-key minute-key))]
+    (vec (map #(assoc % "timestamp" et-stamp
+                         "expiration" (or (get % "expiration") (.strftime expiration "%Y-%m-%d")))
+              rows))))
+
+(defn interval-minute-keys [underlying-by-minute start-time end-time]
+  (let [start (datetime.datetime/strptime start-time "%H:%M:%S")
+        end (datetime.datetime/strptime end-time "%H:%M:%S")]
+    (vec (filter (fn [key]
+                   (let [wall (.astimezone (parse-et-timestamp key) et)
+                         clock (.replace wall ** :year 1900 :month 1 :day 1 :tzinfo nil)]
+                     (and (not (< clock start)) (not (> clock end)))))
+                 (sort (keys underlying-by-minute))))))
+
+(defn fetch-option-at-time-chain-by-minute
+  "Fetch a bounded matrix of [minute, expiration] at_time snapshots. Tasks
+  are consumed in deterministic order after bounded parallel transport."
+  [transport base-url symbol expirations target minute-keys strike-range jobs
+   underlying-by-minute observed-offset-seconds quote-minute-offset grid-contracts-only?]
+  (let [tasks (vec (for [minute minute-keys expiration expirations] [minute expiration]))
+        worker (fn [[minute expiration]]
+                 [minute expiration
+                  (try
+                    (fetch-option-at-time-rows transport base-url symbol expiration target minute strike-range)
+                    (catch python/Exception e
+                      (if (no-data-error? e) [] (throw e))))])
+        workers (min (max 1 (int jobs)) (count tasks))
+        results (cond
+                  (empty? tasks) []
+                  (= workers 1) (vec (map worker tasks))
+                  :else (let [executor (concurrent.futures/ThreadPoolExecutor ** :max_workers workers)
+                              futures (vec (map #(.submit executor worker %) tasks))]
+                          (try
+                            (vec (map #(.result %) futures))
+                            (finally (.shutdown executor true)))))
+        rows (vec (mapcat #(nth % 2) results))]
+    (option-rows-to-chain-by-minute rows symbol target underlying-by-minute
+                                    observed-offset-seconds quote-minute-offset
+                                    grid-contracts-only?)))
+
+(defn columnar-option-payload? [payload]
+  (and (python/isinstance payload python/dict)
+       (python/isinstance (.get payload "timestamp") python/list)
+       (python/isinstance (.get payload "strike") python/list)))
+
+(defn column-value [payload key idx default]
+  (let [values (.get payload key)]
+    (if (and (python/isinstance values python/list) (< idx (len values)))
+      (.__getitem__ values idx)
+      default)))
+
+(defn option-payloads-to-grid-chain-by-minute [payloads symbol target-date underlying-by-minute observed-offset-seconds quote-minute-offset]
+  ;; Exact production grid scope: contracts outside +/-12% never reach the
+  ;; bridge's GreeksGridBuilder. Raw option aggregates stay neutralized and are
+  ;; therefore intentionally outside this bounded grid-parity path.
+  (let [grouped (collections/defaultdict python/dict)]
+    (doseq [payload payloads :when (columnar-option-payload? payload)]
+      (let [timestamps (.get payload "timestamp")]
+        (doseq [idx (range (len timestamps))]
+          (let [ts (parse-et-timestamp (.__getitem__ timestamps idx) target-date)
+                quote-key (minute-key ts)
+                key (shifted-minute-key quote-key (- (int quote-minute-offset)))
+                underlying (underlying-price underlying-by-minute key)
+                strike (finite-float (column-value payload "strike" idx ##NaN) ##NaN)]
+            (when (and (pos? underlying) (math/isfinite strike)
+                       (< (/ (abs (- strike underlying)) underlying) 0.12))
+              (let [expiration (column-value payload "expiration" idx nil)]
+                ;; A malformed row cannot build a Greeks-grid contract. Skip it
+                ;; rather than making a bounded diagnostic cohort fail outright.
+                (when expiration
+                  (let [right (normalize-right (column-value payload "right" idx ""))
+                        contract-key (python/tuple [(str expiration) strike right])]
+                    ;; The live fetcher receives a point-in-time chain, one
+                    ;; quote per contract. ThetaData history can include many
+                    ;; updates inside a minute, so retain the latest payload
+                    ;; row for each contract instead of weighting a grid by
+                    ;; intraminute quote-update count.
+                    (.__setitem__ (.__getitem__ grouped key) contract-key
+                                 {"symbol" symbol
+                                  "strike" strike
+                                  "right" right
+                                  "bid" (finite-float (column-value payload "bid" idx 0.0) 0.0)
+                                  "ask" (finite-float (column-value payload "ask" idx 0.0) 0.0)
+                                  "bid_size" (int (finite-float (column-value payload "bid_size" idx 0.0) 0.0))
+                                  "ask_size" (int (finite-float (column-value payload "ask_size" idx 0.0) 0.0))
+                                  "expiration" (parse-expiration expiration)})))))))))
+    (into {} (for [key (.keys grouped)]
+               (let [underlying (underlying-price underlying-by-minute key)]
+                 [key {"observed_at" (shifted-observed-at key observed-offset-seconds)
+                       "quote_minute_offset" (int quote-minute-offset)
+                       "underlying" underlying
+                       "spy" underlying
+                       "contracts" (vec (map second (sort-by first (.items (.__getitem__ grouped key)))))}])))))
+
+(defn fetch-many-option-quote-payloads [transport base-url symbol expirations target start-time end-time strike-range]
+  (vec (for [expiration expirations]
+         (try
+           (fetch-option-quote-payload transport base-url symbol expiration target start-time end-time strike-range)
+           (catch python/Exception e
+             (if (no-data-error? e) (python/dict) (throw e)))))))
+
+(defn fetch-option-enrichment-rows [transport base-url endpoint symbol expiration target start-time end-time strike-range]
+  (fetch-rows transport (request-url base-url endpoint
+                                     (option-history-params symbol expiration target start-time end-time strike-range))))
+
+(defn option-row-join-key [row target]
+  (let [ts-value (or (get row "timestamp") (get row "time") (get row "datetime"))
+        strike (finite-float (get row "strike") ##NaN)
+        expiration (get row "expiration")]
+    (when (and ts-value (math/isfinite strike) expiration)
+      [(minute-key (parse-et-timestamp ts-value target))
+       (python/format strike ".8f")
+       (normalize-right (get row "right"))
+       (parse-expiration expiration)])))
+
+(defn merge-option-enrichment-rows [quote-rows ohlc-rows oi-rows target]
+  (let [by-key (atom {})]
+    (doseq [row quote-rows]
+      (when-let [k (option-row-join-key row target)]
+        (swap! by-key update k #(merge (or % {}) row))))
+    (doseq [row ohlc-rows]
+      (when-let [k (option-row-join-key row target)]
+        (when (contains? @by-key k)
+          (doseq [field ["open" "high" "low" "close" "volume" "count"]]
+            (when (contains? row field)
+              (swap! by-key assoc-in [k field] (get row field)))))))
+    (doseq [row oi-rows]
+      (when-let [k (option-row-join-key row target)]
+        (when (contains? @by-key k)
+          (when (contains? row "open_interest")
+            (swap! by-key assoc-in [k "open_interest"] (get row "open_interest")))
+          (when (contains? row "oi")
+            (swap! by-key assoc-in [k "oi"] (get row "oi"))))))
+    (vec (vals @by-key))))
+
+(defn fetch-option-expiration-rows [transport base-url symbol exp target start-time end-time strike-range skip-enrichment?]
+  (try
+    (let [quote-rows (fetch-option-quote-rows transport base-url symbol exp target start-time end-time strike-range)
+          ohlc-rows (if skip-enrichment?
+                      []
+                      (try
+                        (fetch-option-enrichment-rows transport base-url "/v3/option/history/ohlc"
+                                                      symbol exp target start-time end-time strike-range)
+                        (catch python/Exception _ [])))
+          oi-rows (if skip-enrichment?
+                    []
+                    (try
+                      (fetch-option-enrichment-rows transport base-url "/v3/option/history/open_interest"
+                                                    symbol exp target start-time end-time strike-range)
+                      (catch python/Exception _ [])))]
+      (merge-option-enrichment-rows quote-rows ohlc-rows oi-rows target))
+    (catch python/Exception e
+      (if (no-data-error? e) [] (throw e)))))
+
+(defn fetch-many-option-quote-rows [transport base-url symbol expirations target start-time end-time strike-range jobs skip-enrichment?]
+  ;; Fetch expiration partitions concurrently, but consume futures in the input
+  ;; order so historical tensors remain byte-for-byte deterministic.
+  (let [expirations (vec expirations)
+        worker (fn [exp]
+                 (fetch-option-expiration-rows transport base-url symbol exp target
+                                                start-time end-time strike-range skip-enrichment?))
+        workers (min (max 1 (int jobs)) (count expirations))]
+    (cond
+      (empty? expirations) []
+      (= workers 1) (vec (mapcat worker expirations))
+      :else
+      (let [executor (concurrent.futures/ThreadPoolExecutor ** :max_workers workers)
+            futures (vec (map #(.submit executor worker %) expirations))]
+        (try
+          (vec (mapcat #(.result %) futures))
+          (finally
+            (.shutdown executor true)))))))
+
+(defn padded-grid-history [grid-history grid-history-len]
+  (let [items (python/list grid-history)
+        n (count items)
+        out (numpy/zeros (python/tuple [grid-history-len 6 21 8]) ** :dtype numpy/float32)]
+    (when (pos? n)
+      (let [stack (.astype (numpy/stack items) numpy/float32)
+            start (- grid-history-len n)]
+        (.__setitem__ out
+                      (python/tuple [(slice start nil)
+                                     (slice nil nil)
+                                     (slice nil nil)
+                                     (slice nil nil)])
+                      stack)))
+    out))
+
+(defn build-feature-rows [ref-root bundle stock-bars spy-chain-by-minute surfaces-by-prefix-minute
+                          max-bars grid-history-len apply-neutralization? grid-input-only? max-feature-rows max-grid-contracts
+                          implementation]
+  (add-ref-to-path! ref-root)
+  (let [names (vec (read-json (os.path/join bundle "feature_names.json")))
+        name-to-idx (into {} (map-indexed (fn [idx name] [name idx]) names))
+        legacy-engine (when (= implementation "legacy-python")
+                        (load-legacy-feature-engine bundle))
+        legacy-grid-adapter (when (= implementation "legacy-python")
+                              (load-legacy-grid-adapter))
+        dictionary-atoms0 (load-npz-optional (os.path/join bundle "dictionary_atoms.npz"))
+        dictionary-atoms (when dictionary-atoms0
+                           {"components" (get dictionary-atoms0 "components")
+                            "train_mean" (get dictionary-atoms0 "train_mean")
+                            "train_std" (get dictionary-atoms0 "train_std")})
+        hmm-model0 (load-npz-optional (os.path/join bundle "hmm_model.npz"))
+        hmm-model (when hmm-model0
+                    {"means" (get hmm-model0 "means")
+                     "covars" (get hmm-model0 "covars")
+                     "transmat" (get hmm-model0 "transmat")
+                     "startprob" (get hmm-model0 "startprob")})
+        [neutral-idx neutral-means] (if grid-input-only?
+                                      [(numpy/asarray [] ** :dtype numpy/int64)
+                                       (numpy/asarray [] ** :dtype numpy/float32)]
+                                      (load-neutralization bundle name-to-idx))
+        bar-buffers-by-minute (build-bar-buffers-by-minute stock-bars max-bars)
+        grid-history (collections/deque ** :maxlen grid-history-len)
+        rows (atom [])
+        times (atom [])
+        grids (atom [])
+        grid-histories (atom [])
+        bar-buffers-jsons (atom [])
+        option-chain-jsons (atom [])
+        row-provenance (atom [])
+        overlay-counts (atom {})
+        all-keys (vec (sort (keys bar-buffers-by-minute)))
+        eligible-keys (vec (filter #(contains? spy-chain-by-minute %) all-keys))
+        emitted-keys (if (pos? (int max-feature-rows))
+                       (set (take-last (int max-feature-rows) eligible-keys))
+                       nil)]
+    ;; Always advance the grid history across all available chain minutes. The
+    ;; cap limits emitted feature vectors, not the warmup state that feeds them.
+    (doseq [key all-keys]
+      (let [buffers (get bar-buffers-by-minute key)
+            raw-chain (get spy-chain-by-minute key)
+            chain (limit-chain-contracts raw-chain max-grid-contracts)
+            before-history-len (len grid-history)
+            grid-appended? (atom false)]
+        (when chain
+          (let [grid (if (= implementation "legacy-python")
+                       (legacy-grid-from-chain legacy-grid-adapter chain)
+                       (raw-unlock/build-option-greeks-grid-from-payload chain))]
+            (when grid
+              (.append grid-history grid)
+              (reset! grid-appended? true))))
+	    (when (and (> (len grid-history) 0)
+                       (or (nil? emitted-keys) (contains? emitted-keys key)))
+	          (let [grid-history-list (python/list grid-history)
+	                vector (if grid-input-only?
+	                         (numpy/zeros (count names) ** :dtype numpy/float32)
+                         (if (= implementation "legacy-python")
+                           (.compute_all_features legacy-engine
+                                                  ** :bar_buffers buffers
+                                                     :greeks_grids_history grid-history-list
+                                                     :hmm_model hmm-model
+                                                     :dictionary_atoms dictionary-atoms)
+                           ;; The native implementation remains available for
+                           ;; migration diagnostics, not current production
+                           ;; historical parity.
+                           (raw-unlock/compute-live-feature-vector names buffers grid-history-list hmm-model dictionary-atoms)))]
+            (when grid-input-only?
+              (swap! overlay-counts update "grid_input_only" (fnil inc 0)))
+            (when-not grid-input-only?
+              (swap! overlay-counts update "v2_grid" (fnil + 0)
+                     (overlay! vector name-to-idx (raw-unlock/compute-v2-grid-features grid-history-list)))
+              (swap! overlay-counts update "spy_greek_grid" (fnil + 0)
+                     (overlay! vector name-to-idx (raw-unlock/compute-spy-greek-grid-features grid-history-list)))
+              (when chain
+                (let [chain-json (json/dumps (->jsonable chain))]
+                  (swap! overlay-counts update "spy_option" (fnil + 0)
+                         (overlay! vector name-to-idx (raw-unlock/compute-spy-option-features chain-json)))
+                  (let [spy-grid (raw-unlock/build-option-greeks-grid-from-payload chain)]
+                    (when spy-grid
+                      (swap! overlay-counts update "spy_greek_grid" (fnil + 0)
+                             (overlay! vector name-to-idx (raw-unlock/compute-spy-greek-grid-features spy-grid)))))))
+              (doseq [[prefix by-minute] surfaces-by-prefix-minute]
+                (when-let [surface (limit-chain-contracts (get by-minute key) max-grid-contracts)]
+                  (let [surface-json (json/dumps (->jsonable surface))]
+                    (swap! overlay-counts update "sidecar_option" (fnil + 0)
+                           (overlay! vector name-to-idx (raw-unlock/compute-option-features prefix surface-json)))
+                    (let [surface-grid (raw-unlock/build-option-greeks-grid-from-payload surface)]
+                      (when surface-grid
+                        (swap! overlay-counts update "sidecar_greek_grid" (fnil + 0)
+                               (overlay! vector name-to-idx (raw-unlock/compute-greek-grid-features prefix surface-grid))))))))
+              (when (and apply-neutralization? (> (.-size neutral-idx) 0))
+                (.__setitem__ vector neutral-idx neutral-means)
+                (swap! overlay-counts update "neutralized" (fnil + 0) (int (.-size neutral-idx)))))
+            (swap! rows conj vector)
+            (swap! grids conj (numpy/asarray (.__getitem__ grid-history -1) ** :dtype numpy/float32))
+            (swap! grid-histories conj (padded-grid-history grid-history grid-history-len))
+            (swap! bar-buffers-jsons conj
+                   (json/dumps (->jsonable
+                                (into {} (for [[sym values] buffers]
+                                           [sym (python/list values)])))))
+            (swap! option-chain-jsons conj (if chain (json/dumps (->jsonable chain)) ""))
+            (swap! row-provenance conj
+                   {"time" key
+                    "chain_present" (boolean chain)
+                    "grid_appended" @grid-appended?
+                    "grid_history_len_before" before-history-len
+                    "grid_history_len_after" (len grid-history)
+                    "spy_contracts" (if (and chain (map? chain) (vector? (get chain "contracts")))
+                                      (count (get chain "contracts"))
+                                      0)
+                    "surface_symbols_present" (vec (sort (for [[prefix by-minute] surfaces-by-prefix-minute
+                                                                 :when (contains? by-minute key)]
+                                                             prefix)))})
+            (swap! times conj key)))))
+    (if (empty? @rows)
+      [(numpy/asarray [] ** :dtype object)
+       (numpy/empty (python/tuple [0 (count names)]) ** :dtype numpy/float32)
+       (numpy/empty #py (0 6 21 8) ** :dtype numpy/float32)
+       (numpy/empty (python/tuple [0 grid-history-len 6 21 8]) ** :dtype numpy/float32)
+       (numpy/asarray [] ** :dtype object)
+       (numpy/asarray [] ** :dtype object)
+       []
+       @overlay-counts]
+      [(numpy/asarray @times)
+       (.astype (numpy/vstack (python/list @rows)) numpy/float32)
+       (.astype (numpy/stack (python/list @grids)) numpy/float32)
+       (.astype (numpy/stack (python/list @grid-histories)) numpy/float32)
+       (numpy/asarray @bar-buffers-jsons ** :dtype object)
+       (numpy/asarray @option-chain-jsons ** :dtype object)
+       @row-provenance
+       @overlay-counts])))
+
+(defn row-provenance-summary [rows]
+  (let [n (count rows)
+        chain-present (count (filter #(get % "chain_present") rows))
+        grid-appended (count (filter #(get % "grid_appended") rows))
+        carried (- n grid-appended)
+        hist-lens (vec (map #(get % "grid_history_len_after") rows))]
+    {"rows" n
+     "chain_present_rows" chain-present
+     "grid_appended_rows" grid-appended
+     "carried_grid_rows" carried
+     "min_grid_history_len" (when (seq hist-lens) (apply min hist-lens))
+     "max_grid_history_len" (when (seq hist-lens) (apply max hist-lens))
+     "first_rows" (vec (take 5 rows))
+     "last_rows" (vec (take-last 5 rows))}))
+
+(defn grid-summary [grids]
+  (let [shape (.-shape grids)]
+    (if (or (= (len shape) 0)
+            (= (.__getitem__ shape 0) 0))
+      {"rows" 0}
+      (let [finite (numpy/isfinite grids)]
+        {"rows" (int (.__getitem__ shape 0))
+         "shape" (vec shape)
+         "finite_frac" (float (numpy/mean finite))
+         "nonzero_frac" (float (numpy/mean (numpy/not_equal grids 0.0)))
+         "iv_mean" (float (numpy/nanmean (.__getitem__ grids #py ((slice nil nil) 0 (slice nil nil) (slice nil nil)))))
+         "iv_std" (float (numpy/nanstd (.__getitem__ grids #py ((slice nil nil) 0 (slice nil nil) (slice nil nil)))))
+         "delta_mean" (float (numpy/nanmean (.__getitem__ grids #py ((slice nil nil) 1 (slice nil nil) (slice nil nil)))))
+         "delta_std" (float (numpy/nanstd (.__getitem__ grids #py ((slice nil nil) 1 (slice nil nil) (slice nil nil)))))}))))
+
+(defn reject [reason out-json details stale-npz]
+  (when stale-npz
+    (try
+      (when (os.path/exists stale-npz) (os/unlink stale-npz))
+      (catch python/Exception _ nil)))
+  (let [details (or details {})
+        target-date (get details "target_date")
+        payload (cond-> {"ok" false
+                         "status" "error"
+                         "reason" reason
+                         "error_class" (classify-failure reason)
+                         "details" details}
+                  target-date (assoc "target_date" target-date))]
+    (write-json! out-json payload))
+  (binding [*out* *err*] (println reason))
+  1)
+
+(defn parse-args [argv]
+  (let [parser (argparse/ArgumentParser)]
+    (.add_argument parser "--target-date" ** :required true)
+    (.add_argument parser "--ref-root" ** :required true)
+    (.add_argument parser "--bundle" ** :required true)
+    (.add_argument parser "--out-npz" ** :required true)
+    (.add_argument parser "--out-json" ** :required true)
+    (.add_argument parser "--implementation" ** :choices (python/list ["legacy-python" "native"])
+                   :default "legacy-python"
+                   :help "Feature engine for historical tensors; legacy-python matches the deployed Steve V2 bridge")
+    (.add_argument parser "--base-url" ** :default "http://127.0.0.1:25503")
+    (.add_argument parser "--stock-venue" ** :choices (python/list ["nqb" "utp_cta"])
+                   :default "nqb"
+                   :help "ThetaData stock venue. Must equal the live capture venue for certification.")
+    (.add_argument parser "--start-time" ** :default "09:30:00")
+    (.add_argument parser "--end-time" ** :default "15:59:00")
+    (.add_argument parser "--stock-start-time" ** :default nil)
+    (.add_argument parser "--index-source" ** :choices (python/list ["live-proxy" "historical"])
+                   :default "live-proxy"
+                   :help "Use production live index proxies (default) or historical index bars for a diagnostic only")
+    (.add_argument parser "--chain-horizon-days" ** :type int :default default-chain-horizon-days
+                   :help "SPY chain horizon in calendar days; default matches launch_steve_six.lpy")
+    (.add_argument parser "--surface-horizon-days" ** :type int :default default-surface-horizon-days)
+    (.add_argument parser "--surface-symbols" ** :default nil
+                   :help "comma-separated sidecar option surface symbols to fetch; empty disables sidecar surfaces")
+    (.add_argument parser "--strike-range" ** :default nil)
+    (.add_argument parser "--spy-strike-range" ** :default default-spy-strike-range
+                   :help "SPY strike count for historical option fetches; default matches live broad snapshot + bridge +/-12%% filter")
+    (.add_argument parser "--max-bars" ** :type int :default 200)
+    (.add_argument parser "--grid-history-len" ** :type int :default 10)
+    (.add_argument parser "--min-rows" ** :type int :default 60)
+    (.add_argument parser "--max-feature-rows" ** :type int :default 0
+                   :help "Optional cap on emitted trailing feature rows; grid history is still warmed from prior chain minutes")
+    (.add_argument parser "--cohort-window-minutes" ** :type int :default 0
+                   :help "Fetch only this trailing option-chain window plus grid warmup; 0 means the full requested session")
+    (.add_argument parser "--max-grid-contracts" ** :type int :default 0
+                   :help "Optional diagnostic cap on nearest-to-underlying option contracts per chain before Greek-grid construction; 0 means uncapped")
+    (.add_argument parser "--grid-contracts-only" ** :action "store_true"
+                   :help "Keep only production +/-12%% moneyness contracts; valid for grid parity while raw option aggregates remain neutralized")
+    (.add_argument parser "--jobs" ** :type int :default 4)
+    (.add_argument parser "--request-timeout" ** :type float :default default-request-timeout)
+    (.add_argument parser "--thetadata-cache-dir" ** :default nil
+                   :help "Optional raw ThetaData JSON response cache directory keyed by request URL")
+    (.add_argument parser "--option-observed-offset-seconds" ** :type int :default 0
+                   :help "Shift historical option-chain observed_at timestamps while keeping row minute keys fixed")
+    (.add_argument parser "--option-quote-minute-offset" ** :type int :default 0
+                   :help "Use option quote rows from model row minute plus this offset while keeping output row minute keys fixed")
+    (.add_argument parser "--option-reconstruction"
+                   ** :choices (python/list ["history-last-quote-per-minute" "at-time-quote"])
+                   :default "history-last-quote-per-minute"
+                   :help "Historical option method. Only at-time-quote is eligible for source certification.")
+    (.add_argument parser "--skip-option-enrichment" ** :action "store_true"
+                   :help "Diagnostic mode: skip option OHLC/open-interest enrichment fetches when quote chains alone are sufficient")
+    (.add_argument parser "--skip-contract-coverage" ** :action "store_true"
+                   :help "Diagnostic mode: skip expensive contract field coverage metadata")
+    (.add_argument parser "--allow-missing-surfaces" ** :action "store_true")
+    (.add_argument parser "--no-neutralization" ** :action "store_true")
+    (.add_argument parser "--grid-input-only" ** :action "store_true"
+                   :help "Only build times/grids/grid_histories for source-grid parity diagnostics; skip expensive feature transforms")
+    (.parse_args parser (python/list argv))))
+
+(defn run-main [argv]
+  (let [args (parse-args argv)
+        target (datetime.date/fromisoformat (.-target_date args))
+        stock-start-time (or (.-stock_start_time args) (.-start_time args))
+        option-start-time (cohort-option-start-time (.-start_time args)
+                                                    (.-end_time args)
+                                                    (.-cohort_window_minutes args)
+                                                    (.-grid_history_len args))
+        bundle (os.path/abspath (.-bundle args))
+        out-json (os.path/abspath (.-out_json args))
+        out-npz (os.path/abspath (.-out_npz args))]
+    (try
+      (when-not (os.path/exists bundle)
+        (throw (python/ValueError "bundle directory missing")))
+      (validate-strike-range (.-strike_range args) "--strike-range")
+      (validate-strike-range (.-spy_strike_range args) "--spy-strike-range")
+      (when (and (= "at-time-quote" (.-option_reconstruction args))
+                 (seq (split-symbols (.-surface_symbols args) [])))
+        (throw (python/ValueError
+                "at-time-quote currently certifies SPY chain inputs only; disable --surface-symbols")))
+      (let [cache-dir (when (.-thetadata_cache_dir args)
+                        (os.path/abspath (.-thetadata_cache_dir args)))
+            cache-stats (atom {"hits" 0 "misses" 0 "writes" 0})
+            transport (transport-with-timeout (.-request_timeout args) cache-dir cache-stats)
+            selected-surface-symbols (split-symbols (.-surface_symbols args) surface-symbols)
+            stock-bars0 (into {}
+                              (for [sym stock-symbols
+                                    :let [_ (progress! "fetch stock bars " sym)]]
+                                [sym (fetch-stock-bars transport (.-base_url args) sym target stock-start-time (.-end_time args)
+                                                       (.-stock_venue args))]))
+            index-bars (if (= "historical" (.-index_source args))
+                         (into {}
+                               (for [sym index-symbols
+                                     :let [_ (progress! "fetch index bars " sym)]]
+                                 [sym (try
+                                        (fetch-index-bars transport (.-base_url args) sym target stock-start-time (.-end_time args))
+                                        (catch python/Exception e
+                                          (when-not (no-data-error? e)
+                                            (binding [*out* *err*]
+                                              (println (str "WARN: index history unavailable for " sym ": " e))))
+                                          {}))]))
+                         {})
+            stock-bars (merge stock-bars0 index-bars)
+            spy-underlying (into {} (for [[k bar] (get stock-bars "SPY" {})] [k (get bar "close")]))
+            vix-underlying (into {} (for [[k bar] (get stock-bars "VXX" {})] [k (get bar "close")]))
+            spx-underlying0 (into {} (for [[k bar] (get stock-bars "SPX" {})] [k (get bar "close")]))
+            spx-underlying (if (seq spx-underlying0)
+                             spx-underlying0
+                             (into {} (for [[k v] spy-underlying] [k (* v 10.0)])))
+            vix-index-underlying0 (into {} (for [[k bar] (get stock-bars "VIX" {})] [k (get bar "close")]))
+            vix-index-underlying (if (seq vix-index-underlying0)
+                                   vix-index-underlying0
+                                   vix-underlying)
+            underlying-by-symbol {"SPY" spy-underlying
+                                  "SPX" spx-underlying
+                                  "SPXW" spx-underlying
+                                  "VIX" vix-index-underlying
+                                  "VIXW" vix-index-underlying}
+            _ (progress! "fetch SPY expirations")
+            spy-exps (select-expirations (fetch-expirations transport (.-base_url args) "SPY")
+                                         target (.-chain_horizon_days args))
+            _ (progress! "fetch SPY option quotes method=" (.-option_reconstruction args)
+                         " expirations=" (count spy-exps))
+            grid-only-columnar? (and (.-grid_contracts_only args)
+                                      (.-skip_option_enrichment args))
+            spy-chain-by-minute
+            (if (= "at-time-quote" (.-option_reconstruction args))
+              (fetch-option-at-time-chain-by-minute
+               transport (.-base_url args) "SPY" spy-exps target
+               (interval-minute-keys (get underlying-by-symbol "SPY") option-start-time (.-end_time args))
+               (or (.-spy_strike_range args) (.-strike_range args)) (.-jobs args)
+               (get underlying-by-symbol "SPY")
+               (.-option_observed_offset_seconds args)
+               (.-option_quote_minute_offset args)
+               (.-grid_contracts_only args))
+              (if grid-only-columnar?
+              (option-payloads-to-grid-chain-by-minute
+               (fetch-many-option-quote-payloads transport (.-base_url args) "SPY" spy-exps target
+                                                 option-start-time (.-end_time args)
+                                                 (or (.-spy_strike_range args) (.-strike_range args)))
+               "SPY"
+               target
+               (get underlying-by-symbol "SPY")
+               (.-option_observed_offset_seconds args)
+               (.-option_quote_minute_offset args))
+              (let [spy-rows (fetch-many-option-quote-rows transport (.-base_url args) "SPY" spy-exps target
+                                                           option-start-time (.-end_time args)
+                                                           (or (.-spy_strike_range args) (.-strike_range args))
+                                                           (.-jobs args)
+                                                           (.-skip_option_enrichment args))]
+                (option-rows-to-chain-by-minute spy-rows
+                                                 "SPY"
+                                                 target
+                                                 (get underlying-by-symbol "SPY")
+                                                 (.-option_observed_offset_seconds args)
+                                                 (.-option_quote_minute_offset args)
+                                                 (.-grid_contracts_only args)))))
+            surfaces (atom {})
+            surface-fetch-failures (atom [])]
+        (doseq [symbol selected-surface-symbols]
+          (let [request-symbol (historical-option-symbol symbol)
+                empty-surface (fn [stage e]
+                                (let [failure {"symbol" symbol
+                                               "request_symbol" request-symbol
+                                               "stage" stage
+                                               "error" (str e)}]
+                                  (swap! surface-fetch-failures conj failure)
+                                  (binding [*out* *err*]
+                                    (println (str "WARN: option surface unavailable for " symbol
+                                                  " stage=" stage ": " e)))
+                                  (swap! surfaces assoc symbol {})))]
+            (try
+              (progress! "fetch surface expirations " symbol " request-symbol=" request-symbol)
+              (let [exps (select-expirations (fetch-expirations transport (.-base_url args) request-symbol)
+                                             target (.-surface_horizon_days args))
+                    _ (progress! "fetch surface option quote history " symbol " expirations=" (count exps))
+                    rows (fetch-many-option-quote-rows transport (.-base_url args) request-symbol exps target
+                                                       option-start-time (.-end_time args)
+                                                       (.-strike_range args) (.-jobs args)
+                                                       (.-skip_option_enrichment args))]
+                (swap! surfaces assoc symbol
+                      (option-rows-to-chain-by-minute rows
+                                                      symbol
+                                                      target
+                                                      (get underlying-by-symbol symbol)
+                                                      (.-option_observed_offset_seconds args)
+                                                      (.-option_quote_minute_offset args)
+                                                      (.-grid_contracts_only args))))
+              (catch python/Exception e
+                (if (.-allow_missing_surfaces args)
+                  (empty-surface "history" e)
+                  (throw e))))))
+        (let [contract-coverage (if (.-skip_contract_coverage args)
+                                  {}
+                                  (historical-contract-coverage spy-chain-by-minute @surfaces))
+              [times x grids grid-histories bar-buffers-jsons option-chain-jsons row-provenance overlay-counts] (build-feature-rows (os.path/abspath (.-ref_root args))
+                                                           bundle
+                                                           stock-bars
+                                                           spy-chain-by-minute
+                                                           @surfaces
+                                                           (.-max_bars args)
+                                                           (.-grid_history_len args)
+                                                           (not (.-no_neutralization args))
+                                                           (.-grid_input_only args)
+                                                           (.-max_feature_rows args)
+                                                           (.-max_grid_contracts args)
+                                                           (.-implementation args))]
+          (if (< (.__getitem__ (.-shape x) 0) (.-min_rows args))
+            (reject "insufficient historical feature rows"
+                    out-json
+                    {"rows" (int (.__getitem__ (.-shape x) 0))
+                     "min_rows" (.-min_rows args)
+                     "max_feature_rows" (.-max_feature_rows args)
+	                     "cohort_window_minutes" (.-cohort_window_minutes args)
+	                     "option_start_time" option-start-time
+	                     "index_source" (.-index_source args)
+                     "max_grid_contracts" (.-max_grid_contracts args)
+                     "grid_contracts_only" (.-grid_contracts_only args)
+                     "option_chain_mode" (if grid-only-columnar? "grid-contracts-only-columnar" "full-chain-rows")
+                     "implementation" (.-implementation args)
+                     "target_date" (.-target_date args)
+                     "stock_rows" (into {} (for [[sym rows] stock-bars] [sym (count rows)]))
+                     "chain_horizon_days" (.-chain_horizon_days args)
+	                     "surface_horizon_days" (.-surface_horizon_days args)
+	                     "strike_range" (.-strike_range args)
+	                     "spy_strike_range" (or (.-spy_strike_range args) (.-strike_range args))
+	                     "option_observed_offset_seconds" (.-option_observed_offset_seconds args)
+	                     "option_quote_minute_offset" (.-option_quote_minute_offset args)
+	                     "skip_option_enrichment" (.-skip_option_enrichment args)
+	                     "skip_contract_coverage" (.-skip_contract_coverage args)
+		                     "spy_chain_minutes" (count spy-chain-by-minute)
+	                     "surface_minutes" (into {} (for [[sym rows] @surfaces] [sym (count rows)]))
+	                     "surface_fetch_failures" @surface-fetch-failures
+	                     "contract_field_coverage" contract-coverage
+                     "stock_minute_diagnostics" (stock-minute-diagnostics stock-bars)
+	                     "spy_chain_minute_diagnostics" (chain-minute-diagnostics spy-chain-by-minute)
+                         "thetadata_cache" {"dir" cache-dir
+                                            "stats" @cache-stats}
+	                     "row_provenance_summary" (row-provenance-summary row-provenance)}
+	                    out-npz)
+            (do
+              (os/makedirs (os.path/dirname out-npz) ** :exist_ok true)
+              ;; Persist the exact source contract with every row. The source
+              ;; parity gate compares this to the live capture before a cohort
+              ;; can enter a retraining corpus.
+              (let [provenance {"schema_version" 2
+                                "feature_contract" "steve-v2-canonical-input/v2"
+                                "stock" {"provider" "thetadata"
+                                         "provider_family" "thetadata-v3"
+                                         "endpoint" "/v3/stock/history/ohlc"
+                                         "venue" (.-stock_venue args)
+                                         "timeframe" "1m"
+                                         "bar_status" "completed"
+                                         "bar_timestamp" "open-time"
+                                         "symbols" stock-symbols}
+                                "options" {"provider" "thetadata"
+                                           "provider_family" "thetadata-v3"
+                                           "endpoint" (if (= "at-time-quote" (.-option_reconstruction args))
+                                                        "/v3/option/at_time/quote"
+                                                        "/v3/option/history/quote")
+                                           "snapshot_kind" (if (= "at-time-quote" (.-option_reconstruction args))
+                                                             "last-nbbo-at-requested-time"
+                                                             "last-quote-in-minute")
+                                           "selection" "all-contracts-per-selected-expiration"
+                                           "strike_range" (str (or (.-spy_strike_range args) (.-strike_range args)))
+                                           "reconstruction" (.-option_reconstruction args)
+                                           "symbols" (vec (concat ["SPY"] selected-surface-symbols))}
+                                "capture" {"sidecar_retention" "every-inference"
+                                           "feature_implementation" (.-implementation args)
+                                           "greeks_policy" "bridge-local-bs-v1/rate-0.043/no-dividend"}}
+                    provenance-json (.array numpy
+                                             (python/list (repeat (len times)
+                                                                  (json/dumps (->jsonable provenance) ** :sort_keys true)))
+                                             ** :dtype (.-object_ numpy))]
+              (numpy/savez_compressed out-npz
+                                      ** :times times
+                                         :X x
+                                         :grids grids
+                                         :grid_histories grid-histories
+                                         :provenance_json provenance-json
+                                         :bar_buffers_json bar-buffers-jsons
+                                         :option_chain_json option-chain-jsons))
+              (let [payload {"ok" true
+                             "status" "ok"
+                             "target_date" (.-target_date args)
+                             "start_time" (.-start_time args)
+                             "stock_start_time" stock-start-time
+                             "end_time" (.-end_time args)
+                             "rows" (int (.__getitem__ (.-shape x) 0))
+                             "max_feature_rows" (.-max_feature_rows args)
+	                             "cohort_window_minutes" (.-cohort_window_minutes args)
+	                             "option_start_time" option-start-time
+                                     "index_source" (.-index_source args)
+                             "max_grid_contracts" (.-max_grid_contracts args)
+	                             "grid_contracts_only" (.-grid_contracts_only args)
+                             "option_chain_mode" (if grid-only-columnar? "grid-contracts-only-columnar" "full-chain-rows")
+                             "option_reconstruction" (.-option_reconstruction args)
+                             "implementation" (.-implementation args)
+                             "features" (int (.__getitem__ (.-shape x) 1))
+                             "out_npz" out-npz
+                             "first_time" (if (> (len times) 0) (str (.__getitem__ times 0)) nil)
+                             "last_time" (if (> (len times) 0) (str (.__getitem__ times (dec (len times)))) nil)
+                             "stock_rows" (into {} (for [[sym rows] stock-bars0] [sym (count rows)]))
+                             "index_rows" (into {} (for [[sym rows] index-bars] [sym (count rows)]))
+                             "index_proxy_fallbacks" (vec (for [sym index-symbols
+                                                                :when (empty? (get index-bars sym))]
+                                                            sym))
+                             "surface_symbols" selected-surface-symbols
+                             "chain_horizon_days" (.-chain_horizon_days args)
+                             "surface_horizon_days" (.-surface_horizon_days args)
+                             "spy_expirations" (count spy-exps)
+                             "spy_chain_minutes" (count spy-chain-by-minute)
+	                             "surface_minutes" (into {} (for [[sym rows] @surfaces] [sym (count rows)]))
+	                             "surface_fetch_failures" @surface-fetch-failures
+	                             "contract_field_coverage" contract-coverage
+	                             "stock_minute_diagnostics" (stock-minute-diagnostics stock-bars)
+	                             "spy_chain_minute_diagnostics" (chain-minute-diagnostics spy-chain-by-minute)
+                                 "thetadata_cache" {"dir" cache-dir
+                                                    "stats" @cache-stats}
+	                             "row_provenance_summary" (row-provenance-summary row-provenance)
+                             "overlay_counts" overlay-counts
+                             "grid_summary" (grid-summary grids)
+	                             "strike_range" (.-strike_range args)
+	                             "spy_strike_range" (or (.-spy_strike_range args) (.-strike_range args))
+	                             "option_observed_offset_seconds" (.-option_observed_offset_seconds args)
+	                             "option_quote_minute_offset" (.-option_quote_minute_offset args)
+	                             "skip_option_enrichment" (.-skip_option_enrichment args)
+	                             "skip_contract_coverage" (.-skip_contract_coverage args)
+	                             "jobs" (.-jobs args)
+                             "request_timeout" (.-request_timeout args)
+                             "allow_missing_surfaces" (.-allow_missing_surfaces args)
+                             "neutralization_applied" (and (not (.-no_neutralization args))
+                                                           (not (.-grid_input_only args)))
+                             "grid_input_only" (.-grid_input_only args)}]
+                (write-json! out-json payload)
+                (println (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+                0)))))
+      (catch python/ValueError e
+        (reject (str e)
+                out-json
+                {"bundle" bundle
+                 "target_date" (.-target_date args)
+                 "base_url" (.-base_url args)}
+                out-npz))
+      (catch python/Exception e
+        (reject (str "thetadata historical cohort build failed: " e)
+                out-json
+                {"bundle" bundle
+                 "target_date" (.-target_date args)
+                 "base_url" (.-base_url args)}
+                out-npz)))))
+
+(python/exit (run-main *command-line-args*))

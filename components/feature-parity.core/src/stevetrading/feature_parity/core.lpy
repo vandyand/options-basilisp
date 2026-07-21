@@ -1,0 +1,3642 @@
+(ns stevetrading.feature-parity.core
+  "Operational live-vs-backtest feature parity gates."
+  (:require [clojure.set :as set]
+            [clojure.string :as str])
+  (:import collections csv datetime glob json math numpy operator os os.path))
+
+(def default-analysis-dir "live_runtime/analysis")
+(def default-capture-dir "live_runtime/feature-capture")
+(def required-raw-replay-arrays #{"bar_buffers_json"
+                                  "option_chain_json"
+                                  "option_surfaces_json"})
+(def required-option-surface-prefixes #{"SPX" "SPXW" "VIX" "VIXW"})
+
+(declare md-table ->jsonable compact-date capture-date-from-name)
+
+(defn reject-duplicate-json-object
+  [pairs]
+  (loop [remaining (seq pairs)
+         seen #{}
+         out {}]
+    (if-not remaining
+      out
+      (let [pair (first remaining)
+            k (first pair)
+            v (second pair)]
+        (when (contains? seen k)
+          (throw (python/ValueError (str "duplicate JSON key: " k))))
+        (recur (next remaining)
+               (conj seen k)
+               (assoc out k v))))))
+
+(defn read-json
+  [path]
+  (json/loads (slurp (str path)) ** :object_pairs_hook reject-duplicate-json-object))
+
+(defn clear-artifacts!
+  [paths]
+  (doseq [path paths]
+    (try
+      (os/remove path)
+      (catch python/FileNotFoundError _ nil))))
+
+(def metric-keys
+  ["active_problem"
+   "active_sane"
+   "active_zero_filled"
+   "active_degenerate"
+   "active_low_variance"
+   "active_offset"
+   "active_nonfinite"])
+
+(def baseline-csv-columns
+  ["feature"
+   "family"
+   "status"
+   "neutralized"
+   "active_problem"
+   "live_mean"
+   "live_std"
+   "z_mean"
+   "z_std"
+   "zero_frac"
+   "nonfinite_frac"
+   "train_mean"
+   "train_std"])
+
+(def prediction-delta-csv-columns
+  ["date"
+   "account"
+   "rows"
+   "candidate_mode"
+   "candidate_feature_count"
+   "long_mean_abs_delta"
+   "long_p95_abs_delta"
+   "long_max_abs_delta"
+   "long_mean_abs_seed_z"
+   "long_p95_abs_seed_z"
+   "long_max_abs_seed_z"
+   "gen_mean_abs_delta"
+   "gen_p95_abs_delta"
+   "gen_max_abs_delta"
+   "gen_mean_abs_seed_z"
+   "gen_p95_abs_seed_z"
+   "gen_max_abs_seed_z"
+   "short_mean_abs_delta"
+   "short_p95_abs_delta"
+   "short_max_abs_delta"
+   "short_mean_abs_seed_z"
+   "short_p95_abs_seed_z"
+   "short_max_abs_seed_z"
+   "p95_abs_seed_z_any_head"
+   "max_abs_seed_z_any_head"])
+
+(def matched-feature-parity-csv-columns
+  ["feature"
+   "family"
+   "neutralized"
+   "active_problem"
+   "matched_rows"
+   "live_mean"
+   "historical_mean"
+   "live_std"
+   "historical_std"
+   "live_min"
+   "historical_min"
+   "live_max"
+   "historical_max"
+   "live_zero_frac"
+   "historical_zero_frac"
+   "live_leading_zero_count"
+   "live_leading_zero_until"
+   "historical_leading_zero_count"
+   "historical_leading_zero_until"
+   "live_nan_frac"
+   "historical_nan_frac"
+   "correlation"
+   "mean_abs_deviation"
+   "max_abs_deviation"
+   "status"])
+
+(def neutralization-audit-csv-columns
+  ["feature"
+   "family"
+   "status"
+   "recoverability"
+   "reason"
+   "model_split_count"
+   "model_gain"
+   "model_gain_pct"
+   "account_count"
+   "head_count"
+   "live_mean"
+   "live_std"
+   "z_mean"
+   "z_std"
+   "zero_frac"
+   "nonfinite_frac"
+   "source_note"])
+
+(def model-usage-csv-columns
+  ["account"
+   "head"
+   "feature_index"
+   "feature"
+   "feature_kind"
+   "family"
+   "status"
+   "neutralized"
+   "active_problem"
+   "split_count"
+   "total_gain"
+   "avg_gain"
+   "total_cover"
+   "min_threshold"
+   "max_threshold"])
+
+(def xgb-head-files
+  {"long" "xgb_long.json"
+   "gen" "xgb_gen.json"
+   "short" "xgb_short.json"})
+
+(def feature-status-values
+  #{"SANE"
+    "BOTH_ZERO"
+    "ZERO_FILLED_LIVE"
+    "DEGENERATE_LIVE"
+    "LOW_VARIANCE"
+    "OFFSET"
+    "WILD_OFFSET"
+    "WILD_SCALE"
+    "NONFINITE"})
+
+(defn feature-family
+  [name]
+  (let [head (first (.split name "_"))]
+    (cond
+      (contains? #{"dict" "scat" "tda" "wass"} head) "v3-grid"
+      (contains? #{"vix_proxy"
+                   "vix_term_slope"
+                   "put_call_ratio"
+                   "vix_momentum_5"
+                   "vix_momentum_20"
+                   "realized_vol_20"
+                   "realized_vol_60"
+                   "vol_ratio"
+                   "hmm_state_0"
+                   "hmm_state_1"
+                   "hmm_state_2"} name) "v2-grid"
+      (contains? #{"SPX" "VIX" "TNX"} head) "index-proxy"
+      (or (not= (.find name "opt") -1)
+          (not= (.find name "greeks") -1)
+          (contains? #{"SPXW" "VIXW"} head)) "options-base"
+      :else "equity-base")))
+
+(defn classify-feature
+  [raw z train-std]
+  (let [finite (numpy/logical_and (numpy/isfinite raw) (numpy/isfinite z))]
+    (if-not (bool (numpy/any finite))
+      "NONFINITE"
+      (let [raw-f (aget raw finite)
+            z-f (aget z finite)
+            live-zero (bool (numpy/all (== raw-f 0)))
+            z-mu (float (numpy/mean z-f))
+            z-sd (float (numpy/std z-f))]
+        (cond
+          (and live-zero (> (float train-std) 1e-12)) "ZERO_FILLED_LIVE"
+          live-zero "BOTH_ZERO"
+          (< z-sd 1e-3) "DEGENERATE_LIVE"
+          (and (< (math/fabs z-mu) 2.0) (< 0.1 z-sd) (< z-sd 4.0)) "SANE"
+          (>= (math/fabs z-mu) 8.0) "WILD_OFFSET"
+          (>= z-sd 4.0) "WILD_SCALE"
+          (<= z-sd 0.1) "LOW_VARIANCE"
+          :else "OFFSET")))))
+
+(defn- nanmean
+  [x]
+  (float (numpy/nanmean x)))
+
+(defn- nanstd
+  [x]
+  (float (numpy/nanstd x)))
+
+(defn- bool-str
+  [x]
+  (if x "True" "False"))
+
+(defn parse-bool
+  [x]
+  (contains? #{"1" "true" "yes" "y"}
+             (.lower (.strip (str (or x ""))))))
+
+(defn parse-float
+  ([x] (parse-float x 0.0))
+  ([x default]
+   (try
+     (if (or (nil? x) (= "" x))
+       default
+       (float x))
+     (catch python/Exception _
+       default))))
+
+(defn build-baseline-rows
+  [X names mean std neutralized]
+  (vec
+   (for [j (range (count names))]
+     (let [name (nth names j)
+           raw (numpy/take X j ** :axis 1)
+           train-mean (float (aget mean j))
+           train-std (float (aget std j))
+           denom (if (= train-std 0.0) 1.0 train-std)
+           z (/ (- raw train-mean) denom)
+           status (classify-feature raw z train-std)
+           finite (numpy/logical_and (numpy/isfinite raw) (numpy/isfinite z))
+           neutral (contains? neutralized name)
+           active-problem (and (not neutral)
+                               (not (contains? #{"SANE" "BOTH_ZERO"} status)))]
+       {"feature" name
+        "family" (feature-family name)
+        "status" status
+        "neutralized" neutral
+        "active_problem" active-problem
+        "live_mean" (nanmean raw)
+        "live_std" (nanstd raw)
+        "z_mean" (nanmean z)
+        "z_std" (nanstd z)
+        "zero_frac" (float (numpy/mean (== raw 0)))
+        "nonfinite_frac" (float (- 1.0 (float (numpy/mean finite))))
+        "train_mean" train-mean
+        "train_std" train-std}))))
+
+(defn summarize-baseline-rows
+  [rows]
+  (let [active (filter #(not (get % "neutralized")) rows)
+        active-problems (filter #(get % "active_problem") rows)
+        counts (frequencies (map #(get % "status") rows))]
+    {"active_features" (count active)
+     "active_sane" (count (filter #(= (get % "status") "SANE") active))
+     "active_problem" (count active-problems)
+     "active_zero_filled" (count (filter #(= (get % "status") "ZERO_FILLED_LIVE") active))
+     "active_degenerate" (count (filter #(= (get % "status") "DEGENERATE_LIVE") active))
+     "active_low_variance" (count (filter #(= (get % "status") "LOW_VARIANCE") active))
+     "active_offset" (count (filter #(= (get % "status") "OFFSET") active))
+     "status_counts" counts}))
+
+(defn load-captures
+  [capture-dir dates]
+  (let [arrays (atom [])
+        captures (atom [])
+        files (atom [])
+        rows-by-file (atom {})
+        raw-replay-missing-by-file (atom {})
+        skipped (atom {})
+        wanted (when (seq dates) (set dates))]
+    (doseq [path (sort (glob/glob (os.path/join (str capture-dir) "live_features_*.npz")))]
+      (let [base (os.path/basename path)
+            stem (first (.rsplit base "." 1))
+            date (last (.rsplit stem "_" 1))]
+        (when (or (nil? wanted) (contains? wanted date))
+          (try
+            (let [data (numpy/load path ** :allow_pickle true)
+                  file-set (set (vec (.-files data)))
+                  required #{"times" "spy" "grids" "chestnut" "lynx" "moose"}
+                  missing-raw (set/difference required-raw-replay-arrays file-set)]
+              (if-not (empty? (set/difference required file-set))
+                (swap! skipped assoc base "missing required capture arrays")
+                (let [arr (.astype (aget data "chestnut") numpy/float64)
+                      n-rows (int (first (.-shape arr)))
+                      row-counts {"times" (int (first (.-shape (aget data "times"))))
+                                  "spy" (int (first (.-shape (aget data "spy"))))
+                                  "grids" (int (first (.-shape (aget data "grids"))))
+                                  "chestnut" n-rows
+                                  "lynx" (int (first (.-shape (aget data "lynx"))))
+                                  "moose" (int (first (.-shape (aget data "moose"))))}]
+                  (if (or (zero? n-rows)
+                          (not= 1 (count (set (vals row-counts)))))
+                    (swap! skipped assoc base (str "inconsistent capture row counts "
+                                                   row-counts))
+                    (do
+                      (swap! arrays conj arr)
+                      (swap! captures conj {"date" date
+                                            "path" path
+                                            "rows" n-rows
+                                            "raw_replay_ready" (empty? missing-raw)
+                                            "raw_replay_missing" (vec (sort missing-raw))
+                                            "array" arr})
+                      (swap! files conj path)
+                      (swap! rows-by-file assoc base n-rows)
+                      (when (seq missing-raw)
+                        (swap! raw-replay-missing-by-file assoc base
+                               (vec (sort missing-raw)))))))))
+            (catch python/Exception e
+              (swap! skipped assoc base (str e)))))))
+    (when (empty? @arrays)
+      (throw (ex-info (str "no captures found in " capture-dir)
+                      {:capture-dir capture-dir
+                       :skipped @skipped})))
+    [(numpy/vstack (python/list @arrays))
+     {"files" @files
+      "rows_by_file" @rows-by-file
+      "skipped_files" @skipped
+      "required_raw_replay_arrays" (vec (sort required-raw-replay-arrays))
+      "raw_replay_missing_by_file" @raw-replay-missing-by-file}
+     @captures]))
+
+(defn write-baseline-csv!
+  [path rows]
+  (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+  (with-open [fh (open (str path) ** :mode "w" :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list baseline-csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer row)))))
+
+(defn- counter-get
+  [m k]
+  (get m k 0))
+
+(defn baseline-markdown
+  [summary rows]
+  (let [by-status (frequencies (map #(get % "status") rows))
+        by-family (reduce (fn [acc r]
+                            (update-in acc [(get r "family") (get r "status")] (fnil inc 0)))
+                          {} rows)
+        active-bad (filter #(get % "active_problem") rows)
+        neutralized-bad (filter #(and (get % "neutralized")
+                                      (not (contains? #{"SANE" "BOTH_ZERO"}
+                                                      (get % "status"))))
+                                rows)
+        status-rows (vec (concat [["Status" "Count"]]
+                                 (map (fn [[k v]] [k (str v)])
+                                      (sort by-status))))
+        family-rows (atom [["Family" "SANE" "ZERO" "DEGEN" "OFFSET" "WILD" "Other" "Total"]])
+        _ (doseq [[fam counts] (sort by-family)]
+            (let [wild (+ (counter-get counts "WILD_OFFSET")
+                          (counter-get counts "WILD_SCALE"))
+                  known (+ (counter-get counts "SANE")
+                           (counter-get counts "ZERO_FILLED_LIVE")
+                           (counter-get counts "DEGENERATE_LIVE")
+                           (counter-get counts "OFFSET")
+                           wild)
+                  total (reduce + (vals counts))
+                  other (- total known)]
+              (swap! family-rows conj [fam
+                                        (str (counter-get counts "SANE"))
+                                        (str (counter-get counts "ZERO_FILLED_LIVE"))
+                                        (str (counter-get counts "DEGENERATE_LIVE"))
+                                        (str (counter-get counts "OFFSET"))
+                                        (str wild)
+                                        (str other)
+                                        (str total)])))
+        capture-rows (vec (concat [["Date" "Rows" "Active Sane" "Active Problems"
+                                    "Active Zero" "Active Degen" "Low Var" "Offset"]]
+                                  (map (fn [item]
+                                         (let [s (get item "summary")]
+                                           [(get item "date")
+                                            (str (get item "rows"))
+                                            (str (get s "active_sane"))
+                                            (str (get s "active_problem"))
+                                            (str (get s "active_zero_filled"))
+                                            (str (get s "active_degenerate"))
+                                            (str (get s "active_low_variance"))
+                                            (str (get s "active_offset"))]))
+                                       (get summary "per_capture"))))
+        worst (take 40
+                    (sort-by (fn [r]
+                               [(not (contains? #{"WILD_OFFSET" "WILD_SCALE"
+                                                   "ZERO_FILLED_LIVE"
+                                                   "DEGENERATE_LIVE"}
+                                                 (get r "status")))
+                                (- (math/fabs (float (get r "z_mean"))))
+                                (get r "z_std")])
+                             active-bad))
+        worst-rows (vec (concat [["Feature" "Family" "Status" "z_mean" "z_std" "zero_frac"]]
+                                (map (fn [r]
+                                       [(get r "feature")
+                                        (get r "family")
+                                        (get r "status")
+                                        (python/format (get r "z_mean") "+.3f")
+                                        (python/format (get r "z_std") ".3f")
+                                        (python/format (get r "zero_frac") ".3f")])
+                                     worst)))]
+    (str "# Live Feature Parity Baseline\n\n"
+         "Generated: `" (get summary "generated_at") "`\n\n"
+         "## Scope\n\n"
+         "This report aggregates captured live feature vectors and standardizes them with\n"
+         "the corrected raw training stats from:\n\n"
+         "`" (get summary "bundle") "`\n\n"
+         "It is a live-data health baseline. It does not establish trade-level parity or\n"
+         "same-population performance by itself.\n\n"
+         "## Inputs\n\n"
+         "- Capture rows: `" (get summary "rows") "`\n"
+         "- Capture files: `" (get summary "capture_file_count") "`\n"
+         "- Features: `" (get summary "features") "`\n"
+         "- Neutralized features in active bundle: `" (get summary "neutralized_count") "`\n\n"
+         "## Headline\n\n"
+         "- Active suspicious features: `" (get summary "active_problem_count") "`\n"
+         "- Active sane features: `" (get summary "active_sane_count") "`\n"
+         "- Suspicious but neutralized features: `" (count neutralized-bad) "`\n\n"
+         "## Status Counts\n\n"
+         (md-table status-rows) "\n\n"
+         "## Family Counts\n\n"
+         (md-table @family-rows) "\n\n"
+         "## Per-Capture Active Health\n\n"
+         (md-table capture-rows) "\n\n"
+         "## Worst Active Problems\n\n"
+         (md-table worst-rows) "\n\n"
+         "## Interpretation\n\n"
+         "- `ZERO_FILLED_LIVE`: live emits all zero while training has nonzero scale.\n"
+         "- `DEGENERATE_LIVE`: live emits a nearly constant nonzero value.\n"
+         "- `OFFSET`: live varies but is materially shifted under training stats.\n"
+         "- `WILD_OFFSET` / `WILD_SCALE`: severe out-of-training-distribution behavior.\n"
+         "- `SANE`: live standardized distribution is plausibly centered and nondegenerate.\n\n"
+         "The next remediation step is not to blindly neutralize every `OFFSET`. Price\n"
+         "level features can look offset when market level is outside the historical\n"
+         "window. We should distinguish source/computation bugs from expected market\n"
+         "regime shift before changing model inputs.\n")))
+
+(defn write-baseline!
+  [{:keys [capture-dir bundle out-dir dates generated-at target-date]}]
+  (let [capture-dir (or capture-dir default-capture-dir)
+        out-dir (or out-dir default-analysis-dir)
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        stamp (compact-date (or target-date generated-at))
+        out-base (os.path/join (str out-dir) (str "live_feature_parity_baseline_" stamp))
+        csv-path (str out-base ".csv")
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")
+        _ (clear-artifacts! [csv-path json-path md-path])
+        names (vec (read-json (os.path/join (str bundle) "feature_names.json")))
+        stats (numpy/load (os.path/join (str bundle) "feature_stats.npz"))
+        mean (.astype (aget stats "mean") numpy/float64)
+        std (.astype (aget stats "std") numpy/float64)
+        neutralized-path (os.path/join (str bundle) "neutralize_features.json")
+        neutralized (if (os.path/exists neutralized-path)
+                      (set (read-json neutralized-path))
+                      #{})
+        [X meta captures] (load-captures capture-dir dates)]
+    (when (not= (nth (.-shape X) 1) (count names))
+      (throw (ex-info (str "feature count mismatch: capture=" (nth (.-shape X) 1)
+                           " names=" (count names))
+                      {:capture-features (nth (.-shape X) 1)
+                       :names (count names)})))
+    (let [rows (build-baseline-rows X names mean std neutralized)
+          per-capture (vec (map (fn [cap]
+                                  (let [cap-rows (build-baseline-rows (get cap "array")
+                                                                       names mean std neutralized)]
+                                    {"date" (get cap "date")
+                                     "path" (get cap "path")
+                                     "rows" (get cap "rows")
+                                     "raw_replay_ready" (get cap "raw_replay_ready")
+                                     "raw_replay_missing" (get cap "raw_replay_missing")
+                                     "summary" (summarize-baseline-rows cap-rows)}))
+                                captures))
+          aggregate (summarize-baseline-rows rows)
+          summary {"generated_at" generated-at
+                   "target_date" (or target-date (subs generated-at 0 10))
+                   "bundle" (str bundle)
+                   "captures" meta
+                   "per_capture" per-capture
+                   "rows" (int (first (.-shape X)))
+                   "capture_file_count" (count (get meta "files"))
+                   "features" (count names)
+                   "neutralized_count" (count neutralized)
+                   "active_problem_count" (get aggregate "active_problem")
+                   "active_sane_count" (get aggregate "active_sane")
+                   "status_counts" (get aggregate "status_counts")}
+          ]
+      (os/makedirs (str out-dir) ** :exist_ok true)
+      (write-baseline-csv! csv-path rows)
+      (spit json-path (json/dumps (->jsonable {"summary" summary "features" rows})
+                                  ** :indent 2 :sort_keys true))
+      (spit md-path (baseline-markdown summary rows))
+      {:summary summary
+       :rows rows
+       :csv-path csv-path
+       :json-path json-path
+       :markdown-path md-path})))
+
+(defn normalize-match-time
+  [value]
+  (let [raw (.strip (str value))
+        s (if (and (.startswith raw "#inst \"")
+                   (.endswith raw "\""))
+            (subs raw 7 (dec (count raw)))
+            raw)]
+    (try
+      (let [iso (.replace s "Z" "+00:00")
+            parsed (datetime.datetime/fromisoformat iso)
+            utc (.astimezone parsed datetime.timezone/utc)]
+        (.strftime utc "%Y-%m-%dT%H:%M:%SZ"))
+      (catch python/Exception _
+        s))))
+
+(defn matched-time-indexes
+  [live-times historical-times]
+  (let [historical-by-time
+        (reduce (fn [acc [idx t]]
+                  (let [k (normalize-match-time t)]
+                    (if (contains? acc k)
+                      acc
+                      (assoc acc k idx))))
+                {}
+                (map-indexed vector (vec historical-times)))]
+    (loop [remaining (seq (map-indexed vector (vec live-times)))
+           matches []]
+      (if-not remaining
+        (let [ordered (sort-by #(get % "time") matches)]
+          {"live_indexes" (vec (map #(get % "live_index") ordered))
+           "historical_indexes" (vec (map #(get % "historical_index") ordered))
+           "times" (vec (map #(get % "time") ordered))})
+        (let [[idx t] (first remaining)
+              k (normalize-match-time t)
+              hist-idx (get historical-by-time k)]
+          (if (some? hist-idx)
+            (recur (next remaining)
+                   (conj matches {"time" k
+                                  "live_index" idx
+                                  "historical_index" hist-idx}))
+            (recur (next remaining) matches)))))))
+
+(defn- finite-values
+  [x]
+  (aget x (numpy/isfinite x)))
+
+(defn- nanmin
+  [x]
+  (let [finite (finite-values x)]
+    (when (pos? (int (first (.-shape finite))))
+      (float (numpy/min finite)))))
+
+(defn- nanmax
+  [x]
+  (let [finite (finite-values x)]
+    (when (pos? (int (first (.-shape finite))))
+      (float (numpy/max finite)))))
+
+(defn- nan-frac
+  [x]
+  (float (numpy/mean (numpy/isnan x))))
+
+(defn- zero-frac
+  [x]
+  (float (numpy/mean (== x 0))))
+
+(defn- leading-zero-info
+  [values matched-times]
+  (let [n (int (first (.-shape values)))
+        limit (min n (count matched-times))]
+    (loop [i 0
+           last-time nil]
+      (if (and (< i limit)
+               (let [v (float (aget values i))]
+                 (and (math/isfinite v)
+                      (= v 0.0))))
+        (recur (inc i) (nth matched-times i))
+        {"count" i
+         "until" last-time}))))
+
+(defn- correlation
+  [live historical]
+  (let [mask (numpy/logical_and (numpy/isfinite live) (numpy/isfinite historical))
+        live-f (aget live mask)
+        hist-f (aget historical mask)
+        n (int (first (.-shape live-f)))]
+    (when (and (>= n 2)
+               (> (float (numpy/std live-f)) 1e-12)
+               (> (float (numpy/std hist-f)) 1e-12))
+      (float (aget (numpy/corrcoef live-f hist-f) 0 1)))))
+
+(defn- matched-status
+  [corr max-dev live-std hist-std]
+  (cond
+    (or (nil? max-dev) (nil? live-std) (nil? hist-std)) "NO_FINITE_OVERLAP"
+    (<= (math/fabs (float max-dev)) 1e-9) "EXACT_MATCH"
+    (and (some? corr) (>= (float corr) 0.999) (<= (float max-dev) 1e-6)) "MATCH"
+    (and (some? corr) (>= (float corr) 0.99)) "TRACKS_WITH_OFFSET_OR_SCALE"
+    (or (< (float live-std) 1e-12) (< (float hist-std) 1e-12)) "CONSTANT_OR_DEGENERATE"
+    :else "DIVERGED"))
+
+(defn matched-feature-parity-rows
+  ([live historical names]
+   (matched-feature-parity-rows live historical names #{} []))
+  ([live historical names neutralized]
+   (matched-feature-parity-rows live historical names neutralized []))
+  ([live historical names neutralized matched-times]
+  (when-not (= (nth (.-shape live) 1) (nth (.-shape historical) 1) (count names))
+    (throw (ex-info "feature matrix width mismatch"
+                    {:live-features (nth (.-shape live) 1)
+                     :historical-features (nth (.-shape historical) 1)
+                     :names (count names)})))
+  (vec
+   (for [j (range (count names))]
+     (let [name (nth names j)
+           lv (.astype (numpy/take live j ** :axis 1) numpy/float64)
+           hv (.astype (numpy/take historical j ** :axis 1) numpy/float64)
+           diff (numpy/abs (- lv hv))
+           corr (correlation lv hv)
+           live-std (nanstd lv)
+           hist-std (nanstd hv)
+           live-leading-zero (leading-zero-info lv matched-times)
+           historical-leading-zero (leading-zero-info hv matched-times)
+           max-dev (nanmax diff)
+           status (matched-status corr max-dev live-std hist-std)
+           neutralized? (contains? neutralized name)
+           active-problem? (and (not neutralized?)
+                                (not (contains? #{"EXACT_MATCH" "MATCH"} status)))]
+       {"feature" name
+        "family" (feature-family name)
+        "neutralized" neutralized?
+        "active_problem" active-problem?
+        "matched_rows" (int (first (.-shape lv)))
+        "live_mean" (nanmean lv)
+        "historical_mean" (nanmean hv)
+        "live_std" live-std
+        "historical_std" hist-std
+        "live_min" (nanmin lv)
+        "historical_min" (nanmin hv)
+        "live_max" (nanmax lv)
+        "historical_max" (nanmax hv)
+        "live_zero_frac" (zero-frac lv)
+        "historical_zero_frac" (zero-frac hv)
+        "live_leading_zero_count" (get live-leading-zero "count")
+        "live_leading_zero_until" (get live-leading-zero "until")
+        "historical_leading_zero_count" (get historical-leading-zero "count")
+        "historical_leading_zero_until" (get historical-leading-zero "until")
+        "live_nan_frac" (nan-frac lv)
+        "historical_nan_frac" (nan-frac hv)
+        "correlation" corr
+        "mean_abs_deviation" (nanmean diff)
+        "max_abs_deviation" max-dev
+        "status" status})))))
+
+(defn write-matched-feature-parity-csv!
+  [path rows]
+  (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+  (with-open [fh (open (str path) ** :mode "w" :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list matched-feature-parity-csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer (python/dict
+                           (map (fn [field]
+                                  (python/tuple [field (get row field "")]))
+                                matched-feature-parity-csv-columns)))))))
+
+(defn matched-feature-parity-summary
+  [rows matched-times generated-at target-date]
+  (let [counts (frequencies (map #(get % "status") rows))
+        problematic (filter #(not (contains? #{"EXACT_MATCH" "MATCH"}
+                                             (get % "status")))
+                            rows)
+        active-problematic (filter #(get % "active_problem") rows)
+        neutralized-problematic (filter #(and (get % "neutralized")
+                                              (not (contains? #{"EXACT_MATCH" "MATCH"}
+                                                              (get % "status"))))
+                                        rows)]
+    {"generated_at" generated-at
+     "target_date" target-date
+     "matched_rows" (count matched-times)
+     "matched_start" (first matched-times)
+     "matched_end" (last matched-times)
+     "feature_count" (count rows)
+     "neutralized_count" (count (filter #(get % "neutralized") rows))
+     "status_counts" counts
+     "problem_feature_count" (count problematic)
+     "active_problem_count" (count active-problematic)
+     "neutralized_problem_count" (count neutralized-problematic)
+     "max_abs_deviation" (if (seq rows)
+                           (apply max (map #(or (get % "max_abs_deviation") 0.0) rows))
+                           0.0)
+     "min_correlation" (let [corrs (vec (keep #(get % "correlation") rows))]
+                         (when (seq corrs) (apply min corrs)))}))
+
+(defn matched-feature-parity-markdown
+  [summary rows]
+  (let [status-rows (vec (concat [["Status" "Count"]]
+                                 (map (fn [[k v]] [k (str v)])
+                                      (sort (get summary "status_counts")))))
+        worst (take 40 (sort-by #(or (get % "max_abs_deviation") 0.0) > rows))
+        worst-rows (vec (concat [["Feature" "Family" "Status" "Corr" "Max Abs Dev" "Live Mean" "Historical Mean" "Live Leading Zero Until"]]
+                                (map (fn [r]
+                                       [(get r "feature")
+                                        (get r "family")
+                                        (get r "status")
+                                        (if (some? (get r "correlation"))
+                                          (python/format (get r "correlation") ".5f")
+                                          "")
+                                        (python/format (or (get r "max_abs_deviation") 0.0) ".8f")
+                                        (python/format (get r "live_mean") ".8f")
+                                        (python/format (get r "historical_mean") ".8f")
+                                        (or (get r "live_leading_zero_until") "")])
+                                     worst)))]
+    (str "# Matched Live vs Historical Feature Parity\n\n"
+         "Generated: `" (get summary "generated_at") "`\n\n"
+         "- Target date: `" (get summary "target_date") "`\n"
+         "- Matched rows: `" (get summary "matched_rows") "`\n"
+         "- Window: `" (or (get summary "matched_start") "n/a") "` to `"
+         (or (get summary "matched_end") "n/a") "`\n"
+         "- Features: `" (get summary "feature_count") "`\n"
+         "- Neutralized features: `" (get summary "neutralized_count") "`\n"
+         "- Problem features: `" (get summary "problem_feature_count") "`\n"
+         "- Active problem features: `" (get summary "active_problem_count") "`\n"
+         "- Neutralized problem features: `" (get summary "neutralized_problem_count") "`\n"
+         "- Max absolute deviation: `" (get summary "max_abs_deviation") "`\n\n"
+         "## Status Counts\n\n"
+         (md-table status-rows) "\n\n"
+         "## Worst Deviations\n\n"
+         (md-table worst-rows) "\n")))
+
+(defn matched-feature-parity-unavailable-markdown
+  [summary]
+  (str "# Matched Live vs Historical Feature Parity\n\n"
+       "Generated: `" (get summary "generated_at") "`\n\n"
+       "Status: `unavailable`\n\n"
+       "- Target date: `" (get summary "target_date") "`\n"
+       "- Reason: `" (get summary "unavailable_reason") "`\n"
+       "- Matched rows: `" (get summary "matched_rows") "`\n"
+       "- Required rows: `" (get summary "min_rows") "`\n\n"
+       "This artifact is intentionally fail-closed. It records why the matched\n"
+       "live-vs-historical parity proof could not be produced, without fabricating\n"
+       "feature-level parity metrics.\n"))
+
+(defn write-matched-feature-parity-unavailable!
+  [{:keys [out-dir target-date generated-at reason details min-rows]}]
+  (let [out-dir (or out-dir default-analysis-dir)
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        target-date (or target-date (subs generated-at 0 10))
+        stamp (compact-date target-date)
+        out-base (os.path/join (str out-dir) (str "matched_feature_parity_" stamp))
+        csv-path (str out-base ".csv")
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")
+        summary {"generated_at" generated-at
+                 "target_date" target-date
+                 "status" "unavailable"
+                 "available" false
+                 "unavailable_reason" (str reason)
+                 "details" (or details {})
+                 "matched_rows" 0
+                 "matched_start" nil
+                 "matched_end" nil
+                 "feature_count" 0
+                 "neutralized_count" 0
+                 "status_counts" {}
+                 "problem_feature_count" 0
+                 "active_problem_count" 0
+                 "neutralized_problem_count" 0
+                 "max_abs_deviation" nil
+                 "min_correlation" nil
+                 "min_rows" (or min-rows 60)}]
+    (os/makedirs (str out-dir) ** :exist_ok true)
+    (write-matched-feature-parity-csv! csv-path [])
+    (spit json-path (json/dumps (->jsonable {"summary" summary "features" []})
+                                ** :indent 2 :sort_keys true))
+    (spit md-path (matched-feature-parity-unavailable-markdown summary))
+    {:summary summary
+     :rows []
+     :csv-path csv-path
+     :json-path json-path
+     :markdown-path md-path}))
+
+(defn write-matched-feature-parity!
+  [{:keys [live-capture historical-npz feature-names out-dir target-date
+           live-array historical-array generated-at min-rows]}]
+  (let [live-array (or live-array "chestnut")
+        historical-array (or historical-array "X")
+        out-dir (or out-dir default-analysis-dir)
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        stamp (compact-date (or target-date generated-at))
+        out-base (os.path/join (str out-dir) (str "matched_feature_parity_" stamp))
+        csv-path (str out-base ".csv")
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")
+        names (vec (read-json feature-names))
+        feature-dir (os.path/dirname (str feature-names))
+        neutralized-path (os.path/join feature-dir "neutralize_features.json")
+        neutralized (if (os.path/exists neutralized-path)
+                      (set (read-json neutralized-path))
+                      #{})
+        live-data (numpy/load (str live-capture) ** :allow_pickle true)
+        historical-data (numpy/load (str historical-npz) ** :allow_pickle true)
+        live-times (aget live-data "times")
+        historical-times (aget historical-data "times")
+        matched (matched-time-indexes live-times historical-times)
+        live-idxs (get matched "live_indexes")
+        historical-idxs (get matched "historical_indexes")
+        matched-times (get matched "times")]
+    (clear-artifacts! [csv-path json-path md-path])
+    (when (empty? matched-times)
+      (throw (ex-info "no overlapping timestamps between live and historical tensors"
+                      {:live-capture live-capture
+                       :historical-npz historical-npz})))
+    (when (and min-rows (< (count matched-times) (int min-rows)))
+      (throw (ex-info "insufficient overlapping timestamps between live and historical tensors"
+                      {:live-capture live-capture
+                       :historical-npz historical-npz
+                       :matched-rows (count matched-times)
+                       :min-rows (int min-rows)})))
+    (let [live (.astype (numpy/take (aget live-data live-array)
+                                    (python/list live-idxs)
+                                    ** :axis 0)
+                        numpy/float64)
+          historical (.astype (numpy/take (aget historical-data historical-array)
+                                          (python/list historical-idxs)
+                                          ** :axis 0)
+                              numpy/float64)
+          rows (matched-feature-parity-rows live historical names neutralized matched-times)
+          summary (matched-feature-parity-summary rows matched-times generated-at
+                                                  (or target-date (subs generated-at 0 10)))]
+      (write-matched-feature-parity-csv! csv-path rows)
+      (spit json-path (json/dumps (->jsonable {"summary" summary "features" rows})
+                                  ** :indent 2 :sort_keys true))
+      (spit md-path (matched-feature-parity-markdown summary rows))
+      {:summary summary
+       :rows rows
+       :csv-path csv-path
+       :json-path json-path
+       :markdown-path md-path})))
+
+(defn latest
+  "Return the newest file matching pattern in directory, or nil."
+  [directory pattern]
+  (let [matches (glob/glob (os.path/join (str directory) pattern))]
+    (when (seq matches)
+      (last (sort-by os.path/getmtime matches)))))
+
+(defn dated-artifact
+  "Return a target-date artifact when target-date is provided; otherwise latest match."
+  [directory prefix suffix target-date]
+  (if target-date
+    (let [path (os.path/join (str directory)
+                             (str prefix "_" (compact-date target-date) suffix))]
+      (when (os.path/exists path)
+        path))
+    (latest directory (str prefix "_*" suffix))))
+
+(defn read-csv
+  [path]
+  (with-open [fh (open (str path) ** :newline "")]
+    (vec (csv/DictReader fh))))
+
+(defn- read-csv-with-fieldnames
+  [path]
+  (with-open [fh (open (str path) ** :newline "")]
+    (let [reader (csv/DictReader fh)
+          rows (vec reader)
+          fieldnames (set (vec (or (.-fieldnames reader) [])))]
+      {"rows" rows
+       "fieldnames" fieldnames})))
+
+(defn- truthy-string?
+  [x]
+  (= "true" (.lower (.strip (str (or x ""))))))
+
+(defn- boolean-string?
+  [x]
+  (contains? #{"true" "false"} (.lower (.strip (str (or x ""))))))
+
+(defn- finite-float
+  [x]
+  (try
+    (when-not (or (nil? x)
+                  (= "" (.strip (str x))))
+      (let [v (float x)]
+        (when (math/isfinite v)
+          v)))
+    (catch python/Exception _ nil)))
+
+(defn- finite-nonnegative-float
+  [x]
+  (try
+    (let [v (float x)]
+      (when (and (math/isfinite v) (not (< v 0.0)))
+        v))
+    (catch python/Exception _ nil)))
+
+(defn- baseline-numeric-issues
+  [idx row]
+  (let [issues (atom [])]
+    (doseq [col ["live_mean" "z_mean" "train_mean"]]
+      (when (contains? row col)
+        (when (nil? (finite-float (get row col)))
+          (swap! issues conj (str "feature parity baseline row " idx
+                                  " " col " must be finite numeric")))))
+    (doseq [col ["live_std" "z_std" "train_std"]]
+      (when (contains? row col)
+        (let [v (finite-float (get row col))]
+          (cond
+            (nil? v)
+            (swap! issues conj (str "feature parity baseline row " idx
+                                    " " col " must be finite numeric"))
+            (< v 0.0)
+            (swap! issues conj (str "feature parity baseline row " idx
+                                    " " col " must be nonnegative"))))))
+    (doseq [col ["zero_frac" "nonfinite_frac"]]
+      (when (contains? row col)
+        (let [v (finite-float (get row col))]
+          (cond
+            (nil? v)
+            (swap! issues conj (str "feature parity baseline row " idx
+                                    " " col " must be finite numeric"))
+            (or (< v 0.0) (> v 1.0))
+            (swap! issues conj (str "feature parity baseline row " idx
+                                    " " col " must be between 0 and 1"))))))
+    @issues))
+
+(defn- gate-baseline-issues
+  ([rows] (gate-baseline-issues rows nil))
+  ([rows fieldnames]
+   (let [issues (atom [])
+         required #{"feature" "status" "neutralized" "active_problem"}
+         allowed (set baseline-csv-columns)]
+     (when (some? fieldnames)
+       (let [missing-columns (set/difference required fieldnames)
+             extra-columns (set/difference fieldnames allowed)]
+         (when (seq missing-columns)
+           (swap! issues conj (str "feature parity baseline CSV missing required columns "
+                                   (pr-str missing-columns))))
+         (when (seq extra-columns)
+           (swap! issues conj (str "feature parity baseline CSV has unexpected columns "
+                                   (pr-str extra-columns))))))
+     (when (empty? rows)
+       (swap! issues conj "feature parity baseline CSV has no feature rows"))
+     (doseq [[feature n] (frequencies (remove #(= "" (.strip (str (or % ""))))
+                                              (map #(get % "feature") rows)))]
+        (when (> n 1)
+          (swap! issues conj (str "feature parity baseline has duplicate feature row "
+                                 feature))))
+     (doseq [[idx row] (map-indexed vector rows)]
+       (let [missing (set/difference required (set (.keys row)))
+             feature (get row "feature")
+             status (get row "status")
+             neutralized-raw (get row "neutralized")
+             active-problem-raw (get row "active_problem")
+             neutralized? (truthy-string? neutralized-raw)
+             active-problem? (truthy-string? active-problem-raw)
+             expected-active-problem? (and (not neutralized?)
+                                           (not (contains? #{"SANE" "BOTH_ZERO"} status)))]
+         (when (seq missing)
+           (swap! issues conj (str "feature parity baseline row " idx
+                                   " missing required columns " (pr-str missing))))
+         (when (and (contains? row "feature")
+                    (= "" (.strip (str (or feature "")))))
+           (swap! issues conj (str "feature parity baseline row " idx
+                                   " feature must be nonblank")))
+         (when (and (contains? row "neutralized")
+                    (not (boolean-string? neutralized-raw)))
+           (swap! issues conj (str "feature parity baseline row " idx
+                                   " neutralized must be true/false")))
+         (when (and (contains? row "active_problem")
+                    (not (boolean-string? active-problem-raw)))
+           (swap! issues conj (str "feature parity baseline row " idx
+                                   " active_problem must be true/false")))
+         (when-not (contains? feature-status-values status)
+           (swap! issues conj (str "feature parity baseline row " idx
+                                   " has unknown status " status)))
+         (when (and (contains? feature-status-values status)
+                    (not= active-problem? expected-active-problem?))
+           (swap! issues conj (str "feature parity baseline row " idx
+                                   " active_problem="
+                                   (get row "active_problem")
+                                   " contradicts status/neutralized")))
+         (doseq [issue (baseline-numeric-issues idx row)]
+           (swap! issues conj issue))))
+     @issues)))
+
+(defn load-prediction-delta
+  [path]
+  (if (nil? path)
+    {"available" false}
+    (let [data (read-csv-with-fieldnames path)
+          rows (get data "rows")
+          fieldnames (get data "fieldnames")
+          missing-columns (set/difference #{"p95_abs_seed_z_any_head"
+                                             "max_abs_seed_z_any_head"}
+                                          fieldnames)
+          allowed-columns (conj (set prediction-delta-csv-columns)
+                                ;; Legacy fixtures/artifacts used strategy before
+                                ;; the live generator standardized on account.
+                                "strategy")
+          extra-columns (set/difference fieldnames allowed-columns)
+          column-issues (vec
+                         (concat
+                          (when (seq missing-columns)
+                            [(str "prediction delta CSV missing required columns "
+                                  (pr-str missing-columns))])
+                          (when (seq extra-columns)
+                            [(str "prediction delta CSV has unexpected columns "
+                                  (pr-str extra-columns))])))]
+      (if (empty? rows)
+        {"available" false
+         "path" (str path)
+         "issues" (vec (concat column-issues
+                               ["prediction delta CSV has no rows"]))}
+        (let [parsed (vec
+                      (map-indexed
+                       (fn [idx row]
+                         (let [p95 (finite-nonnegative-float
+                                    (get row "p95_abs_seed_z_any_head"))
+                               max-z (finite-nonnegative-float
+                                      (get row "max_abs_seed_z_any_head"))]
+                           {"idx" idx "p95" p95 "max" max-z}))
+                       rows))
+              issues (vec
+                      (keep (fn [r]
+                              (cond
+                                (nil? (get r "p95"))
+                                (str "prediction delta row " (get r "idx")
+                                     " has missing/nonfinite/negative p95_abs_seed_z_any_head")
+                                (nil? (get r "max"))
+                                (str "prediction delta row " (get r "idx")
+                                     " has missing/nonfinite/negative max_abs_seed_z_any_head")
+                                (> (get r "p95") (get r "max"))
+                                (str "prediction delta row " (get r "idx")
+                                     " has p95_abs_seed_z_any_head greater than max_abs_seed_z_any_head")))
+                            parsed))]
+          (if (seq issues)
+            {"available" false
+             "path" (str path)
+             "issues" (vec (concat column-issues issues))}
+            (if (seq column-issues)
+              {"available" false
+               "path" (str path)
+               "issues" column-issues}
+              {"available" true
+               "path" (str path)
+               "p95_abs_seed_z" (apply max (map #(get % "p95") parsed))
+               "max_abs_seed_z" (apply max (map #(get % "max") parsed))
+               "issues" []})))))))
+
+(defn verdict
+  [summary]
+  (let [prediction-delta (get summary "prediction_delta")
+        fail-reasons (cond-> []
+                       (seq (get summary "gate_errors"))
+                       (into (get summary "gate_errors"))
+
+                       (> (get summary "active_nonfinite" 0) 0)
+                       (conj "active nonfinite features present")
+
+                       (> (get summary "active_zero_filled" 0) 0)
+                       (conj "active zero-filled features present")
+
+                       (and (get prediction-delta "available")
+                            (>= (get prediction-delta "p95_abs_seed_z") 0.50))
+                       (conj "prediction delta p95 >= 0.50 calibration-sigma"))]
+    (if (seq fail-reasons)
+      ["FAIL" fail-reasons]
+      (let [watch-reasons (cond-> []
+                            (> (get summary "active_degenerate" 0) 0)
+                            (conj "active degenerate features present")
+
+                            (> (get summary "active_problem" 0) 0)
+                            (conj "active suspicious features present")
+
+                            (and (get prediction-delta "available")
+                                 (>= (get prediction-delta "p95_abs_seed_z") 0.10))
+                            (conj "prediction delta p95 >= 0.10 calibration-sigma")
+
+                            (not (get prediction-delta "available"))
+                            (conj "prediction delta report missing"))]
+        (if (seq watch-reasons)
+          ["WATCH" watch-reasons]
+          ["PASS" []])))))
+
+(defn summarize-gate
+  [{:keys [baseline-csv prediction-delta-csv out-dir generated-at target-date]}]
+  (let [analysis-dir (or out-dir default-analysis-dir)
+        baseline (or baseline-csv
+                     (dated-artifact analysis-dir
+                                     "live_feature_parity_baseline"
+                                     ".csv"
+                                     target-date))]
+    (when (nil? baseline)
+      (throw (ex-info (str "no baseline CSV found in " analysis-dir)
+                      {:analysis-dir analysis-dir})))
+    (let [pred-csv (or prediction-delta-csv
+                       (dated-artifact analysis-dir
+                                       "live_feature_prediction_delta_aggregate"
+                                       ".csv"
+                                       target-date))
+          baseline-data (read-csv-with-fieldnames baseline)
+          rows (get baseline-data "rows")
+          baseline-issues (gate-baseline-issues rows (get baseline-data "fieldnames"))
+          target-stamp (when target-date (compact-date target-date))
+          baseline-stamp (when target-stamp
+                           (capture-date-from-name baseline))
+          delta-stamp (when (and target-stamp pred-csv)
+                        (capture-date-from-name pred-csv))
+          date-issues (vec
+                       (concat
+                        (when (and target-stamp (nil? baseline-stamp))
+                          ["feature parity baseline CSV filename does not contain a parseable YYYYMMDD date"])
+                        (when (and target-stamp
+                                   baseline-stamp
+                                   (not= target-stamp baseline-stamp))
+                          [(str "feature parity baseline CSV is not for target date "
+                                target-date)])
+                        (when (and target-stamp pred-csv (nil? delta-stamp))
+                          ["prediction delta CSV filename does not contain a parseable YYYYMMDD date"])
+                        (when (and target-stamp pred-csv delta-stamp
+                                   (not= target-stamp delta-stamp))
+                          [(str "prediction delta CSV is not for target date "
+                                target-date)])
+                        (when (and baseline-stamp delta-stamp
+                                   (not= baseline-stamp delta-stamp))
+                          ["feature parity baseline and prediction delta CSV dates do not match"])))
+          active (filter #(not (truthy-string? (get % "neutralized"))) rows)
+          active-problem (filter #(truthy-string? (get % "active_problem")) rows)
+          counts (frequencies (map #(get % "status") active))
+          prediction-delta (load-prediction-delta pred-csv)
+          summary {"generated_at" (or generated-at
+                                      (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                                 "%Y-%m-%dT%H:%M:%SZ"))
+                   "baseline_csv" (str baseline)
+                   "target_date" target-date
+                   "active_features" (count active)
+                   "active_problem" (count active-problem)
+                   "active_sane" (get counts "SANE" 0)
+                   "active_zero_filled" (get counts "ZERO_FILLED_LIVE" 0)
+                   "active_degenerate" (get counts "DEGENERATE_LIVE" 0)
+                   "active_low_variance" (get counts "LOW_VARIANCE" 0)
+                   "active_offset" (get counts "OFFSET" 0)
+                   "active_nonfinite" (get counts "NONFINITE" 0)
+                   "prediction_delta" prediction-delta
+                   "gate_errors" (vec
+                                  (concat baseline-issues
+                                          date-issues
+                                          (get prediction-delta "issues" [])))}
+          [status reasons] (verdict summary)]
+      (assoc summary "verdict" status "reasons" reasons))))
+
+(defn md-table
+  [rows]
+  (let [widths (mapv (fn [i] (apply max (map #(count (str (nth % i))) rows)))
+                     (range (count (first rows))))
+        render-row (fn [row]
+                     (str "| "
+                          (.join " | " (map-indexed
+                                         (fn [i v] (.ljust (str v) (nth widths i)))
+                                         row))
+                          " |"))]
+    (.join "\n"
+           (concat [(render-row (first rows))
+                    (render-row (mapv #(apply str (repeat % "-")) widths))]
+                   (map render-row (rest rows))))))
+
+(defn markdown
+  [payload]
+  (let [metric-rows (vec (concat [["Metric" "Value"]]
+                                 (map (fn [k] [k (str (get payload k))])
+                                      metric-keys)))
+        pd (get payload "prediction_delta")
+        metric-rows (if (get pd "available")
+                      (conj metric-rows
+                            ["prediction_delta_p95_abs_seed_z"
+                             (python/format (get pd "p95_abs_seed_z") ".4f")]
+                            ["prediction_delta_max_abs_seed_z"
+                             (python/format (get pd "max_abs_seed_z") ".4f")])
+                      (conj metric-rows ["prediction_delta" "missing"]))
+        reason-rows (vec (concat [["Reason"]]
+                                 (map vector (get payload "reasons"))))]
+    (str "# Live Feature Parity Gate\n\n"
+         "Generated: `" (get payload "generated_at") "`\n\n"
+         "Scope: Steve-v2 918-feature model stack only.\n\n"
+         "Verdict: `" (get payload "verdict") "`\n\n"
+         "Baseline CSV: `" (get payload "baseline_csv") "`\n\n"
+         "Prediction delta CSV: `" (get pd "path" "missing") "`\n\n"
+         "## Metrics\n\n"
+         (md-table metric-rows) "\n\n"
+         "## Reasons\n\n"
+         (md-table reason-rows) "\n\n"
+         "## Gate Policy\n\n"
+         "- `FAIL`: active nonfinite or zero-filled features, or p95 prediction delta\n"
+         "  greater than or equal to `0.50` calibration-sigma.\n"
+         "- `WATCH`: active suspicious/degenerate features, missing prediction delta, or\n"
+         "  p95 prediction delta greater than or equal to `0.10` calibration-sigma.\n"
+         "- `PASS`: no active problems and prediction delta below watch threshold.\n")))
+
+(defn ->jsonable
+  [x]
+  (cond
+    (map? x) (python/dict
+              (map (fn [[k v]] (python/tuple [(str k) (->jsonable v)])) x))
+    (python/isinstance x python/dict) (python/dict
+                                       (map (fn [[k v]]
+                                              (python/tuple [(str k) (->jsonable v)]))
+                                            (.items x)))
+    (python/isinstance x python/list) (python/list (map ->jsonable x))
+    (or (vector? x) (seq? x)) (python/list (map ->jsonable x))
+    :else x))
+
+(defn write-gate!
+  [opts]
+  (let [out-dir (or (:out-dir opts) default-analysis-dir)
+        payload (summarize-gate (assoc opts :out-dir out-dir))
+        stamp (compact-date (or (get payload "target_date")
+                                (get payload "generated_at")))
+        out-base (os.path/join (str out-dir) (str "live_feature_parity_gate_" stamp))
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")]
+    (os/makedirs (str out-dir) ** :exist_ok true)
+    (spit json-path (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+    (spit md-path (markdown payload))
+    {:payload payload
+     :json-path json-path
+     :markdown-path md-path}))
+
+(defn source-note
+  [family option-cache]
+  (cond
+    (= family "options-base")
+    (if (> (get option-cache "rows" 0) 0)
+      (let [overlap (get option-cache "capture_date_overlap" [])]
+        (str "offline option bars present: " (get option-cache "rows" 0)
+             " rows, " (get option-cache "symbols" 0) " symbols, "
+             (get option-cache "dates" 0) " dates"
+             (when (seq overlap)
+               (str "; overlaps " (count overlap) " saved feature-capture dates"))))
+      "no offline option-bar cache found")
+
+    (= family "v3-grid")
+    "requires v3-grid live builder parity; captured values decide current recoverability"
+
+    (= family "index-proxy")
+    "requires index/proxy feed parity and warmup alignment"
+
+    :else
+    "equity/proxy live captures available"))
+
+(defn recoverability
+  [row used-gain]
+  (let [status (get row "status")
+        family (get row "family")]
+    (cond
+      (= status "SANE")
+      (if (> used-gain 0.0)
+        ["candidate-now" "neutralized but live captures look sane and model uses it"]
+        ["low-priority-candidate" "neutralized and sane, but no observed XGB split usage"])
+
+      (= status "BOTH_ZERO")
+      ["maybe-safe-zero" "live and train both zero; likely low-information"]
+
+      (= status "OFFSET")
+      ["review-shift" "live varies but shifted under train stats; may be market regime or feed mismatch"]
+
+      (= status "LOW_VARIANCE")
+      ["review-warmup-or-regime" "live is nonzero but too low-variance under current captures"]
+
+      (contains? #{"WILD_OFFSET" "WILD_SCALE"} status)
+      ["blocked-distribution" "live distribution is severely out of training range"]
+
+      (= status "ZERO_FILLED_LIVE")
+      (if (= family "options-base")
+        ["blocked-live-source" "option feature is zero-filled in captures despite offline option cache"]
+        ["blocked-live-source" "live feature appears missing or uncomputed"])
+
+      (= status "DEGENERATE_LIVE")
+      ["blocked-live-builder" "live feature is degenerate; source/builder likely not reproducing training feature"]
+
+      (= status "NONFINITE")
+      ["blocked-nonfinite" "live feature is nonfinite"]
+
+      :else
+      ["unknown" (str "unclassified status " status)])))
+
+(defn option-cache-inventory
+  [path]
+  (if-not (and path (os.path/exists (str path)))
+    {"path" (str path)
+     "exists" false
+     "rows" 0
+     "symbols" 0
+     "dates" 0
+     "date_values" []}
+    (let [symbols (atom #{})
+          dates (atom #{})
+          rows (atom 0)]
+      (doseq [line (.splitlines (slurp (str path)))]
+        (when (seq (.strip line))
+          (swap! rows inc)
+          (try
+            (let [item (json/loads line ** :object_pairs_hook reject-duplicate-json-object)
+                  sym (get item "symbol")
+                  ts (get item "ts")]
+              (when sym
+                (swap! symbols conj sym))
+              (when ts
+                (swap! dates conj (subs (str ts) 0 (min 10 (count (str ts)))))))
+            (catch python/Exception _
+              nil))))
+      {"path" (str path)
+       "exists" true
+       "rows" @rows
+       "symbols" (count @symbols)
+       "dates" (count @dates)
+       "sample_symbols" (vec (take 20 (sort @symbols)))
+       "sample_dates" (vec (take 20 (sort @dates)))
+       "date_values" (vec (sort @dates))})))
+
+(defn capture-date-inventory
+  [path]
+  (if-not (and path (os.path/exists (str path)))
+    {"path" (str path)
+     "exists" false
+     "files" 0
+     "dates" []}
+    (let [files (sort (glob/glob (os.path/join (str path) "live_features_*.npz")))
+          dates (vec
+                 (sort
+                  (set
+                   (keep (fn [f]
+                           (let [stem (os.path/splitext (os.path/basename f))
+                                 raw (last (.split (first stem) "live_features_" 1))]
+                             (when (and (= 8 (count raw))
+                                        (.isdigit raw))
+                               (str (subs raw 0 4) "-" (subs raw 4 6)
+                                    "-" (subs raw 6 8)))))
+                         files))))]
+      {"path" (str path)
+       "exists" true
+       "files" (count files)
+       "dates" dates})))
+
+(defn aggregate-usage
+  [rows]
+  (let [usage (atom {})
+        total-gain (atom 0.0)]
+    (doseq [row rows]
+      (let [feature (get row "feature")
+            gain (parse-float (get row "total_gain"))
+            splits (parse-float (get row "split_count"))
+            cover (parse-float (get row "total_cover"))
+            account (get row "account")
+            head (get row "head")]
+        (when feature
+          (swap! total-gain + gain)
+          (swap! usage update feature
+                 (fn [current]
+                   (let [current (or current {"split_count" 0.0
+                                              "total_gain" 0.0
+                                              "total_cover" 0.0
+                                              "accounts" #{}
+                                              "heads" #{}})]
+                     (-> current
+                         (update "split_count" + splits)
+                         (update "total_gain" + gain)
+                         (update "total_cover" + cover)
+                         (update "accounts" #(if account (conj % account) %))
+                         (update "heads" #(if head (conj % head) %)))))))))
+    [(into {}
+           (map (fn [[feature stats]]
+                  [feature {"split_count" (get stats "split_count")
+                            "total_gain" (get stats "total_gain")
+                            "total_cover" (get stats "total_cover")
+                            "account_count" (count (get stats "accounts"))
+                            "head_count" (count (get stats "heads"))}])
+                @usage))
+     @total-gain]))
+
+(defn neutralization-audit-rows
+  [{:keys [baseline-rows usage-rows option-cache]}]
+  (let [[usage total-model-gain] (aggregate-usage usage-rows)]
+    [(vec
+      (keep (fn [row]
+              (when (parse-bool (get row "neutralized"))
+                (let [feature (get row "feature")
+                      family (or (get row "family") (feature-family feature))
+                      u (get usage feature {})
+                      model-gain (float (get u "total_gain" 0.0))
+                      model-gain-pct (if (> total-model-gain 0.0)
+                                       (/ model-gain total-model-gain)
+                                       0.0)
+                      [rec reason] (recoverability {"status" (get row "status")
+                                                    "family" family}
+                                                   model-gain)]
+                  {"feature" feature
+                   "family" family
+                   "status" (get row "status")
+                   "recoverability" rec
+                   "reason" reason
+                   "model_split_count" (int (get u "split_count" 0))
+                   "model_gain" model-gain
+                   "model_gain_pct" model-gain-pct
+                   "account_count" (int (get u "account_count" 0))
+                   "head_count" (int (get u "head_count" 0))
+                   "live_mean" (parse-float (get row "live_mean"))
+                   "live_std" (parse-float (get row "live_std"))
+                   "z_mean" (parse-float (get row "z_mean"))
+                   "z_std" (parse-float (get row "z_std"))
+                   "zero_frac" (parse-float (get row "zero_frac"))
+                   "nonfinite_frac" (parse-float (get row "nonfinite_frac"))
+                   "source_note" (source-note family option-cache)})))
+            baseline-rows))
+     total-model-gain]))
+
+(defn- candidate-recoverability?
+  [rec]
+  (or (str/starts-with? rec "candidate")
+      (str/ends-with? rec "candidate")
+      (= rec "maybe-safe-zero")))
+
+(defn- review-recoverability?
+  [rec]
+  (str/starts-with? rec "review"))
+
+(defn- normalize-family-summary
+  [m]
+  (into {}
+        (map (fn [[family s]]
+               [family {"neutralized" (get s "neutralized" 0)
+                        "candidate" (get s "candidate" 0)
+                        "review" (get s "review" 0)
+                        "blocked" (get s "blocked" 0)
+                        "model_gain_pct" (get s "model_gain_pct" 0.0)}])
+             m)))
+
+(defn- normalize-recoverability-summary
+  [m]
+  (into {}
+        (map (fn [[rec s]]
+               [rec {"count" (get s "count" 0)
+                     "model_gain_pct" (get s "model_gain_pct" 0.0)}])
+             m)))
+
+(defn- missing-csv-columns-issues
+  [label fieldnames required]
+  (let [missing-columns (set/difference required fieldnames)]
+    (when (seq missing-columns)
+      [(str label " CSV missing required columns " (pr-str missing-columns))])))
+
+(defn- neutralization-usage-issues
+  [rows fieldnames]
+  (vec
+   (concat
+    (missing-csv-columns-issues
+     "model usage"
+     fieldnames
+     #{"feature" "total_gain" "split_count" "total_cover" "account" "head"})
+    (apply concat
+           (map-indexed
+            (fn [idx row]
+              (let [issues (atom [])]
+                (when (= "" (.strip (str (or (get row "feature") ""))))
+                  (swap! issues conj (str "model usage CSV row " idx
+                                          " feature must be nonblank")))
+                (doseq [col ["total_gain" "split_count" "total_cover"]]
+                  (when (contains? row col)
+                    (let [v (finite-float (get row col))]
+                      (cond
+                        (nil? v)
+                        (swap! issues conj (str "model usage CSV row " idx
+                                                " " col " must be finite numeric"))
+                        (< v 0.0)
+                        (swap! issues conj (str "model usage CSV row " idx
+                                                " " col " must be nonnegative"))))))
+                @issues))
+            rows)))))
+
+(defn- assert-neutralization-inputs!
+  [baseline-rows baseline-fieldnames usage-rows usage-fieldnames]
+  (let [issues (vec
+                (concat
+                 (gate-baseline-issues baseline-rows baseline-fieldnames)
+                 (neutralization-usage-issues usage-rows usage-fieldnames)))]
+    (when (seq issues)
+      (throw (ex-info "neutralization audit input CSV validation failed"
+                      {:error/code :neutralization/malformed-input
+                       :issues issues})))))
+
+(defn summarize-neutralization-audit
+  [{:keys [baseline-csv usage-csv option-cache capture-dir generated-at target-date]}]
+  (when (nil? baseline-csv)
+    (throw (ex-info "baseline CSV is required for neutralization audit"
+                    {:error/code :error/missing-baseline-csv})))
+  (when (nil? usage-csv)
+    (throw (ex-info "model usage CSV is required for neutralization audit"
+                    {:error/code :error/missing-usage-csv})))
+  (let [baseline-data (read-csv-with-fieldnames baseline-csv)
+        usage-data (read-csv-with-fieldnames usage-csv)
+        baseline-rows (get baseline-data "rows")
+        usage-rows (get usage-data "rows")
+        _ (assert-neutralization-inputs! baseline-rows
+                                         (get baseline-data "fieldnames")
+                                         usage-rows
+                                         (get usage-data "fieldnames"))
+        option-cache (option-cache-inventory option-cache)
+        captures (capture-date-inventory capture-dir)
+        overlap (vec (sort (set (filter (set (get captures "dates" []))
+                                        (get option-cache "date_values" [])))))
+        option-cache (assoc option-cache "capture_date_overlap" overlap)
+        [rows total-model-gain] (neutralization-audit-rows
+                                 {:baseline-rows baseline-rows
+                                  :usage-rows usage-rows
+                                  :option-cache option-cache})
+        by-family (reduce (fn [acc row]
+                            (let [family (get row "family")
+                                  rec (get row "recoverability")
+                                  gain-pct (get row "model_gain_pct")
+                                  bucket (cond
+                                           (candidate-recoverability? rec) "candidate"
+                                           (review-recoverability? rec) "review"
+                                           :else "blocked")]
+                              (-> acc
+                                  (update-in [family "neutralized"] (fnil inc 0))
+                                  (update-in [family bucket] (fnil inc 0))
+                                  (update-in [family "model_gain_pct"]
+                                             (fnil + 0.0) gain-pct))))
+                          {} rows)
+        by-recoverability (reduce (fn [acc row]
+                                    (let [rec (get row "recoverability")]
+                                      (-> acc
+                                          (update-in [rec "count"] (fnil inc 0))
+                                          (update-in [rec "model_gain_pct"]
+                                                     (fnil + 0.0)
+                                                     (get row "model_gain_pct")))))
+                                  {} rows)
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        payload {"generated_at" generated-at
+                 "target_date" (or target-date (subs generated-at 0 10))
+                 "baseline_csv" (str baseline-csv)
+                 "usage_csv" (str usage-csv)
+                 "total_features" (count baseline-rows)
+                 "neutralized_features" (count rows)
+                 "total_model_gain" total-model-gain
+                 "neutralized_model_gain" (reduce + (map #(get % "model_gain") rows))
+                 "neutralized_model_gain_pct" (reduce + (map #(get % "model_gain_pct") rows))
+                 "candidate_now" (count (filter #(= "candidate-now"
+                                                     (get % "recoverability"))
+                                                rows))
+                 "review_count" (count (filter #(review-recoverability?
+                                                  (get % "recoverability"))
+                                                rows))
+                 "blocked_count" (count (filter #(and (not (candidate-recoverability?
+                                                             (get % "recoverability")))
+                                                      (not (review-recoverability?
+                                                            (get % "recoverability"))))
+                                                rows))
+                 "option_cache" option-cache
+                 "feature_captures" captures
+                 "by_family" (normalize-family-summary by-family)
+                 "by_recoverability" (normalize-recoverability-summary by-recoverability)}]
+    {:summary payload
+     :rows rows}))
+
+(defn write-neutralization-audit-csv!
+  [path rows]
+  (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+  (with-open [fh (open (str path) ** :mode "w" :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list neutralization-audit-csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer row))))
+  path)
+
+(defn neutralization-audit-markdown
+  [payload rows]
+  (let [family-rows (vec
+                     (concat [["Family" "Neutral" "Candidate" "Review" "Blocked" "Model Gain %"]]
+                             (map (fn [[family s]]
+                                    [family
+                                     (str (get s "neutralized" 0))
+                                     (str (get s "candidate" 0))
+                                     (str (get s "review" 0))
+                                     (str (get s "blocked" 0))
+                                     (str (python/format (* 100.0 (get s "model_gain_pct" 0.0))
+                                                         ".2f")
+                                          "%")])
+                                  (sort (get payload "by_family")))))
+        rec-rows (vec
+                  (concat [["Recoverability" "Count" "Model Gain %"]]
+                          (map (fn [[rec s]]
+                                 [rec
+                                  (str (get s "count" 0))
+                                  (str (python/format (* 100.0
+                                                         (get s "model_gain_pct" 0.0))
+                                                      ".2f")
+                                       "%")])
+                               (sort (get payload "by_recoverability")))))
+        top-rows (vec
+                  (concat [["Feature" "Family" "Status" "Class" "Gain %" "z_mean" "z_std"]]
+                          (map (fn [r]
+                                 [(get r "feature")
+                                  (get r "family")
+                                  (get r "status")
+                                  (get r "recoverability")
+                                  (str (python/format (* 100.0 (get r "model_gain_pct"))
+                                                      ".3f")
+                                       "%")
+                                  (python/format (get r "z_mean") "+.3f")
+                                  (python/format (get r "z_std") ".3f")])
+                               (take 40 (sort-by #(- (get % "model_gain")) rows)))))
+        candidate-rows (vec
+                        (concat [["Feature" "Family" "Status" "Gain %" "z_mean" "z_std"]]
+                                (map (fn [r]
+                                       [(get r "feature")
+                                        (get r "family")
+                                        (get r "status")
+                                        (str (python/format (* 100.0
+                                                               (get r "model_gain_pct"))
+                                                            ".3f")
+                                             "%")
+                                        (python/format (get r "z_mean") "+.3f")
+                                        (python/format (get r "z_std") ".3f")])
+                                     (take 60
+                                           (sort-by #(- (get % "model_gain"))
+                                                    (filter #(candidate-recoverability?
+                                                              (get % "recoverability"))
+                                                            rows))))))]
+    (str "# Neutralization Audit\n\n"
+         "Generated: `" (get payload "generated_at") "`\n\n"
+         "Baseline CSV: `" (get payload "baseline_csv") "`\n\n"
+         "Model usage CSV: `" (get payload "usage_csv") "`\n\n"
+         "This is read-only. It does not modify `neutralize_features.json`.\n\n"
+         "## Headline\n\n"
+         "- Total features: `" (get payload "total_features") "`\n"
+         "- Neutralized features: `" (get payload "neutralized_features") "`\n"
+         "- Offline option cache rows: `" (get-in payload ["option_cache" "rows"]) "`\n"
+         "- Offline option cache symbols: `" (get-in payload ["option_cache" "symbols"]) "`\n"
+         "- Offline option cache dates: `" (get-in payload ["option_cache" "dates"]) "`\n"
+         "- Feature capture files: `" (get-in payload ["feature_captures" "files"]) "`\n"
+         "- Feature capture dates: `"
+         (let [dates (get-in payload ["feature_captures" "dates"])]
+           (if (seq dates) (.join ", " dates) "none"))
+         "`\n"
+         "- Option/cache capture-date overlap: `"
+         (count (get-in payload ["option_cache" "capture_date_overlap"] [])) "`\n"
+         "- Neutralized model gain share: `"
+         (python/format (* 100.0 (get payload "neutralized_model_gain_pct")) ".2f")
+         "%`\n"
+         "- Candidate-now neutralized features: `" (get payload "candidate_now") "`\n"
+         "- Review neutralized features: `" (get payload "review_count") "`\n"
+         "- Blocked neutralized features: `" (get payload "blocked_count") "`\n\n"
+         (when (and (> (get-in payload ["option_cache" "rows"] 0) 0)
+                    (empty? (get-in payload ["option_cache" "capture_date_overlap"] [])))
+           "- Warning: saved option-bar cache exists, but it has no date overlap with saved feature captures.\n\n")
+         "## By Family\n\n"
+         (md-table family-rows) "\n\n"
+         "## By Recoverability\n\n"
+         (md-table rec-rows) "\n\n"
+         "## Top Neutralized Features By Model Gain\n\n"
+         (md-table top-rows) "\n\n"
+         "## Candidate Neutralized Features\n\n"
+         (md-table candidate-rows) "\n\n"
+         "## Interpretation\n\n"
+         "- `candidate-now`: neutralized, live captures look sane, and the model uses it.\n"
+         "- `low-priority-candidate`: neutralized and sane, but no observed split usage.\n"
+         "- `review-*`: live values exist but distribution is shifted/low variance; inspect before unmasking.\n"
+         "- `blocked-*`: current saved live captures do not reproduce a useful live feature.\n\n"
+         "ThetaData terminal access is not required for this audit. The audit uses saved\n"
+         "feature captures and saved option-bar cache inventory. Live terminal access\n"
+         "would only be needed for a fresh capture or for testing a repaired live builder.\n")))
+
+(defn write-neutralization-audit!
+  [{:keys [baseline-csv usage-csv out-dir option-cache capture-dir generated-at target-date]}]
+  (let [analysis-dir (or out-dir default-analysis-dir)
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        stamp (compact-date (or target-date generated-at))
+        out-base (os.path/join (str analysis-dir) (str "neutralization_audit_" stamp))
+        csv-path (str out-base ".csv")
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")]
+    (clear-artifacts! [csv-path json-path md-path])
+    (let [baseline-csv (or baseline-csv
+                           (latest analysis-dir "live_feature_parity_baseline_*.csv"))
+          usage-csv (or usage-csv
+                        (latest analysis-dir "live_feature_model_usage_*.csv"))
+          {:keys [summary rows]} (summarize-neutralization-audit
+                                  {:baseline-csv baseline-csv
+                                   :usage-csv usage-csv
+                                   :option-cache option-cache
+                                   :capture-dir (or capture-dir default-capture-dir)
+                                   :generated-at generated-at
+                                   :target-date target-date})]
+      (os/makedirs (str analysis-dir) ** :exist_ok true)
+      (write-neutralization-audit-csv! csv-path rows)
+      (spit json-path (json/dumps (->jsonable {"summary" summary
+                                               "features" rows})
+                                  ** :indent 2 :sort_keys true))
+      (spit md-path (neutralization-audit-markdown summary rows))
+      {:summary summary
+       :rows rows
+       :csv-path csv-path
+       :json-path json-path
+       :markdown-path md-path})))
+
+(defn- parse-compact-date
+  [date-str]
+  (let [s (str date-str)]
+    (cond
+      (and (= 8 (count s)) (.isdigit s))
+      (let [iso (str (subs s 0 4) "-" (subs s 4 6) "-" (subs s 6 8))]
+        (datetime.date/fromisoformat iso)
+        s)
+
+      (= 10 (count s))
+      (do
+        (datetime.date/fromisoformat s)
+        (.replace s "-" ""))
+
+      (and (> (count s) 10) (= "T" (subs s 10 11)))
+      (let [normalized (if (.endswith s "Z")
+                         (str (subs s 0 (- (count s) 1)) "+00:00")
+                         s)
+            dt (datetime.datetime/fromisoformat normalized)]
+        (.strftime dt "%Y%m%d"))
+
+      :else
+      (throw (ex-info (str "invalid date/timestamp: " s) {:value s})))))
+
+(defn- compact-date
+  [date-str]
+  (parse-compact-date date-str))
+
+(defn- maybe-compact-date
+  [date-str]
+  (try
+    (when date-str
+      (compact-date date-str))
+    (catch python/Exception _ nil)))
+
+(defn- artifact-session-stamp
+  [artifact]
+  (or (maybe-compact-date (get artifact "target_date"))
+      (maybe-compact-date (get artifact "generated_at"))))
+
+(defn- compact-date-token?
+  [x]
+  (and (string? x)
+       (= 8 (count x))
+       (.isdigit x)
+       (some? (maybe-compact-date x))))
+
+(defn- capture-date-from-name
+  [path]
+  (let [base (os.path/basename (str path))
+        stem (first (.rsplit base "." 1))
+        token (last (.rsplit stem "_" 1))]
+    (when (compact-date-token? token)
+      token)))
+
+(defn- int-value
+  ([x] (int-value x 0))
+  ([x default]
+   (try
+     (int x)
+     (catch python/Exception _ default))))
+
+(defn- add-capture-row-count
+  [m date rows]
+  (let [k (or date "missing")]
+    (assoc m k (+ (int-value (get m k 0)) (int-value rows)))))
+
+(defn- nonnegative-int-value
+  [x]
+    (try
+      (cond
+        (nil? x) nil
+        (boolean? x) nil
+        (string? x)
+        (let [s (.strip x)]
+        (when (and (not= "" s) (.isdigit s))
+          (int s)))
+      :else
+      (let [f (float x)
+            i (int x)]
+        (when (and (math/isfinite f)
+                   (not (< i 0))
+                   (= f (float i)))
+          i)))
+    (catch python/Exception _ nil)))
+
+(defn- positive-int-value
+  [x]
+  (let [n (nonnegative-int-value x)]
+    (when (and (some? n) (pos? n))
+      n)))
+
+(defn- nonnegative-int-field-issues
+  [label m fields]
+  (vec
+   (keep (fn [field]
+           (when (or (not (contains? m field))
+                     (nil? (nonnegative-int-value (get m field))))
+             (str label " " field " must be nonnegative integer")))
+         fields)))
+
+(defn- sum-int-values
+  [xs]
+  (reduce + 0 (map int-value xs)))
+
+(defn- map-items
+  [m]
+  (cond
+    (nil? m) []
+    (map? m) m
+    (isinstance m python/dict) (.items m)
+    :else []))
+
+(defn- json-object?
+  [x]
+  (or (map? x) (isinstance x python/dict)))
+
+(defn- json-list?
+  [x]
+  (or (vector? x) (seq? x) (isinstance x python/list)))
+
+(defn- object-shape-issue
+  [label x]
+  (when (and (some? x) (not (json-object? x)))
+    (str label " must be object")))
+
+(defn- list-shape-issue
+  [label x]
+  (when (and (some? x) (not (json-list? x)))
+    (str label " must be list")))
+
+(defn- nonnegative-int-map-value-issues
+  [label m]
+  (vec
+   (concat
+    (when-let [issue (object-shape-issue label m)]
+      [issue])
+    (keep (fn [[k v]]
+            (when (nil? (nonnegative-int-value v))
+              (str label " " k " must be nonnegative integer")))
+          (map-items m)))))
+
+(defn- baseline-count-issues
+  [baseline-summary]
+  (let [per-capture (get baseline-summary "per_capture" [])
+        per-capture-rows (if (json-list? per-capture) per-capture [])]
+    (vec
+     (concat
+      (nonnegative-int-field-issues
+       "baseline"
+       baseline-summary
+       ["rows" "capture_file_count" "active_problem_count"])
+      (when (contains? baseline-summary "features")
+        (nonnegative-int-field-issues "baseline" baseline-summary ["features"]))
+      (when-let [issue (list-shape-issue "baseline per_capture" per-capture)]
+        [issue])
+      (apply concat
+             (map-indexed
+              (fn [idx item]
+                (vec
+                 (concat
+                  (when-let [issue (object-shape-issue
+                                    (str "baseline per_capture row " idx)
+                                    item)]
+                    [issue])
+                  (when (json-object? item)
+                    (nonnegative-int-field-issues
+                     (str "baseline per_capture row " idx)
+                     item
+                     ["rows"])))))
+              per-capture-rows))
+      (when-let [issue (object-shape-issue "baseline captures"
+                                           (get baseline-summary "captures"))]
+        [issue])
+      (nonnegative-int-map-value-issues
+       "baseline captures.rows_by_file"
+       (get-in baseline-summary ["captures" "rows_by_file"] {}))))))
+
+(defn- probe-count-issues
+  [probe]
+  (let [summary (get probe "summary" {})]
+    (vec
+     (concat
+      (nonnegative-int-field-issues
+       "ThetaData probe summary"
+       summary
+       ["total" "ok" "usable" "failed" "payload_examples"])
+      (nonnegative-int-map-value-issues
+       "ThetaData probe error_classes"
+       (get summary "error_classes" {}))))))
+
+(defn- payload-verification-count-issues
+  [payload-verification]
+  (vec
+   (concat
+    (nonnegative-int-field-issues
+     "ThetaData payload verification"
+     payload-verification
+     ["total" "checked" "skipped" "invalid"])
+    (nonnegative-int-map-value-issues
+     "ThetaData payload verification example_generated_date_counts"
+     (get payload-verification "example_generated_date_counts" {}))
+    (nonnegative-int-map-value-issues
+     "ThetaData payload verification example_target_date_counts"
+     (get payload-verification "example_target_date_counts" {}))
+    (nonnegative-int-map-value-issues
+     "ThetaData payload verification example_path_date_counts"
+     (get payload-verification "example_path_date_counts" {})))))
+
+(defn- neutralization-count-issues
+  [neutralization]
+  (vec
+   (concat
+    (nonnegative-int-field-issues
+     "neutralization audit"
+     neutralization
+     ["candidate_now" "review_count" "blocked_count" "neutralized_features"])
+    (when (contains? neutralization "total_features")
+      (nonnegative-int-field-issues "neutralization audit" neutralization ["total_features"])))))
+
+(defn- baseline-capture-row-date-counts
+  [baseline]
+  (let [per-capture (get baseline "per_capture")]
+    (if (seq per-capture)
+      (reduce (fn [acc item]
+                (add-capture-row-count acc
+                                       (or (get item "date")
+                                           (capture-date-from-name (get item "path")))
+                                       (get item "rows" 0)))
+              {}
+              per-capture)
+      (reduce (fn [acc [path rows]]
+                (add-capture-row-count acc (capture-date-from-name path) rows))
+              {}
+              (map-items (get-in baseline ["captures" "rows_by_file"] {}))))))
+
+(defn- baseline-capture-file-date-counts
+  [baseline]
+  (reduce (fn [acc path]
+            (update acc (or (capture-date-from-name path) "missing") (fnil inc 0)))
+          {}
+          (get-in baseline ["captures" "files"] [])))
+
+(defn- baseline-capture-metadata-issues
+  [baseline target-stamp]
+  (let [issues (atom [])
+        summary-rows (int-value (get baseline "rows" 0))
+        per-capture (get baseline "per_capture" [])
+        per-capture-row-sum (sum-int-values (map #(get % "rows" 0) per-capture))
+        rows-by-file (get-in baseline ["captures" "rows_by_file"] {})
+        rows-by-file-sum (sum-int-values (map second (map-items rows-by-file)))
+        files (get-in baseline ["captures" "files"] [])
+        required-raw (get-in baseline ["captures" "required_raw_replay_arrays"])
+        raw-missing-by-file (get-in baseline ["captures" "raw_replay_missing_by_file"])
+        declared-file-count (int-value (get baseline "capture_file_count" 0))
+        file-date-counts (baseline-capture-file-date-counts baseline)]
+    (when (and (seq per-capture) (not= summary-rows per-capture-row-sum))
+      (swap! issues conj "baseline rows do not equal per_capture row total"))
+    (when (and (seq rows-by-file) (not= summary-rows rows-by-file-sum))
+      (swap! issues conj "baseline rows do not equal captures.rows_by_file total"))
+    (when (and (seq files) (not= declared-file-count (count files)))
+      (swap! issues conj "baseline capture_file_count does not match captures.files count"))
+    (doseq [item per-capture]
+      (let [item-date (maybe-compact-date (get item "date"))
+            path-date (capture-date-from-name (get item "path"))]
+        (when (and item-date path-date (not= item-date path-date))
+          (swap! issues conj "baseline per_capture date does not match capture path date"))))
+    (when (and (seq file-date-counts)
+               (or (not= #{target-stamp} (set (keys file-date-counts)))
+                   (contains? file-date-counts "missing")))
+      (swap! issues conj "baseline capture files include non-target-date files"))
+    (cond
+      (nil? required-raw)
+      (swap! issues conj "baseline missing raw replay sidecar metadata; rerun baseline with capture-version 2 support")
+
+      (not= (set required-raw) required-raw-replay-arrays)
+      (swap! issues conj "baseline raw replay sidecar requirements are not current"))
+    (when-not (json-object? raw-missing-by-file)
+      (swap! issues conj "baseline missing raw replay missing-by-file metadata"))
+    (when (json-object? raw-missing-by-file)
+      (doseq [[path missing] (map-items raw-missing-by-file)]
+        (when (= target-stamp (capture-date-from-name path))
+          (swap! issues conj
+                 (str "target-date capture missing raw replay sidecars: "
+                      path " " (pr-str missing))))))
+    (doseq [item per-capture]
+      (when (and (= target-stamp (or (maybe-compact-date (get item "date"))
+                                     (capture-date-from-name (get item "path"))))
+                 (not= true (get item "raw_replay_ready")))
+        (swap! issues conj
+               (str "target-date per_capture row is not raw replay ready: "
+                    (get item "path")))))
+    @issues))
+
+(defn- baseline-feature-issues
+  [baseline-payload baseline-summary]
+  (let [features (get baseline-payload "features" [])
+        issues (atom [])
+        summary-active (int-value (get baseline-summary "active_problem_count" 0))
+        feature-active (count (filter #(= true (get % "active_problem")) features))
+        summary-feature-count (get baseline-summary "features")]
+    (when (seq features)
+      (when (pos? feature-active)
+        (swap! issues conj "baseline features contain active live feature parity problems"))
+      (when (not= summary-active feature-active)
+        (swap! issues conj "baseline active_problem_count does not match feature rows"))
+      (when (and summary-feature-count
+                 (not= (int-value summary-feature-count) (count features)))
+        (swap! issues conj "baseline feature count does not match feature rows")))
+    @issues))
+
+(defn- artifact-fresh?
+  [path target-stamp]
+  (and path (not= -1 (.find (os.path/basename (str path)) target-stamp))))
+
+(defn- existing-json-payload
+  [path]
+  (when (and path (os.path/exists (str path)))
+    (read-json path)))
+
+(defn- baseline-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- baseline-summary
+  [payload]
+  (when payload
+    (get payload "summary")))
+
+(defn- probe-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- neutralization-summary
+  [path]
+  (when-let [payload (existing-json-payload path)]
+    (get payload "summary")))
+
+(defn- neutralization-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- payload-verification-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- capture-check-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- option-surface-sidecar-check-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- legacy-greek-search-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- greek-promotion-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- matched-parity-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- historical-cohort-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- raw-unlock-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- v3-unlock-payload
+  [path]
+  (existing-json-payload path))
+
+(defn- probe-result-counts
+  [probe]
+  (let [results (get probe "results" [])
+        result-rows (if (json-list? results) results [])]
+    {"total" (count result-rows)
+     "ok" (count (filter #(= true (get % "ok")) result-rows))
+     "usable" (count (filter #(= true (get % "usable")) result-rows))
+     "failed" (count (filter #(not= true (get % "ok")) result-rows))
+     "payload_examples" (count (filter #(seq (str (or (get % "payload_example") "")))
+                                       result-rows))}))
+
+(defn- payload-verification-result-counts
+  [payload-verification]
+  (let [results (get payload-verification "results" [])
+        result-rows (if (json-list? results) results [])]
+    {"total" (count result-rows)
+     "checked" (count (filter #(not= "skipped" (str (get % "status"))) result-rows))
+     "skipped" (count (filter #(= "skipped" (str (get % "status"))) result-rows))
+     "invalid" (count (filter #(false? (get % "valid?")) result-rows))}))
+
+(defn- nonblank-text
+  [x]
+  (let [s (.strip (str (or x "")))]
+    (when (not= "" s) s)))
+
+(defn- duplicate-values
+  [xs]
+  (vec (sort (map first (filter (fn [[_ n]] (> n 1)) (frequencies xs))))))
+
+(defn- realpath-text
+  [x]
+  (when-let [s (nonblank-text x)]
+    (try
+      (os.path/realpath s)
+      (catch python/Exception _ s))))
+
+(defn- payload-verification-probe-coverage-issues
+  [probe payload-verification]
+  (if (and probe payload-verification)
+    (let [probe-results (get probe "results" [])
+          probe-rows (if (json-list? probe-results) probe-results [])
+          verification-results (get payload-verification "results" [])
+          verification-rows (if (json-list? verification-results)
+                              verification-results
+                              [])
+          expected (vec
+                    (keep (fn [row]
+                            (when (and (json-object? row)
+                                       (nonblank-text (get row "payload_example")))
+                              (realpath-text (get row "payload_example"))))
+                          probe-rows))
+          actual (vec
+                  (keep (fn [row]
+                          (when (and (json-object? row)
+                                     (not= "skipped" (str (get row "status"))))
+                            (realpath-text (get row "path"))))
+                        verification-rows))
+          expected-set (set expected)
+          actual-set (set actual)
+          missing (vec (sort (set/difference expected-set actual-set)))
+          unexpected (vec (sort (set/difference actual-set expected-set)))
+          duplicate-expected (duplicate-values expected)
+          duplicate-actual (duplicate-values actual)]
+      (vec
+       (keep identity
+             [(when (seq duplicate-expected)
+                (str "ThetaData probe duplicate payload example identities: "
+                     (str/join ", " duplicate-expected)))
+              (when (seq duplicate-actual)
+                (str "ThetaData payload verification duplicate checked probe identities: "
+                     (str/join ", " duplicate-actual)))
+              (when (seq missing)
+                (str "ThetaData payload verification missing checked probe identities: "
+                     (str/join ", " missing)))
+              (when (seq unexpected)
+                (str "ThetaData payload verification checked unexpected probe identities: "
+                     (str/join ", " unexpected)))])))
+    []))
+
+(defn- probe-result-shape-issues
+  [probe]
+  (let [results (get probe "results" [])
+        result-rows (if (json-list? results) results [])]
+    (vec
+     (concat
+      (when-let [issue (list-shape-issue "ThetaData probe results" results)]
+        [issue])
+      (mapcat
+       (fn [[idx row]]
+         (vec
+          (concat
+           (when-let [issue (object-shape-issue
+                             (str "ThetaData probe result row " idx)
+                             row)]
+             [issue])
+           (when (json-object? row)
+             (keep identity
+                   [(when-not (seq (str (or (get row "name") "")))
+                      (str "ThetaData probe result row " idx
+                           " missing probe identity"))
+                    (when-not (or (true? (get row "ok"))
+                                  (false? (get row "ok")))
+                      (str "ThetaData probe result row " idx
+                           " ok must be boolean"))
+                    (when-not (or (true? (get row "usable"))
+                                  (false? (get row "usable")))
+                      (str "ThetaData probe result row " idx
+                           " usable must be boolean"))
+                    (when (and (seq (str (or (get row "payload_example") "")))
+                               (not= true (get row "ok")))
+                      (str "ThetaData probe result row " idx
+                           " saved payload example despite ok=false"))
+                    (when (= true (get row "usable"))
+                      (let [summary (get row "summary")]
+                        (when-not (json-object? summary)
+                          (str "ThetaData probe result row " idx
+                               " usable summary must be object"))))
+                    (when (= true (get row "usable"))
+                      (let [summary (get row "summary")]
+                        (when (and (json-object? summary)
+                                   (not= true (get summary "required_ok")))
+                          (str "ThetaData probe result row " idx
+                               " usable summary required_ok must be true"))))
+                    (when (= true (get row "usable"))
+                      (let [summary (get row "summary")]
+                        (when (and (json-object? summary)
+                                   (= false (get summary "row_width_valid")))
+                          (str "ThetaData probe result row " idx
+                               " usable summary row_width_valid must not be false"))))])))))
+       (map-indexed vector result-rows))))))
+
+(defn- payload-verification-result-shape-issues
+  [payload-verification]
+  (let [results (get payload-verification "results" [])
+        result-rows (if (json-list? results) results [])]
+    (vec
+     (concat
+      (when-let [issue (list-shape-issue
+                        "ThetaData payload verification results"
+                        results)]
+        [issue])
+      (mapcat
+       (fn [[idx row]]
+         (vec
+          (concat
+           (when-let [issue (object-shape-issue
+                             (str "ThetaData payload verification result row "
+                                  idx)
+                             row)]
+             [issue])
+           (when (json-object? row)
+             (keep identity
+                   [(when-not (contains? #{"ok" "error" "skipped"}
+                                         (str (get row "status")))
+                      (str "ThetaData payload verification result row "
+                           idx " status is invalid"))
+                    (when-not (or (true? (get row "valid?"))
+                                  (false? (get row "valid?")))
+                      (str "ThetaData payload verification result row "
+                           idx " valid? must be boolean"))
+                    (when-not (seq (str (or (get row "probe") "")))
+                      (str "ThetaData payload verification result row "
+                           idx " missing probe identity"))])))))
+       (map-indexed vector result-rows))))))
+
+(defn- evidence-result-consistency-reasons
+  [label summary-counts result-counts required? checks]
+  (let [primary-field (first (first checks))]
+    (vec
+     (concat
+      (when (and required?
+                 (pos? (int-value (get summary-counts primary-field 0)))
+                 (zero? (int-value (get result-counts primary-field 0))))
+        [(str label " results missing")])
+      (keep (fn [[field reason]]
+              (when (not= (int-value (get summary-counts field 0))
+                          (int-value (get result-counts field 0)))
+                reason))
+            checks)))))
+
+(defn- neutralization-row-counts
+  [rows]
+  {"neutralized_features" (count rows)
+   "candidate_now" (count (filter #(= "candidate-now" (get % "recoverability")) rows))
+   "review_count" (count (filter #(review-recoverability? (get % "recoverability")) rows))
+   "blocked_count" (count (filter #(and (not (candidate-recoverability?
+                                               (get % "recoverability")))
+                                        (not (review-recoverability?
+                                              (get % "recoverability"))))
+                                  rows))})
+
+(defn- neutralization-row-consistency-reasons
+  [summary rows]
+  (let [counts (neutralization-row-counts rows)]
+    (vec
+     (keep (fn [[field reason]]
+             (when (not= (int-value (get summary field 0))
+                         (int-value (get counts field 0)))
+               reason))
+           [["neutralized_features" "neutralization audit neutralized_features does not match feature rows"]
+            ["candidate_now" "neutralization audit candidate_now does not match feature rows"]
+            ["review_count" "neutralization audit review_count does not match feature rows"]
+            ["blocked_count" "neutralization audit blocked_count does not match feature rows"]]))))
+
+(defn evidence-readiness
+  [{:keys [analysis-dir target-date baseline-json probe-json neutralization-json
+           payload-verification-json capture-check-json option-surface-sidecar-check-json
+           legacy-greek-search-json
+           greek-promotion-json
+           historical-cohort-json raw-unlock-json v3-unlock-json
+           matched-parity-json
+           min-capture-rows generated-at]}]
+  (let [analysis-dir (or analysis-dir default-analysis-dir)
+        target-date (or target-date
+                        (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                   "%Y-%m-%d"))
+        target-stamp (compact-date target-date)
+        raw-min-capture-rows min-capture-rows
+        min-capture-rows (or (positive-int-value raw-min-capture-rows) 60)
+        min-capture-rows-valid? (or (nil? raw-min-capture-rows)
+                                    (some? (positive-int-value
+                                            raw-min-capture-rows)))
+        baseline-json (or baseline-json
+                          (dated-artifact analysis-dir
+                                          "live_feature_parity_baseline"
+                                          ".json"
+                                          target-date))
+        probe-json (or probe-json
+                       (dated-artifact analysis-dir
+                                       "thetadata_capability_probe"
+                                       ".json"
+                                       target-date))
+        neutralization-json (or neutralization-json
+                                (dated-artifact analysis-dir
+                                                "neutralization_audit"
+                                                ".json"
+                                                target-date))
+        payload-verification-json
+        (or payload-verification-json
+            (dated-artifact analysis-dir
+                            "thetadata_payload_verification"
+                            ".json"
+                            target-date))
+        capture-check-json (or capture-check-json
+                               (dated-artifact analysis-dir
+                                               "capture_v2_sidecar_check"
+                                               ".json"
+                                               target-date))
+        option-surface-sidecar-check-required? (some? option-surface-sidecar-check-json)
+        option-surface-sidecar-check-json
+        (or option-surface-sidecar-check-json
+            (dated-artifact analysis-dir
+                            "option_surface_sidecar_check"
+                            ".json"
+                            target-date))
+        legacy-greek-search-json
+        (or legacy-greek-search-json
+            (dated-artifact analysis-dir
+                            "legacy_greek_formula_search"
+                            ".json"
+                            target-date))
+        greek-promotion-json
+        (or greek-promotion-json
+            (dated-artifact analysis-dir
+                            "greek_reconstruction_promotion_gate"
+                            ".json"
+                            target-date))
+        historical-cohort-json
+        (or historical-cohort-json
+            (dated-artifact analysis-dir
+                            "historical_feature_cohort"
+                            ".json"
+                            target-date))
+        raw-unlock-json
+        (or raw-unlock-json
+            (dated-artifact analysis-dir
+                            "raw_feature_unlock_audit"
+                            ".json"
+                            target-date))
+        v3-unlock-json
+        (or v3-unlock-json
+            (dated-artifact analysis-dir
+                            "v3_grid_unlock_audit"
+                            ".json"
+                            target-date))
+        matched-parity-json
+        (or matched-parity-json
+            (dated-artifact analysis-dir
+                            "matched_feature_parity"
+                            ".json"
+                            target-date))
+        baseline-payload (baseline-payload baseline-json)
+        baseline (baseline-summary baseline-payload)
+        probe (probe-payload probe-json)
+        neutralization-payload (neutralization-payload neutralization-json)
+        neutralization (when neutralization-payload
+                         (get neutralization-payload "summary"))
+        neutralization-features (get neutralization-payload "features" [])
+        payload-verification (payload-verification-payload payload-verification-json)
+        capture-check (capture-check-payload capture-check-json)
+        option-surface-sidecar-check
+        (option-surface-sidecar-check-payload option-surface-sidecar-check-json)
+        legacy-greek-search (legacy-greek-search-payload legacy-greek-search-json)
+        greek-promotion (greek-promotion-payload greek-promotion-json)
+        historical-cohort (historical-cohort-payload historical-cohort-json)
+        raw-unlock-payload (raw-unlock-payload raw-unlock-json)
+        raw-unlock (when raw-unlock-payload
+                     (get raw-unlock-payload "summary"))
+        v3-unlock-payload (v3-unlock-payload v3-unlock-json)
+        v3-unlock (when v3-unlock-payload
+                    (get v3-unlock-payload "summary"))
+        matched-parity-payload (matched-parity-payload matched-parity-json)
+        matched-parity (when matched-parity-payload
+                         (get matched-parity-payload "summary"))
+        matched-parity-unavailable? (= "unavailable" (get matched-parity "status"))
+        matched-parity-available? (and matched-parity (not matched-parity-unavailable?))
+        matched-parity-features (get matched-parity-payload "features" [])
+        capture-rows (int-value (get baseline "rows" 0))
+        capture-row-date-counts (baseline-capture-row-date-counts baseline)
+        target-capture-rows (int-value (get capture-row-date-counts target-stamp 0))
+        non-target-capture-rows (- (reduce + 0 (vals capture-row-date-counts))
+                                   target-capture-rows)
+        skipped (get-in baseline ["captures" "skipped_files"] {})
+        probe-summary (get probe "summary" {})
+        probe-errors-raw (get probe-summary "error_classes" {})
+        probe-errors (if (json-object? probe-errors-raw) probe-errors-raw {})
+        total-probes (int-value (get probe-summary "total" 0))
+        ok-probes (int-value (get probe-summary "ok" 0))
+        usable-probes (int-value (get probe-summary "usable" 0))
+        failed-probes (int-value (get probe-summary "failed" 0))
+        terminal-failures (int-value (get probe-errors "terminal-unreachable" 0))
+        timeout-failures (int-value (get probe-errors "timeout" 0))
+        payload-examples-raw (int-value (get probe-summary "payload_examples" 0))
+        payload-total (int-value (get payload-verification "total" 0))
+        payload-checked (int-value (get payload-verification "checked" 0))
+        payload-skipped (int-value (get payload-verification "skipped" 0))
+        payload-invalid (int-value (get payload-verification "invalid" 0))
+        payload-valid? (get payload-verification "valid?")
+        payload-generated-date-counts-raw (get payload-verification "example_generated_date_counts" {})
+        payload-target-date-counts-raw (get payload-verification "example_target_date_counts" {})
+        payload-path-date-counts-raw (get payload-verification "example_path_date_counts" {})
+        payload-generated-date-counts (if (json-object? payload-generated-date-counts-raw)
+                                        payload-generated-date-counts-raw
+                                        {})
+        payload-target-date-counts (if (json-object? payload-target-date-counts-raw)
+                                     payload-target-date-counts-raw
+                                     {})
+        payload-path-date-counts (if (json-object? payload-path-date-counts-raw)
+                                   payload-path-date-counts-raw
+                                   {})
+        payload-target-missing-count (int-value (get payload-target-date-counts "missing" 0))
+        payload-target-present-total (- (sum-int-values (vals payload-target-date-counts))
+                                        payload-target-missing-count)
+        payload-target-date-target-count (int-value (get payload-target-date-counts target-stamp 0))
+        payload-path-target-count (int-value (get payload-path-date-counts target-stamp 0))
+        payload-target-date-total (sum-int-values (vals payload-target-date-counts))
+        payload-path-total (sum-int-values (vals payload-path-date-counts))
+        payload-examples (if (and (zero? payload-examples-raw)
+                                  payload-verification
+                                  (pos? payload-total)
+                                  (= payload-total payload-checked)
+                                  (zero? payload-skipped)
+                                  (zero? payload-invalid)
+                                  (= true payload-valid?)
+                                  (= "ok" (get payload-verification "status"))
+                                  (= payload-total payload-path-target-count))
+                           payload-total
+                           payload-examples-raw)
+        active-problem-count (int-value (get baseline "active_problem_count" 0))
+        capture-check-version (get capture-check "capture_version")
+        capture-check-ok? (= true (get capture-check "ok"))
+        capture-check-row-count (int-value (get capture-check "row_count" 0))
+        capture-check-unique-time-count (int-value (get capture-check "unique_time_count"
+                                                        capture-check-row-count))
+        capture-check-duplicate-time-count (int-value (get capture-check "duplicate_time_count" 0))
+        capture-check-status (get capture-check "status")
+        capture-check-issues (get capture-check "issues" [])
+        capture-check-warnings (get capture-check "warnings" [])
+        capture-check-sidecar-useful (get capture-check "sidecar_useful_rows" {})
+        capture-check-sidecar-contracts (get capture-check "sidecar_total_contracts" {})
+        capture-check-sidecar-malformed (get capture-check "sidecar_malformed_contracts" {})
+        capture-check-option-surface-prefixes (set (get capture-check "option_surface_prefixes" []))
+        capture-check-missing-option-surface-prefixes
+        (vec (sort (set/difference required-option-surface-prefixes
+                                    capture-check-option-surface-prefixes)))
+        option-surface-sidecar-ok? (= true (get option-surface-sidecar-check "ok"))
+        option-surface-sidecar-row-count (int-value (get option-surface-sidecar-check "row_count" 0))
+        option-surface-sidecar-useful-row-count
+        (int-value (get option-surface-sidecar-check "useful_row_count" 0))
+        option-surface-sidecar-prefixes (set (get option-surface-sidecar-check "prefixes_present" []))
+        option-surface-sidecar-required-prefixes
+        (set (get option-surface-sidecar-check
+                  "required_prefixes"
+                  required-option-surface-prefixes))
+        option-surface-sidecar-missing-prefixes
+        (vec (sort (set/difference option-surface-sidecar-required-prefixes
+                                    option-surface-sidecar-prefixes)))
+        option-surface-sidecar-contracts-by-prefix
+        (get option-surface-sidecar-check "contracts_by_prefix" {})
+        option-surface-sidecar-malformed-by-prefix
+        (get option-surface-sidecar-check "malformed_by_prefix" {})
+        option-surface-sidecar-issues (get option-surface-sidecar-check "issues" [])
+        legacy-search-summary (get legacy-greek-search "summary" {})
+        legacy-candidate-formula-hits (int-value (get legacy-search-summary "candidate_formula_hits" 0))
+        legacy-formula-provenance-hits (int-value (get legacy-search-summary
+                                                       "legacy_formula_provenance_hits"
+                                                       legacy-candidate-formula-hits))
+        legacy-candidate-reconstruction-hits (int-value (get legacy-search-summary
+                                                             "candidate_reconstruction_hits"
+                                                             0))
+        legacy-manifest-ref-count (int-value (get legacy-search-summary "manifest_reference_count" 0))
+        legacy-manifest-missing (int-value (get legacy-search-summary "manifest_impl_classes_missing" 0))
+        greek-promotion-summary (get greek-promotion "summary" {})
+        greek-promotion-capture-ok? (= true (get greek-promotion-summary "capture_ok"))
+        greek-promotion-coverage-ok? (= true (get greek-promotion-summary "coverage_ok"))
+        greek-promotion-evaluated-count (int-value (get greek-promotion-summary "evaluated_count" 0))
+        greek-promotion-min-evaluated-count (int-value (get greek-promotion-summary "min_evaluated_count" 0))
+        greek-promotion-candidate-count (int-value (get greek-promotion-summary "candidate_count" 0))
+        greek-promotion-candidate-features (get greek-promotion-summary "candidate_features" [])
+        greek-promotion-capture-reasons (get greek-promotion-summary "capture_reasons" [])
+        greek-promotion-coverage-reasons (get greek-promotion-summary "coverage_reasons" [])
+        historical-cohort-ok? (= true (get historical-cohort "ok"))
+        historical-cohort-reason (get historical-cohort "reason")
+        historical-cohort-error-class (get historical-cohort "error_class")
+        raw-unlock-status (get raw-unlock "status")
+        raw-unlock-unavailable-reason (get raw-unlock "unavailable_reason")
+        v3-unlock-status (get v3-unlock "status")
+        v3-unlock-unavailable-reason (get v3-unlock "unavailable_reason")
+        matched-parity-session-stamp (artifact-session-stamp matched-parity)
+        matched-parity-matched-rows (int-value (get matched-parity "matched_rows" 0))
+        matched-parity-feature-count (int-value (get matched-parity "feature_count" 0))
+        matched-parity-problem-count (int-value (get matched-parity "problem_feature_count" 0))
+        matched-parity-active-problem-count (int-value (get matched-parity "active_problem_count"
+                                                            matched-parity-problem-count))
+        matched-parity-neutralized-problem-count (int-value (get matched-parity "neutralized_problem_count" 0))
+        matched-parity-neutralized-count (int-value (get matched-parity "neutralized_count" 0))
+        matched-parity-status-counts (into {} (.items (get matched-parity "status_counts" {})))
+        matched-parity-row-status-counts (frequencies (map #(get % "status") matched-parity-features))
+        matched-parity-row-problem-count
+        (count (filter #(not (contains? #{"EXACT_MATCH" "MATCH"}
+                                        (get % "status")))
+                       matched-parity-features))
+        matched-parity-row-active-problem-count
+        (count (filter #(= true (get % "active_problem")) matched-parity-features))
+        matched-parity-row-neutralized-count
+        (count (filter #(= true (get % "neutralized")) matched-parity-features))
+        matched-parity-row-neutralized-problem-count
+        (count (filter #(and (= true (get % "neutralized"))
+                             (not (contains? #{"EXACT_MATCH" "MATCH"}
+                                             (get % "status"))))
+                       matched-parity-features))
+        probe-result-counts (probe-result-counts probe)
+        payload-verification-result-counts (payload-verification-result-counts payload-verification)
+        probe-result-shape-issues (if probe
+                                    (probe-result-shape-issues probe)
+                                    [])
+        payload-verification-result-shape-issues
+        (if payload-verification
+          (payload-verification-result-shape-issues payload-verification)
+          [])
+        probe-result-issues (if probe
+                              (evidence-result-consistency-reasons
+                               "ThetaData probe"
+                               {"total" total-probes
+                                "ok" ok-probes
+                                "usable" usable-probes
+                                "failed" failed-probes
+                                "payload_examples" payload-examples-raw}
+                               probe-result-counts
+                               true
+                               [["total" "ThetaData probe summary total does not match result rows"]
+                                ["ok" "ThetaData probe summary ok count does not match result rows"]
+                                ["usable" "ThetaData probe summary usable count does not match result rows"]
+                                ["failed" "ThetaData probe summary failed count does not match result rows"]
+                                ["payload_examples" "ThetaData probe summary payload_examples count does not match result rows"]])
+                              [])
+        payload-result-issues (if payload-verification
+                                (evidence-result-consistency-reasons
+                                 "ThetaData payload verification"
+                                 {"total" payload-total
+                                  "checked" payload-checked
+                                  "skipped" payload-skipped
+                                  "invalid" payload-invalid}
+                                 payload-verification-result-counts
+                                 true
+                                 [["total" "ThetaData payload verification total does not match result rows"]
+                                  ["checked" "ThetaData payload verification checked count does not match result rows"]
+                                  ["skipped" "ThetaData payload verification skipped count does not match result rows"]
+                                  ["invalid" "ThetaData payload verification invalid count does not match result rows"]])
+                                [])
+        payload-probe-coverage-issues
+        (if (pos? payload-examples-raw)
+          (payload-verification-probe-coverage-issues probe payload-verification)
+          [])
+        payload-target-date-count-issues
+        (vec
+         (concat
+          (when (and payload-verification
+                     (pos? payload-total)
+                     (seq payload-target-date-counts)
+                     (not= payload-total payload-target-date-total))
+            ["ThetaData payload verification target date counts do not sum to total"])
+          (when (and payload-verification
+                     (pos? payload-total)
+                     (seq payload-target-date-counts)
+                     (pos? payload-target-present-total)
+                     (not= payload-target-present-total payload-target-date-target-count))
+            ["ThetaData payload verification target date counts include non-target dates"])))
+        neutralization-row-issues (if (and neutralization (seq neutralization-features))
+                                    (neutralization-row-consistency-reasons
+                                     neutralization
+                                     neutralization-features)
+                                    [])
+        baseline-session-stamp (artifact-session-stamp baseline)
+        probe-session-stamp (artifact-session-stamp probe)
+        payload-verification-session-stamp (artifact-session-stamp payload-verification)
+        neutralization-session-stamp (artifact-session-stamp neutralization)
+        neutralization-baseline-csv (get neutralization "baseline_csv")
+        neutralization-usage-csv (get neutralization "usage_csv")
+        neutralization-artifact-issues
+        (vec
+         (concat
+          (when (nil? neutralization)
+            ["neutralization audit missing"])
+          (when (and neutralization
+                     (= "unavailable" (get neutralization "status")))
+            [(str "neutralization audit unavailable"
+                  (when-let [reason (get neutralization "unavailable_reason")]
+                    (str ": " reason)))])
+          (when (and neutralization (not (artifact-fresh? neutralization-json target-stamp)))
+            ["neutralization audit is not for target date"])
+          (when (and neutralization (not= target-stamp neutralization-session-stamp))
+            ["neutralization audit target_date/generated_at is not for target date"])
+          neutralization-row-issues
+          (when (and neutralization (not (seq (str (or neutralization-baseline-csv "")))))
+            ["neutralization audit missing baseline CSV provenance"])
+          (when (and neutralization (not (seq (str (or neutralization-usage-csv "")))))
+            ["neutralization audit missing model usage CSV provenance"])
+          (when (and neutralization neutralization-baseline-csv
+                     (not (artifact-fresh? neutralization-baseline-csv target-stamp)))
+            ["neutralization audit baseline CSV is not for target date"])
+          (when (and neutralization neutralization-usage-csv
+                     (not (artifact-fresh? neutralization-usage-csv target-stamp)))
+            ["neutralization audit model usage CSV is not for target date"])))
+        capture-check-artifact-issues
+        (vec
+         (concat
+          (when (and capture-check (not (artifact-fresh? capture-check-json target-stamp)))
+            ["capture-v2 sidecar check is not for target date"])
+          (when (and capture-check
+                     (not= target-stamp (artifact-session-stamp capture-check)))
+            ["capture-v2 sidecar check target_date/generated_at is not for target date"])
+          (when (and capture-check (not capture-check-ok?))
+            ["capture-v2 sidecar check did not pass"])
+          (when (and capture-check (not= 2 capture-check-version))
+            ["capture-v2 sidecar check did not validate capture_version 2"])
+          (when (and capture-check (< capture-check-unique-time-count min-capture-rows))
+            [(str "capture-v2 sidecar check unique timestamp rows below minimum "
+                  min-capture-rows)])
+          (when (and capture-check (pos? capture-check-duplicate-time-count))
+            ["capture-v2 sidecar check contains duplicate timestamp rows"])
+          (when (and capture-check (seq capture-check-issues))
+            ["capture-v2 sidecar check has issues"])
+          (when (and capture-check
+                     (< (int-value (get capture-check-sidecar-useful "bar_buffers_json" 0))
+                        min-capture-rows))
+            ["capture-v2 bar buffer sidecars below minimum useful rows"])
+          (when (and capture-check
+                     (< (int-value (get capture-check-sidecar-useful "grid_history_json" 0))
+                        min-capture-rows))
+            ["capture-v2 grid history sidecars below minimum useful rows"])
+          (when (and capture-check
+                     (< (int-value (get capture-check-sidecar-useful "option_chain_json" 0))
+                        min-capture-rows))
+            ["capture-v2 option chain sidecars below minimum useful rows"])
+          (when (and capture-check
+                     (< (int-value (get capture-check-sidecar-useful "option_surfaces_json" 0))
+                        min-capture-rows))
+            ["capture-v2 option surface sidecars below minimum useful rows"])
+          (when (and capture-check
+                     (not (pos? (int-value (get capture-check-sidecar-contracts "option_chain_json" 0)))))
+            ["capture-v2 option chain sidecars contain no contracts"])
+          (when (and capture-check
+                     (not (pos? (int-value (get capture-check-sidecar-contracts "option_surfaces_json" 0)))))
+            ["capture-v2 option surface sidecars contain no contracts"])
+          (when (and capture-check
+                     (pos? (sum-int-values (vals capture-check-sidecar-malformed))))
+            ["capture-v2 option sidecars contain malformed non-object contract entries"])
+          (when (and capture-check (seq capture-check-missing-option-surface-prefixes))
+            [(str "capture-v2 option surface sidecars missing required prefixes: "
+                  (str/join ", " capture-check-missing-option-surface-prefixes))])))
+        option-surface-sidecar-artifact-issues
+        (vec
+         (concat
+          (when (and option-surface-sidecar-check-required?
+                     (nil? option-surface-sidecar-check))
+            ["option-surface sidecar check missing"])
+          (when (and option-surface-sidecar-check
+                     (not (artifact-fresh? option-surface-sidecar-check-json target-stamp)))
+            ["option-surface sidecar check is not for target date"])
+          (when (and option-surface-sidecar-check
+                     (not= target-stamp (artifact-session-stamp option-surface-sidecar-check)))
+            ["option-surface sidecar check target_date/generated_at is not for target date"])
+          (when (and option-surface-sidecar-check (not option-surface-sidecar-ok?))
+            ["option-surface sidecar check did not pass"])
+          (when (and option-surface-sidecar-check
+                     (seq option-surface-sidecar-issues))
+            ["option-surface sidecar check has issues"])
+          (when (and option-surface-sidecar-check
+                     (seq option-surface-sidecar-missing-prefixes))
+            [(str "option-surface sidecar check missing required prefixes: "
+                  (str/join ", " option-surface-sidecar-missing-prefixes))])
+          (when (and option-surface-sidecar-check
+                     (pos? (sum-int-values (vals option-surface-sidecar-malformed-by-prefix))))
+            ["option-surface sidecar check found malformed contract entries"])))
+        legacy-search-artifact-issues
+        (vec
+         (concat
+          (when (and legacy-greek-search
+                     (not (artifact-fresh? legacy-greek-search-json target-stamp)))
+            ["legacy Greek formula search is not for target date"])
+          (when (and legacy-greek-search
+                     (not= target-stamp (artifact-session-stamp legacy-search-summary)))
+            ["legacy Greek formula search target_date/generated_at is not for target date"])))
+        greek-promotion-artifact-issues
+        (vec
+         (concat
+          (when (and greek-promotion
+                     (not (artifact-fresh? greek-promotion-json target-stamp)))
+            ["Greek reconstruction promotion gate is not for target date"])
+          (when (and greek-promotion
+                     (not= target-stamp (artifact-session-stamp greek-promotion-summary)))
+            ["Greek reconstruction promotion gate target_date/generated_at is not for target date"])
+          (when (and greek-promotion
+                     (not (json-list? greek-promotion-candidate-features)))
+            ["Greek reconstruction promotion gate candidate_features is not a list"])
+          (when (and greek-promotion
+                     (not greek-promotion-coverage-ok?))
+            ["Greek reconstruction promotion gate coverage is incomplete"])
+          (when (and greek-promotion
+                     (seq greek-promotion-coverage-reasons))
+            ["Greek reconstruction promotion gate has coverage reasons"])
+          (when (and greek-promotion
+                     (< greek-promotion-evaluated-count greek-promotion-min-evaluated-count))
+            [(str "Greek reconstruction promotion gate evaluated rows below minimum "
+                  greek-promotion-min-evaluated-count)])
+          (when (and greek-promotion
+                     (json-list? greek-promotion-candidate-features)
+                     (not= greek-promotion-candidate-count
+                           (count greek-promotion-candidate-features)))
+            ["Greek reconstruction promotion gate candidate_count does not match candidate_features"])))
+        historical-cohort-artifact-issues
+        (vec
+         (concat
+          (when (and historical-cohort
+                     (not (artifact-fresh? historical-cohort-json target-stamp)))
+            ["historical feature cohort is not for target date"])
+          (when (and historical-cohort
+                     (not= target-stamp (artifact-session-stamp historical-cohort)))
+            ["historical feature cohort target_date/generated_at is not for target date"])
+          (when (and historical-cohort (not historical-cohort-ok?))
+            [(str "historical feature cohort unavailable"
+                  (when historical-cohort-reason
+                    (str ": " historical-cohort-reason)))])))
+        raw-unlock-artifact-issues
+        (vec
+         (concat
+          (when (and raw-unlock
+                     (not (artifact-fresh? raw-unlock-json target-stamp)))
+            ["raw feature unlock audit is not for target date"])
+          (when (and raw-unlock
+                     (not= target-stamp (artifact-session-stamp raw-unlock)))
+            ["raw feature unlock audit target_date/generated_at is not for target date"])
+          (when (and raw-unlock (= "unavailable" raw-unlock-status))
+            [(str "raw feature unlock audit unavailable"
+                  (when raw-unlock-unavailable-reason
+                    (str ": " raw-unlock-unavailable-reason)))])))
+        v3-unlock-artifact-issues
+        (vec
+         (concat
+          (when (and v3-unlock
+                     (not (artifact-fresh? v3-unlock-json target-stamp)))
+            ["V3 grid unlock audit is not for target date"])
+          (when (and v3-unlock
+                     (not= target-stamp (artifact-session-stamp v3-unlock)))
+            ["V3 grid unlock audit target_date/generated_at is not for target date"])
+          (when (and v3-unlock (= "unavailable" v3-unlock-status))
+            [(str "V3 grid unlock audit unavailable"
+                  (when v3-unlock-unavailable-reason
+                    (str ": " v3-unlock-unavailable-reason)))])))
+        matched-parity-artifact-issues
+        (vec
+         (concat
+          (when (nil? matched-parity)
+            ["matched live-vs-historical feature parity report missing"])
+          (when matched-parity-unavailable?
+            [(str "matched live-vs-historical feature parity unavailable: "
+                  (get matched-parity "unavailable_reason"))])
+          (when (and matched-parity-available?
+                     (not (artifact-fresh? matched-parity-json target-stamp)))
+            ["matched live-vs-historical feature parity report is not for target date"])
+          (when (and matched-parity-available?
+                     (not= target-stamp matched-parity-session-stamp))
+            ["matched live-vs-historical feature parity target_date/generated_at is not for target date"])
+          (when (and matched-parity-available?
+                     (< matched-parity-matched-rows min-capture-rows))
+            [(str "matched live-vs-historical feature parity rows below minimum "
+                  min-capture-rows)])
+          (when (and matched-parity-available?
+                     (not= matched-parity-feature-count
+                           (count matched-parity-features)))
+            ["matched live-vs-historical feature parity feature_count does not match feature rows"])
+          (when (and matched-parity-available?
+                     (not= matched-parity-problem-count
+                           matched-parity-row-problem-count))
+            ["matched live-vs-historical feature parity problem_feature_count does not match feature rows"])
+          (when (and matched-parity-available?
+                     (not= matched-parity-status-counts
+                           matched-parity-row-status-counts))
+            ["matched live-vs-historical feature parity status_counts does not match feature rows"])
+          (when (and matched-parity-available?
+                     (not= matched-parity-active-problem-count
+                           matched-parity-row-active-problem-count))
+            ["matched live-vs-historical feature parity active_problem_count does not match feature rows"])
+          (when (and matched-parity-available?
+                     (not= matched-parity-neutralized-count
+                           matched-parity-row-neutralized-count))
+            ["matched live-vs-historical feature parity neutralized_count does not match feature rows"])
+          (when (and matched-parity-available?
+                     (not= matched-parity-neutralized-problem-count
+                           matched-parity-row-neutralized-problem-count))
+            ["matched live-vs-historical feature parity neutralized_problem_count does not match feature rows"])
+          (when (and matched-parity-available?
+                     (pos? matched-parity-problem-count))
+            ["matched live-vs-historical feature parity has problem features"])))
+        baseline-invariant-issues (if baseline
+                                    (vec (concat (baseline-capture-metadata-issues baseline target-stamp)
+                                                 (baseline-feature-issues baseline-payload baseline)))
+                                    [])
+        artifact-count-issues (vec
+                               (concat
+                                (when baseline
+                                  (baseline-count-issues baseline))
+                                (when probe
+                                  (probe-count-issues probe))
+                                (when payload-verification
+                                  (payload-verification-count-issues payload-verification))
+                                (when neutralization
+                                  (neutralization-count-issues neutralization))))
+        reasons-base (vec
+                      (concat
+                       (when (not min-capture-rows-valid?)
+                         ["min-capture-rows must be positive integer"])
+                       (when (nil? baseline)
+                         ["baseline artifact missing"])
+                       (when (and baseline (= "unavailable" (get baseline "status")))
+                         [(str "baseline artifact unavailable"
+                               (when-let [reason (get baseline "unavailable_reason")]
+                                 (str ": " reason)))])
+                       artifact-count-issues
+                       (when (and baseline (not (artifact-fresh? baseline-json target-stamp)))
+                         ["baseline artifact is not for target date"])
+                       (when (and baseline (not= target-stamp baseline-session-stamp))
+                         ["baseline target_date/generated_at is not for target date"])
+                       (when (and baseline (< capture-rows min-capture-rows))
+                         [(str "capture rows below minimum " min-capture-rows)])
+                       (when (and baseline (empty? capture-row-date-counts))
+                         ["baseline capture row dates missing"])
+                       (when (and baseline
+                                  (seq capture-row-date-counts)
+                                  (< target-capture-rows min-capture-rows))
+                         [(str "target-date capture rows below minimum " min-capture-rows)])
+                       (when (and baseline (pos? non-target-capture-rows))
+                         ["baseline includes non-target-date capture rows"])
+                       (when (and baseline (seq skipped))
+                         ["baseline skipped malformed capture files"])
+                       baseline-invariant-issues
+                       (when (nil? probe)
+                         ["ThetaData capability probe missing"])
+                       (when (and probe (not (artifact-fresh? probe-json target-stamp)))
+                         ["ThetaData capability probe is not for target date"])
+                       (when (and probe (not= target-stamp probe-session-stamp))
+                         ["ThetaData capability probe target_date/generated_at is not for target date"])
+                       (when (and probe (zero? usable-probes) (pos? terminal-failures))
+                         ["ThetaData terminal unreachable for all usable surfaces"])
+                       (when (and probe (zero? usable-probes) (pos? timeout-failures))
+                         ["ThetaData probe timed out without usable surfaces"])
+                       (when (and probe (zero? usable-probes))
+                         ["ThetaData probe found no usable surfaces"])
+                       (when (and probe (not (pos? total-probes)))
+                         ["ThetaData probe total must be positive"])
+                       (when (and probe (> usable-probes ok-probes))
+                         ["ThetaData probe usable count exceeds ok count"])
+                       (when (and probe (> ok-probes total-probes))
+                         ["ThetaData probe ok count exceeds total"])
+                       (when (and probe (> failed-probes total-probes))
+                         ["ThetaData probe failed count exceeds total"])
+                       (when (and probe (> (+ ok-probes failed-probes) total-probes))
+                         ["ThetaData probe ok plus failed counts exceed total"])
+                       (when (and probe (> payload-examples ok-probes))
+                         ["ThetaData probe payload_examples exceeds ok count"])
+                       probe-result-issues
+                       probe-result-shape-issues
+                       (when (nil? payload-verification)
+                         ["ThetaData payload verification missing"])
+                       (when (and payload-verification
+                                  (not (artifact-fresh? payload-verification-json target-stamp)))
+                         ["ThetaData payload verification is not for target date"])
+                       (when (and payload-verification
+                                  (not= target-stamp payload-verification-session-stamp))
+                         ["ThetaData payload verification target_date/generated_at is not for target date"])
+                       (when (and probe (zero? payload-examples))
+                         ["ThetaData probe saved no payload examples"])
+                       (when (and payload-verification
+                                  (pos? payload-examples)
+                                  (not= payload-examples payload-total))
+                         ["ThetaData payload verification count does not match probe saved examples"])
+                       (when (and payload-verification
+                                  (pos? payload-total)
+                                  (empty? payload-generated-date-counts))
+                         ["ThetaData payload verification missing example generated date counts"])
+                       payload-target-date-count-issues
+                       (when (and payload-verification
+                                  (pos? payload-total)
+                                  (empty? payload-path-date-counts))
+                         ["ThetaData payload verification missing example path date counts"])
+                       (when (and payload-verification
+                                  (pos? payload-total)
+                                  (not= payload-total payload-path-target-count))
+                         ["ThetaData payload verification includes examples outside target-date directory"])
+                       (when (and payload-verification
+                                  (pos? payload-total)
+                                  (not= payload-total payload-path-total))
+                         ["ThetaData payload verification path date counts do not sum to total"])
+                       (when (and payload-verification
+                                  (pos? payload-total)
+                                  (not= #{target-stamp} (set (keys payload-path-date-counts))))
+                         ["ThetaData payload verification path date counts include non-target dates"])
+                       (when (and payload-verification (zero? payload-checked))
+                         ["ThetaData payload verification checked no supported examples"])
+                       (when (and payload-verification (pos? payload-skipped))
+                         ["ThetaData payload verification skipped unsupported examples"])
+                       (when (and payload-verification
+                                  (pos? payload-examples)
+                                  (not= payload-examples payload-checked))
+                         ["ThetaData payload verification checked count does not match probe saved examples"])
+                       (when (and payload-verification (pos? payload-invalid))
+                         ["ThetaData payload verification found invalid examples"])
+                       (when (and payload-verification (not= true payload-valid?))
+                         ["ThetaData payload verification valid flag is not true"])
+                       (when (and payload-verification
+                                  (not= "ok" (get payload-verification "status")))
+                         ["ThetaData payload verification status is not ok"])
+                       payload-result-issues
+                       payload-probe-coverage-issues
+                       payload-verification-result-shape-issues
+                       neutralization-artifact-issues
+                       capture-check-artifact-issues
+                       option-surface-sidecar-artifact-issues
+                       legacy-search-artifact-issues
+                       greek-promotion-artifact-issues
+                       historical-cohort-artifact-issues
+                       raw-unlock-artifact-issues
+                       v3-unlock-artifact-issues))
+        reasons (vec (concat reasons-base matched-parity-artifact-issues))
+        watch-reasons (cond-> []
+                        (and probe (> failed-probes 0) (> usable-probes 0))
+                        (conj "ThetaData probe partially failed")
+
+                        (and neutralization (> (get neutralization "review_count" 0) 0))
+                        (conj "neutralization audit still has review-class features")
+
+                        (and neutralization (> (get neutralization "blocked_count" 0) 0))
+                        (conj "neutralization audit still has blocked features")
+
+                        (and capture-check (seq capture-check-warnings))
+                        (conj "capture-v2 sidecar check has warnings")
+
+                        (and baseline (pos? active-problem-count))
+                        (conj "baseline has active training-distribution warnings")
+
+                        (and legacy-greek-search (pos? legacy-formula-provenance-hits))
+                        (conj "legacy Greek formula search found legacy formula provenance contexts")
+
+                        (and greek-promotion (not greek-promotion-capture-ok?))
+                        (conj "Greek reconstruction promotion gate capture check is not clean")
+
+                        (and greek-promotion (seq greek-promotion-capture-reasons))
+                        (conj "Greek reconstruction promotion gate has capture reasons")
+
+                        (and greek-promotion (pos? greek-promotion-candidate-count))
+                        (conj "Greek reconstruction promotion gate produced candidate features"))
+        verdict (cond
+                  (seq reasons) "FAIL"
+                  (seq watch-reasons) "WATCH"
+                  :else "PASS")]
+    {"generated_at" (or generated-at
+                        (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                   "%Y-%m-%dT%H:%M:%SZ"))
+     "target_date" (str target-date)
+     "verdict" verdict
+     "reasons" (if (= verdict "FAIL") reasons watch-reasons)
+     "fail_reasons" reasons
+     "watch_reasons" watch-reasons
+     "inputs" {"baseline_json" (str baseline-json)
+               "probe_json" (str probe-json)
+               "neutralization_json" (str neutralization-json)
+               "payload_verification_json" (str payload-verification-json)
+               "capture_check_json" (str capture-check-json)
+               "option_surface_sidecar_check_json" (str option-surface-sidecar-check-json)
+               "legacy_greek_search_json" (str legacy-greek-search-json)
+               "greek_promotion_json" (str greek-promotion-json)
+               "historical_cohort_json" (str historical-cohort-json)
+               "raw_unlock_json" (str raw-unlock-json)
+               "v3_unlock_json" (str v3-unlock-json)
+               "matched_parity_json" (str matched-parity-json)}
+     "baseline" {"available" (boolean baseline)
+                 "status" (get baseline "status")
+                 "unavailable_reason" (get baseline "unavailable_reason")
+                 "rows" capture-rows
+                 "target_date_rows" target-capture-rows
+                 "capture_row_date_counts" capture-row-date-counts
+                 "min_rows" min-capture-rows
+                 "capture_file_count" (get baseline "capture_file_count" 0)
+                 "skipped_files" skipped
+                 "active_problem_count" active-problem-count}
+     "thetadata_probe" {"available" (boolean probe)
+                        "total" (get probe-summary "total" 0)
+                        "usable" usable-probes
+                        "failed" failed-probes
+                        "payload_examples" payload-examples
+                        "error_classes" probe-errors
+                        "result_counts" probe-result-counts}
+     "thetadata_payload_verification" {"available" (boolean payload-verification)
+                                       "status" (get payload-verification "status")
+                                       "total" payload-total
+                                       "checked" payload-checked
+                                       "skipped" payload-skipped
+                                       "invalid" payload-invalid
+                                       "valid" payload-valid?
+                                       "example_generated_date_counts" payload-generated-date-counts
+                                       "example_path_date_counts" payload-path-date-counts
+                                       "result_counts" payload-verification-result-counts}
+     "neutralization" {"available" (boolean neutralization)
+                       "candidate_now" (get neutralization "candidate_now" 0)
+                       "review_count" (get neutralization "review_count" 0)
+                       "blocked_count" (get neutralization "blocked_count" 0)
+                       "neutralized_features" (get neutralization "neutralized_features" 0)}
+     "capture_v2_sidecars" {"available" (boolean capture-check)
+                            "ok" capture-check-ok?
+                            "status" capture-check-status
+                            "capture_version" capture-check-version
+                            "row_count" capture-check-row-count
+                            "unique_time_count" capture-check-unique-time-count
+                            "duplicate_time_count" capture-check-duplicate-time-count
+                            "sidecar_useful_rows" capture-check-sidecar-useful
+                            "sidecar_total_contracts" capture-check-sidecar-contracts
+                            "sidecar_malformed_contracts" capture-check-sidecar-malformed
+                            "required_option_surface_prefixes" (vec (sort required-option-surface-prefixes))
+                            "option_surface_prefixes" (vec (sort capture-check-option-surface-prefixes))
+                            "missing_option_surface_prefixes" capture-check-missing-option-surface-prefixes
+                            "issue_count" (count capture-check-issues)
+                            "warning_count" (count capture-check-warnings)}
+     "option_surface_sidecar" {"available" (boolean option-surface-sidecar-check)
+                               "required" option-surface-sidecar-check-required?
+                               "ok" option-surface-sidecar-ok?
+                               "row_count" option-surface-sidecar-row-count
+                               "useful_row_count" option-surface-sidecar-useful-row-count
+                               "required_prefixes" (vec (sort option-surface-sidecar-required-prefixes))
+                               "prefixes_present" (vec (sort option-surface-sidecar-prefixes))
+                               "missing_prefixes" option-surface-sidecar-missing-prefixes
+                               "contracts_by_prefix" option-surface-sidecar-contracts-by-prefix
+                               "malformed_by_prefix" option-surface-sidecar-malformed-by-prefix
+                               "issue_count" (count option-surface-sidecar-issues)}
+     "legacy_greek_formula_search" {"available" (boolean legacy-greek-search)
+                                    "candidate_formula_hits" legacy-candidate-formula-hits
+                                    "legacy_formula_provenance_hits" legacy-formula-provenance-hits
+                                    "candidate_reconstruction_hits" legacy-candidate-reconstruction-hits
+                                    "manifest_reference_count" legacy-manifest-ref-count
+                                    "manifest_impl_classes_missing" legacy-manifest-missing}
+     "greek_reconstruction_promotion" {"available" (boolean greek-promotion)
+                                       "capture_ok" greek-promotion-capture-ok?
+                                       "coverage_ok" greek-promotion-coverage-ok?
+                                       "evaluated_count" greek-promotion-evaluated-count
+                                       "min_evaluated_count" greek-promotion-min-evaluated-count
+                                       "candidate_count" greek-promotion-candidate-count
+                                       "capture_reasons" greek-promotion-capture-reasons
+                                       "coverage_reasons" greek-promotion-coverage-reasons}
+     "historical_feature_cohort" {"available" (boolean historical-cohort)
+                                  "status" (get historical-cohort "status")
+                                  "ok" historical-cohort-ok?
+                                  "reason" historical-cohort-reason
+                                  "error_class" historical-cohort-error-class
+                                  "target_date" (get historical-cohort "target_date")
+                                  "alignment" (get historical-cohort "alignment")
+                                  "matched_rows" (get historical-cohort "matched_rows" 0)
+                                  "features" (get historical-cohort "features" 0)}
+     "raw_feature_unlock" {"available" (boolean raw-unlock)
+                           "status" raw-unlock-status
+                           "unavailable_reason" raw-unlock-unavailable-reason
+                           "capture_rows" (get raw-unlock "capture_rows" 0)
+                           "replayed_rows" (get raw-unlock "replayed_rows" 0)
+                           "neutralized_total" (get raw-unlock "neutralized_total" 0)
+                           "supported_neutralized" (get raw-unlock "supported_neutralized" 0)
+                           "unsupported_neutralized" (get raw-unlock "unsupported_neutralized" 0)
+                           "candidate_count" (get raw-unlock "candidate_count" 0)
+                           "guarded_greek_reconstruction_count" (get raw-unlock "guarded_greek_reconstruction_count" 0)
+                           "source_counts" (get raw-unlock "source_counts" {})
+                           "status_counts" (get raw-unlock "status_counts" {})}
+     "v3_grid_unlock" {"available" (boolean v3-unlock)
+                       "status" v3-unlock-status
+                       "unavailable_reason" v3-unlock-unavailable-reason
+                       "neutralized_v3_features" (get v3-unlock "neutralized_v3_features" 0)
+                       "recomputed_candidate_now" (get v3-unlock "recomputed_candidate_now" 0)
+                       "recomputed_non_degenerate" (get v3-unlock "recomputed_non_degenerate" 0)
+                       "prediction_delta_status" (get v3-unlock "prediction_delta_status")
+                       "prediction_delta_p95_abs_seed_z" (get v3-unlock "prediction_delta_p95_abs_seed_z")
+                       "prediction_delta_max_abs_seed_z" (get v3-unlock "prediction_delta_max_abs_seed_z")
+                       "status_counts" (get v3-unlock "status_counts" {})}
+     "matched_feature_parity" {"available" (boolean matched-parity-available?)
+                               "status" (if matched-parity-unavailable?
+                                          "unavailable"
+                                          (if matched-parity-available? "available" "missing"))
+                               "unavailable_reason" (when matched-parity-unavailable?
+                                                      (get matched-parity "unavailable_reason"))
+                               "matched_rows" matched-parity-matched-rows
+                               "feature_count" matched-parity-feature-count
+                               "problem_feature_count" matched-parity-problem-count
+                               "active_problem_count" matched-parity-active-problem-count
+                               "neutralized_count" matched-parity-neutralized-count
+                               "neutralized_problem_count" matched-parity-neutralized-problem-count
+                               "status_counts" matched-parity-status-counts
+                               "row_status_counts" matched-parity-row-status-counts
+                               "max_abs_deviation" (get matched-parity "max_abs_deviation")
+                               "min_correlation" (get matched-parity "min_correlation")
+                               "matched_start" (get matched-parity "matched_start")
+                               "matched_end" (get matched-parity "matched_end")}}))
+
+(defn evidence-readiness-markdown
+  [payload]
+  (let [input-rows [["Artifact" "Path"]
+                    ["Baseline" (get-in payload ["inputs" "baseline_json"])]
+                    ["ThetaData Probe" (get-in payload ["inputs" "probe_json"])]
+                    ["ThetaData Payload Verification" (get-in payload ["inputs" "payload_verification_json"])]
+                    ["Neutralization" (get-in payload ["inputs" "neutralization_json"])]
+                    ["Capture V2 Sidecar Check" (get-in payload ["inputs" "capture_check_json"])]
+                    ["Option Surface Sidecar Check" (get-in payload ["inputs" "option_surface_sidecar_check_json"])]
+                    ["Legacy Greek Formula Search" (get-in payload ["inputs" "legacy_greek_search_json"])]
+                    ["Greek Reconstruction Promotion" (get-in payload ["inputs" "greek_promotion_json"])]
+                    ["Matched Feature Parity" (get-in payload ["inputs" "matched_parity_json"])]]
+        metric-rows [["Area" "Metric" "Value"]
+                     ["Baseline" "Rows" (str (get-in payload ["baseline" "rows"]))]
+                     ["Baseline" "Skipped Files" (str (count (get-in payload ["baseline" "skipped_files"] {})))]
+                     ["ThetaData" "Usable Probes" (str (get-in payload ["thetadata_probe" "usable"]))]
+                     ["ThetaData" "Failed Probes" (str (get-in payload ["thetadata_probe" "failed"]))]
+                     ["ThetaData" "Payload Examples" (str (get-in payload ["thetadata_probe" "payload_examples"]))]
+                     ["Payload Verification" "Checked" (str (get-in payload ["thetadata_payload_verification" "checked"]))]
+                     ["Payload Verification" "Invalid" (str (get-in payload ["thetadata_payload_verification" "invalid"]))]
+                     ["Neutralization" "Candidate Now" (str (get-in payload ["neutralization" "candidate_now"]))]
+                     ["Neutralization" "Review" (str (get-in payload ["neutralization" "review_count"]))]
+                     ["Neutralization" "Blocked" (str (get-in payload ["neutralization" "blocked_count"]))]
+                     ["Capture V2" "OK" (str (get-in payload ["capture_v2_sidecars" "ok"]))]
+                     ["Capture V2" "Rows" (str (get-in payload ["capture_v2_sidecars" "row_count"]))]
+                     ["Capture V2" "Issues" (str (get-in payload ["capture_v2_sidecars" "issue_count"]))]
+                     ["Option Surface Sidecar" "OK" (str (get-in payload ["option_surface_sidecar" "ok"]))]
+                     ["Option Surface Sidecar" "Rows" (str (get-in payload ["option_surface_sidecar" "row_count"]))]
+                     ["Option Surface Sidecar" "Useful Rows" (str (get-in payload ["option_surface_sidecar" "useful_row_count"]))]
+                     ["Option Surface Sidecar" "Issues" (str (get-in payload ["option_surface_sidecar" "issue_count"]))]
+                     ["Matched Parity" "Rows" (str (get-in payload ["matched_feature_parity" "matched_rows"]))]
+                     ["Matched Parity" "Problems" (str (get-in payload ["matched_feature_parity" "problem_feature_count"]))]
+                     ["Matched Parity" "Max Abs Dev" (str (get-in payload ["matched_feature_parity" "max_abs_deviation"]))]
+                     ["Legacy Greeks" "Legacy Formula Provenance Hits" (str (get-in payload ["legacy_greek_formula_search" "legacy_formula_provenance_hits"]))]
+                     ["Legacy Greeks" "Candidate Reconstruction Hits" (str (get-in payload ["legacy_greek_formula_search" "candidate_reconstruction_hits"]))]
+                     ["Legacy Greeks" "Missing Impl Classes" (str (get-in payload ["legacy_greek_formula_search" "manifest_impl_classes_missing"]))]
+                     ["Greek Promotion" "Evaluated" (str (get-in payload ["greek_reconstruction_promotion" "evaluated_count"]))]
+                     ["Greek Promotion" "Coverage OK" (str (get-in payload ["greek_reconstruction_promotion" "coverage_ok"]))]
+                     ["Greek Promotion" "Candidates" (str (get-in payload ["greek_reconstruction_promotion" "candidate_count"]))]]
+        reason-rows (vec (concat [["Reason"]]
+                                 (map vector (get payload "reasons"))))]
+    (str "# Market Evidence Readiness\n\n"
+         "Generated: `" (get payload "generated_at") "`\n\n"
+         "Target date: `" (get payload "target_date") "`\n\n"
+         "Verdict: `" (get payload "verdict") "`\n\n"
+         "## Inputs\n\n"
+         (md-table input-rows) "\n\n"
+         "## Metrics\n\n"
+         (md-table metric-rows) "\n\n"
+         "## Reasons\n\n"
+         (md-table reason-rows) "\n\n"
+         "## Policy\n\n"
+         "- `FAIL`: missing/stale artifacts, too few capture rows, malformed capture files, missing or failing matched live-vs-historical feature parity, invalid/missing ThetaData payload verification, failed capture-v2 sidecar checks, incomplete Greek reconstruction coverage, or no usable ThetaData evidence due terminal/timeouts.\n"
+         "- `WATCH`: artifacts are fresh enough to inspect, but ThetaData/neutralization evidence is incomplete, capture sidecars have warnings, legacy Greek formula search found exact formula-provenance contexts, or Greek reconstruction promotion produced review-required candidates.\n"
+         "- `PASS`: fresh baseline/probe/neutralization/capture-v2/matched-parity artifacts with enough rows, no malformed captures, usable probe evidence, no matched feature problems, and no blocked/review neutralization residue.\n")))
+
+(defn write-evidence-readiness!
+  [{:keys [out-dir analysis-dir generated-at] :as opts}]
+  (let [out-dir (or out-dir analysis-dir default-analysis-dir)
+        payload (evidence-readiness opts)
+        stamp (compact-date (get payload "target_date"))
+        out-base (os.path/join (str out-dir) (str "market_evidence_readiness_" stamp))
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")]
+    (os/makedirs (str out-dir) ** :exist_ok true)
+    (spit json-path (json/dumps (->jsonable payload) ** :indent 2 :sort_keys true))
+    (spit md-path (evidence-readiness-markdown payload))
+    {:payload payload
+     :json-path json-path
+     :markdown-path md-path}))
+
+(defn account-from-bundle
+  [bundle]
+  (let [name (os.path/basename (str bundle))
+        prefix "live_model_"
+        suffix "_multihead_corrected"]
+    (if (and (str/starts-with? name prefix)
+             (str/ends-with? name suffix))
+      (subs name (count prefix) (- (count name) (count suffix)))
+      name)))
+
+(defn load-baseline-map
+  [path]
+  (into {}
+        (map (fn [row]
+               (let [row-map (into {} (map vec (.items row)))]
+                 [(get row-map "feature")
+                  (assoc row-map
+                         "neutralized" (parse-bool (get row-map "neutralized"))
+                         "active_problem" (parse-bool (get row-map "active_problem")))]))
+             (read-csv path))))
+
+(defn xgb-trees
+  [path]
+  (let [trees (get-in (read-json path)
+                      ["learner" "gradient_booster" "model" "trees"])]
+    (when (nil? trees)
+      (throw (ex-info "XGBoost model JSON missing trees payload"
+                      {:error/code :error/xgb-missing-trees
+                       :path (str path)})))
+    trees))
+
+(defn- xgb-nonnegative-int
+  [x]
+  (try
+    (let [f (float x)
+          i (int x)]
+      (when (and (math/isfinite f)
+                 (not (< i 0))
+                 (= f (float i)))
+        i))
+    (catch python/Exception _ nil)))
+
+(defn- xgb-finite-float
+  [x]
+  (try
+    (let [f (float x)]
+      (when (math/isfinite f)
+        f))
+    (catch python/Exception _ nil)))
+
+(defn- xgb-nonnegative-float
+  [x]
+  (let [f (xgb-finite-float x)]
+    (when (and (some? f) (not (< f 0.0)))
+      f)))
+
+(defn split-nodes
+  [tree]
+  (let [left (get tree "left_children")
+        right (get tree "right_children")
+        split-indices (get tree "split_indices")
+        loss-changes (get tree "loss_changes")
+        sum-hessian (get tree "sum_hessian")
+        split-conditions (get tree "split_conditions")
+        arrays {"left_children" left
+                "right_children" right
+                "split_indices" split-indices
+                "loss_changes" loss-changes
+                "sum_hessian" sum-hessian
+                "split_conditions" split-conditions}]
+    (doseq [[k v] arrays]
+      (when (nil? v)
+        (throw (ex-info (str "XGBoost tree missing " k)
+                        {:error/code :error/xgb-tree-shape
+                         :missing k}))))
+    (let [n (count split-indices)]
+      (doseq [[k v] arrays]
+        (when (not= n (count v))
+          (throw (ex-info (str "XGBoost tree array length mismatch for " k)
+                          {:error/code :error/xgb-tree-shape
+                           :field k
+                           :expected n
+                           :actual (count v)}))))
+      (loop [node-id 0
+             out []]
+        (if (operator/ge node-id n)
+          out
+          (recur (inc node-id)
+                 (if (and (operator/eq -1 (nth left node-id))
+                          (operator/eq -1 (nth right node-id)))
+                   out
+                   (let [feature-index (xgb-nonnegative-int (nth split-indices node-id))
+                         gain (xgb-nonnegative-float (nth loss-changes node-id))
+                         cover (xgb-nonnegative-float (nth sum-hessian node-id))
+                         threshold (xgb-finite-float (nth split-conditions node-id))]
+                     (when (nil? feature-index)
+                       (throw (ex-info "XGBoost split has invalid feature index"
+                                       {:error/code :error/xgb-split-value
+                                        :node-id node-id
+                                        :field "split_indices"
+                                        :value (nth split-indices node-id)})))
+                     (when (nil? gain)
+                       (throw (ex-info "XGBoost split has invalid gain"
+                                       {:error/code :error/xgb-split-value
+                                        :node-id node-id
+                                        :field "loss_changes"
+                                        :value (nth loss-changes node-id)})))
+                     (when (nil? cover)
+                       (throw (ex-info "XGBoost split has invalid cover"
+                                       {:error/code :error/xgb-split-value
+                                        :node-id node-id
+                                        :field "sum_hessian"
+                                        :value (nth sum-hessian node-id)})))
+                     (when (nil? threshold)
+                       (throw (ex-info "XGBoost split has invalid threshold"
+                                       {:error/code :error/xgb-split-value
+                                        :node-id node-id
+                                        :field "split_conditions"
+                                        :value (nth split-conditions node-id)})))
+                     (conj out {"node_id" node-id
+                                "feature_index" feature-index
+                                "gain" gain
+                                "cover" cover
+                                "threshold" threshold})))))))))
+
+(defn- update-feature-usage
+  [stats split]
+  (let [current (or stats {"split_count" 0
+                           "total_gain" 0.0
+                           "total_cover" 0.0
+                           "min_threshold" nil
+                           "max_threshold" nil})
+        threshold (get split "threshold")
+        threshold (when-not (nil? threshold) (float threshold))
+        min-threshold (get current "min_threshold")
+        max-threshold (get current "max_threshold")]
+    {"split_count" (operator/add (get current "split_count") 1)
+     "total_gain" (operator/add (get current "total_gain") (get split "gain"))
+     "total_cover" (operator/add (get current "total_cover") (get split "cover"))
+     "min_threshold" (cond
+                       (nil? threshold) min-threshold
+                       (nil? min-threshold) threshold
+                       (operator/lt threshold min-threshold) threshold
+                       :else min-threshold)
+     "max_threshold" (cond
+                       (nil? threshold) max-threshold
+                       (nil? max-threshold) threshold
+                       (operator/gt threshold max-threshold) threshold
+                       :else max-threshold)}))
+
+(defn audit-model-head
+  [account bundle head baseline]
+  (let [names (vec (read-json (os.path/join (str bundle) "feature_names.json")))
+        config (read-json (os.path/join (str bundle) "config.json"))
+        n-tabular (int (get config "n_tabular_features"))
+        head-file (get xgb-head-files head)]
+    (when (nil? head-file)
+      (throw (ex-info "Unknown XGBoost head"
+                      {:error/code :error/xgb-unknown-head
+                       :bundle (str bundle)
+                       :head head
+                       :known-heads (vec (keys xgb-head-files))})))
+    (when (not= n-tabular (count names))
+      (throw (ex-info (str bundle ": n_tabular=" n-tabular
+                           " feature_names=" (count names))
+                      {:error/code :error/model-feature-count-mismatch
+                       :bundle (str bundle)
+                       :n-tabular n-tabular
+                       :feature-names (count names)})))
+    (let [feature-stats (python/dict)
+          totals (python/dict {"splits" 0
+                               "tabular_splits" 0
+                               "embedding_splits" 0
+                               "active_problem_splits" 0
+                               "total_gain" 0.0
+                               "tabular_gain" 0.0
+                               "embedding_gain" 0.0
+                               "active_problem_gain" 0.0
+                               "total_cover" 0.0
+                               "active_problem_cover" 0.0})
+          path (os.path/join (str bundle) head-file)]
+      (let [trees (xgb-trees path)
+            tree-count (count trees)]
+        (loop [tree-idx 0]
+          (when (operator/lt tree-idx tree-count)
+            (let [splits (split-nodes (nth trees tree-idx))
+                  split-count (count splits)]
+              (loop [split-idx 0]
+                (when (operator/lt split-idx split-count)
+                  (let [split (nth splits split-idx)
+                        idx (get split "feature_index")
+                        gain (float (get split "gain"))
+                        cover (float (get split "cover"))
+                        _ (when (operator/lt idx 0)
+                            (throw (ex-info "XGBoost split has negative feature index"
+                                            {:error/code :error/xgb-negative-feature-index
+                                             :bundle (str bundle)
+                                             :head head
+                                             :tree-index tree-idx
+                                             :split-index split-idx
+                                             :feature-index idx})))
+                        tabular? (operator/lt idx n-tabular)
+                        feature (if tabular?
+                                  (nth names idx)
+                                  (operator/add
+                                   "embedding_"
+                                   (python/format (operator/sub idx n-tabular) "02d")))
+                        base (if tabular? (get baseline feature {}) {})
+                        active-problem? (boolean (get base "active_problem"))
+                        split-total-key (if tabular? "tabular_splits" "embedding_splits")
+                        gain-total-key (if tabular? "tabular_gain" "embedding_gain")]
+                    (.__setitem__ feature-stats idx
+                                  (update-feature-usage (.get feature-stats idx) split))
+                    (.__setitem__ totals "splits" (operator/add (.get totals "splits") 1))
+                    (.__setitem__ totals split-total-key
+                                  (operator/add (.get totals split-total-key) 1))
+                    (.__setitem__ totals "total_gain"
+                                  (operator/add (float (.get totals "total_gain")) gain))
+                    (.__setitem__ totals gain-total-key
+                                  (operator/add (float (.get totals gain-total-key)) gain))
+                    (.__setitem__ totals "total_cover"
+                                  (operator/add (float (.get totals "total_cover")) cover))
+                    (when active-problem?
+                      (.__setitem__ totals "active_problem_splits"
+                                    (operator/add (.get totals "active_problem_splits") 1))
+                      (.__setitem__ totals "active_problem_gain"
+                                    (operator/add (float (.get totals "active_problem_gain"))
+                                                  gain))
+                      (.__setitem__ totals "active_problem_cover"
+                                    (operator/add (float (.get totals "active_problem_cover"))
+                                                  cover)))
+                    (recur (inc split-idx)))))
+              (recur (inc tree-idx))))))
+      (let [rows (vec
+                  (map (fn [[idx stats]]
+                         (let [tabular? (operator/lt idx n-tabular)
+                               feature (if tabular?
+                                         (nth names idx)
+                                         (operator/add
+                                          "embedding_"
+                                          (python/format (operator/sub idx n-tabular) "02d")))
+                               base (if tabular? (get baseline feature {}) {})
+                               split-count (int (get stats "split_count"))
+                               total-gain (float (get stats "total_gain"))]
+                           {"account" account
+                            "head" head
+                            "feature_index" idx
+                            "feature" feature
+                            "feature_kind" (if tabular? "tabular" "embedding")
+                            "family" (get base "family" "embedding")
+                            "status" (get base "status" "")
+                            "neutralized" (boolean (get base "neutralized" false))
+                            "active_problem" (boolean (get base "active_problem" false))
+                            "split_count" split-count
+                            "total_gain" total-gain
+                            "avg_gain" (if (operator/gt split-count 0)
+                                         (/ total-gain split-count)
+                                         0.0)
+                            "total_cover" (float (get stats "total_cover"))
+                            "min_threshold" (get stats "min_threshold")
+                            "max_threshold" (get stats "max_threshold")}))
+                       (python/sorted (.items feature-stats))))
+            t totals
+            summary {"account" account
+                     "bundle" (str bundle)
+                     "head" head
+                     "splits" (int (get t "splits"))
+                     "tabular_splits" (int (get t "tabular_splits"))
+                     "embedding_splits" (int (get t "embedding_splits"))
+                     "active_problem_splits" (int (get t "active_problem_splits"))
+                     "total_gain" (float (get t "total_gain"))
+                     "tabular_gain" (float (get t "tabular_gain"))
+                     "embedding_gain" (float (get t "embedding_gain"))
+                     "active_problem_gain" (float (get t "active_problem_gain"))
+                     "active_problem_split_pct" (if (operator/gt (get t "splits") 0)
+                                                  (/ (float (get t "active_problem_splits"))
+                                                     (float (get t "splits")))
+                                                  0.0)
+                     "active_problem_gain_pct" (if (operator/gt (get t "total_gain") 0.0)
+                                                 (/ (float (get t "active_problem_gain"))
+                                                    (float (get t "total_gain")))
+                                                 0.0)
+                     "total_cover" (float (get t "total_cover"))
+                     "active_problem_cover" (float (get t "active_problem_cover"))}]
+        [rows summary]))))
+
+(defn model-usage-audit
+  [{:keys [baseline-csv bundles]}]
+  (when (nil? baseline-csv)
+    (throw (ex-info "baseline CSV is required for model usage audit"
+                    {:error/code :error/missing-baseline-csv})))
+  (let [baseline (load-baseline-map baseline-csv)
+        all-rows (atom [])
+        summaries (atom [])]
+    (doseq [bundle bundles]
+      (let [account (account-from-bundle bundle)]
+        (doseq [head (keys xgb-head-files)]
+          (let [[rows summary] (audit-model-head account bundle head baseline)]
+            (swap! all-rows into rows)
+            (swap! summaries conj summary)))))
+    {:summaries @summaries
+     :rows @all-rows}))
+
+(defn write-model-usage-csv!
+  [path rows]
+  (os/makedirs (os.path/dirname (str path)) ** :exist_ok true)
+  (with-open [fh (open (str path) ** :mode "w" :newline "")]
+    (let [writer (csv/DictWriter fh ** :fieldnames (python/list model-usage-csv-columns))]
+      (.writeheader writer)
+      (doseq [row rows]
+        (.writerow writer row))))
+  path)
+
+(defn model-usage-markdown
+  [generated-at baseline-path summaries rows]
+  (let [summary-rows (vec
+                      (concat [["Account" "Head" "Splits" "Tabular" "Embed"
+                                "Active Problem" "Problem Split %" "Problem Gain %"]]
+                              (map (fn [s]
+                                     [(get s "account")
+                                      (get s "head")
+                                      (str (get s "splits"))
+                                      (str (get s "tabular_splits"))
+                                      (str (get s "embedding_splits"))
+                                      (str (get s "active_problem_splits"))
+                                      (str (python/format (* 100.0
+                                                             (get s "active_problem_split_pct"))
+                                                          ".2f")
+                                           "%")
+                                      (str (python/format (* 100.0
+                                                             (get s "active_problem_gain_pct"))
+                                                          ".2f")
+                                           "%")])
+                                   summaries)))
+        active-rows (vec
+                     (concat [["Account" "Head" "Feature" "Status" "Splits" "Gain" "Cover"]]
+                             (map (fn [r]
+                                    [(get r "account")
+                                     (get r "head")
+                                     (get r "feature")
+                                     (get r "status")
+                                     (str (get r "split_count"))
+                                     (python/format (float (get r "total_gain")) ".3f")
+                                     (python/format (float (get r "total_cover")) ".1f")])
+                                  (take 60
+                                        (sort-by #(- (float (get % "total_gain")))
+                                                 (filter #(and (get % "active_problem")
+                                                               (operator/gt (get % "split_count") 0))
+                                                         rows))))))
+        top-rows (vec
+                  (concat [["Account" "Head" "Feature" "Status" "Splits" "Gain"]]
+                          (map (fn [r]
+                                 [(get r "account")
+                                  (get r "head")
+                                  (get r "feature")
+                                  (get r "status")
+                                  (str (get r "split_count"))
+                                  (python/format (float (get r "total_gain")) ".3f")])
+                               (take 40
+                                     (sort-by #(- (float (get % "total_gain")))
+                                              (filter #(and (= "tabular"
+                                                               (get % "feature_kind"))
+                                                            (operator/gt (get % "split_count") 0))
+                                                      rows))))))]
+    (str "# Live Feature Model Usage Audit\n\n"
+         "Generated: `" generated-at "`\n\n"
+         "Baseline CSV: `" baseline-path "`\n\n"
+         "## Purpose\n\n"
+         "This report checks whether live feature parity issues are model-material. It\n"
+         "counts XGBoost split usage and split gain for features marked\n"
+         "`active_problem=true` in the live feature parity baseline.\n\n"
+         "Feature index contract:\n\n"
+         "- `f0..f917`: standardized tabular features from `feature_names.json`.\n"
+         "- `f918..`: encoder embedding coordinates.\n\n"
+         "## Head Summary\n\n"
+         (md-table summary-rows) "\n\n"
+         "## Active Problem Features Used By Models\n\n"
+         (md-table active-rows) "\n\n"
+         "## Top Tabular Features By Gain\n\n"
+         (md-table top-rows) "\n\n"
+         "## Interpretation\n\n"
+         "- If active problem split/gain share is near zero, the mismatch is lower\n"
+         "  severity for current predictions, though still worth tracking.\n"
+         "- If active problem split/gain share is material, classify each feature as\n"
+         "  expected market-level shift versus computation/source bug.\n"
+         "- Do not mutate production bundles during market hours. Produce a proposed\n"
+         "  neutralization patch first, then validate predictions offline.\n")))
+
+(defn write-model-usage-audit!
+  [{:keys [baseline-csv bundles out-dir generated-at target-date]}]
+  (let [analysis-dir (or out-dir default-analysis-dir)
+        generated-at (or generated-at
+                         (.strftime (datetime.datetime/now datetime.timezone/utc)
+                                    "%Y-%m-%dT%H:%M:%SZ"))
+        stamp (compact-date (or target-date generated-at))
+        out-base (os.path/join (str analysis-dir) (str "live_feature_model_usage_" stamp))
+        csv-path (str out-base ".csv")
+        json-path (str out-base ".json")
+        md-path (str out-base ".md")]
+    (clear-artifacts! [csv-path json-path md-path])
+    (let [baseline-csv (or baseline-csv
+                           (latest analysis-dir "live_feature_parity_baseline_*.csv"))
+          {:keys [summaries rows]} (model-usage-audit
+                                    {:baseline-csv baseline-csv
+                                     :bundles bundles})]
+      (os/makedirs (str analysis-dir) ** :exist_ok true)
+      (write-model-usage-csv! csv-path rows)
+      (spit json-path (json/dumps (->jsonable {"generated_at" generated-at
+                                               "target_date" (or target-date (subs generated-at 0 10))
+                                               "baseline_csv" (str baseline-csv)
+                                               "summaries" summaries
+                                               "features" rows})
+                                  ** :indent 2 :sort_keys true))
+      (spit md-path (model-usage-markdown generated-at (str baseline-csv)
+                                          summaries rows))
+      {:summaries summaries
+       :rows rows
+       :csv-path csv-path
+       :json-path json-path
+       :markdown-path md-path})))

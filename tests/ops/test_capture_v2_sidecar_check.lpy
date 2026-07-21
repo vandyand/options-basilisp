@@ -1,0 +1,692 @@
+(ns ops.test-capture-v2-sidecar-check
+  (:import json numpy os pathlib subprocess sys tempfile)
+  (:require [basilisp.test :refer [deftest is]]
+            [clojure.string :as str]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def script (.joinpath root "scripts" "capture_v2_sidecar_check.lpy"))
+(def runtime-preflight (.joinpath root "scripts" "capture_v2_runtime_preflight.lpy"))
+(def prepare-session (.joinpath root "scripts" "prepare_capture_v2_session.lpy"))
+(def basilisp-bin (or (os.environ/get "BASILISP_BIN")
+                      (str (.joinpath root ".venv/bin/basilisp"))))
+
+(defn jsonable [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads [s] (json/loads s))
+(defn read-json [p] (loads (.read_text p)))
+(defn path [parent child] (.joinpath parent child))
+
+(defn obj-array [xs]
+  (numpy/array (python/list xs) ** :dtype object))
+
+(defn sidecar-contract [strike right bid ask expiration]
+  {"strike" strike "right" right "bid" bid "ask" ask "expiration" expiration})
+
+(defn capture-payload
+  [& {:keys [version rows include-sidecars]
+      :or {version 2 rows 3 include-sidecars true}}]
+  (let [base {"capture_version" (numpy/array (python/list [version]))
+              "times" (numpy/array (python/list (for [i (range rows)]
+                                                  (str "2026-07-05T10:0" i ":00"))))
+              "spy" (numpy/arange rows ** :dtype numpy/float32)
+              "grids" (numpy/zeros (python/tuple [rows 6 21 8]) ** :dtype numpy/float32)
+              "chestnut" (numpy/zeros (python/tuple [rows 918]) ** :dtype numpy/float32)
+              "lynx" (numpy/zeros (python/tuple [rows 918]) ** :dtype numpy/float32)
+              "moose" (numpy/zeros (python/tuple [rows 918]) ** :dtype numpy/float32)}]
+    (if-not include-sidecars
+      base
+      (merge base
+             {"bar_buffers_json"
+              (obj-array (for [i (range rows)]
+                           (dumps {"SPY" [{"close" (+ 600.0 i)}]})))
+              "option_chain_json"
+              (obj-array (for [i (range rows)]
+                           (dumps {"contracts" [(sidecar-contract (+ 600.0 i) "CALL" 1.0 1.1 "2026-07-10")]})))
+              "option_surfaces_json"
+              (obj-array (for [i (range rows)]
+                           (dumps {"SPX" (dumps {"contracts" [(sidecar-contract (+ 6000.0 i) "CALL" 10.0 10.5 "2026-07-10")]})
+                                   "SPXW" (dumps {"contracts" [(sidecar-contract (+ 6000.0 i) "PUT" 10.0 10.5 "2026-07-10")]})
+                                   "VIX" (dumps {"contracts" [(sidecar-contract (+ 20.0 i) "CALL" 1.0 1.2 "2026-07-15")]})
+                                   "VIXW" (dumps {"contracts" [(sidecar-contract (+ 20.0 i) "PUT" 1.0 1.2 "2026-07-15")]})})))
+              "grid_history_json"
+              (obj-array (for [_ (range rows)]
+                           (dumps (.tolist (numpy/zeros (python/tuple [1 6 21 8]) ** :dtype numpy/float32)))))}))))
+
+(defn save-payload! [p payload]
+  (.mkdir (.-parent p) ** :parents true :exist_ok true)
+  (cond
+    (and (contains? payload "grid_history_json")
+         (contains? payload "option_surface_status_json"))
+    (numpy/savez_compressed
+     p
+     ** :capture_version (get payload "capture_version")
+        :times (get payload "times")
+        :spy (get payload "spy")
+        :grids (get payload "grids")
+        :chestnut (get payload "chestnut")
+        :lynx (get payload "lynx")
+        :moose (get payload "moose")
+        :bar_buffers_json (get payload "bar_buffers_json")
+        :option_chain_json (get payload "option_chain_json")
+        :option_surfaces_json (get payload "option_surfaces_json")
+        :option_surface_status_json (get payload "option_surface_status_json")
+        :grid_history_json (get payload "grid_history_json"))
+
+    (contains? payload "grid_history_json")
+    (numpy/savez_compressed
+     p
+     ** :capture_version (get payload "capture_version")
+        :times (get payload "times")
+        :spy (get payload "spy")
+        :grids (get payload "grids")
+        :chestnut (get payload "chestnut")
+        :lynx (get payload "lynx")
+        :moose (get payload "moose")
+        :bar_buffers_json (get payload "bar_buffers_json")
+        :option_chain_json (get payload "option_chain_json")
+        :option_surfaces_json (get payload "option_surfaces_json")
+        :grid_history_json (get payload "grid_history_json"))
+
+    (contains? payload "bar_buffers_json")
+    (numpy/savez_compressed
+     p
+     ** :capture_version (get payload "capture_version")
+        :times (get payload "times")
+        :spy (get payload "spy")
+        :grids (get payload "grids")
+        :chestnut (get payload "chestnut")
+        :lynx (get payload "lynx")
+        :moose (get payload "moose")
+        :bar_buffers_json (get payload "bar_buffers_json")
+        :option_chain_json (get payload "option_chain_json")
+        :option_surfaces_json (get payload "option_surfaces_json"))
+
+    :else
+    (numpy/savez_compressed
+     p
+     ** :capture_version (get payload "capture_version")
+        :times (get payload "times")
+        :spy (get payload "spy")
+        :grids (get payload "grids")
+        :chestnut (get payload "chestnut")
+        :lynx (get payload "lynx")
+        :moose (get payload "moose"))))
+
+(defn write-capture
+  [p & {:keys [version rows include-sidecars]
+        :or {version 2 rows 3 include-sidecars true}}]
+  (save-payload! p (capture-payload :version version :rows rows :include-sidecars include-sidecars)))
+
+(defn load-payload [p]
+  (let [data (numpy/load p ** :allow_pickle true)]
+    (into {} (for [k (.-files data)] [k (aget data k)]))))
+
+(defn run-script
+  ([script-path args] (run-script script-path args {} root))
+  ([script-path args env cwd]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script-path) "--"] args))
+   ** :cwd (str cwd)
+      :env (doto (.copy os/environ)
+             (.update env))
+      :text true
+      :capture_output true
+      :check false)))
+
+(defn run-check [& args] (run-script script args))
+(defn run-preflight
+  ([args] (run-preflight args {}))
+  ([args env] (run-script runtime-preflight args env root)))
+(defn run-prepare [& args] (run-script prepare-session args))
+
+(defn stdout-json [result] (loads (.-stdout result)))
+
+(deftest capture-v2-sidecar-check-accepts-valid-capture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture (path tmp "live_features_20260705.npz")
+          out (path tmp "check.json")]
+      (write-capture capture)
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "3"
+                              "--out-json" (str out))
+            payload (read-json out)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "ok")))
+        (is (= 2 (.get payload "capture_version")))
+        (is (= 3 (.get payload "row_count")))
+        (is (= 3 (.get payload "valid_time_count")))
+        (is (= 0 (.get payload "blank_time_count")))
+        (is (= 0 (.get payload "malformed_time_count")))
+        (is (= 3 (.get (.get payload "sidecar_nonblank_rows") "bar_buffers_json")))
+        (is (= 3 (.get (.get payload "sidecar_useful_rows") "bar_buffers_json")))
+        (is (= 3 (.get (.get payload "sidecar_nonblank_rows") "grid_history_json")))
+        (is (= 3 (.get (.get payload "sidecar_useful_rows") "grid_history_json")))
+        (is (= 3 (.get (.get payload "sidecar_useful_rows") "option_chain_json")))
+        (is (= 3 (.get (.get payload "sidecar_useful_rows") "option_surfaces_json")))
+        (is (= 3 (.get (.get payload "sidecar_total_contracts") "option_chain_json")))
+        (is (= 12 (.get (.get payload "sidecar_total_contracts") "option_surfaces_json")))
+        (is (= 0 (.get (.get payload "sidecar_malformed_contracts") "option_chain_json")))
+        (is (= 0 (.get (.get payload "sidecar_malformed_contracts") "option_surfaces_json")))
+        (is (= {"bar_buffers_json" "object"
+                "grid_history_json" "object"
+                "option_chain_json" "object"
+                "option_surfaces_json" "object"}
+               (into {} (.items (.get payload "sidecar_dtypes")))))
+        (is (= ["SPX" "SPXW" "VIX" "VIXW"] (vec (.get payload "option_surface_prefixes"))))
+        (is (= {"SPX" 3 "SPXW" 3 "VIX" 3 "VIXW" 3}
+               (into {} (.items (.get payload "option_surface_contracts_by_prefix")))))
+        (is (= {"SPX" 0 "SPXW" 0 "VIX" 0 "VIXW" 0}
+               (into {} (.items (.get payload "option_surface_malformed_contracts_by_prefix")))))))))
+
+(deftest capture-v2-sidecar-check-can-allow-externalized-option-surfaces
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture (path tmp "live_features_20260705.npz")
+          payload (capture-payload :rows 3)
+          out (path tmp "check.json")]
+      (save-payload! capture (assoc payload "option_surfaces_json"
+                                    (obj-array (repeat 3 "{}"))))
+      (let [strict (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "3")
+            relaxed (run-check "--capture" (str capture)
+                               "--target-date" "2026-07-05"
+                               "--min-rows" "3"
+                               "--allow-missing-option-surfaces"
+                               "--out-json" (str out))
+            relaxed-payload (read-json out)]
+        (is (= 1 (.-returncode strict)))
+        (is (= 0 (.-returncode relaxed)) (.-stderr relaxed))
+        (is (= true (.get relaxed-payload "ok")))
+        (is (= true (.get relaxed-payload "allow_missing_option_surfaces")))
+        (is (= 0 (.get (.get relaxed-payload "sidecar_useful_rows") "option_surfaces_json")))
+        (is (= [] (vec (.get relaxed-payload "issues"))))))))
+
+(deftest capture-v2-runtime-preflight-accepts-repo-wiring
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          out (path tmp "preflight.json")
+          capture-dir (path tmp "captures")]
+      (.mkdir capture-dir)
+      (let [result (run-preflight ["--repo-root" (str root)
+                                   "--capture-dir" (str capture-dir)
+                                   "--out-json" (str out)])
+            payload (read-json out)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "ok")))
+        (doseq [k ["capture_version_2" "option_surfaces_json" "option_surface_status_json"
+                   "grid_history_json" "sidecar_every_default_one"]]
+          (is (= true (.get (.get payload "bridge_markers") k))))
+        (doseq [k ["capture_dir_env" "default_spx_surface" "default_spxw_surface"
+                   "default_vix_surface" "default_vixw_surface"
+                   "extra_surface_refresh_prime" "extra_surface_refresh_live"
+                   "extra_surface_ingest" "extra_surface_status"]]
+          (is (= true (.get (.get payload "launcher_markers") k))))
+        (is (= 1 (.get (.get payload "sidecar_every") "effective")))
+        (is (= [] (vec (.get payload "target_capture_structural_reasons"))))))))
+
+(deftest capture-v2-runtime-preflight-rejects-missing-markers
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          repo (path tmp "repo")
+          bridge (path repo "components/bridge.steve-v2/src/stevetrading/bridge")
+          launcher (path repo "scripts")]
+      (.mkdir bridge ** :parents true)
+      (.mkdir launcher)
+      (.write_text (path bridge "steve_v2.lpy") "(ns broken)\n")
+      (.write_text (path launcher "launch_steve_six.lpy") "(println \"no capture\")\n")
+      (let [result (run-preflight ["--repo-root" (str repo) "--capture-dir" (str (path tmp "captures"))])
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (str/includes? issues "bridge is missing capture-v2 markers"))
+        (is (str/includes? issues "launcher is missing capture-v2 markers"))))))
+
+(deftest capture-v2-runtime-preflight-warns-on-sparse-sidecar-cadence
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")]
+      (.mkdir capture-dir)
+      (let [result (run-preflight ["--repo-root" (str root)
+                                   "--capture-dir" (str capture-dir)
+                                   "--target-date" "2026-07-05"]
+                                  {"STEVE_CAPTURE_SIDECAR_EVERY" "15"})
+            payload (stdout-json result)
+            warnings (str/join "\n" (.get payload "warnings"))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= true (.get payload "ok")))
+        (is (= 15 (.get (.get payload "sidecar_every") "effective")))
+        (is (= false (.get (.get payload "sidecar_every") "parity_evidence_complete")))
+        (is (= true (.get (.get payload "sidecar_every") "live_safe_sparse")))
+        (is (str/includes? warnings "full per-row parity sidecars require setting it to 1"))))))
+
+(deftest capture-v2-runtime-preflight-rejects-invalid-sidecar-cadence
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")]
+      (.mkdir capture-dir)
+      (let [result (run-preflight ["--repo-root" (str root)
+                                   "--capture-dir" (str capture-dir)
+                                   "--target-date" "2026-07-05"]
+                                  {"STEVE_CAPTURE_SIDECAR_EVERY" "0"})
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (= false (.get (.get payload "sidecar_every") "ok")))
+        (is (str/includes? issues "STEVE_CAPTURE_SIDECAR_EVERY must be a positive integer"))))))
+
+(defn replace-capture! [capture f]
+  (let [payload (f (load-payload capture))]
+    (save-payload! capture payload)
+    payload))
+
+(deftest capture-v2-runtime-preflight-rejects-structurally-bad-target-capture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")]
+      (write-capture capture :rows 1)
+      (replace-capture! capture
+                        #(assoc % "option_chain_json"
+                                (numpy/array (python/list [(dumps {"contracts" ["{:strike 600.0, :right \"CALL\", :bid 1.0, :ask 1.1, :expiration \"2026-07-10\"}"]})]))))
+      (let [result (run-preflight ["--repo-root" (str root)
+                                   "--capture-dir" (str capture-dir)
+                                   "--target-date" "2026-07-05"])
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))
+            reasons (str/join "\n" (.get payload "target_capture_structural_reasons"))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? issues "target-date capture has structural defects requiring quarantine"))
+        (is (str/includes? reasons "non-object contract entries"))))))
+
+(deftest capture-v2-runtime-preflight-rejects-malformed-target-capture-timestamps
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")]
+      (write-capture capture :rows 2)
+      (replace-capture! capture #(assoc % "times" (numpy/array (python/list ["" "not-a-time"]))))
+      (let [result (run-preflight ["--repo-root" (str root)
+                                   "--capture-dir" (str capture-dir)
+                                   "--target-date" "2026-07-05"])
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))
+            reasons (str/join "\n" (.get payload "target_capture_structural_reasons"))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? issues "target-date capture has structural defects requiring quarantine"))
+        (is (str/includes? reasons "blank timestamp rows"))
+        (is (str/includes? reasons "malformed timestamp rows"))))))
+
+(deftest prepare-capture-v2-session-leaves-valid-partial-capture-in-place
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")
+          out (path tmp "prepare.json")]
+      (write-capture capture :rows 1)
+      (let [result (run-prepare "--capture-dir" (str capture-dir)
+                                "--target-date" "2026-07-05"
+                                "--out-json" (str out))
+            payload (read-json out)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "none" (.get payload "action")))
+        (is (= [] (vec (.get payload "structural_reasons"))))
+        (is (.exists capture))))))
+
+(deftest prepare-capture-v2-session-quarantines-malformed-contract-capture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")
+          out (path tmp "prepare.json")]
+      (write-capture capture :rows 1)
+      (replace-capture! capture #(assoc % "option_chain_json"
+                                        (numpy/array (python/list [(dumps {"contracts" ["{:strike 600.0, :right \"CALL\", :bid 1.0, :ask 1.1, :expiration \"2026-07-10\"}"]})]))))
+      (let [result (run-prepare "--capture-dir" (str capture-dir)
+                                "--target-date" "2026-07-05"
+                                "--out-json" (str out))
+            payload (read-json out)
+            quarantine-path (pathlib/Path (.get payload "quarantine_path"))
+            reasons (str/join "\n" (.get payload "structural_reasons"))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "quarantined" (.get payload "action")))
+        (is (str/includes? reasons "non-object contract entries"))
+        (is (not (.exists capture)))
+        (is (.exists quarantine-path))
+        (is (= (path capture-dir "quarantine") (.-parent quarantine-path)))))))
+
+(deftest prepare-capture-v2-session-quarantines-fixed-width-unicode-sidecars
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")
+          out (path tmp "prepare.json")]
+      (write-capture capture :rows 1)
+      (replace-capture! capture #(assoc % "option_chain_json" (numpy/array (python/list (vec (get % "option_chain_json"))))))
+      (let [result (run-prepare "--capture-dir" (str capture-dir)
+                                "--target-date" "2026-07-05"
+                                "--out-json" (str out))
+            payload (read-json out)
+            quarantine-path (pathlib/Path (.get payload "quarantine_path"))
+            reasons (str/join "\n" (.get payload "structural_reasons"))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "quarantined" (.get payload "action")))
+        (is (str/includes? reasons "sidecar dtype must be object"))
+        (is (not (.exists capture)))
+        (is (.exists quarantine-path))))))
+
+(deftest prepare-capture-v2-session-quarantines-malformed-timestamp-capture
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")
+          out (path tmp "prepare.json")]
+      (write-capture capture :rows 2)
+      (replace-capture! capture #(assoc % "times" (numpy/array (python/list ["" "not-a-time"]))))
+      (let [result (run-prepare "--capture-dir" (str capture-dir)
+                                "--target-date" "2026-07-05"
+                                "--out-json" (str out))
+            payload (read-json out)
+            quarantine-path (pathlib/Path (.get payload "quarantine_path"))
+            reasons (str/join "\n" (.get payload "structural_reasons"))]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "quarantined" (.get payload "action")))
+        (is (str/includes? reasons "blank timestamp rows"))
+        (is (str/includes? reasons "malformed timestamp rows"))
+        (is (not (.exists capture)))
+        (is (.exists quarantine-path))))))
+
+(deftest prepare-capture-v2-session-does-not-quarantine-only-too-few-rows
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          capture-dir (path tmp "captures")
+          capture (path capture-dir "live_features_20260705.npz")]
+      (write-capture capture :rows 0)
+      (let [result (run-prepare "--capture-dir" (str capture-dir)
+                                "--target-date" "2026-07-05")
+            payload (stdout-json result)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= "none" (.get payload "action")))
+        (is (.exists capture))))))
+
+(deftest capture-v2-sidecar-check-rejects-v1-capture-without-sidecars
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :version 1 :include-sidecars false)
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (str/includes? issues "capture_version must be 2"))
+        (is (str/includes? issues "missing required arrays"))))))
+
+(deftest capture-v2-sidecar-check-requires-grid-history-sidecar
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 2)
+      (replace-capture! capture #(dissoc % "grid_history_json"))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (str/includes? issues "missing required arrays"))
+        (is (str/includes? issues "grid_history_json"))))))
+
+(deftest capture-v2-sidecar-check-rejects-unusable-grid-history-sidecar
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 2)
+      (replace-capture! capture #(assoc % "grid_history_json" (numpy/array (python/list ["[]" (dumps [[1 2 3]])]))))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 2 (.get (.get payload "sidecar_nonblank_rows") "grid_history_json")))
+        (is (= 0 (.get (.get payload "sidecar_useful_rows") "grid_history_json")))
+        (is (str/includes? issues "grid_history_json has no rows with full greeks-grid history"))))))
+
+(deftest capture-v2-sidecar-check-rejects-sparse-useful-sidecar-rows
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 3)
+      (replace-capture! capture
+                        #(assoc % "bar_buffers_json" (numpy/array (python/list [(aget (get % "bar_buffers_json") 0) "" ""]))
+                                  "grid_history_json" (numpy/array (python/list [(aget (get % "grid_history_json") 0) "[]" "[]"]))))
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "3")
+            payload (stdout-json result)
+            issues (set (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 3 (.get payload "row_count")))
+        (is (= 3 (.get payload "unique_time_count")))
+        (is (= 1 (.get (.get payload "sidecar_useful_rows") "bar_buffers_json")))
+        (is (= 1 (.get (.get payload "sidecar_useful_rows") "grid_history_json")))
+        (is (contains? issues "bar_buffers_json has 1 useful rows; expected at least 3"))
+        (is (contains? issues "grid_history_json has 1 useful rows; expected at least 3"))))))
+
+(deftest capture-v2-sidecar-check-row-limit-uses-latest-sidecar-rows
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 4)
+      (replace-capture! capture
+                        #(assoc % "bar_buffers_json"
+                                (numpy/array (python/list ["" "" (aget (get % "bar_buffers_json") 2) (aget (get % "bar_buffers_json") 3)])
+                                             ** :dtype object)
+                                "option_chain_json"
+                                (numpy/array (python/list ["" "" (aget (get % "option_chain_json") 2) (aget (get % "option_chain_json") 3)])
+                                             ** :dtype object)
+                                "grid_history_json"
+                                (numpy/array (python/list ["[]" "[]" (aget (get % "grid_history_json") 2) (aget (get % "grid_history_json") 3)])
+                                             ** :dtype object)))
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "2"
+                              "--sidecar-row-limit" "2")
+            payload (stdout-json result)]
+        (is (= 0 (.-returncode result)) (.-stderr result))
+        (is (= 4 (.get payload "row_count")))
+        (is (= 2 (.get (.get payload "sidecar_useful_rows") "bar_buffers_json")))
+        (is (= 2 (.get (.get payload "sidecar_useful_rows") "option_chain_json")))
+        (is (= 2 (.get (.get payload "sidecar_useful_rows") "grid_history_json")))))))
+
+(deftest capture-v2-sidecar-check-rejects-too-few-rows-and-bad-sidecar-json
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 1)
+      (replace-capture! capture #(assoc % "bar_buffers_json" (numpy/array (python/list ["not-json"]))))
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "2")
+            payload (stdout-json result)
+            issues (set (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (contains? issues "capture has 1 unique timestamp rows; expected at least 2"))
+        (is (contains? issues "bar_buffers_json has 1 invalid JSON rows"))))))
+
+(deftest capture-v2-sidecar-check-rejects-duplicate-timestamps
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 3)
+      (replace-capture! capture #(assoc % "times" (numpy/array (python/list ["2026-07-05T10:00:00" "2026-07-05T10:01:00" "2026-07-05T10:01:00"]))))
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "3")
+            payload (stdout-json result)
+            issues (set (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 3 (.get payload "row_count")))
+        (is (= 2 (.get payload "unique_time_count")))
+        (is (= 1 (.get payload "duplicate_time_count")))
+        (is (= ["2026-07-05T10:01:00Z"] (vec (.get payload "duplicate_times"))))
+        (is (contains? issues "capture has 2 unique timestamp rows; expected at least 3"))))))
+
+(deftest capture-v2-sidecar-check-rejects-blank-and-malformed-timestamps
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 3)
+      (replace-capture! capture #(assoc % "times" (numpy/array (python/list ["" "not-a-time" "#inst \"2026-07-05T10:02:00+00:00\""]))))
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "2")
+            payload (stdout-json result)
+            issues (set (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 3 (.get payload "row_count")))
+        (is (= 1 (.get payload "valid_time_count")))
+        (is (= 1 (.get payload "unique_time_count")))
+        (is (= 1 (.get payload "blank_time_count")))
+        (is (= 1 (.get payload "malformed_time_count")))
+        (is (= ["not-a-time"] (vec (.get payload "malformed_times"))))
+        (is (contains? issues "capture has 1 blank timestamp rows"))
+        (is (contains? issues "capture has 1 malformed timestamp rows"))
+        (is (contains? issues "capture has 1 unique timestamp rows; expected at least 2"))))))
+
+(deftest capture-v2-sidecar-check-normalizes-duplicate-timestamp-encodings
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 3)
+      (replace-capture! capture #(assoc % "times" (numpy/array (python/list ["#inst \"2026-07-05T10:01:00+00:00\"" "2026-07-05T10:01:00Z" "2026-07-05T10:02:00-00:00"]))))
+      (let [result (run-check "--capture" (str capture)
+                              "--target-date" "2026-07-05"
+                              "--min-rows" "3")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 3 (.get payload "valid_time_count")))
+        (is (= 2 (.get payload "unique_time_count")))
+        (is (= 1 (.get payload "duplicate_time_count")))
+        (is (= ["2026-07-05T10:01:00Z"] (vec (.get payload "duplicate_times"))))
+        (is (str/includes? issues "duplicate timestamp rows"))))))
+
+(deftest capture-v2-sidecar-check-rejects-duplicate-sidecar-json-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 1)
+      (replace-capture! capture #(assoc % "option_chain_json" (numpy/array (python/list ["{\"contracts\": [], \"contracts\": [{\"strike\": 600.0}]}" ]))))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (set (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (contains? issues "option_chain_json has 1 invalid JSON rows"))))))
+
+(deftest capture-v2-sidecar-check-rejects-duplicate-nested-surface-json-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")
+          nested "{\"contracts\": [], \"contracts\": [{\"strike\": 6000.0}]}"]
+      (write-capture capture :rows 1)
+      (replace-capture! capture #(assoc % "option_surfaces_json" (numpy/array (python/list [(dumps {"SPXW" nested})]))))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (set (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get payload "ok")))
+        (is (contains? issues "option_surfaces_json has 1 invalid JSON rows"))))))
+
+(deftest capture-v2-sidecar-check-does-not-count-stringified-contract-rows
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")
+          malformed-surface (dumps {"contracts" ["{:strike 6000.0, :right \"CALL\", :bid 10.0, :ask 10.5, :expiration \"2026-07-10\"}"]})]
+      (write-capture capture :rows 1)
+      (replace-capture! capture
+                        #(assoc % "option_chain_json"
+                                (numpy/array (python/list [(dumps {"contracts" ["{:strike 600.0, :right \"CALL\", :bid 1.0, :ask 1.1, :expiration \"2026-07-10\"}"]})]))
+                                  "option_surfaces_json"
+                                  (numpy/array (python/list [(dumps {"SPX" malformed-surface})]))))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 0 (.get (.get payload "sidecar_total_contracts") "option_chain_json")))
+        (is (= 0 (.get (.get payload "sidecar_total_contracts") "option_surfaces_json")))
+        (is (= 1 (.get (.get payload "sidecar_malformed_contracts") "option_chain_json")))
+        (is (= 1 (.get (.get payload "sidecar_malformed_contracts") "option_surfaces_json")))
+        (is (= {"SPX" 0} (into {} (.items (.get payload "option_surface_contracts_by_prefix")))))
+        (is (= {"SPX" 1} (into {} (.items (.get payload "option_surface_malformed_contracts_by_prefix")))))
+        (is (= 0 (.get (.get payload "sidecar_useful_rows") "option_surfaces_json")))
+        (is (str/includes? issues "option_chain_json has 1 non-object contract entries"))
+        (is (str/includes? issues "option_surfaces_json has 1 non-object contract entries"))
+        (is (str/includes? issues "option_surfaces_json has no rows with option contracts"))))))
+
+(deftest capture-v2-sidecar-check-warns-when-required-surface-prefixes-are-missing
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 2)
+      (replace-capture! capture
+                        #(assoc % "option_surfaces_json"
+                                (obj-array (for [i (range 2)]
+                                             (dumps {"SPXW" (dumps {"contracts" [(sidecar-contract (+ 6000.0 i) "PUT" 10.0 10.5 "2026-07-10")]})})))))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= ["SPXW"] (vec (.get payload "option_surface_prefixes"))))
+        (is (= {"SPXW" 2} (into {} (.items (.get payload "option_surface_contracts_by_prefix")))))
+        (is (str/includes? issues "missing required surface prefixes with contracts: SPX, VIX, VIXW"))))))
+
+(deftest capture-v2-sidecar-check-can-allow-missing-for-preflight
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")
+          result (run-check "--capture" (str capture)
+                            "--target-date" "2026-07-05"
+                            "--allow-missing")
+          payload (stdout-json result)]
+      (is (= 0 (.-returncode result)))
+      (is (= true (.get payload "ok")))
+      (is (= "missing" (.get payload "status")))
+      (is (str/includes? (str/join "\n" (.get payload "warnings")) "capture file is not present yet")))))
+
+(deftest capture-v2-sidecar-check-warns-when-option-sidecars-have-no-contracts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 2)
+      (replace-capture! capture
+                        #(assoc % "option_chain_json" (obj-array (for [_ (range 2)] (dumps {"contracts" []})))
+                                  "option_surfaces_json" (obj-array (for [_ (range 2)] (dumps {})))))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            issues (str/join "\n" (.get payload "issues"))]
+        (is (= 1 (.-returncode result)))
+        (is (= 0 (.get (.get payload "sidecar_useful_rows") "option_chain_json")))
+        (is (= 0 (.get (.get payload "sidecar_useful_rows") "option_surfaces_json")))
+        (is (str/includes? issues "SPY option-chain unlocks will not verify"))
+        (is (str/includes? issues "SPX/VIX/VIXW option unlocks will not verify"))))))
+
+(deftest capture-v2-sidecar-check-reports-option-surface-refresh-status
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [capture (path (pathlib/Path tmp-dir) "live_features_20260705.npz")]
+      (write-capture capture :rows 1)
+      (replace-capture! capture
+                        #(assoc % "option_surfaces_json" (obj-array [(dumps {})])
+                                  "option_surface_status_json"
+                                  (obj-array [(dumps {"SPX" (dumps {"ok" false
+                                                                    "reason" "fetch-error"
+                                                                    "error" "connection reset"
+                                                                    "contracts" 0})
+                                                      "VIXW" (dumps {"ok" false
+                                                                     "reason" "missing-underlying"
+                                                                     "contracts" 0})})])))
+      (let [result (run-check "--capture" (str capture) "--target-date" "2026-07-05")
+            payload (stdout-json result)
+            statuses (into {} (.items (.get payload "option_surface_status_by_prefix")))
+            spx (.get statuses "SPX")
+            vixw (.get statuses "VIXW")
+            warnings (str/join "\n" (.get payload "warnings"))]
+        (is (= 1 (.-returncode result)))
+        (is (= false (.get spx "ok")))
+        (is (= "fetch-error" (.get spx "reason")))
+        (is (= "connection reset" (.get spx "error")))
+        (is (= false (.get vixw "ok")))
+        (is (= "missing-underlying" (.get vixw "reason")))
+        (is (not (str/includes? warnings "option_surface_status_json is missing")))))))

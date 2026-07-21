@@ -1,0 +1,157 @@
+(ns feature-parity.test-legacy-greek-formula-search-cli
+  (:import json os pathlib subprocess tempfile)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def root (pathlib/Path (os/getcwd)))
+(def basilisp-bin
+  (str (or (os.environ/get "BASILISP_BIN")
+           (os.path/join (str root) ".venv/bin/basilisp"))))
+(def script (pathlib/Path (os.path/join (str root) "scripts/legacy_greek_formula_search.lpy")))
+
+(defn jsonable
+  [x]
+  (cond
+    (map? x) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) x))
+    (or (vector? x) (seq? x)) (python/list (map jsonable x))
+    :else x))
+
+(defn dumps [x] (json/dumps (jsonable x)))
+(defn loads-path [path] (json/loads (.read_text path)))
+(defn path [parent name] (.joinpath parent name))
+(defn write-json [path payload] (.write_text path (dumps payload)))
+
+(defn run-search
+  [& args]
+  (subprocess/run
+   (python/list (concat [basilisp-bin "run" (str script) "--"] args))
+   ** :cwd (str root)
+      :text true
+      :capture_output true
+      :check false))
+
+(defn output-payload
+  [tmp label]
+  (loads-path (path (path tmp "out") (str "legacy_greek_formula_search_" label ".json"))))
+
+(defn classifications
+  [payload]
+  (set (map (fn [hit] (.get hit "classification")) (.get payload "hits"))))
+
+(defn manifest-row
+  [payload name]
+  (first (filter (fn [row] (= name (.get row "name")))
+                 (.get payload "manifest_references"))))
+
+(deftest legacy-greek-formula-search-classifies-formula-and-artifacts
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          search-root (path tmp "src")]
+      (write-json blocked {"suffixes" [{"suffix" "dollar_delta"}]
+                           "features" [{"feature" "SPY_greeks_dollar_delta"}]})
+      (.mkdir search-root)
+      (.write_text (path search-root "features.py")
+                   "def build(row):\n    SPY_greeks_dollar_delta = row['delta'] * row['underlying'] * 100\n    return SPY_greeks_dollar_delta\n")
+      (.write_text (path search-root "report.json") "{\"feature_names\": [\"SPY_greeks_dollar_delta\"]}\n")
+      (let [result (run-search "--blocked-json" (str blocked)
+                               "--root" (str search-root)
+                               "--out-dir" (str (path tmp "out"))
+                               "--label" "test"
+                               "--target-date" "2026-07-06")
+            summary (json/loads (first (.split (.-stdout result) "\nwrote " 1)))
+            payload (output-payload tmp "test")
+            classes (classifications payload)]
+        (is (= 0 (.-returncode result)))
+        (is (= 1 (.get summary "blocked_suffix_count")))
+        (is (= 1 (.get summary "blocked_feature_count")))
+        (is (>= (.get summary "candidate_formula_hits") 1))
+        (is (= 1 (.get summary "suffixes_with_hits")))
+        (is (contains? classes "candidate_formula_context"))
+        (is (contains? classes "artifact_or_report_reference"))))))
+
+(deftest legacy-greek-formula-search-rejects-duplicate-blocked-json-keys
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          search-root (path tmp "src")]
+      (.write_text blocked "{\n  \"features\": [{\"feature\": \"SPY_greeks_dollar_delta\"}],\n  \"features\": [{\"feature\": \"SPY_greeks_lambda_mean\"}]\n}\n")
+      (.mkdir search-root)
+      (let [result (run-search "--blocked-json" (str blocked)
+                               "--root" (str search-root)
+                               "--out-dir" (str (path tmp "out"))
+                               "--label" "duplicate_blocked")]
+        (is (not= 0 (.-returncode result)))
+        (is (not= -1 (.find (.-stderr result) "duplicate JSON key: features")))
+        (is (false? (.exists (path (path tmp "out") "legacy_greek_formula_search_duplicate_blocked.json"))))))))
+
+(deftest legacy-greek-formula-search-checks-manifest-implementation-classes
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          archive (path tmp "archive")
+          src (path archive "src")
+          pipeline (path archive "pipeline_data")]
+      (write-json blocked {"suffixes" [{"suffix" "dollar_delta"} {"suffix" "dollar_vega"}]
+                           "features" [{"feature" "SPY_greeks_dollar_delta"}
+                                       {"feature" "SPY_greeks_dollar_vega"}]})
+      (.mkdir src ** :parents true)
+      (.mkdir pipeline ** :parents true)
+      (.write_text (path pipeline "feature_manifest.yaml")
+                   "- name: SPY_greeks_dollar_delta\n  version: 1.0.0\n  module: src.features\n  impl_class: SpyGreeksDollarDelta\n- name: SPY_greeks_dollar_vega\n  version: 1.0.0\n  module: src.features\n  impl_class: SpyGreeksDollarVega\n")
+      (.write_text (path src "features.py") "class SpyGreeksDollarDelta:\n    pass\n")
+      (let [result (run-search "--blocked-json" (str blocked)
+                               "--root" (str archive)
+                               "--out-dir" (str (path tmp "out"))
+                               "--label" "manifest")
+            payload (output-payload tmp "manifest")
+            summary (.get payload "summary")
+            delta (manifest-row payload "SPY_greeks_dollar_delta")
+            vega (manifest-row payload "SPY_greeks_dollar_vega")]
+        (is (= 0 (.-returncode result)))
+        (is (= 2 (.get summary "manifest_reference_count")))
+        (is (= 1 (.get summary "manifest_impl_classes_found")))
+        (is (= 1 (.get summary "manifest_impl_classes_missing")))
+        (is (= true (.get delta "impl_class_found")))
+        (is (= false (.get vega "impl_class_found")))))))
+
+(deftest legacy-greek-formula-search-separates-reconstruction-context
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          search-root (path tmp "src")]
+      (write-json blocked {"suffixes" [{"suffix" "dollar_delta"}]
+                           "features" [{"feature" "SPY_greeks_dollar_delta"}]})
+      (.mkdir search-root)
+      (.write_text (path search-root "raw_feature_unlock_audit.py")
+                   "def feature(suffix):\n    return 'SPY_greeks_' + suffix\nfeatures[feature(\"dollar_delta\")] = delta_mean * underlying * multiplier\n")
+      (let [result (run-search "--blocked-json" (str blocked)
+                               "--root" (str search-root)
+                               "--out-dir" (str (path tmp "out"))
+                               "--label" "recon")
+            payload (output-payload tmp "recon")
+            summary (.get payload "summary")
+            classes (classifications payload)]
+        (is (= 0 (.-returncode result)))
+        (is (= 0 (.get summary "candidate_formula_hits")))
+        (is (= 0 (.get summary "legacy_formula_provenance_hits")))
+        (is (= 1 (.get summary "candidate_reconstruction_hits")))
+        (is (= 1 (count classes)))
+        (is (contains? classes "candidate_reconstruction_context"))))))
+
+(deftest legacy-greek-formula-search-can-derive-suffixes-from-features
+  (with-open [tmp-dir (tempfile/TemporaryDirectory)]
+    (let [tmp (pathlib/Path tmp-dir)
+          blocked (path tmp "blocked.json")
+          search-root (path tmp "src")]
+      (write-json blocked {"features" [{"feature" "SPY_greeks_lambda_mean"}]})
+      (.mkdir search-root)
+      (.write_text (path search-root "notes.md") "lambda_mean appears in an old report only\n")
+      (let [result (run-search "--blocked-json" (str blocked)
+                               "--root" (str search-root)
+                               "--out-dir" (str (path tmp "out"))
+                               "--label" "test")
+            payload (output-payload tmp "test")
+            summary (.get payload "summary")]
+        (is (= 0 (.-returncode result)))
+        (is (= 1 (.get summary "blocked_suffix_count")))
+        (is (= 1 (.get (.get summary "suffix_hit_counts") "lambda_mean")))))))
