@@ -80,6 +80,17 @@ if ! PYTHONPATH="$PYPATH" "$BASILISP" run "$REPO/scripts/preflight_live_imports.
   exit 1
 fi
 
+# Reconcile against broker truth before a new strategy process can trade.  A
+# prior process may have died after a fill; those positions are not safe to
+# leave for the new, empty session ledger to infer.  Flatten first and refuse
+# to start if Alpaca cannot prove every paper account is flat.
+log "reconciling Alpaca paper positions and enforcing a flat start"
+if ! python3 "$REPO/scripts/alpaca_position_safety.py" \
+    --mode flatten --ref-root "$REF" --timeout-seconds 90; then
+  log "broker position reconciliation/flatten failed — aborting before terminal start"
+  exit 1
+fi
+
 CAPTURE_DIR="${CAPTURE_DIR:-$REPO/live_runtime/feature-capture}"
 ANALYSIS_DIR="${ANALYSIS_DIR:-$REPO/live_runtime/analysis}"
 mkdir -p "$CAPTURE_DIR" "$ANALYSIS_DIR"

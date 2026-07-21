@@ -1,0 +1,15 @@
+[Unit]
+Description=Independently flatten all SteveTrading Alpaca paper positions
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/current
+EnvironmentFile=/etc/stevetrading/env
+ExecStart=/usr/bin/python3 /opt/stevetrading/current/scripts/alpaca_position_safety.py --mode flatten --ref-root /opt/stevetrading/shared/Data-Preprocessor --timeout-seconds 180
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/var/log/stevetrading/broker-flatten.log
+StandardError=append:/var/log/stevetrading/broker-flatten.log
