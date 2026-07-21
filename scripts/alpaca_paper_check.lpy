@@ -1,0 +1,44 @@
+;; Read-only connectivity/authentication check for one Alpaca paper account.
+(import glob os os.path sys)
+
+(let [repo-root (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))]
+  (doseq [path (concat (glob/glob (os.path/join repo-root "components" "*" "src"))
+                       (glob/glob (os.path/join repo-root "bases" "*" "src")))]
+    (.insert (.-path sys) 0 path)))
+
+(require '[stevetrading.broker.alpaca :as alpaca]
+         '[stevetrading.broker.protocol :as broker])
+
+(def credential-pairs
+  [["APCA_API_KEY_ID" "APCA_API_SECRET_KEY"]
+   ["ALPACA_API_KEY_ID" "ALPACA_API_SECRET"]
+   ["ALPACA_VENTUREVD_API_KEY" "ALPACA_VENTUREVD_API_SECRET"]])
+
+(defn configured-pair []
+  (first
+   (keep (fn [[key-name secret-name]]
+           (let [key (os/getenv key-name)
+                 secret (os/getenv secret-name)]
+             (when (and key secret)
+               {:key-name key-name :secret-name secret-name
+                :key key :secret secret})))
+         credential-pairs)))
+
+(if-let [{:keys [key-name secret-name key secret]} (configured-pair)]
+  (let [adapter (alpaca/make-alpaca-broker {:key-id key :secret secret})
+        heartbeat (broker/health adapter)
+        payload (:fact/payload heartbeat)
+        connected? (= :health/connected (:health/connectivity payload))
+        credentials-valid? (:health/credentials-valid? payload)]
+    (println (str "Alpaca paper connectivity: "
+                  (if connected? "connected" "unreachable")))
+    (println (str "Credentials valid: "
+                  (if (true? credentials-valid?) "yes"
+                      (if (false? credentials-valid?) "no" "unknown"))))
+    (println (str "Credential variables: " key-name " + " secret-name))
+    (python/exit (if (and connected? (not= false credentials-valid?)) 0 1)))
+  (do
+    (binding [*out* *err*]
+      (println "No supported Alpaca credential pair is set.")
+      (println "Set APCA_API_KEY_ID and APCA_API_SECRET_KEY, then retry."))
+    (python/exit 2)))

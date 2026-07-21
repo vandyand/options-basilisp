@@ -1,0 +1,52 @@
+(ns ops.test-steve-cli
+  (:import os pathlib subprocess sys
+           stevetrading_cli)
+  (:require [basilisp.test :refer [deftest is]]))
+
+(def repo-root (.resolve (pathlib/Path (os/getcwd))))
+
+(deftest forwarded-arguments-drop-one-separator
+  (is (= ["all" "--markdown"]
+         (vec (stevetrading_cli/forwarded_args ["--" "all" "--markdown"]))))
+  (is (= ["all"] (vec (stevetrading_cli/forwarded_args ["all"]))))
+  (is (= [] (vec (stevetrading_cli/forwarded_args [])))))
+
+(deftest parser-defaults-six-to-safe-dry-run-and-sim
+  (let [args (.parse_args (stevetrading_cli/build_parser)
+                          ["six" "--ref-root" "example"])]
+    (is (= "sim" (.-broker args)))
+    (is (false? (.-execute args)))
+    (is (= "alpaca" (.-stock_source args)))))
+
+(deftest module-help-is-cross-platform
+  (let [result (subprocess/run
+                [sys/executable "-m" "stevetrading_cli" "--help"]
+                ** :cwd (str repo-root) :capture_output true :text true)]
+    (is (= 0 (.-returncode result)))
+    (is (>= (.find (.-stdout result) "doctor") 0))
+    (is (>= (.find (.-stdout result) "alpaca") 0))
+    (is (>= (.find (.-stdout result) "status") 0))
+    (is (>= (.find (.-stdout result) "six") 0))))
+
+(deftest doctor-validates-the-editable-checkout
+  (let [result (subprocess/run
+                [sys/executable "-m" "stevetrading_cli" "doctor"]
+                ** :cwd (str repo-root) :capture_output true :text true)]
+    (is (= 0 (.-returncode result)))
+    (is (>= (.find (.-stdout result) "[OK] Basilisp") 0))
+    (is (>= (.find (.-stdout result) "Ready.") 0))))
+
+(deftest run-rejects-a-missing-script-without-starting-basilisp
+  (is (= 2 (stevetrading_cli/main ["run" "scripts/does-not-exist.lpy"]))))
+
+(deftest alpaca-check-refuses-to-run-without-credentials
+  (let [names (vec (mapcat identity stevetrading_cli/ALPACA_CREDENTIAL_PAIRS))
+        old-values (into {} (map (fn [name] [name (os/getenv name)]) names))]
+    (try
+      (doseq [[key-name secret-name] stevetrading_cli/ALPACA_CREDENTIAL_PAIRS]
+        (os.environ/pop key-name nil)
+        (os.environ/pop secret-name nil))
+      (is (= 2 (stevetrading_cli/main ["alpaca"])))
+      (finally
+        (doseq [[key-name value] old-values]
+          (when value (os.environ/__setitem__ key-name value)))))))

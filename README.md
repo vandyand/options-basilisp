@@ -18,6 +18,11 @@ recorded in `docs/adr/`. The implementation spec and phase plan are under
 Use this path for a fresh local development checkout. It does not require
 Alpaca credentials, ThetaData, or a VPS.
 
+For Steve's Windows-first installation and paper-session commands, use
+[docs/STEVE_QUICKSTART.md](docs/STEVE_QUICKSTART.md). After installation, the
+supported operator surface is `steve doctor`, `steve alpaca`, `steve status`,
+`steve run`, and the deliberately guarded `steve six` launcher.
+
 Requirements:
 
 - Python 3.12 recommended. The package metadata allows `>=3.10`, but current
@@ -30,6 +35,9 @@ Requirements:
 python3 -m venv .venv
 .venv/bin/pip install -U pip
 .venv/bin/pip install -e .
+
+# optional operator-friendly wrapper
+.venv/bin/steve doctor
 
 # 2. gates
 scripts/lint.sh    # compile check + dependency-direction check

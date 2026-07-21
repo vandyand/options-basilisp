@@ -19,6 +19,9 @@ dependencies = [
   "tzdata>=2025.2",
 ]
 
+[project.scripts]
+steve = "stevetrading_cli:main"
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 markers = [
@@ -96,4 +99,4 @@ testpaths = [
 
 [tool.setuptools]
 include-package-data = true
-py-modules = []
+py-modules = ["stevetrading_cli"]
