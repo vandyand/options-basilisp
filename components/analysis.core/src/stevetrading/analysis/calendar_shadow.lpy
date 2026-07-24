@@ -78,6 +78,14 @@
               (str "could not select SPY 7/42 expirations for " date-text))))
     {"weekly" (.isoformat front) "monthly" (.isoformat back)}))
 
+(defn granular-front-monthly-back-buckets
+  "Select any listed 7-9 DTE front while retaining the standard monthly back."
+  [expiration-texts date-text]
+  (let [granular (spy-expiration-buckets expiration-texts date-text)
+        standard (expiration-buckets expiration-texts date-text)]
+    {"weekly" (get granular "weekly")
+     "monthly" (get standard "monthly")}))
+
 (defn normalize-row [row]
   (let [strike (finite-number (get row "strike"))
         right (normalize-right (get row "right"))]
@@ -171,12 +179,25 @@
      "combined_spread" (* 100.0 (+ (- (get short-quote "ask") (get short-quote "bid"))
                                      (- (get long-quote "ask") (get long-quote "bid"))))}))
 
+(defn portfolio-position? [position]
+  ;; Legacy v1 positions did not carry this field and were all admitted.
+  (not= false (get position "portfolio_admitted" true)))
+
 (defn active-exposure [positions]
-  (let [active (filter #(= "ACTIVE" (get % "status")) positions)]
+  (let [active (filter #(and (= "ACTIVE" (get % "status"))
+                             (portfolio-position? %))
+                       positions)]
     {"active_positions" (count active)
      "aggregate_debit" (reduce + 0.0 (map #(float (get % "entry_debit" 0.0)) active))
      "aggregate_assignment_notional"
      (reduce + 0.0 (map #(float (get % "assignment_notional_usd" 0.0)) active))}))
+
+(defn active-observations [positions]
+  (let [active (filter #(= "ACTIVE" (get % "status")) positions)]
+    {"active_observations" (count active)
+     "portfolio_admitted_observations" (count (filter portfolio-position? active))
+     "research_only_observations" (count (remove portfolio-position? active))
+     "by_variant" (frequencies (map #(get % "observation_variant" "LEGACY") active))}))
 
 (defn admit-calendar-candidates
   "Apply entry-known debit and assignment-notional limits in the supplied priority order."

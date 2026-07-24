@@ -10,15 +10,17 @@ synthetic-forward ATM. At 12:01:00 ET it records a marketable one-contract
 calendar entry, and it records the marketable close at 15:15:00 ET exactly
 five later market sessions after entry.
 
-The expiration selector is intentionally symbol-specific because the frozen
-SPY maturity-grid study and the later cross-symbol replication did not use the
-same listing convention:
+The v2 forward design records two versioned selectors for every symbol:
 
-- SPY selects any listed front expiration from 7-9 DTE nearest 7 DTE and any
-  listed back expiration from 37-47 DTE nearest 42 DTE.
-- QQQ and IWM select the nearest Thursday/Friday weekly-cycle expiration to 7
-  DTE within 3-10 DTE and the nearest standard monthly expiration to 42 DTE
-  within 21-63 DTE.
+- `GM`, the primary research candidate, selects any listed front expiration
+  from 7-9 DTE nearest 7 DTE and the nearest standard-monthly back expiration
+  to 42 DTE within 21-63 DTE.
+- `GG`, the research comparator, uses the same granular front and any listed
+  back expiration from 37-47 DTE nearest 42 DTE.
+
+Both selectors are observed for SPY, QQQ, and IWM. Only `GM` is eligible for
+the constrained 2x portfolio; `GG` is always marked research-only. Selector
+comparison is therefore not confounded with symbol identity.
 
 The fifth market session comes from Alpaca's read-only market calendar. A
 candidate is skipped when its short option expires before that exit session.
@@ -44,6 +46,75 @@ used the cross-symbol Thursday/Friday/standard-monthly selector for all three
 symbols. It is preserved as an immutable operational diagnostic. It must not
 be relabeled as an exact SPY 7/42 maturity-grid observation. The per-symbol
 selector correction and 2x risk policy apply only to later entry receipts.
+
+## July 24 selector follow-up
+
+The completed matched historical comparison now favors expiration flexibility
+for the **front** leg on all three symbols. Averaged across back-leg choices,
+the flexible-front one-lot P&L effect was +$17.85 for SPY, +$24.73 for QQQ,
+and +$9.37 for IWM; all three remained positive after cluster inference and
+Holm correction. Back-expiration flexibility had no reliable positive P&L
+effect. A standard-monthly back was slightly more capital-efficient on the
+shared four-cell portfolio sample.
+
+These findings do not retroactively alter existing receipts and do not by
+themselves authorize a deployed-selector change. The next forward research
+candidate is granular front + standard-monthly back for all three symbols,
+with fully granular retained as a quote-only comparator. Any change to the
+deployed shadow must be versioned prospectively so old and new observations
+cannot be mixed. The full evidence and limitations are recorded in
+`projects/ops/docs/calendar-expiration-selector-comparison-2026-07-24.md`.
+
+## Observation ledger versus constrained portfolio
+
+Version 2 deliberately separates two questions that v1 combined:
+
+1. **What happened to every candidate?** Every GM and GG candidate receives an
+   immutable entry receipt, active observation, five-session exit quote, and
+   executable P&L reconstruction. Risk-rejected candidates remain observable.
+2. **What would the frozen portfolio have admitted?** Only GM candidates enter
+   the SPY-then-QQQ-then-IWM allocator. The 2.5% individual debit, 10%
+   aggregate debit, and 2x assignment-notional limits remain unchanged.
+
+`portfolio_admitted=false` observations never contribute debit or assignment
+notional to the constrained exposure calculation. Legacy v1 positions lack
+that field and are intentionally treated as admitted so migration cannot hide
+existing exposure. Status output reports constrained exposure and total active
+observations separately.
+
+The isolated migration smoke test copied the live v1 state and produced six
+v2 observations plus the existing legacy SPY position. It admitted primary
+SPY and IWM, rejected primary QQQ on the 2x notional limit, retained all three
+GG comparators, and reported seven total observations but only three admitted
+positions. A synthetic future exit closed all seven; replaying the exit was
+idempotent. Every broker check remained flat and both no-order assertions
+remained false.
+
+## Paper-order data collection boundary
+
+Raising paper-account limits is not required to collect selector, quote-path,
+or counterfactual executable-P&L evidence. The unconstrained observation
+ledger supplies that coverage without depending on Alpaca's paper fill model
+or creating assignment operations.
+
+Actual paper orders add different evidence: multi-leg acceptance, fill
+latency, partial fills, buying-power treatment, early assignment, and close
+behavior. If paper writes are later authorized, they must use a separate
+versioned policy. A stronger predicted signal may rank candidates inside that
+policy but may not silently override its limits. Before increasing exposure,
+freeze and validate:
+
+- the signal and threshold known at entry;
+- the maximum simultaneous contracts and per-symbol concentration;
+- aggregate debit and assignment-bridge notional;
+- multi-leg-only submission and naked-leg rejection;
+- assignment and forced-close procedures;
+- stop conditions for rejects, buying-power drift, or state divergence.
+
+A small paper-order sentinel cohort is the appropriate first fill-quality
+experiment. The unconstrained shadow should continue recording every candidate
+in parallel, so research coverage does not depend on how many orders the
+broker accepts.
 
 ## Entry weekday and cadence
 

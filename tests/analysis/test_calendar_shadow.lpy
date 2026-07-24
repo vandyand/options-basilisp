@@ -32,6 +32,14 @@
     (is (= "2026-07-31" (get buckets "weekly")))
     (is (= "2026-09-04" (get buckets "monthly")))))
 
+(deftest granular-front-monthly-back-combines-the-frozen-factors
+  (let [buckets (shadow/granular-front-monthly-back-buckets
+                 ["2026-07-31" "2026-08-04" "2026-08-06" "2026-08-21"
+                  "2026-09-04" "2026-09-18"]
+                 "2026-07-28")]
+    (is (= "2026-08-04" (get buckets "weekly")))
+    (is (= "2026-09-18" (get buckets "monthly")))))
+
 (deftest exact-calendar-selection-and-entry-costs
   (let [selection (shadow/select-put-calendar
                    (chain "2026-07-30" true)
@@ -76,3 +84,18 @@
     (is (= 2 (get (get result "ending_exposure") "active_positions")))
     (is (= 94000.0
            (get (get result "ending_exposure") "aggregate_assignment_notional")))))
+
+(deftest research-only-observations-do-not-consume-portfolio-risk
+  (let [positions [{"status" "ACTIVE" "entry_debit" 500.0
+                    "assignment_notional_usd" 74000.0}
+                   {"status" "ACTIVE" "entry_debit" 900.0
+                    "assignment_notional_usd" 69000.0
+                    "portfolio_admitted" false
+                    "observation_variant" "GG"}]
+        exposure (shadow/active-exposure positions)
+        observations (shadow/active-observations positions)]
+    (is (= 1 (get exposure "active_positions")))
+    (is (= 500.0 (get exposure "aggregate_debit")))
+    (is (= 74000.0 (get exposure "aggregate_assignment_notional")))
+    (is (= 2 (get observations "active_observations")))
+    (is (= 1 (get observations "research_only_observations")))))

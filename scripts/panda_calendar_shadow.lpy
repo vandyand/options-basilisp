@@ -12,14 +12,19 @@
 (def symbols ["SPY" "QQQ" "IWM"])
 (def symbol-priority ["SPY" "QQQ" "IWM"])
 (def orders-enabled false)
-(def policy-version "assignment-notional-2x-2026-07-24")
+(def policy-version "dual-selector-observation-v2-2026-07-24")
 (def limits {"individual_debit_fraction" 0.025
              "aggregate_debit_fraction" 0.10
              "aggregate_assignment_notional_multiple" 2.0})
 (def selector-profiles
-  {"SPY" "spy-any-listed-7to9d-front-37to47d-back-v1"
-   "QQQ" "cross-symbol-thursday-friday-weekly-standard-monthly-v1"
-   "IWM" "cross-symbol-thursday-friday-weekly-standard-monthly-v1"})
+  {"GM" "granular-front-standard-monthly-back-v2"
+   "GG" "granular-front-granular-back-v2"})
+(def primary-observation-variant "GM")
+(def observation-variants
+  [{"variant" "GM" "role" "PRIMARY" "portfolio_eligible" true
+    "selector_profile" (get selector-profiles "GM")}
+   {"variant" "GG" "role" "COMPARATOR" "portfolio_eligible" false
+    "selector_profile" (get selector-profiles "GG")}])
 (def nyse-holidays #{"2026-07-03" "2026-09-07" "2026-11-26" "2026-12-25"})
 
 (defn py-list? [value] (python/isinstance value python/list))
@@ -225,10 +230,11 @@
               (str "missing exact put quote " symbol " " expiration " " strike))))
     [result quote]))
 
-(defn expiration-buckets-for [symbol expirations date-text]
-  (if (= symbol "SPY")
-    (shadow/spy-expiration-buckets expirations date-text)
-    (shadow/expiration-buckets expirations date-text)))
+(defn expiration-buckets-for [variant expirations date-text]
+  (case variant
+    "GM" (shadow/granular-front-monthly-back-buckets expirations date-text)
+    "GG" (shadow/spy-expiration-buckets expirations date-text)
+    (throw (python/RuntimeError (str "unknown observation variant: " symbol)))))
 
 (defn scheduled-time [date-text clock-text]
   (datetime.datetime/combine (datetime.date/fromisoformat date-text)
@@ -252,6 +258,7 @@
    "mode" "QUOTE_ONLY" "orders_enabled" false "broker_orders_submitted" false
    "account" "PANDA" "symbols" symbols "symbol_priority" symbol-priority
    "policy_version" policy-version "selector_profiles" selector-profiles
+   "observation_variants" observation-variants
    "limits" limits "positions" [] "events" [] "created_at_utc" (iso-utc)
    "updated_at_utc" (iso-utc)})
 
@@ -275,7 +282,9 @@
 
 (defn current-policy? [state]
   (and (= policy-version (get state "policy_version"))
-       (= limits (get state "limits"))))
+       (= limits (get state "limits"))
+       (= selector-profiles (get state "selector_profiles"))
+       (= observation-variants (get state "observation_variants"))))
 
 (defn require-current-policy! [state]
   (when-not (current-policy? state)
@@ -297,7 +306,10 @@
 
 (defn apply-entry-receipt [state receipt-path receipt]
   (let [existing (set (map #(get % "trade_id") (.get state "positions")))
-        admitted (filter #(get % "admitted") (.get receipt "admissions"))
+        observations (.get receipt "observations")
+        admitted (if observations
+                   observations
+                   (filter #(get % "admitted") (.get receipt "admissions")))
         additions
         (vec (keep (fn [row]
                      (when-not (contains? existing (get row "trade_id"))
@@ -307,6 +319,11 @@
                         "weekly_expiration" (get row "weekly_expiration")
                         "monthly_expiration" (get row "monthly_expiration")
                         "selector_profile" (get row "selector_profile")
+                        "observation_variant" (get row "observation_variant" "LEGACY")
+                        "observation_role" (get row "observation_role" "LEGACY")
+                        "portfolio_admitted" (get row "portfolio_admitted"
+                                                    (get row "admitted" true))
+                        "admission_reason" (get row "admission_reason" "LEGACY_ADMITTED")
                         "strike" (get row "selected_strike")
                         "entry_debit" (get row "entry_debit")
                         "assignment_notional_usd" (get row "assignment_notional_usd")
@@ -356,7 +373,8 @@
       (-> state
           (assoc "policy_version" (.get receipt "new_policy_version")
                  "limits" (persistent-data (.get receipt "new_limits"))
-                 "selector_profiles" selector-profiles)
+                 "selector_profiles" selector-profiles
+                 "observation_variants" observation-variants)
           (add-event {"phase" "POLICY_UPDATE" "receipt" receipt-path
                       "applied_at_utc" (iso-utc)})))))
 
@@ -380,6 +398,7 @@
                      "new_policy_version" policy-version
                      "new_limits" limits
                      "selector_profiles" selector-profiles
+                     "observation_variants" observation-variants
                      "orders_enabled" false
                      "broker_orders_submitted" false}
             _ (immutable-json! out receipt)
@@ -398,6 +417,8 @@
                 "broker" broker
                 "theta" (dissoc theta "payload")
                 "state" {"active_exposure" (shadow/active-exposure (.get state "positions"))
+                         "active_observations" (shadow/active-observations
+                                                (.get state "positions"))
                          "position_count" (count (.get state "positions"))
                          "policy_version" (get state "policy_version")
                          "limits" (get state "limits")}
@@ -425,111 +446,147 @@
               _ (wait-for-clock! date-text "12:00:00" (.-max_lateness_seconds args)
                                  (.-capture_now args))
               decisions
-              (into {}
-                    (for [symbol symbols]
-                      (let [[expiration-raw expirations] (fetch-expirations args symbol)
-                            buckets (expiration-buckets-for symbol expirations date-text)
+              (vec
+               (mapcat
+                (fn [symbol]
+                  (let [[expiration-raw expirations] (fetch-expirations args symbol)]
+                    (for [variant-spec observation-variants]
+                      (let [variant (get variant-spec "variant")
+                            buckets (expiration-buckets-for variant expirations date-text)
                             weekly (get buckets "weekly") monthly (get buckets "monthly")
                             [weekly-raw weekly-rows] (fetch-chain args symbol weekly)
                             [monthly-raw monthly-rows] (fetch-chain args symbol monthly)
                             selection (shadow/select-put-calendar
                                        weekly-rows monthly-rows weekly monthly)]
-                        [symbol {"weekly_expiration" weekly "monthly_expiration" monthly
-                                 "selector_profile" (get selector-profiles symbol)
-                                 "selection" selection "expiration_raw" expiration-raw
-                                 "weekly_raw" weekly-raw "monthly_raw" monthly-raw}])))
+                        {"symbol" symbol "observation_variant" variant
+                         "observation_role" (get variant-spec "role")
+                         "portfolio_eligible" (get variant-spec "portfolio_eligible")
+                         "weekly_expiration" weekly "monthly_expiration" monthly
+                         "selector_profile" (get variant-spec "selector_profile")
+                         "selection" selection "expiration_raw" expiration-raw
+                         "weekly_raw" weekly-raw "monthly_raw" monthly-raw}))))
+                symbols))
               _ (wait-for-clock! date-text "12:01:00" (.-max_lateness_seconds args)
                                  (.-capture_now args))
-              eligible-symbols
-              (vec (filter (fn [symbol]
-                             (>= (get (get decisions symbol) "weekly_expiration")
-                                 planned-exit-date))
-                           symbols))
+              eligible-decisions
+              (vec (filter #(>= (get % "weekly_expiration") planned-exit-date) decisions))
               skips
-              (vec (for [symbol symbols
-                         :when (not (contains? (set eligible-symbols) symbol))]
-                     {"symbol" symbol "reason" "SHORT_EXPIRES_BEFORE_FIVE_SESSION_EXIT"
-                      "weekly_expiration" (get (get decisions symbol) "weekly_expiration")
+              (vec (for [decision decisions
+                         :when (< (get decision "weekly_expiration") planned-exit-date)]
+                     {"symbol" (get decision "symbol")
+                      "observation_variant" (get decision "observation_variant")
+                      "reason" "SHORT_EXPIRES_BEFORE_FIVE_SESSION_EXIT"
+                      "weekly_expiration" (get decision "weekly_expiration")
                       "planned_exit_date" planned-exit-date}))
               entries
-              (into {}
-                    (for [symbol eligible-symbols]
-                      (let [decision (get decisions symbol)
-                            weekly (get decision "weekly_expiration")
-                            monthly (get decision "monthly_expiration")
-                            strike (get (get decision "selection") "selected_strike")
-                            [weekly-raw weekly-rows] (fetch-chain args symbol weekly)
-                            [monthly-raw monthly-rows] (fetch-chain args symbol monthly)
-                            weekly-quote (get (shadow/quote-map weekly-rows weekly) [strike "P"])
-                            monthly-quote (get (shadow/quote-map monthly-rows monthly) [strike "P"])
-                            _ (when-not (and weekly-quote monthly-quote)
-                                (throw (python/RuntimeError (str "entry quote missing for " symbol))))
-                            selection {"atm_strike" (get (get decision "selection") "atm_strike")
-                                       "selected_strike" strike
-                                       "short_weekly" (assoc weekly-quote "quantity" -1)
-                                       "long_monthly" (assoc monthly-quote "quantity" 1)}
-                            economics (shadow/entry-economics selection)]
-                        [symbol {"selection" selection "economics" economics
-                                 "weekly_raw" weekly-raw "monthly_raw" monthly-raw}])))
+              (vec
+               (for [decision eligible-decisions]
+                 (let [symbol (get decision "symbol")
+                       variant (get decision "observation_variant")
+                       weekly (get decision "weekly_expiration")
+                       monthly (get decision "monthly_expiration")
+                       strike (get (get decision "selection") "selected_strike")
+                       [weekly-raw weekly-rows] (fetch-chain args symbol weekly)
+                       [monthly-raw monthly-rows] (fetch-chain args symbol monthly)
+                       weekly-quote (get (shadow/quote-map weekly-rows weekly) [strike "P"])
+                       monthly-quote (get (shadow/quote-map monthly-rows monthly) [strike "P"])
+                       _ (when-not (and weekly-quote monthly-quote)
+                           (throw (python/RuntimeError
+                                   (str "entry quote missing for " symbol " " variant))))
+                       selection {"atm_strike" (get (get decision "selection") "atm_strike")
+                                  "selected_strike" strike
+                                  "short_weekly" (assoc weekly-quote "quantity" -1)
+                                  "long_monthly" (assoc monthly-quote "quantity" 1)}
+                       economics (shadow/entry-economics selection)]
+                   (assoc decision "selection" selection "economics" economics
+                          "weekly_entry_raw" weekly-raw
+                          "monthly_entry_raw" monthly-raw))))
               candidates
-              (vec (for [symbol eligible-symbols]
-                     (let [decision (get decisions symbol)
-                           entry (get entries symbol)
-                           selection (get entry "selection")
-                           economics (get entry "economics")
-                           strike (get selection "selected_strike")]
-                       {"trade_id" (str "PANDA::" symbol "::" date-text "::" strike)
-                        "symbol" symbol
-                        "weekly_expiration" (get decision "weekly_expiration")
-                        "monthly_expiration" (get decision "monthly_expiration")
-                        "planned_exit_date" planned-exit-date
-                        "selector_profile" (get decision "selector_profile")
-                        "selected_strike" strike
-                        "entry_debit" (get economics "entry_debit")
-                        "assignment_notional_usd" (* 100.0 strike)
-                        "selection" selection "economics" economics})))
+              (vec
+               (for [entry entries]
+                 (let [symbol (get entry "symbol")
+                       variant (get entry "observation_variant")
+                       selection (get entry "selection")
+                       economics (get entry "economics")
+                       strike (get selection "selected_strike")]
+                   {"trade_id" (str "PANDA::" symbol "::" date-text "::" variant "::" strike)
+                    "symbol" symbol
+                    "observation_variant" variant
+                    "observation_role" (get entry "observation_role")
+                    "portfolio_eligible" (get entry "portfolio_eligible")
+                    "weekly_expiration" (get entry "weekly_expiration")
+                    "monthly_expiration" (get entry "monthly_expiration")
+                    "planned_exit_date" planned-exit-date
+                    "selector_profile" (get entry "selector_profile")
+                    "selected_strike" strike
+                    "entry_debit" (get economics "entry_debit")
+                    "assignment_notional_usd" (* 100.0 strike)
+                    "selection" selection "economics" economics})))
+              primary-candidates
+              (vec (filter #(= primary-observation-variant
+                               (get % "observation_variant")) candidates))
               account-equity (float (.get (.get broker "account") "equity"))
               admission (shadow/admit-calendar-candidates
-                         (.get state "positions") candidates account-equity limits symbol-priority)
+                         (.get state "positions") primary-candidates
+                         account-equity limits symbol-priority)
               admissions (get admission "admissions")
+              admission-map (into {} (map #(vector (get % "trade_id") %) admissions))
+              observations
+              (vec
+               (for [candidate candidates]
+                 (if (= primary-observation-variant
+                        (get candidate "observation_variant"))
+                   (let [row (get admission-map (get candidate "trade_id"))]
+                     (assoc candidate
+                            "admitted" (get row "admitted")
+                            "portfolio_admitted" (get row "admitted")
+                            "admission_reason" (get row "admission_reason")))
+                   (assoc candidate
+                          "admitted" false "portfolio_admitted" false
+                          "admission_reason" "RESEARCH_COMPARATOR_ONLY"))))
               raw-root (os.path/join (os.path/dirname out) "raw")
               raw-receipts
               (into {}
                     (concat
                      (mapcat
-                      (fn [symbol]
-                        (let [decision (get decisions symbol)]
-                          [[(str symbol "_expirations")
-                            (persist-raw! (os.path/join raw-root (str symbol "-expirations.json"))
+                      (fn [decision]
+                        (let [prefix (str (get decision "symbol") "-"
+                                          (get decision "observation_variant"))]
+                          [[(str prefix "_expirations")
+                            (persist-raw! (os.path/join raw-root (str prefix "-expirations.json"))
                                           (get decision "expiration_raw"))]
-                           [(str symbol "_weekly_decision")
-                            (persist-raw! (os.path/join raw-root (str symbol "-weekly-decision.json"))
+                           [(str prefix "_weekly_decision")
+                            (persist-raw! (os.path/join raw-root (str prefix "-weekly-decision.json"))
                                           (get decision "weekly_raw"))]
-                           [(str symbol "_monthly_decision")
-                            (persist-raw! (os.path/join raw-root (str symbol "-monthly-decision.json"))
+                           [(str prefix "_monthly_decision")
+                            (persist-raw! (os.path/join raw-root (str prefix "-monthly-decision.json"))
                                           (get decision "monthly_raw"))]]))
-                      symbols)
+                      decisions)
                      (mapcat
-                      (fn [symbol]
-                        (let [entry (get entries symbol)]
-                          [[(str symbol "_weekly_entry")
-                            (persist-raw! (os.path/join raw-root (str symbol "-weekly-entry.json"))
-                                          (get entry "weekly_raw"))]
-                           [(str symbol "_monthly_entry")
-                            (persist-raw! (os.path/join raw-root (str symbol "-monthly-entry.json"))
-                                          (get entry "monthly_raw"))]]))
-                      eligible-symbols)))
+                      (fn [entry]
+                        (let [prefix (str (get entry "symbol") "-"
+                                          (get entry "observation_variant"))]
+                          [[(str prefix "_weekly_entry")
+                            (persist-raw! (os.path/join raw-root (str prefix "-weekly-entry.json"))
+                                          (get entry "weekly_entry_raw"))]
+                           [(str prefix "_monthly_entry")
+                            (persist-raw! (os.path/join raw-root (str prefix "-monthly-entry.json"))
+                                          (get entry "monthly_entry_raw"))]]))
+                      entries)))
               calendar-receipt
               (persist-raw! (os.path/join raw-root "alpaca-market-calendar.json") calendar-raw)
-              receipt {"schema_version" 1 "kind" "panda-core-calendar-shadow-entry-v1"
+              receipt {"schema_version" 2 "kind" "panda-core-calendar-shadow-entry-v2"
                        "status" "ENTRY_CAPTURED" "session_date" date-text
                        "decision_anchor_et" "12:00:00" "entry_clock_et" "12:01:00"
                        "captured_at_utc" (iso-utc) "account_equity_usd" account-equity
                        "horizon_sessions" 5 "planned_exit_date" planned-exit-date
                        "policy_version" policy-version
                        "selector_profiles" selector-profiles
+                       "observation_variants" observation-variants
+                       "primary_observation_variant" primary-observation-variant
                        "symbols" symbols "symbol_priority" symbol-priority "limits" limits
-                       "skips" skips
+                       "skips" skips "observations" observations
+                       "unconstrained_observation_count" (count observations)
                        "admissions" admissions "ending_exposure" (get admission "ending_exposure")
                        "raw_receipts" (assoc raw-receipts "alpaca_market_calendar" calendar-receipt)
                        "orders_enabled" false
@@ -561,14 +618,21 @@
             results
             (vec (for [position due]
                    (let [symbol (get position "symbol") strike (get position "strike")
+                         variant (get position "observation_variant" "LEGACY")
                          weekly (get position "weekly_expiration")
                          monthly (get position "monthly_expiration")
                          [weekly-raw short] (fetch-exact-put args symbol weekly strike)
                          [monthly-raw long] (fetch-exact-put args symbol monthly strike)
                          economics (shadow/exit-economics
                                     (get position "entry_debit") short long)
-                         prefix (str symbol "-" (.replace (str strike) "." "_"))]
+                         prefix (str symbol "-" variant "-"
+                                     (.replace (str strike) "." "_"))]
                      {"trade_id" (get position "trade_id") "symbol" symbol
+                      "observation_variant" variant
+                      "observation_role" (get position "observation_role" "LEGACY")
+                      "portfolio_admitted" (get position "portfolio_admitted" true)
+                      "admission_reason" (get position "admission_reason" "LEGACY_ADMITTED")
+                      "selector_profile" (get position "selector_profile")
                       "selected_strike" strike "short_weekly" short "long_monthly" long
                       "exit_economics" economics
                       "raw_receipts"
@@ -576,7 +640,7 @@
                                               weekly-raw)
                        "monthly" (persist-raw! (os.path/join raw-root (str prefix "-monthly.json"))
                                                monthly-raw)}})))
-            receipt {"schema_version" 1 "kind" "panda-core-calendar-shadow-exit-v1"
+            receipt {"schema_version" 2 "kind" "panda-core-calendar-shadow-exit-v2"
                      "status" (if (seq due) "EXIT_CAPTURED" "NO_DUE_POSITIONS")
                      "session_date" date-text "exit_clock_et" "15:15:00"
                      "captured_at_utc" (iso-utc) "exits" results
@@ -598,6 +662,7 @@
                 "policy_current" (current-policy? state)
                 "limits" (get state "limits")
                 "active_exposure" (shadow/active-exposure (.get state "positions"))
+                "active_observations" (shadow/active-observations (.get state "positions"))
                 "positions" (.get state "positions")}]
     (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))))
 

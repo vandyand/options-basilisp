@@ -6,7 +6,7 @@ RUNNER = ROOT / "scripts" / "panda_calendar_shadow.lpy"
 UNIT_ROOT = ROOT / "projects" / "ops" / "scripts" / "systemd"
 
 
-def test_runner_is_structurally_quote_only_and_uses_frozen_rule():
+def test_runner_is_structurally_quote_only_and_uses_versioned_dual_selector():
     source = RUNNER.read_text(encoding="utf-8")
 
     assert "(def orders-enabled false)" in source
@@ -16,8 +16,17 @@ def test_runner_is_structurally_quote_only_and_uses_frozen_rule():
     assert '(def symbols ["SPY" "QQQ" "IWM"])' in source
     assert '(def symbol-priority ["SPY" "QQQ" "IWM"])' in source
     assert '"aggregate_assignment_notional_multiple" 2.0' in source
-    assert 'policy-version "assignment-notional-2x-2026-07-24"' in source
+    assert 'policy-version "dual-selector-observation-v2-2026-07-24"' in source
+    assert '(def primary-observation-variant "GM")' in source
+    assert '"portfolio_eligible" true' in source
+    assert '"portfolio_eligible" false' in source
+    assert '"RESEARCH_COMPARATOR_ONLY"' in source
+    assert '"unconstrained_observation_count"' in source
+    assert '"panda-core-calendar-shadow-entry-v2"' in source
+    assert '"panda-core-calendar-shadow-exit-v2"' in source
     assert "shadow/spy-expiration-buckets" in source
+    assert "shadow/granular-front-monthly-back-buckets" in source
+    assert "shadow/active-observations" in source
     assert '"individual_debit_fraction" 0.025' in source
     assert '"aggregate_debit_fraction" 0.10' in source
     assert '"12:00:00"' in source
