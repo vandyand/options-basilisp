@@ -60,6 +60,24 @@
               (str "could not select weekly and monthly expirations for " date-text))))
     {"weekly" (.isoformat weekly) "monthly" (.isoformat monthly)}))
 
+(defn spy-expiration-buckets
+  "Select the frozen SPY maturity-grid benchmark: any listed 7-9 DTE front and
+  37-47 DTE back expiration, nearest the 7/42 targets."
+  [expiration-texts date-text]
+  (let [expirations (vec (sort (set (map datetime.date/fromisoformat expiration-texts))))
+        trade-date (datetime.date/fromisoformat date-text)
+        eligible? (fn [_] true)
+        front (nearest-in-window expirations trade-date
+                                 (+ trade-date (datetime/timedelta ** :days 7))
+                                 7 9 eligible?)
+        back (nearest-in-window expirations trade-date
+                                (+ trade-date (datetime/timedelta ** :days 42))
+                                37 47 eligible?)]
+    (when-not (and front back)
+      (throw (python/RuntimeError
+              (str "could not select SPY 7/42 expirations for " date-text))))
+    {"weekly" (.isoformat front) "monthly" (.isoformat back)}))
+
 (defn normalize-row [row]
   (let [strike (finite-number (get row "strike"))
         right (normalize-right (get row "right"))]

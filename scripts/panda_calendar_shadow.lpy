@@ -12,9 +12,14 @@
 (def symbols ["SPY" "QQQ" "IWM"])
 (def symbol-priority ["SPY" "QQQ" "IWM"])
 (def orders-enabled false)
+(def policy-version "assignment-notional-2x-2026-07-24")
 (def limits {"individual_debit_fraction" 0.025
              "aggregate_debit_fraction" 0.10
-             "aggregate_assignment_notional_multiple" 1.0})
+             "aggregate_assignment_notional_multiple" 2.0})
+(def selector-profiles
+  {"SPY" "spy-any-listed-7to9d-front-37to47d-back-v1"
+   "QQQ" "cross-symbol-thursday-friday-weekly-standard-monthly-v1"
+   "IWM" "cross-symbol-thursday-friday-weekly-standard-monthly-v1"})
 (def nyse-holidays #{"2026-07-03" "2026-09-07" "2026-11-26" "2026-12-25"})
 
 (defn py-list? [value] (python/isinstance value python/list))
@@ -220,6 +225,11 @@
               (str "missing exact put quote " symbol " " expiration " " strike))))
     [result quote]))
 
+(defn expiration-buckets-for [symbol expirations date-text]
+  (if (= symbol "SPY")
+    (shadow/spy-expiration-buckets expirations date-text)
+    (shadow/expiration-buckets expirations date-text)))
+
 (defn scheduled-time [date-text clock-text]
   (datetime.datetime/combine (datetime.date/fromisoformat date-text)
                              (datetime.time/fromisoformat clock-text) eastern))
@@ -241,6 +251,7 @@
   {"schema_version" 1 "kind" "panda-calendar-shadow-state-v1"
    "mode" "QUOTE_ONLY" "orders_enabled" false "broker_orders_submitted" false
    "account" "PANDA" "symbols" symbols "symbol_priority" symbol-priority
+   "policy_version" policy-version "selector_profiles" selector-profiles
    "limits" limits "positions" [] "events" [] "created_at_utc" (iso-utc)
    "updated_at_utc" (iso-utc)})
 
@@ -261,6 +272,15 @@
 
 (defn add-event [state event]
   (update state "events" #(conj (vec %) event)))
+
+(defn current-policy? [state]
+  (and (= policy-version (get state "policy_version"))
+       (= limits (get state "limits"))))
+
+(defn require-current-policy! [state]
+  (when-not (current-policy? state)
+    (throw (python/RuntimeError
+            "Panda shadow risk policy differs from deployed policy; run policy-update"))))
 
 (defn artifact-receipt [path]
   {"path" path "sha256" (sha256-file path) "bytes" (os.path/getsize path)})
@@ -286,6 +306,7 @@
                         "planned_exit_date" (get row "planned_exit_date")
                         "weekly_expiration" (get row "weekly_expiration")
                         "monthly_expiration" (get row "monthly_expiration")
+                        "selector_profile" (get row "selector_profile")
                         "strike" (get row "selected_strike")
                         "entry_debit" (get row "entry_debit")
                         "assignment_notional_usd" (get row "assignment_notional_usd")
@@ -322,17 +343,64 @@
   (let [d (datetime.date/fromisoformat date-text)]
     (and (< (.weekday d) 5) (not (contains? nyse-holidays date-text)))))
 
+(defn policy-receipt-path [args]
+  (os.path/join (.-output_root args) "policies" policy-version "receipt.json"))
+
+(defn apply-policy-receipt [state receipt-path receipt]
+  (let [already-applied?
+        (some #(and (= "POLICY_UPDATE" (get % "phase"))
+                    (= receipt-path (get % "receipt")))
+              (.get state "events"))]
+    (if already-applied?
+      state
+      (-> state
+          (assoc "policy_version" (.get receipt "new_policy_version")
+                 "limits" (persistent-data (.get receipt "new_limits"))
+                 "selector_profiles" selector-profiles)
+          (add-event {"phase" "POLICY_UPDATE" "receipt" receipt-path
+                      "applied_at_utc" (iso-utc)})))))
+
+(defn policy-update! [args]
+  (let [out (policy-receipt-path args)
+        state (load-state args)]
+    (broker-snapshot args)
+    (if (os.path/exists out)
+      (let [receipt (json/loads (slurp out))
+            updated (apply-policy-receipt state out receipt)]
+        (save-state! args updated)
+        (println (json/dumps (jsonable {"status" "ALREADY_APPLIED"
+                                       "receipt" out}) ** :indent 2)))
+      (let [receipt {"schema_version" 1
+                     "kind" "panda-calendar-shadow-policy-update-v1"
+                     "status" "POLICY_UPDATED"
+                     "approved_by" "user"
+                     "approved_at_utc" (iso-utc)
+                     "prior_policy_version" (get state "policy_version" "initial-1x-v1")
+                     "prior_limits" (get state "limits")
+                     "new_policy_version" policy-version
+                     "new_limits" limits
+                     "selector_profiles" selector-profiles
+                     "orders_enabled" false
+                     "broker_orders_submitted" false}
+            _ (immutable-json! out receipt)
+            updated (apply-policy-receipt state out receipt)]
+        (save-state! args updated)
+        (println (json/dumps (jsonable receipt) ** :indent 2 :sort_keys true))))))
+
 (defn preflight! [args]
   (let [date-text (.-session_date args)
         broker (broker-snapshot args)
         [theta _] (fetch-expirations args "SPY")
         state (load-state args)
+        _ (require-current-policy! state)
         result {"schema_version" 1 "kind" "panda-calendar-shadow-preflight-v1"
                 "status" "PASS" "session_date" date-text "checked_at_utc" (iso-utc)
                 "broker" broker
                 "theta" (dissoc theta "payload")
                 "state" {"active_exposure" (shadow/active-exposure (.get state "positions"))
-                         "position_count" (count (.get state "positions"))}
+                         "position_count" (count (.get state "positions"))
+                         "policy_version" (get state "policy_version")
+                         "limits" (get state "limits")}
                 "orders_enabled" false "broker_orders_submitted" false}]
     (immutable-json! (os.path/join (.-output_root args) "preflights" date-text
                                   (str "receipt-" (artifact-stamp) ".json")) result)
@@ -349,6 +417,7 @@
         (println (json/dumps (jsonable {"status" "ALREADY_CAPTURED"
                                        "receipt" out "state_reconciled" true}) ** :indent 2)))
       (do
+        (require-current-policy! state)
         (when-not (market-day? date-text)
           (throw (python/RuntimeError (str date-text " is not a configured market day"))))
         (let [broker (broker-snapshot args)
@@ -359,13 +428,14 @@
               (into {}
                     (for [symbol symbols]
                       (let [[expiration-raw expirations] (fetch-expirations args symbol)
-                            buckets (shadow/expiration-buckets expirations date-text)
+                            buckets (expiration-buckets-for symbol expirations date-text)
                             weekly (get buckets "weekly") monthly (get buckets "monthly")
                             [weekly-raw weekly-rows] (fetch-chain args symbol weekly)
                             [monthly-raw monthly-rows] (fetch-chain args symbol monthly)
                             selection (shadow/select-put-calendar
                                        weekly-rows monthly-rows weekly monthly)]
                         [symbol {"weekly_expiration" weekly "monthly_expiration" monthly
+                                 "selector_profile" (get selector-profiles symbol)
                                  "selection" selection "expiration_raw" expiration-raw
                                  "weekly_raw" weekly-raw "monthly_raw" monthly-raw}])))
               _ (wait-for-clock! date-text "12:01:00" (.-max_lateness_seconds args)
@@ -413,6 +483,7 @@
                         "weekly_expiration" (get decision "weekly_expiration")
                         "monthly_expiration" (get decision "monthly_expiration")
                         "planned_exit_date" planned-exit-date
+                        "selector_profile" (get decision "selector_profile")
                         "selected_strike" strike
                         "entry_debit" (get economics "entry_debit")
                         "assignment_notional_usd" (* 100.0 strike)
@@ -455,6 +526,8 @@
                        "decision_anchor_et" "12:00:00" "entry_clock_et" "12:01:00"
                        "captured_at_utc" (iso-utc) "account_equity_usd" account-equity
                        "horizon_sessions" 5 "planned_exit_date" planned-exit-date
+                       "policy_version" policy-version
+                       "selector_profiles" selector-profiles
                        "symbols" symbols "symbol_priority" symbol-priority "limits" limits
                        "skips" skips
                        "admissions" admissions "ending_exposure" (get admission "ending_exposure")
@@ -520,6 +593,10 @@
         result {"kind" "panda-calendar-shadow-status-v1" "checked_at_utc" (iso-utc)
                 "mode" "QUOTE_ONLY" "orders_enabled" false
                 "broker_orders_submitted" false "broker" broker
+                "policy_version" (get state "policy_version")
+                "deployed_policy_version" policy-version
+                "policy_current" (current-policy? state)
+                "limits" (get state "limits")
                 "active_exposure" (shadow/active-exposure (.get state "positions"))
                 "positions" (.get state "positions")}]
     (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))))
@@ -527,7 +604,8 @@
 (defn parse-args []
   (let [parser (argparse/ArgumentParser
                 ** :description "Durable Panda core-calendar quote-only shadow")]
-    (.add_argument parser "--phase" ** :choices ["preflight" "entry" "exit" "status"]
+    (.add_argument parser "--phase"
+                   ** :choices ["policy-update" "preflight" "entry" "exit" "status"]
                    :required true)
     (.add_argument parser "--session-date"
                    ** :default (.isoformat (.date (now-et))))
@@ -547,6 +625,7 @@
 (defn -main []
   (let [args (parse-args)]
     (case (.-phase args)
+      "policy-update" (policy-update! args)
       "preflight" (preflight! args)
       "entry" (capture-entry! args)
       "exit" (capture-exit! args)

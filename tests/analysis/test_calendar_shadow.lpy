@@ -24,6 +24,14 @@
     (is (= "2026-07-30" (get buckets "weekly")))
     (is (= "2026-08-21" (get buckets "monthly")))))
 
+(deftest spy-maturity-grid-selection-uses-any-listed-7-and-42-dte-expirations
+  (let [buckets (shadow/spy-expiration-buckets
+                 ["2026-07-31" "2026-08-06" "2026-08-21" "2026-09-04"
+                  "2026-09-18"]
+                 "2026-07-24")]
+    (is (= "2026-07-31" (get buckets "weekly")))
+    (is (= "2026-09-04" (get buckets "monthly")))))
+
 (deftest exact-calendar-selection-and-entry-costs
   (let [selection (shadow/select-put-calendar
                    (chain "2026-07-30" true)

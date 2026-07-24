@@ -5,12 +5,20 @@
 ## Frozen research rule
 
 The forward shadow observes SPY, QQQ, and IWM in fixed priority order. At
-12:00:00 ET it selects the common put strike nearest the monthly
+12:00:00 ET it selects the common put strike nearest the back-expiration
 synthetic-forward ATM. At 12:01:00 ET it records a marketable one-contract
-calendar entry: sell the nearest eligible approximately 7-DTE Thursday/Friday
-put and buy the standard approximately 42-DTE monthly put at the same strike.
-It records the marketable close at 15:15:00 ET exactly five later market
-sessions after entry.
+calendar entry, and it records the marketable close at 15:15:00 ET exactly
+five later market sessions after entry.
+
+The expiration selector is intentionally symbol-specific because the frozen
+SPY maturity-grid study and the later cross-symbol replication did not use the
+same listing convention:
+
+- SPY selects any listed front expiration from 7-9 DTE nearest 7 DTE and any
+  listed back expiration from 37-47 DTE nearest 42 DTE.
+- QQQ and IWM select the nearest Thursday/Friday weekly-cycle expiration to 7
+  DTE within 3-10 DTE and the nearest standard monthly expiration to 42 DTE
+  within 21-63 DTE.
 
 The fifth market session comes from Alpaca's read-only market calendar. A
 candidate is skipped when its short option expires before that exit session.
@@ -23,11 +31,36 @@ it does not equate "five sessions" with an arbitrary number of calendar days.
 - Account capability required by every run: ACTIVE, unblocked, Level 3 options.
 - Individual entry-debit ceiling: 2.5% of current equity.
 - Aggregate active entry-debit ceiling: 10% of current equity.
-- Aggregate active short-put assignment notional ceiling: 1.0 times equity.
+- Aggregate active short-put assignment notional ceiling: 2.0 times equity,
+  effective prospectively under policy
+  `assignment-notional-2x-2026-07-24`.
 - Candidate priority is fixed as SPY, then QQQ, then IWM. It is not reordered
   using observed forward outcomes.
 - This ceiling is a conservative assignment-bridge stress rule, not a claim
   about the spread's economic maximum loss or Alpaca's margin calculation.
+
+The first July 24 entry receipt was captured under the original 1x policy and
+used the cross-symbol Thursday/Friday/standard-monthly selector for all three
+symbols. It is preserved as an immutable operational diagnostic. It must not
+be relabeled as an exact SPY 7/42 maturity-grid observation. The per-symbol
+selector correction and 2x risk policy apply only to later entry receipts.
+
+## Entry weekday and cadence
+
+The frozen research generated candidates on every eligible session and
+allowed overlapping five-session positions subject to the entry-known risk
+limits. It was not a once-per-week or Friday-only rule. The forward runner
+therefore evaluates the portfolio every weekday. A symbol can be skipped
+because its selected short leg expires before the five-session exit, or because
+an active-position limit prevents admission.
+
+A post-hoc weekday summary did not identify one consistent best weekday. SPY's
+mean executable return declined from 18.05% on Monday to 9.77% on Friday, but
+QQQ was strongest on Thursday and IWM was strongest on Friday. QQQ and IWM had
+only one and three Monday observations respectively. These overlapping,
+unequal samples are descriptive and do not authorize a weekday filter. The
+shadow retains every eligible weekday to avoid selecting a calendar day after
+seeing its historical outcome.
 
 ## Safety boundary
 
