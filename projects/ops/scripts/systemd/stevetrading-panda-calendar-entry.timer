@@ -1,0 +1,12 @@
+[Unit]
+Description=Start Panda calendar quote-only entry capture immediately before its decision anchor
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 11:59:15 America/New_York
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=stevetrading-panda-calendar-entry.service
+
+[Install]
+WantedBy=timers.target

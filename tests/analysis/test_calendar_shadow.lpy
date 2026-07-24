@@ -1,0 +1,70 @@
+(ns analysis.test-calendar-shadow
+  (:import math)
+  (:require [stevetrading.analysis.calendar-shadow :as shadow]
+            [basilisp.test :refer [deftest is testing]]))
+
+(defn sample-quote [expiration strike right bid ask]
+  {"expiration" expiration "strike" strike "right" right
+   "bid" bid "ask" ask "bid_size" 20 "ask_size" 25
+   "timestamp" "2026-07-23T15:31:00.000"})
+
+(defn chain [expiration weekly?]
+  [(sample-quote expiration 99.0 "CALL" 3.0 3.2)
+   (sample-quote expiration 99.0 "PUT" 1.0 1.2)
+   (sample-quote expiration 100.0 "CALL" (if weekly? 2.0 4.7) (if weekly? 2.2 5.0))
+   (sample-quote expiration 100.0 "PUT" (if weekly? 2.0 4.7) (if weekly? 2.2 5.0))
+   (sample-quote expiration 101.0 "CALL" 1.0 1.2)
+   (sample-quote expiration 101.0 "PUT" 3.0 3.2)])
+
+(deftest historical-expiration-selection-is-preserved
+  (let [buckets (shadow/expiration-buckets
+                 ["2026-07-23" "2026-07-24" "2026-07-30" "2026-07-31"
+                  "2026-08-21" "2026-09-18"]
+                 "2026-07-23")]
+    (is (= "2026-07-30" (get buckets "weekly")))
+    (is (= "2026-08-21" (get buckets "monthly")))))
+
+(deftest exact-calendar-selection-and-entry-costs
+  (let [selection (shadow/select-put-calendar
+                   (chain "2026-07-30" true)
+                   (chain "2026-08-21" false)
+                   "2026-07-30" "2026-08-21")
+        economics (shadow/entry-economics selection)]
+    (is (= 100.0 (get selection "atm_strike")))
+    (is (= 100.0 (get selection "selected_strike")))
+    (is (= -1 (get (get selection "short_weekly") "quantity")))
+    (is (= 1 (get (get selection "long_monthly") "quantity")))
+    (is (math/isclose 301.3 (get economics "entry_debit")))
+    (is (= 20.0 (get economics "minimum_executable_size")))))
+
+(deftest exit-crosses-both-spreads-and-pays-fees
+  (let [short (sample-quote "2026-07-30" 100.0 "PUT" 0.4 0.5)
+        long (sample-quote "2026-08-21" 100.0 "PUT" 6.0 6.2)
+        economics (shadow/exit-economics 301.3 short long)]
+    (is (math/isclose 550.0 (get economics "market_credit")))
+    (is (math/isclose 548.7 (get economics "exit_credit")))
+    (is (math/isclose 247.4 (get economics "net_pnl")))
+    (is (= 20.0 (get economics "minimum_executable_size")))))
+
+(deftest assignment-aware-admission-is-entry-known-and-priority-stable
+  (let [positions [{"status" "ACTIVE" "entry_debit" 500.0
+                    "assignment_notional_usd" 20000.0}]
+        candidates [{"symbol" "QQQ" "entry_debit" 700.0
+                     "assignment_notional_usd" 60000.0}
+                    {"symbol" "SPY" "entry_debit" 600.0
+                     "assignment_notional_usd" 74000.0}
+                    {"symbol" "IWM" "entry_debit" 300.0
+                     "assignment_notional_usd" 25000.0}]
+        limits {"individual_debit_fraction" 0.025
+                "aggregate_debit_fraction" 0.10
+                "aggregate_assignment_notional_multiple" 1.0}
+        result (shadow/admit-calendar-candidates
+                positions candidates 100000.0 limits ["SPY" "QQQ" "IWM"])
+        admissions (get result "admissions")]
+    (is (= ["SPY" "QQQ" "IWM"] (mapv #(get % "symbol") admissions)))
+    (is (= [true false false] (mapv #(get % "admitted") admissions)))
+    (is (= "ASSIGNMENT_NOTIONAL_LIMIT"
+           (get (nth admissions 1) "admission_reason")))
+    (is (= 2 (get (get result "ending_exposure") "active_positions")))
+    (is (= 94000.0
+           (get (get result "ending_exposure") "aggregate_assignment_notional")))))

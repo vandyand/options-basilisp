@@ -1,0 +1,21 @@
+[Unit]
+Description=SteveTrading Panda calendar quote-only 12:00 decision and 12:01 entry capture
+Wants=network-online.target
+After=network-online.target stevetrading-six.service
+
+[Service]
+Type=oneshot
+User=bot
+WorkingDirectory=/opt/stevetrading/shared/panda-calendar-v1/tool
+EnvironmentFile=/etc/stevetrading/env
+Environment=STEVE_REPO_ROOT=/opt/stevetrading/shared/panda-calendar-v1/tool
+Environment=PYTHONPATH=/opt/stevetrading/shared/panda-calendar-v1/tool/components/analysis.core/src
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/stevetrading/shared/Data-Preprocessor/.venv/bin/basilisp run scripts/panda_calendar_shadow.lpy -- --phase entry --base-url http://127.0.0.1:25503 --ref-root /opt/stevetrading/shared/Data-Preprocessor --output-root /opt/stevetrading/shared/panda-calendar-v1
+TimeoutStartSec=600
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=append:/var/log/stevetrading/panda-calendar.log
+StandardError=append:/var/log/stevetrading/panda-calendar.log

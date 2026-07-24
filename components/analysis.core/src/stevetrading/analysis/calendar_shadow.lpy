@@ -1,0 +1,196 @@
+(ns stevetrading.analysis.calendar-shadow
+  "Pure selection and execution math for the frozen SPY put-calendar shadow."
+  (:import bisect datetime math)
+  (:require [clojure.set]))
+
+(def fee-per-contract-side 0.65)
+
+(defn finite-number [value]
+  (try
+    (let [number (float value)]
+      (when (math/isfinite number) number))
+    (catch python/Exception _ nil)))
+
+(defn normalize-right [value]
+  (case (.upper (str value))
+    ("C" "CALL") "C"
+    ("P" "PUT") "P"
+    nil))
+
+(defn valid-quote? [row]
+  (let [bid (finite-number (get row "bid"))
+        ask (finite-number (get row "ask"))]
+    (and bid ask (pos? bid) (>= ask bid))))
+
+(defn nearest-in-window [expirations trade-date target min-dte max-dte eligible?]
+  (let [minimum (+ trade-date (datetime/timedelta ** :days min-dte))
+        maximum (+ trade-date (datetime/timedelta ** :days max-dte))
+        low (bisect/bisect_left expirations minimum)
+        high (bisect/bisect_right expirations maximum)
+        window (.__getitem__ expirations (slice low high))
+        candidates (filter (fn [expiration]
+                             (let [dte (.-days (- expiration trade-date))]
+                               (and (>= dte min-dte) (<= dte max-dte)
+                                    (eligible? expiration))))
+                           window)]
+    (when (seq candidates)
+      (first (sort-by (fn [expiration]
+                        [(abs (.-days (- expiration target))) expiration])
+                      candidates)))))
+
+(defn expiration-buckets [expiration-texts date-text]
+  (let [expirations (vec (sort (set (map datetime.date/fromisoformat expiration-texts))))
+        expiration-set (set expirations)
+        trade-date (datetime.date/fromisoformat date-text)
+        weekly-cycle? #(contains? #{3 4} (.weekday %))
+        standard-monthly?
+        #(and (>= (.-day %) 15) (<= (.-day %) 21)
+              (or (= 4 (.weekday %))
+                  (and (= 3 (.weekday %))
+                       (not (contains? expiration-set
+                                       (+ % (datetime/timedelta ** :days 1)))))))
+        weekly (nearest-in-window expirations trade-date
+                                  (+ trade-date (datetime/timedelta ** :days 7))
+                                  3 10 weekly-cycle?)
+        monthly (nearest-in-window expirations trade-date
+                                   (+ trade-date (datetime/timedelta ** :days 42))
+                                   21 63 standard-monthly?)]
+    (when-not (and weekly monthly)
+      (throw (python/RuntimeError
+              (str "could not select weekly and monthly expirations for " date-text))))
+    {"weekly" (.isoformat weekly) "monthly" (.isoformat monthly)}))
+
+(defn normalize-row [row]
+  (let [strike (finite-number (get row "strike"))
+        right (normalize-right (get row "right"))]
+    (when (and strike right)
+      {"expiration" (str (get row "expiration"))
+       "strike" strike
+       "right" right
+       "bid" (finite-number (get row "bid"))
+       "ask" (finite-number (get row "ask"))
+       "bid_size" (or (finite-number (get row "bid_size")) 0.0)
+       "ask_size" (or (finite-number (get row "ask_size")) 0.0)
+       "timestamp" (get row "timestamp")})))
+
+(defn quote-map [rows expiration]
+  (reduce (fn [out raw]
+            (if-let [row (normalize-row raw)]
+              (if (and (= expiration (get row "expiration")) (valid-quote? row))
+                (let [key [(get row "strike") (get row "right")]
+                      old (get out key)]
+                  (if (or (nil? old)
+                          (> (get row "bid") (get old "bid"))
+                          (and (= (get row "bid") (get old "bid"))
+                               (< (get row "ask") (get old "ask"))))
+                    (assoc out key row)
+                    out))
+                out)
+              out))
+          {} rows))
+
+(defn synthetic-atm [monthly-quotes]
+  (let [strikes (sort (set (map first (keys monthly-quotes))))
+        candidates
+        (keep (fn [strike]
+                (let [call (get monthly-quotes [strike "C"])
+                      put (get monthly-quotes [strike "P"])]
+                  (when (and call put)
+                    (let [call-mid (/ (+ (get call "bid") (get call "ask")) 2.0)
+                          put-mid (/ (+ (get put "bid") (get put "ask")) 2.0)
+                          spread (+ (- (get call "ask") (get call "bid"))
+                                    (- (get put "ask") (get put "bid")))]
+                      [(abs (- call-mid put-mid)) spread strike]))))
+              strikes)]
+    (when-not (seq candidates)
+      (throw (python/RuntimeError "monthly snapshot has no valid paired call/put strikes")))
+    (nth (first (sort candidates)) 2)))
+
+(defn select-put-calendar [weekly-rows monthly-rows weekly-expiration monthly-expiration]
+  (let [weekly (quote-map weekly-rows weekly-expiration)
+        monthly (quote-map monthly-rows monthly-expiration)
+        atm (synthetic-atm monthly)
+        weekly-put-strikes (set (keep (fn [[[strike right] _]]
+                                        (when (= right "P") strike)) weekly))
+        monthly-put-strikes (set (keep (fn [[[strike right] _]]
+                                         (when (= right "P") strike)) monthly))
+        shared (sort (clojure.set/intersection weekly-put-strikes monthly-put-strikes))]
+    (when-not (seq shared)
+      (throw (python/RuntimeError "weekly/monthly snapshots have no shared valid put strike")))
+    (let [strike (first (sort-by #(abs (- % atm)) shared))]
+      {"atm_strike" atm
+       "selected_strike" strike
+       "short_weekly" (assoc (get weekly [strike "P"]) "quantity" -1)
+       "long_monthly" (assoc (get monthly [strike "P"]) "quantity" 1)})))
+
+(defn entry-economics [selection]
+  (let [short (get selection "short_weekly")
+        long (get selection "long_monthly")
+        market-debit (* 100.0 (- (get long "ask") (get short "bid")))
+        fees (* 2.0 fee-per-contract-side)
+        debit (+ market-debit fees)]
+    (when-not (pos? debit)
+      (throw (python/RuntimeError "calendar entry is not a positive debit")))
+    {"market_debit" market-debit
+     "entry_fees" fees
+     "entry_debit" debit
+     "minimum_executable_size" (min (get short "bid_size") (get long "ask_size"))
+     "combined_spread" (* 100.0 (+ (- (get short "ask") (get short "bid"))
+                                     (- (get long "ask") (get long "bid"))))}))
+
+(defn exit-economics [entry-debit short-quote long-quote]
+  (let [market-credit (* 100.0 (- (get long-quote "bid") (get short-quote "ask")))
+        fees (* 2.0 fee-per-contract-side)
+        credit (- market-credit fees)
+        pnl (- credit entry-debit)]
+    {"market_credit" market-credit
+     "exit_fees" fees
+     "exit_credit" credit
+     "net_pnl" pnl
+     "net_return" (/ pnl entry-debit)
+     "minimum_executable_size" (min (get short-quote "ask_size")
+                                     (get long-quote "bid_size"))
+     "combined_spread" (* 100.0 (+ (- (get short-quote "ask") (get short-quote "bid"))
+                                     (- (get long-quote "ask") (get long-quote "bid"))))}))
+
+(defn active-exposure [positions]
+  (let [active (filter #(= "ACTIVE" (get % "status")) positions)]
+    {"active_positions" (count active)
+     "aggregate_debit" (reduce + 0.0 (map #(float (get % "entry_debit" 0.0)) active))
+     "aggregate_assignment_notional"
+     (reduce + 0.0 (map #(float (get % "assignment_notional_usd" 0.0)) active))}))
+
+(defn admit-calendar-candidates
+  "Apply entry-known debit and assignment-notional limits in the supplied priority order."
+  [positions candidates account-equity limits priority]
+  (let [rank (zipmap priority (range))
+        ordered (sort-by #(get rank (get % "symbol") 999) candidates)
+        individual-limit (* account-equity (get limits "individual_debit_fraction"))
+        aggregate-debit-limit (* account-equity (get limits "aggregate_debit_fraction"))
+        aggregate-notional-limit
+        (* account-equity (get limits "aggregate_assignment_notional_multiple"))]
+    (loop [remaining ordered
+           exposure (active-exposure positions)
+           admissions []]
+      (if-not (seq remaining)
+        {"admissions" admissions "ending_exposure" exposure}
+        (let [candidate (first remaining)
+              debit (float (get candidate "entry_debit"))
+              notional (float (get candidate "assignment_notional_usd"))
+              next-debit (+ (get exposure "aggregate_debit") debit)
+              next-notional (+ (get exposure "aggregate_assignment_notional") notional)
+              reason (cond
+                       (> debit individual-limit) "INDIVIDUAL_DEBIT_LIMIT"
+                       (> next-debit aggregate-debit-limit) "AGGREGATE_DEBIT_LIMIT"
+                       (> next-notional aggregate-notional-limit) "ASSIGNMENT_NOTIONAL_LIMIT"
+                       :else "ADMITTED")
+              admitted? (= reason "ADMITTED")
+              next-exposure
+              (if admitted?
+                {"active_positions" (inc (get exposure "active_positions"))
+                 "aggregate_debit" next-debit
+                 "aggregate_assignment_notional" next-notional}
+                exposure)]
+          (recur (rest remaining) next-exposure
+                 (conj admissions
+                       (assoc candidate "admitted" admitted? "admission_reason" reason))))))))

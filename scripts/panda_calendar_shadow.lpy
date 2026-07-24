@@ -1,0 +1,555 @@
+"""Durable SPY/QQQ/IWM Panda calendar shadow. This file contains no broker write path."""
+
+(import argparse collections.abc datetime hashlib json os os.path pathlib re sys time
+        urllib.parse urllib.request zoneinfo)
+
+(def repo-root (os.path/abspath (or (os.environ/get "STEVE_REPO_ROOT") (os/getcwd))))
+(.insert (.-path sys) 0 (os.path/join repo-root "components/analysis.core/src"))
+(require '[stevetrading.analysis.calendar-shadow :as shadow])
+
+(def eastern (zoneinfo/ZoneInfo "America/New_York"))
+(def utc datetime.timezone/utc)
+(def symbols ["SPY" "QQQ" "IWM"])
+(def symbol-priority ["SPY" "QQQ" "IWM"])
+(def orders-enabled false)
+(def limits {"individual_debit_fraction" 0.025
+             "aggregate_debit_fraction" 0.10
+             "aggregate_assignment_notional_multiple" 1.0})
+(def nyse-holidays #{"2026-07-03" "2026-09-07" "2026-11-26" "2026-12-25"})
+
+(defn py-list? [value] (python/isinstance value python/list))
+(defn py-dict? [value] (python/isinstance value python/dict))
+(defn py-mapping? [value] (python/isinstance value collections.abc/Mapping))
+
+(defn jsonable [value]
+  (cond
+    (map? value) (python/dict (map (fn [[k v]] (python/tuple [(str k) (jsonable v)])) value))
+    (or (vector? value) (seq? value) (set? value)) (python/list (map jsonable value))
+    (py-dict? value) (python/dict
+                      (map (fn [key] (python/tuple [(str key) (jsonable (.get value key))]))
+                           (.keys value)))
+    (py-mapping? value) (python/dict
+                         (map (fn [[k v]] (python/tuple [(str k) (jsonable v)]))
+                              (.items value)))
+    (py-list? value) (python/list (map jsonable value))
+    :else value))
+
+(defn persistent-data [value]
+  (cond
+    (py-mapping? value) (into {} (map (fn [[k v]] [(str k) (persistent-data v)])
+                                      (.items value)))
+    (py-list? value) (vec (map persistent-data value))
+    :else value))
+
+(defn now-et [] (datetime.datetime/now eastern))
+(defn iso-utc [] (.isoformat (datetime.datetime/now utc)))
+(defn artifact-stamp [] (.strftime (datetime.datetime/now utc) "%Y%m%dT%H%M%S_%fZ"))
+(defn compact-date [text] (.replace (str text) "-" ""))
+
+(defn sha256-file [path]
+  (let [digest (hashlib/sha256)]
+    (with-open [stream (open path "rb")]
+      (loop []
+        (let [chunk (.read stream (* 1024 1024))]
+          (when (pos? (count chunk)) (.update digest chunk) (recur)))))
+    (.hexdigest digest)))
+
+(defn atomic-json! [path value]
+  (let [target (pathlib/Path path)
+        temporary (.with_suffix target (str (.-suffix target) ".tmp-" (os/getpid)))
+        text (str (json/dumps (jsonable value) ** :indent 2 :sort_keys true
+                              :allow_nan false) "\n")]
+    (.mkdir (.-parent target) ** :parents true :exist_ok true)
+    (spit (str temporary) text)
+    (os/replace (str temporary) (str target))
+    (str target)))
+
+(defn immutable-json! [path value]
+  (when (os.path/exists path)
+    (throw (python/FileExistsError (str "immutable artifact already exists: " path))))
+  (atomic-json! path value))
+
+(defn parse-env [path]
+  (into {}
+        (keep (fn [line]
+                (let [match (re/match "^([A-Za-z_][A-Za-z0-9_]*)=(.*)$" (.strip line))]
+                  (when match
+                    [(.__getitem__ match 1)
+                     (.strip (.strip (.__getitem__ match 2)) "\"'")])))
+              (.splitlines (slurp path)))))
+
+(defn panda-creds [ref-root]
+  (let [env (parse-env (os.path/join ref-root ".env"))
+        key (.get env "ALPACA_PANDA_API_KEY")
+        secret (.get env "ALPACA_PANDA_API_SECRET")]
+    (when-not (and key secret)
+      (throw (python/RuntimeError "Panda credentials are missing")))
+    {"key" key "secret" secret}))
+
+(defn request-url [base-url path params]
+  (let [pairs (python/list (map (fn [[k v]] (python/tuple [(str k) (str v)]))
+                                (sort-by first params)))]
+    (str (.rstrip base-url "/") path "?" (urllib.parse/urlencode pairs))))
+
+(defn fetch-json [url headers timeout-s]
+  (let [started (time/monotonic)
+        request (urllib.request/Request url ** :headers (jsonable headers))]
+    (.add_header request "Accept" "application/json")
+    (with-open [response (urllib.request/urlopen request ** :timeout timeout-s)]
+      {"url" url "http_status" (.-status response)
+       "elapsed_ms" (int (* 1000.0 (- (time/monotonic) started)))
+       "received_at_utc" (iso-utc)
+       "payload" (json/loads (.decode (.read response) "utf-8" "strict"))})))
+
+(defn alpaca-get [base-url path creds timeout-s]
+  (fetch-json (str (.rstrip base-url "/") path)
+              {"APCA-API-KEY-ID" (get creds "key")
+               "APCA-API-SECRET-KEY" (get creds "secret")}
+              timeout-s))
+
+(defn header-columns [payload]
+  (let [header (when (py-dict? payload) (.get payload "header"))
+        columns (when (py-dict? header)
+                  (or (.get header "format") (.get header "columns") (.get header "fields")))]
+    (when (py-list? columns) (vec (map str columns)))))
+
+(defn table-rows [payload]
+  (cond
+    (py-list? payload) (vec (filter py-dict? payload))
+    (and (py-dict? payload) (py-list? (.get payload "response"))
+         (seq (header-columns payload)))
+    (let [columns (header-columns payload)]
+      (vec (keep (fn [row]
+                   (when (py-list? row)
+                     (into {} (map-indexed
+                               (fn [i column]
+                                 [column (when (< i (count row)) (nth row i))])
+                               columns))))
+                 (.get payload "response"))))
+    (py-dict? payload)
+    (let [columns (vec (filter #(py-list? (.get payload %)) (.keys payload)))
+          n (if (seq columns) (apply max (map #(count (.get payload %)) columns)) 0)]
+      (vec (for [i (range n)]
+             (into {} (map (fn [column]
+                             [column (when (< i (count (.get payload column)))
+                                       (nth (.get payload column) i))])
+                           columns)))))
+    :else []))
+
+(defn selected-fields [document fields]
+  (into {} (keep (fn [field]
+                   (let [value (.get document field)]
+                     (when (some? value) [field value]))) fields)))
+
+(defn broker-snapshot [args]
+  (let [creds (panda-creds (.-ref_root args))
+        account-result (alpaca-get (.-alpaca_base_url args) "/v2/account" creds (.-timeout_s args))
+        positions-result (alpaca-get (.-alpaca_base_url args) "/v2/positions" creds (.-timeout_s args))
+        orders-result (alpaca-get (.-alpaca_base_url args) "/v2/orders?status=open&limit=500"
+                                  creds (.-timeout_s args))
+        account (.get account-result "payload")
+        positions (.get positions-result "payload")
+        orders (.get orders-result "payload")
+        safe {"account" (selected-fields
+                          account ["status" "equity" "cash" "buying_power"
+                                   "options_buying_power" "multiplier"
+                                   "options_approved_level" "options_trading_level"
+                                   "account_blocked" "trading_blocked"
+                                   "trade_suspended_by_user"])
+              "position_count" (count positions)
+              "positions" (vec (map #(selected-fields % ["symbol" "qty" "side" "market_value"])
+                                    positions))
+              "open_order_count" (count orders)
+              "open_orders" (vec (map #(selected-fields % ["id" "symbol" "qty" "side"
+                                                              "status" "order_class"])
+                                      orders))}]
+    (when-not (= "ACTIVE" (.get account "status"))
+      (throw (python/RuntimeError "Panda account is not ACTIVE")))
+    (when (or (.get account "account_blocked") (.get account "trading_blocked")
+              (.get account "trade_suspended_by_user"))
+      (throw (python/RuntimeError "Panda account is blocked or suspended")))
+    (when-not (and (= 3 (.get account "options_approved_level"))
+                   (= 3 (.get account "options_trading_level")))
+      (throw (python/RuntimeError "Panda is not enabled for Level 3 options")))
+    (when (and (not orders-enabled) (or (pos? (count positions)) (pos? (count orders))))
+      (throw (python/RuntimeError
+              "quote-only Panda account drift: broker positions or orders are present")))
+    safe))
+
+(defn fetch-market-calendar [args date-text]
+  (let [creds (panda-creds (.-ref_root args))
+        start (datetime.date/fromisoformat date-text)
+        end (+ start (datetime/timedelta ** :days 21))
+        path (str "/v2/calendar?start=" (.isoformat start) "&end=" (.isoformat end))
+        result (alpaca-get (.-alpaca_base_url args) path creds (.-timeout_s args))
+        rows (.get result "payload")
+        session-dates (vec (map #(.get % "date") rows))
+        future-dates (vec (filter #(> % date-text) session-dates))]
+    (when-not (contains? (set session-dates) date-text)
+      (throw (python/RuntimeError (str date-text " is not an Alpaca market session"))))
+    (when (< (count future-dates) 5)
+      (throw (python/RuntimeError "Alpaca calendar did not return five future sessions")))
+    [result (nth future-dates 4)]))
+
+(defn fetch-expirations [args symbol]
+  (let [result (fetch-json
+                (request-url (.-base_url args) "/v3/option/list/expirations"
+                             {"symbol" symbol "format" "json"})
+                {} (.-timeout_s args))]
+    [result (vec (sort (set (keep #(get % "expiration")
+                                  (table-rows (get result "payload"))))))]))
+
+(defn fetch-chain [args symbol expiration]
+  (let [result (fetch-json
+                (request-url (.-base_url args) "/v3/option/snapshot/quote"
+                             {"symbol" symbol "expiration" (compact-date expiration)
+                              "strike_range" (.-strike_range args) "format" "json"})
+                {} (.-timeout_s args))]
+    [result (table-rows (get result "payload"))]))
+
+(defn fetch-exact-put [args symbol expiration strike]
+  (let [result (fetch-json
+                (request-url (.-base_url args) "/v3/option/snapshot/quote"
+                             {"symbol" symbol "expiration" (compact-date expiration)
+                              "strike" strike "right" "put" "format" "json"})
+                {} (.-timeout_s args))
+        rows (table-rows (get result "payload"))
+        quote (get (shadow/quote-map rows expiration) [(float strike) "P"])]
+    (when-not quote
+      (throw (python/RuntimeError
+              (str "missing exact put quote " symbol " " expiration " " strike))))
+    [result quote]))
+
+(defn scheduled-time [date-text clock-text]
+  (datetime.datetime/combine (datetime.date/fromisoformat date-text)
+                             (datetime.time/fromisoformat clock-text) eastern))
+
+(defn wait-for-clock! [date-text clock-text max-lateness capture-now]
+  (when-not capture-now
+    (let [target (scheduled-time date-text clock-text)
+          remaining (.total_seconds (- target (now-et)))]
+      (when (< remaining (- max-lateness))
+        (throw (python/RuntimeError
+                (str "scheduled clock missed by " (- remaining) " seconds: " clock-text))))
+      (loop []
+        (let [left (.total_seconds (- target (now-et)))]
+          (when (pos? left) (time/sleep (min left 1.0)) (recur)))))))
+
+(defn state-path [args] (os.path/join (.-output_root args) "state.json"))
+
+(defn initial-state []
+  {"schema_version" 1 "kind" "panda-calendar-shadow-state-v1"
+   "mode" "QUOTE_ONLY" "orders_enabled" false "broker_orders_submitted" false
+   "account" "PANDA" "symbols" symbols "symbol_priority" symbol-priority
+   "limits" limits "positions" [] "events" [] "created_at_utc" (iso-utc)
+   "updated_at_utc" (iso-utc)})
+
+(defn load-state [args]
+  (let [path (state-path args)
+        state (if (os.path/exists path)
+                (persistent-data (json/loads (slurp path)))
+                (initial-state))]
+    (when-not (= "panda-calendar-shadow-state-v1" (.get state "kind"))
+      (throw (python/RuntimeError "unexpected Panda calendar state kind")))
+    (when-not (and (= false (.get state "orders_enabled"))
+                   (= false (.get state "broker_orders_submitted")))
+      (throw (python/RuntimeError "Panda shadow state does not prove no-order mode")))
+    state))
+
+(defn save-state! [args state]
+  (atomic-json! (state-path args) (assoc state "updated_at_utc" (iso-utc))))
+
+(defn add-event [state event]
+  (update state "events" #(conj (vec %) event)))
+
+(defn artifact-receipt [path]
+  {"path" path "sha256" (sha256-file path) "bytes" (os.path/getsize path)})
+
+(defn persist-raw! [path result]
+  (atomic-json! path result)
+  (artifact-receipt path))
+
+(defn entry-receipt-path [args date-text]
+  (os.path/join (.-output_root args) "entries" date-text "decision=12_00_00" "receipt.json"))
+
+(defn exit-receipt-path [args date-text]
+  (os.path/join (.-output_root args) "exits" date-text "exit=15_15_00" "receipt.json"))
+
+(defn apply-entry-receipt [state receipt-path receipt]
+  (let [existing (set (map #(get % "trade_id") (.get state "positions")))
+        admitted (filter #(get % "admitted") (.get receipt "admissions"))
+        additions
+        (vec (keep (fn [row]
+                     (when-not (contains? existing (get row "trade_id"))
+                       {"trade_id" (get row "trade_id") "symbol" (get row "symbol")
+                        "status" "ACTIVE" "entry_date" (.get receipt "session_date")
+                        "planned_exit_date" (get row "planned_exit_date")
+                        "weekly_expiration" (get row "weekly_expiration")
+                        "monthly_expiration" (get row "monthly_expiration")
+                        "strike" (get row "selected_strike")
+                        "entry_debit" (get row "entry_debit")
+                        "assignment_notional_usd" (get row "assignment_notional_usd")
+                        "entry_receipt" receipt-path}))
+                   admitted))]
+    (if (seq additions)
+      (-> state
+          (update "positions" #(into (vec %) additions))
+          (add-event {"phase" "ENTRY" "session_date" (.get receipt "session_date")
+                      "receipt" receipt-path "applied_at_utc" (iso-utc)}))
+      state)))
+
+(defn apply-exit-receipt [state receipt-path receipt]
+  (let [already-applied?
+        (some #(and (= "EXIT" (get % "phase"))
+                    (= receipt-path (get % "receipt")))
+              (.get state "events"))]
+    (if already-applied?
+      state
+      (let [closed-ids (set (map #(get % "trade_id") (.get receipt "exits")))]
+        (-> state
+            (assoc "positions"
+                   (vec (map (fn [position]
+                               (if (contains? closed-ids (get position "trade_id"))
+                                 (assoc position "status" "CLOSED"
+                                        "exit_date" (.get receipt "session_date")
+                                        "exit_receipt" receipt-path)
+                                 position))
+                             (.get state "positions"))))
+            (add-event {"phase" "EXIT" "session_date" (.get receipt "session_date")
+                        "receipt" receipt-path "applied_at_utc" (iso-utc)}))))))
+
+(defn market-day? [date-text]
+  (let [d (datetime.date/fromisoformat date-text)]
+    (and (< (.weekday d) 5) (not (contains? nyse-holidays date-text)))))
+
+(defn preflight! [args]
+  (let [date-text (.-session_date args)
+        broker (broker-snapshot args)
+        [theta _] (fetch-expirations args "SPY")
+        state (load-state args)
+        result {"schema_version" 1 "kind" "panda-calendar-shadow-preflight-v1"
+                "status" "PASS" "session_date" date-text "checked_at_utc" (iso-utc)
+                "broker" broker
+                "theta" (dissoc theta "payload")
+                "state" {"active_exposure" (shadow/active-exposure (.get state "positions"))
+                         "position_count" (count (.get state "positions"))}
+                "orders_enabled" false "broker_orders_submitted" false}]
+    (immutable-json! (os.path/join (.-output_root args) "preflights" date-text
+                                  (str "receipt-" (artifact-stamp) ".json")) result)
+    (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))))
+
+(defn capture-entry! [args]
+  (let [date-text (.-session_date args)
+        out (entry-receipt-path args date-text)
+        state (load-state args)]
+    (if (os.path/exists out)
+      (let [receipt (json/loads (slurp out))
+            recovered (apply-entry-receipt state out receipt)]
+        (save-state! args recovered)
+        (println (json/dumps (jsonable {"status" "ALREADY_CAPTURED"
+                                       "receipt" out "state_reconciled" true}) ** :indent 2)))
+      (do
+        (when-not (market-day? date-text)
+          (throw (python/RuntimeError (str date-text " is not a configured market day"))))
+        (let [broker (broker-snapshot args)
+              [calendar-raw planned-exit-date] (fetch-market-calendar args date-text)
+              _ (wait-for-clock! date-text "12:00:00" (.-max_lateness_seconds args)
+                                 (.-capture_now args))
+              decisions
+              (into {}
+                    (for [symbol symbols]
+                      (let [[expiration-raw expirations] (fetch-expirations args symbol)
+                            buckets (shadow/expiration-buckets expirations date-text)
+                            weekly (get buckets "weekly") monthly (get buckets "monthly")
+                            [weekly-raw weekly-rows] (fetch-chain args symbol weekly)
+                            [monthly-raw monthly-rows] (fetch-chain args symbol monthly)
+                            selection (shadow/select-put-calendar
+                                       weekly-rows monthly-rows weekly monthly)]
+                        [symbol {"weekly_expiration" weekly "monthly_expiration" monthly
+                                 "selection" selection "expiration_raw" expiration-raw
+                                 "weekly_raw" weekly-raw "monthly_raw" monthly-raw}])))
+              _ (wait-for-clock! date-text "12:01:00" (.-max_lateness_seconds args)
+                                 (.-capture_now args))
+              eligible-symbols
+              (vec (filter (fn [symbol]
+                             (>= (get (get decisions symbol) "weekly_expiration")
+                                 planned-exit-date))
+                           symbols))
+              skips
+              (vec (for [symbol symbols
+                         :when (not (contains? (set eligible-symbols) symbol))]
+                     {"symbol" symbol "reason" "SHORT_EXPIRES_BEFORE_FIVE_SESSION_EXIT"
+                      "weekly_expiration" (get (get decisions symbol) "weekly_expiration")
+                      "planned_exit_date" planned-exit-date}))
+              entries
+              (into {}
+                    (for [symbol eligible-symbols]
+                      (let [decision (get decisions symbol)
+                            weekly (get decision "weekly_expiration")
+                            monthly (get decision "monthly_expiration")
+                            strike (get (get decision "selection") "selected_strike")
+                            [weekly-raw weekly-rows] (fetch-chain args symbol weekly)
+                            [monthly-raw monthly-rows] (fetch-chain args symbol monthly)
+                            weekly-quote (get (shadow/quote-map weekly-rows weekly) [strike "P"])
+                            monthly-quote (get (shadow/quote-map monthly-rows monthly) [strike "P"])
+                            _ (when-not (and weekly-quote monthly-quote)
+                                (throw (python/RuntimeError (str "entry quote missing for " symbol))))
+                            selection {"atm_strike" (get (get decision "selection") "atm_strike")
+                                       "selected_strike" strike
+                                       "short_weekly" (assoc weekly-quote "quantity" -1)
+                                       "long_monthly" (assoc monthly-quote "quantity" 1)}
+                            economics (shadow/entry-economics selection)]
+                        [symbol {"selection" selection "economics" economics
+                                 "weekly_raw" weekly-raw "monthly_raw" monthly-raw}])))
+              candidates
+              (vec (for [symbol eligible-symbols]
+                     (let [decision (get decisions symbol)
+                           entry (get entries symbol)
+                           selection (get entry "selection")
+                           economics (get entry "economics")
+                           strike (get selection "selected_strike")]
+                       {"trade_id" (str "PANDA::" symbol "::" date-text "::" strike)
+                        "symbol" symbol
+                        "weekly_expiration" (get decision "weekly_expiration")
+                        "monthly_expiration" (get decision "monthly_expiration")
+                        "planned_exit_date" planned-exit-date
+                        "selected_strike" strike
+                        "entry_debit" (get economics "entry_debit")
+                        "assignment_notional_usd" (* 100.0 strike)
+                        "selection" selection "economics" economics})))
+              account-equity (float (.get (.get broker "account") "equity"))
+              admission (shadow/admit-calendar-candidates
+                         (.get state "positions") candidates account-equity limits symbol-priority)
+              admissions (get admission "admissions")
+              raw-root (os.path/join (os.path/dirname out) "raw")
+              raw-receipts
+              (into {}
+                    (concat
+                     (mapcat
+                      (fn [symbol]
+                        (let [decision (get decisions symbol)]
+                          [[(str symbol "_expirations")
+                            (persist-raw! (os.path/join raw-root (str symbol "-expirations.json"))
+                                          (get decision "expiration_raw"))]
+                           [(str symbol "_weekly_decision")
+                            (persist-raw! (os.path/join raw-root (str symbol "-weekly-decision.json"))
+                                          (get decision "weekly_raw"))]
+                           [(str symbol "_monthly_decision")
+                            (persist-raw! (os.path/join raw-root (str symbol "-monthly-decision.json"))
+                                          (get decision "monthly_raw"))]]))
+                      symbols)
+                     (mapcat
+                      (fn [symbol]
+                        (let [entry (get entries symbol)]
+                          [[(str symbol "_weekly_entry")
+                            (persist-raw! (os.path/join raw-root (str symbol "-weekly-entry.json"))
+                                          (get entry "weekly_raw"))]
+                           [(str symbol "_monthly_entry")
+                            (persist-raw! (os.path/join raw-root (str symbol "-monthly-entry.json"))
+                                          (get entry "monthly_raw"))]]))
+                      eligible-symbols)))
+              calendar-receipt
+              (persist-raw! (os.path/join raw-root "alpaca-market-calendar.json") calendar-raw)
+              receipt {"schema_version" 1 "kind" "panda-core-calendar-shadow-entry-v1"
+                       "status" "ENTRY_CAPTURED" "session_date" date-text
+                       "decision_anchor_et" "12:00:00" "entry_clock_et" "12:01:00"
+                       "captured_at_utc" (iso-utc) "account_equity_usd" account-equity
+                       "horizon_sessions" 5 "planned_exit_date" planned-exit-date
+                       "symbols" symbols "symbol_priority" symbol-priority "limits" limits
+                       "skips" skips
+                       "admissions" admissions "ending_exposure" (get admission "ending_exposure")
+                       "raw_receipts" (assoc raw-receipts "alpaca_market_calendar" calendar-receipt)
+                       "orders_enabled" false
+                       "broker_orders_submitted" false "locked_periods_read" false}
+              _ (immutable-json! out receipt)
+              updated (apply-entry-receipt state out receipt)]
+          (save-state! args updated)
+          (println (json/dumps (jsonable (dissoc receipt "raw_receipts"))
+                               ** :indent 2 :sort_keys true)))))))
+
+(defn capture-exit! [args]
+  (let [date-text (.-session_date args)
+        out (exit-receipt-path args date-text)
+        state (load-state args)]
+    (if (os.path/exists out)
+      (let [receipt (json/loads (slurp out))
+            recovered (apply-exit-receipt state out receipt)]
+        (save-state! args recovered)
+        (println (json/dumps (jsonable {"status" "ALREADY_CAPTURED"
+                                       "receipt" out "state_reconciled" true}) ** :indent 2)))
+      (let [due (vec (filter #(and (= "ACTIVE" (get % "status"))
+                                   (= date-text (get % "planned_exit_date")))
+                             (.get state "positions")))
+            _ (when (seq due)
+                (do (broker-snapshot args)
+                    (wait-for-clock! date-text "15:15:00" (.-max_lateness_seconds args)
+                                     (.-capture_now args))))
+            raw-root (os.path/join (os.path/dirname out) "raw")
+            results
+            (vec (for [position due]
+                   (let [symbol (get position "symbol") strike (get position "strike")
+                         weekly (get position "weekly_expiration")
+                         monthly (get position "monthly_expiration")
+                         [weekly-raw short] (fetch-exact-put args symbol weekly strike)
+                         [monthly-raw long] (fetch-exact-put args symbol monthly strike)
+                         economics (shadow/exit-economics
+                                    (get position "entry_debit") short long)
+                         prefix (str symbol "-" (.replace (str strike) "." "_"))]
+                     {"trade_id" (get position "trade_id") "symbol" symbol
+                      "selected_strike" strike "short_weekly" short "long_monthly" long
+                      "exit_economics" economics
+                      "raw_receipts"
+                      {"weekly" (persist-raw! (os.path/join raw-root (str prefix "-weekly.json"))
+                                              weekly-raw)
+                       "monthly" (persist-raw! (os.path/join raw-root (str prefix "-monthly.json"))
+                                               monthly-raw)}})))
+            receipt {"schema_version" 1 "kind" "panda-core-calendar-shadow-exit-v1"
+                     "status" (if (seq due) "EXIT_CAPTURED" "NO_DUE_POSITIONS")
+                     "session_date" date-text "exit_clock_et" "15:15:00"
+                     "captured_at_utc" (iso-utc) "exits" results
+                     "orders_enabled" false "broker_orders_submitted" false
+                     "locked_periods_read" false}
+            _ (immutable-json! out receipt)
+            updated (apply-exit-receipt state out receipt)]
+        (save-state! args updated)
+        (println (json/dumps (jsonable receipt) ** :indent 2 :sort_keys true))))))
+
+(defn status! [args]
+  (let [state (load-state args)
+        broker (broker-snapshot args)
+        result {"kind" "panda-calendar-shadow-status-v1" "checked_at_utc" (iso-utc)
+                "mode" "QUOTE_ONLY" "orders_enabled" false
+                "broker_orders_submitted" false "broker" broker
+                "active_exposure" (shadow/active-exposure (.get state "positions"))
+                "positions" (.get state "positions")}]
+    (println (json/dumps (jsonable result) ** :indent 2 :sort_keys true))))
+
+(defn parse-args []
+  (let [parser (argparse/ArgumentParser
+                ** :description "Durable Panda core-calendar quote-only shadow")]
+    (.add_argument parser "--phase" ** :choices ["preflight" "entry" "exit" "status"]
+                   :required true)
+    (.add_argument parser "--session-date"
+                   ** :default (.isoformat (.date (now-et))))
+    (.add_argument parser "--capture-now" ** :action "store_true")
+    (.add_argument parser "--base-url" ** :default "http://127.0.0.1:25503")
+    (.add_argument parser "--alpaca-base-url" ** :default "https://paper-api.alpaca.markets")
+    (.add_argument parser "--ref-root"
+                   ** :default (or (os.environ/get "STEVE_REF_ROOT")
+                                   "/opt/stevetrading/shared/Data-Preprocessor"))
+    (.add_argument parser "--output-root"
+                   ** :default "/opt/stevetrading/shared/panda-calendar-v1")
+    (.add_argument parser "--strike-range" ** :type int :default 30)
+    (.add_argument parser "--timeout-s" ** :type float :default 60.0)
+    (.add_argument parser "--max-lateness-seconds" ** :type float :default 45.0)
+    (.parse_args parser (python/list *command-line-args*))))
+
+(defn -main []
+  (let [args (parse-args)]
+    (case (.-phase args)
+      "preflight" (preflight! args)
+      "entry" (capture-entry! args)
+      "exit" (capture-exit! args)
+      "status" (status! args))))
+
+(-main)
