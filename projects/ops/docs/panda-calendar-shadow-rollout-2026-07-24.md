@@ -2,6 +2,9 @@
 
 **Status:** deployed only as a quote-recording shadow; broker writes are absent
 
+**Current release:** `20260724T190043Z`, policy
+`dual-selector-observation-v2-2026-07-24`, Git commit `812a2d3`
+
 ## Frozen research rule
 
 The forward shadow observes SPY, QQQ, and IWM in fixed priority order. At
@@ -57,12 +60,12 @@ Holm correction. Back-expiration flexibility had no reliable positive P&L
 effect. A standard-monthly back was slightly more capital-efficient on the
 shared four-cell portfolio sample.
 
-These findings do not retroactively alter existing receipts and do not by
-themselves authorize a deployed-selector change. The next forward research
-candidate is granular front + standard-monthly back for all three symbols,
-with fully granular retained as a quote-only comparator. Any change to the
-deployed shadow must be versioned prospectively so old and new observations
-cannot be mixed. The full evidence and limitations are recorded in
+These findings do not retroactively alter existing receipts. With explicit
+user authorization, the quote-only shadow was promoted prospectively to the
+granular-front + standard-monthly-back candidate for all three symbols, with
+fully granular retained as a research comparator. The versioned migration
+keeps old and new observations distinguishable. It does not authorize paper
+orders. The full evidence and limitations are recorded in
 `projects/ops/docs/calendar-expiration-selector-comparison-2026-07-24.md`.
 
 ## Observation ledger versus constrained portfolio
@@ -89,6 +92,12 @@ GG comparators, and reported seven total observations but only three admitted
 positions. A synthetic future exit closed all seven; replaying the exit was
 idempotent. Every broker check remained flat and both no-order assertions
 remained false.
+
+The validated release was promoted after the July 24 v1 exit timer completed
+successfully. Its deployment receipt is
+`/opt/stevetrading/shared/panda-calendar-v1/deployments/dual-selector-observation-v2-2026-07-24/receipt.json`.
+Post-promotion status preserved the legacy SPY observation, reported the v2
+policy current, and showed zero Panda broker positions and orders.
 
 ## Paper-order data collection boundary
 
